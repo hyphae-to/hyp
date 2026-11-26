@@ -417,9 +417,7 @@ pub fn validate_exec_secret_name(name: &str) -> Result<(), (&'static str, String
         };
         return Err((
             "RESERVED_SECRET_NAME",
-            format!(
-                "Reserved Hyphae system secret {label} is permanently blocked from `hyp exec`"
-            ),
+            format!("Reserved Hyphae system secret {label} is permanently blocked from `hyp exec`"),
         ));
     }
     if validate_secret_name(name).is_err() {
@@ -837,7 +835,13 @@ where
         match resolve_exec_state_dir(args.state_dir.as_deref(), args.config.as_deref()) {
             Ok(v) => v,
             Err(msg) => {
-                return write_exec_error(&mut stderr_writer, EXIT_ERROR, "CONFIG_ERROR", &msg, None);
+                return write_exec_error(
+                    &mut stderr_writer,
+                    EXIT_ERROR,
+                    "CONFIG_ERROR",
+                    &msg,
+                    None,
+                );
             }
         };
     let mut infra_config_secrets: HashSet<String> = HashSet::new();
@@ -878,7 +882,10 @@ where
                     &mut stderr_writer,
                     EXIT_ERROR,
                     "SECRET_NOT_FOUND",
-                    &format!("Secret '{}' was not found in SecretStore", binding.secret_name),
+                    &format!(
+                        "Secret '{}' was not found in SecretStore",
+                        binding.secret_name
+                    ),
                     Some(&hint),
                 );
             }
@@ -1020,7 +1027,11 @@ mod tests {
         Exec(ExecArgs),
     }
 
-    fn scrub_with_chunk_size(input: &[u8], rules: Arc<RedactionRuleSet>, chunk_size: usize) -> Vec<u8> {
+    fn scrub_with_chunk_size(
+        input: &[u8],
+        rules: Arc<RedactionRuleSet>,
+        chunk_size: usize,
+    ) -> Vec<u8> {
         let mut scrubber = StreamScrubber::new(rules);
         let mut out = Vec::new();
         for chunk in input.chunks(chunk_size) {
@@ -1053,7 +1064,10 @@ mod tests {
         .expect("valid exec invocation");
 
         let TestCommands::Exec(args) = parsed.command;
-        assert_eq!(args.env, vec!["API_KEY=openai-key", "SECONDARY_TOKEN=stripe-prod"]);
+        assert_eq!(
+            args.env,
+            vec!["API_KEY=openai-key", "SECONDARY_TOKEN=stripe-prod"]
+        );
         assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/hyphae-state")));
         assert_eq!(args.config, None);
         assert_eq!(
@@ -1096,7 +1110,10 @@ mod tests {
             "BASH_FUNC_foo",
         ];
         for var in blocked {
-            assert!(is_dangerous_env_var(var), "expected '{var}' to be dangerous");
+            assert!(
+                is_dangerous_env_var(var),
+                "expected '{var}' to be dangerous"
+            );
             let err = validate_env_var_name(var).unwrap_err();
             assert_eq!(err.0, "DANGEROUS_ENV_VAR", "var={var}");
         }
@@ -1184,7 +1201,8 @@ mod tests {
         let expected = "raw=[REDACTED:stripe-key]\nb64=[REDACTED:stripe-key]\nurl64=[REDACTED:stripe-key]\npctU=[REDACTED:stripe-key]\npctL=[REDACTED:stripe-key]\ntail";
 
         for chunk_size in [1, 2, 3, 7, 16, 64, 4096] {
-            let scrubbed = scrub_with_chunk_size(payload.as_bytes(), Arc::clone(&rules), chunk_size);
+            let scrubbed =
+                scrub_with_chunk_size(payload.as_bytes(), Arc::clone(&rules), chunk_size);
             assert_eq!(
                 String::from_utf8(scrubbed).unwrap(),
                 expected,

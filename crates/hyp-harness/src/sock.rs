@@ -22,9 +22,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream as TokioUnixStream;
 
@@ -549,7 +549,9 @@ pub async fn daemon_rpc_async(
 ) -> DaemonRpcResult {
     let fut = async {
         let (read_half, mut write_half) = connect_daemon_async(socket_path).await.ok()?;
-        write_ndjson_line_async(&mut write_half, packet).await.ok()?;
+        write_ndjson_line_async(&mut write_half, packet)
+            .await
+            .ok()?;
         let mut reader = tokio::io::BufReader::new(read_half);
         let line = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
             .await

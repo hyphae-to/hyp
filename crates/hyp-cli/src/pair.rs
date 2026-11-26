@@ -47,9 +47,13 @@ use hyp_node::engine::{
     PairServerReply, guest_pair_proof_canonical, p2p_offer_secret_name,
 };
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
-use hyp_proto::manifest::{NodeManifestPayload, NodeProfile as ProtoNodeProfile, SignedNodeManifest};
+use hyp_proto::manifest::{
+    NodeManifestPayload, NodeProfile as ProtoNodeProfile, SignedNodeManifest,
+};
 use hyp_proto::problem::ProblemDetails;
-use hyp_proto::scopes::{EscalationNote, ScopePreset, ScopeSet, V2_STAR_EXPANSION, expand_v2_scopes};
+use hyp_proto::scopes::{
+    EscalationNote, ScopePreset, ScopeSet, V2_STAR_EXPANSION, expand_v2_scopes,
+};
 use hyp_store::{
     GrantDirection, GrantInput, KeyStatus, KeyUse, ManifestCacheUpdate, NodeDb, PeerInput,
     PeerKeyInput, PeerProfile, PeerStatus, RevocationInput, StoreError,
@@ -591,7 +595,9 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
         println!();
     }
 
-    println!("Transport Options (all enforce full Hyphae v2 E2EE, Ed25519 auth & manifest verification):");
+    println!(
+        "Transport Options (all enforce full Hyphae v2 E2EE, Ed25519 auth & manifest verification):"
+    );
     for tr in &transports {
         println!("  [{}] {}", tr.id, tr.title);
         println!("    Best for: {}", tr.best_for);
@@ -603,10 +609,7 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
 
     println!("Scope Presets (note: '*' and 'full' NEVER grant bridge:post or forward:via):");
     for p in &presets {
-        println!(
-            "  {:<10}  tier={:<6}  {}",
-            p.name, p.trust_tier, p.summary
-        );
+        println!("  {:<10}  tier={:<6}  {}", p.name, p.trust_tier, p.summary);
         println!("              scopes: {}", p.scopes.join(" "));
     }
 
@@ -688,12 +691,7 @@ fn generate_offer_id() -> Result<String, String> {
     rng.fill(&mut b)
         .map_err(|_| "OS CSPRNG failure".to_string())?;
     let h = hex::encode(b);
-    Ok(format!(
-        "offer-{}-{}-{}",
-        &h[0..8],
-        &h[8..12],
-        &h[12..20]
-    ))
+    Ok(format!("offer-{}-{}-{}", &h[0..8], &h[8..12], &h[12..20]))
 }
 
 pub(crate) fn admin_ca_secret_name(node_id: &str) -> String {
@@ -759,7 +757,11 @@ fn project_v2_to_v1_scopes(v2_scopes: &[String]) -> Vec<&'static str> {
     v1
 }
 
-fn infer_trust_tier(mode: InviteMode, preset: Option<CliScopePreset>, scopes: &[String]) -> &'static str {
+fn infer_trust_tier(
+    mode: InviteMode,
+    preset: Option<CliScopePreset>,
+    scopes: &[String],
+) -> &'static str {
     if let Some(p) = preset {
         return trust_tier_str(p.to_proto().trust_tier());
     }
@@ -784,10 +786,7 @@ fn is_privileged_opt_in_scope(scope: &str) -> bool {
 
 /// Strips `bridge:post` and `forward:via` from default counter-grants, recording a clear warning
 /// whenever any privileged scope was removed (`P1-8`).
-fn strip_privileged_default_scopes(
-    scopes: Vec<String>,
-    warnings: &mut Vec<String>,
-) -> Vec<String> {
+fn strip_privileged_default_scopes(scopes: Vec<String>, warnings: &mut Vec<String>) -> Vec<String> {
     let mut safe = Vec::with_capacity(scopes.len());
     let mut stripped = Vec::new();
     for s in scopes {
@@ -1185,7 +1184,10 @@ fn run_invite(
                         EXIT_ERROR,
                         "KEYSTORE_ERROR",
                         format!("Failed to load/create node identity keys: {e}"),
-                        Some("Check permissions on --state-dir or HYPHAE_SECRET_BACKEND.".to_string()),
+                        Some(
+                            "Check permissions on --state-dir or HYPHAE_SECRET_BACKEND."
+                                .to_string(),
+                        ),
                     );
                 }
             };
@@ -1262,7 +1264,14 @@ fn run_invite(
             })) {
                 Ok(s) => s,
                 Err(e) => {
-                    return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "ENCODE_ERROR",
+                        e.to_string(),
+                        None,
+                    );
                 }
             };
             if let Err(e) = db.peers().add_grant(
@@ -1292,7 +1301,14 @@ fn run_invite(
             let offer_json = match serde_json::to_string(&offer) {
                 Ok(s) => s,
                 Err(e) => {
-                    return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "ENCODE_ERROR",
+                        e.to_string(),
+                        None,
+                    );
                 }
             };
             if let Err(e) = store.set(&offer_secret_key, &offer_json) {
@@ -1357,7 +1373,9 @@ fn run_invite(
                     println!("      Target Peer: {p}");
                 }
                 if endpoint_auto_detected {
-                    println!("      Endpoint:    {endpoint} (auto-detected via Tailscale MagicDNS)");
+                    println!(
+                        "      Endpoint:    {endpoint} (auto-detected via Tailscale MagicDNS)"
+                    );
                 } else {
                     println!("      Endpoint:    {endpoint}");
                 }
@@ -1406,19 +1424,20 @@ fn run_invite(
             };
 
             let v1_scopes = project_v2_to_v1_scopes(&offered_scopes);
-            let issued_v1 = match issue_grant_v1(&admin_key, &target_peer, &v1_scopes, ttl_ms, now_ms) {
-                Ok(g) => g,
-                Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "GRANT_ERROR",
-                        format!("Failed to issue Admin-CA grant: {e}"),
-                        None,
-                    );
-                }
-            };
+            let issued_v1 =
+                match issue_grant_v1(&admin_key, &target_peer, &v1_scopes, ttl_ms, now_ms) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        return emit_error(
+                            cmd,
+                            as_json,
+                            EXIT_ERROR,
+                            "GRANT_ERROR",
+                            format!("Failed to issue Admin-CA grant: {e}"),
+                            None,
+                        );
+                    }
+                };
 
             let parsed_v1 = match parse_pairing_code_v1(&issued_v1.code) {
                 Ok(p) => p,
@@ -1489,7 +1508,10 @@ fn run_invite(
                     == Some(ProtoNodeProfile::Router);
             if is_local_router_hub {
                 let db_path = effective_state_dir.join("node.sqlite");
-                match (NodeDb::open(&db_path), serde_json::to_string(&signed_grant_v2)) {
+                match (
+                    NodeDb::open(&db_path),
+                    serde_json::to_string(&signed_grant_v2),
+                ) {
                     (Ok(db), Ok(signed_grant_json)) => {
                         if let Err(e) = db.peers().add_grant(
                             &GrantInput {
@@ -1613,7 +1635,9 @@ fn run_invite(
                 println!("      Node ID:      {node_id}");
                 println!("      Target Peer:  {target_peer}");
                 if endpoint_auto_detected {
-                    println!("      Endpoint:     {endpoint} (auto-detected via Tailscale MagicDNS)");
+                    println!(
+                        "      Endpoint:     {endpoint} (auto-detected via Tailscale MagicDNS)"
+                    );
                 } else {
                     println!("      Endpoint:     {endpoint}");
                 }
@@ -1656,7 +1680,10 @@ fn encode_hp2p1_with_metadata(
     };
     map.insert("offerSig".to_string(), Value::String(offer_sig));
     if let Some(note) = escalation_note {
-        map.insert("escalationNote".to_string(), Value::String(note.to_string()));
+        map.insert(
+            "escalationNote".to_string(),
+            Value::String(note.to_string()),
+        );
     }
     if let Some(tier) = trust_tier {
         map.insert("trustTier".to_string(), Value::String(tier.to_string()));
@@ -1694,14 +1721,23 @@ fn encode_am2_with_metadata(
         "scopes".to_string(),
         Value::Array(scopes.iter().cloned().map(Value::String).collect()),
     );
-    map.insert("trustTier".to_string(), Value::String(trust_tier.to_string()));
-    map.insert("expiresAt".to_string(), Value::String(expires_at.to_string()));
+    map.insert(
+        "trustTier".to_string(),
+        Value::String(trust_tier.to_string()),
+    );
+    map.insert(
+        "expiresAt".to_string(),
+        Value::String(expires_at.to_string()),
+    );
     map.insert(
         "signedGrantV2".to_string(),
         serde_json::to_value(signed_grant_v2).map_err(|e| e.to_string())?,
     );
     if let Some(note) = escalation_note {
-        map.insert("escalationNote".to_string(), Value::String(note.to_string()));
+        map.insert(
+            "escalationNote".to_string(),
+            Value::String(note.to_string()),
+        );
     }
     let canon = to_canonical_json(&Value::Object(map)).map_err(|e| e.to_string())?;
     let token = format!("{AM2_PREFIX}{}", URL_SAFE_NO_PAD.encode(canon.as_bytes()));
@@ -1715,7 +1751,10 @@ fn encode_am2_with_metadata(
 // ============================================================================
 
 #[cfg_attr(not(unix), allow(unused_variables, clippy::ptr_arg))]
-fn read_bounded_token(token_file: Option<&Path>, warnings: &mut Vec<String>) -> Result<String, (u8, &'static str, String)> {
+fn read_bounded_token(
+    token_file: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Result<String, (u8, &'static str, String)> {
     let mut raw = String::new();
     match token_file {
         Some(path) => {
@@ -1858,7 +1897,10 @@ fn inspect_hp2p1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
                 EXIT_ERROR,
                 "INVALID_TOKEN",
                 format!("Invalid or tampered hp2p1_ pairing token: {e}"),
-                Some("Ask the inviter to generate a fresh token with `hyp pair invite --mode p2p`.".to_string()),
+                Some(
+                    "Ask the inviter to generate a fresh token with `hyp pair invite --mode p2p`."
+                        .to_string(),
+                ),
             );
         }
     };
@@ -1941,7 +1983,10 @@ fn inspect_hp2p1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
     let ok = !expired;
     let next = if ok {
         vec![
-            format!("Verify JWK kid '{kid}' out-of-band with '{}'.", offer.node_id),
+            format!(
+                "Verify JWK kid '{kid}' out-of-band with '{}'.",
+                offer.node_id
+            ),
             "Accept via stdin: hyp pair accept <<< '<token>'".to_string(),
         ]
     } else {
@@ -1975,7 +2020,10 @@ fn inspect_hp2p1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
         let error = if expired {
             Some(CliError {
                 code: "TOKEN_EXPIRED".to_string(),
-                message: format!("P2P pairing offer '{}' expired at {}", offer.offer_id, offer.expires_at),
+                message: format!(
+                    "P2P pairing offer '{}' expired at {}",
+                    offer.offer_id, offer.expires_at
+                ),
                 fix: next.first().cloned(),
             })
         } else {
@@ -2079,7 +2127,10 @@ fn inspect_am2(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitCod
                 EXIT_ERROR,
                 code,
                 msg,
-                Some("Ask your organization administrator for a fresh am2_ invite bundle.".to_string()),
+                Some(
+                    "Ask your organization administrator for a fresh am2_ invite bundle."
+                        .to_string(),
+                ),
             );
         }
     };
@@ -2221,10 +2272,7 @@ fn inspect_am2(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitCod
         println!("      Admin kid:   {kid}");
         println!("      Fingerprint: {admin_fingerprint}");
         println!("      Trust Tier:  {trust_tier}");
-        println!(
-            "      RequireE2EE: {}",
-            invite.require_e2ee.unwrap_or(true)
-        );
+        println!("      RequireE2EE: {}", invite.require_e2ee.unwrap_or(true));
         match &expires_at {
             Some(ts) => println!("      Expiry:      {expiry_status} ({ts})"),
             None => println!("      Expiry:      {expiry_status} (enforced server-side by router)"),
@@ -2274,7 +2322,8 @@ fn inspect_t3mp1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
             "Verify admin fingerprint '{}' with your router administrator.",
             parsed.admin_fingerprint
         ),
-        "Prefer generating v2 tokens via `hyp pair invite --mode team` or `--mode p2p`.".to_string(),
+        "Prefer generating v2 tokens via `hyp pair invite --mode team` or `--mode p2p`."
+            .to_string(),
     ];
 
     let data = json!({
@@ -2293,7 +2342,10 @@ fn inspect_t3mp1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
-            summary: Some(format!("Inspected legacy v1 t3mp1_ code (grant {})", parsed.grant_id)),
+            summary: Some(format!(
+                "Inspected legacy v1 t3mp1_ code (grant {})",
+                parsed.grant_id
+            )),
             data: Some(data),
             warnings,
             next,
@@ -2674,7 +2726,8 @@ fn verify_signed_manifest_strict(
     if canonical != signed.payload {
         return Err((
             "NON_CANONICAL_MANIFEST",
-            "Pairing reply manifest payload is not canonical RFC 8785 JCS (fail-closed)".to_string(),
+            "Pairing reply manifest payload is not canonical RFC 8785 JCS (fail-closed)"
+                .to_string(),
         ));
     }
     let crypto_sign_jwk = proto_jwk_to_crypto(&payload.identity.signing_jwk);
@@ -2724,7 +2777,10 @@ fn verify_signed_manifest_strict(
     let exp_ms = parse_rfc3339_millis(&payload.expires_at).map_err(|e| {
         (
             "INVALID_MANIFEST",
-            format!("Invalid expiresAt '{}' in pairing manifest: {e}", payload.expires_at),
+            format!(
+                "Invalid expiresAt '{}' in pairing manifest: {e}",
+                payload.expires_at
+            ),
         )
     })?;
     if now_unix_ms() > exp_ms {
@@ -2847,7 +2903,10 @@ fn decode_handshake_http_error(
             message: format!("POST {url} rejected ({}): {detail}", problem.error),
         };
     }
-    let snippet: String = String::from_utf8_lossy(body_bytes).chars().take(200).collect();
+    let snippet: String = String::from_utf8_lossy(body_bytes)
+        .chars()
+        .take(200)
+        .collect();
     let code = match status {
         401 | 403 => "PAIR_REJECTED",
         404 => not_found_code,
@@ -2893,17 +2952,13 @@ fn execute_live_p2p_handshake(
             message: format!("Failed to sign local P2P counter-grant: {e}"),
         }
     })?;
-    let resp_body: P2pPairResponse = create_p2p_response(
-        offer,
-        local_node_id,
-        local_endpoint,
-        local_keys,
-        &bob_grant,
-    )
-    .map_err(|e| LiveHandshakeError::Rejected {
-        code: "OFFER_ERROR",
-        message: format!("Failed to construct P2P pairing response: {e}"),
-    })?;
+    let resp_body: P2pPairResponse =
+        create_p2p_response(offer, local_node_id, local_endpoint, local_keys, &bob_grant).map_err(
+            |e| LiveHandshakeError::Rejected {
+                code: "OFFER_ERROR",
+                message: format!("Failed to construct P2P pairing response: {e}"),
+            },
+        )?;
     let req_bytes = serde_json::to_vec(&resp_body).map_err(|e| LiveHandshakeError::Rejected {
         code: "ENCODE_ERROR",
         message: format!("Failed to serialize P2P pairing response: {e}"),
@@ -2938,14 +2993,12 @@ fn execute_live_p2p_handshake(
         offer_id: server_reply.offer_id.clone(),
         alice_grant_to_bob: server_reply.alice_grant_to_bob.clone(),
     };
-    let alice_grant_verified =
-        verify_p2p_confirmation(offer, &confirmation, local_node_id).map_err(|e| {
-            LiveHandshakeError::Rejected {
-                code: "INVALID_SIGNATURE",
-                message: format!(
-                    "Peer P2P confirmation failed zero-TOFU verification against out-of-band JWK: {e}"
-                ),
-            }
+    let alice_grant_verified = verify_p2p_confirmation(offer, &confirmation, local_node_id)
+        .map_err(|e| LiveHandshakeError::Rejected {
+            code: "INVALID_SIGNATURE",
+            message: format!(
+                "Peer P2P confirmation failed zero-TOFU verification against out-of-band JWK: {e}"
+            ),
         })?;
 
     let (manifest_payload, _sign_pk, _enc_pk) = verify_signed_manifest_strict(
@@ -2986,13 +3039,12 @@ fn execute_live_am2_handshake(
     local_keys: &NodeIdentityKeys,
     inline_signed_grant: Option<&SignedPayload>,
 ) -> Result<LiveAm2HandshakeResult, LiveHandshakeError> {
-    let pair_kp =
-        derive_pairing_key_v1(&parsed_v1.secret, &parsed_v1.grant_id).map_err(|e| {
-            LiveHandshakeError::Rejected {
-                code: "INVALID_TOKEN",
-                message: format!("Failed to derive one-time pairing key from am2_ bundle: {e}"),
-            }
-        })?;
+    let pair_kp = derive_pairing_key_v1(&parsed_v1.secret, &parsed_v1.grant_id).map_err(|e| {
+        LiveHandshakeError::Rejected {
+            code: "INVALID_TOKEN",
+            message: format!("Failed to derive one-time pairing key from am2_ bundle: {e}"),
+        }
+    })?;
 
     let binding = PairBindingV2 {
         v: 2,
@@ -3017,10 +3069,11 @@ fn execute_live_am2_handshake(
         pairing_sig,
         self_sig,
     };
-    let mut req_val = serde_json::to_value(&pair_req).map_err(|e| LiveHandshakeError::Rejected {
-        code: "ENCODE_ERROR",
-        message: format!("Failed to serialize PairRequestV2: {e}"),
-    })?;
+    let mut req_val =
+        serde_json::to_value(&pair_req).map_err(|e| LiveHandshakeError::Rejected {
+            code: "ENCODE_ERROR",
+            message: format!("Failed to serialize PairRequestV2: {e}"),
+        })?;
     if let Some(sg) = inline_signed_grant {
         if let Some(obj) = req_val.as_object_mut() {
             let sg_val = serde_json::to_value(sg).map_err(|e| LiveHandshakeError::Rejected {
@@ -3061,7 +3114,10 @@ fn execute_live_am2_handshake(
     if reply.node_id == LOCAL_NODE_ID || !is_valid_node_id(&reply.node_id) {
         return Err(LiveHandshakeError::Rejected {
             code: "PAIR_HANDSHAKE_INVALID",
-            message: format!("Hub returned invalid nodeId '{}' in /v1/pair reply", reply.node_id),
+            message: format!(
+                "Hub returned invalid nodeId '{}' in /v1/pair reply",
+                reply.node_id
+            ),
         });
     }
     if let Some(expected) = expected_hub_id {
@@ -3076,14 +3132,13 @@ fn execute_live_am2_handshake(
         }
     }
 
-    let verified_grant = verify_grant_v2(&reply.grant, admin_pk).map_err(|e| {
-        LiveHandshakeError::Rejected {
+    let verified_grant =
+        verify_grant_v2(&reply.grant, admin_pk).map_err(|e| LiveHandshakeError::Rejected {
             code: "INVALID_SIGNATURE",
             message: format!(
                 "Hub /v1/pair returned grant that failed Admin-CA signature verification: {e}"
             ),
-        }
-    })?;
+        })?;
     if verified_grant.node_id != local_node_id {
         return Err(LiveHandshakeError::Rejected {
             code: "PAIR_REJECTED",
@@ -3094,13 +3149,9 @@ fn execute_live_am2_handshake(
         });
     }
 
-    let (manifest_payload, hub_signing_pk, hub_encryption_pk) = verify_signed_manifest_strict(
-        &reply.signed_manifest,
-        Some(&reply.node_id),
-        None,
-        None,
-    )
-    .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    let (manifest_payload, hub_signing_pk, hub_encryption_pk) =
+        verify_signed_manifest_strict(&reply.signed_manifest, Some(&reply.node_id), None, None)
+            .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
 
     let manifest_json = serde_json::to_string(&reply.signed_manifest).map_err(|e| {
         LiveHandshakeError::Rejected {
@@ -3156,7 +3207,10 @@ fn resolve_pair_daemon_socket(state_dir: &Path, explicit_state: bool) -> PathBuf
 ///
 /// Always fail-safe: returns `reloaded: false` without error if the daemon is stopped,
 /// unreachable, or timed out so an already-committed pairing/revocation never fails.
-pub(crate) fn try_reload_live_daemon(state_dir: &Path, explicit_state: bool) -> DaemonReloadOutcome {
+pub(crate) fn try_reload_live_daemon(
+    state_dir: &Path,
+    explicit_state: bool,
+) -> DaemonReloadOutcome {
     let socket_path = resolve_pair_daemon_socket(state_dir, explicit_state);
     try_reload_live_daemon_at_socket(&socket_path)
 }
@@ -3300,7 +3354,10 @@ fn run_accept(
             EXIT_ERROR,
             "UNSUPPORTED_TOKEN",
             "Legacy v1 t3mp1_ codes do not include a router URL or Admin-CA JWK; use a v2 am2_ or hp2p1_ token.",
-            Some("Generate a v2 invite via `hyp pair invite --mode team` or `--mode p2p`.".to_string()),
+            Some(
+                "Generate a v2 invite via `hyp pair invite --mode team` or `--mode p2p`."
+                    .to_string(),
+            ),
         )
     } else {
         emit_error(
@@ -3333,7 +3390,10 @@ fn accept_hp2p1(
                 EXIT_ERROR,
                 "INVALID_TOKEN",
                 format!("Invalid or tampered hp2p1_ pairing token: {e}"),
-                Some("Ask the inviter to generate a fresh token with `hyp pair invite --mode p2p`.".to_string()),
+                Some(
+                    "Ask the inviter to generate a fresh token with `hyp pair invite --mode p2p`."
+                        .to_string(),
+                ),
             );
         }
     };
@@ -3532,14 +3592,11 @@ fn accept_hp2p1(
         }
     }
 
-    let local_node_id = match resolve_local_node_id(
-        node_id_arg.as_deref(),
-        &state_dir,
-        existing_db.as_ref(),
-    ) {
-        Ok(id) => id,
-        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
-    };
+    let local_node_id =
+        match resolve_local_node_id(node_id_arg.as_deref(), &state_dir, existing_db.as_ref()) {
+            Ok(id) => id,
+            Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
+        };
 
     let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
     let local_keys = match secrets.load_or_create_node_keys(&local_node_id) {
@@ -3676,11 +3733,29 @@ fn accept_hp2p1(
 
     let sign_jwk_json = match serde_json::to_string(&offer.signing_jwk) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
     let enc_jwk_json = match serde_json::to_string(&offer.encryption_jwk) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
 
     if let Err(e) = db.peers().upsert_peer_key(
@@ -3728,7 +3803,16 @@ fn accept_hp2p1(
         // Persist Alice's verified outbound grant, Bob's inbound counter-grant, and Alice's verified manifest!
         let alice_grant_json = match serde_json::to_string(&live.alice_grant_signed) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         if let Err(e) = save_grant_idempotent(
             &db,
@@ -3750,7 +3834,16 @@ fn accept_hp2p1(
 
         let bob_grant_json = match serde_json::to_string(&live.bob_grant_signed) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         if let Err(e) = save_grant_idempotent(
             &db,
@@ -3773,7 +3866,16 @@ fn accept_hp2p1(
 
         let manifest_json = match serde_json::to_string(&live.signed_manifest) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         let caps: Vec<String> = live
             .manifest_payload
@@ -3797,7 +3899,10 @@ fn accept_hp2p1(
                 as_json,
                 EXIT_ERROR,
                 "MANIFEST_CACHE_ERROR",
-                format!("Failed to cache verified manifest for '{}': {e}", offer.node_id),
+                format!(
+                    "Failed to cache verified manifest for '{}': {e}",
+                    offer.node_id
+                ),
                 None,
             );
         }
@@ -3833,7 +3938,14 @@ fn accept_hp2p1(
         let signed_counter_json = match serde_json::to_string(&signed_counter) {
             Ok(s) => s,
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None);
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
             }
         };
         if let Err(e) = save_grant_idempotent(
@@ -3927,7 +4039,9 @@ fn accept_hp2p1(
         println!("      Offered:     {}", expanded_offered.join(" "));
         println!("      Granted:     {}", granted_scopes.join(" "));
         if daemon_reloaded {
-            println!("      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed).");
+            println!(
+                "      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed)."
+            );
         }
         if let Some(ref note) = untrusted_note {
             println!(
@@ -3971,7 +4085,10 @@ fn accept_am2(
             as_json,
             EXIT_ERROR,
             "INVALID_ENDPOINT",
-            format!("Untrusted router endpoint '{}' in am2_ bundle: {e}", invite.router),
+            format!(
+                "Untrusted router endpoint '{}' in am2_ bundle: {e}",
+                invite.router
+            ),
             None,
         );
     }
@@ -4024,7 +4141,10 @@ fn accept_am2(
                 EXIT_ERROR,
                 code,
                 msg,
-                Some("Request a fresh unmodified am2_ bundle from your organization administrator.".to_string()),
+                Some(
+                    "Request a fresh unmodified am2_ bundle from your organization administrator."
+                        .to_string(),
+                ),
             );
         }
     };
@@ -4051,7 +4171,10 @@ fn accept_am2(
                     EXIT_ERROR,
                     "TOKEN_EXPIRED",
                     format!("Org Admin-CA invite bundle expired at {ts}"),
-                    Some("Request a fresh am2_ invite bundle from your organization administrator.".to_string()),
+                    Some(
+                        "Request a fresh am2_ invite bundle from your organization administrator."
+                            .to_string(),
+                    ),
                 );
             }
             Ok(ms) => expires_at_ms = Some(ms),
@@ -4200,14 +4323,11 @@ fn accept_am2(
         None
     };
 
-    let local_node_id = match resolve_local_node_id(
-        node_id_arg.as_deref(),
-        &state_dir,
-        existing_db.as_ref(),
-    ) {
-        Ok(id) => id,
-        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
-    };
+    let local_node_id =
+        match resolve_local_node_id(node_id_arg.as_deref(), &state_dir, existing_db.as_ref()) {
+            Ok(id) => id,
+            Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
+        };
 
     let secrets = crate::config_file::open_secret_store(&state_dir, explicit_state);
     let local_keys = match secrets.load_or_create_node_keys(&local_node_id) {
@@ -4229,12 +4349,9 @@ fn accept_am2(
             .map(ToOwned::to_owned)
             .or_else(|| derive_peer_id_from_url(&invite.router).ok());
         if let Some(ref candidate_peer_id) = preflight_peer_id {
-            if let Err((code, msg)) = check_existing_peer_pin(
-                db,
-                candidate_peer_id,
-                PeerProfile::Router,
-                &invite.router,
-            ) {
+            if let Err((code, msg)) =
+                check_existing_peer_pin(db, candidate_peer_id, PeerProfile::Router, &invite.router)
+            {
                 return emit_error(
                     cmd,
                     as_json,
@@ -4264,7 +4381,9 @@ fn accept_am2(
                 EXIT_ERROR,
                 "INVALID_TOKEN",
                 "am2_ invite bundle is missing a valid t3mp1_ pairingCode required for live POST /v1/pair",
-                Some("Generate a fresh team invite with `hyp pair invite --mode team`.".to_string()),
+                Some(
+                    "Generate a fresh team invite with `hyp pair invite --mode team`.".to_string(),
+                ),
             );
         };
         match execute_live_am2_handshake(
@@ -4435,7 +4554,16 @@ fn accept_am2(
 
     let admin_jwk_json = match serde_json::to_string(&invite.admin_jwk) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
     if let Err(e) = db.peers().upsert_peer_key(
         &PeerKeyInput {
@@ -4463,11 +4591,29 @@ fn accept_am2(
         let hub_enc_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.encryption_jwk);
         let hub_sign_json = match serde_json::to_string(&hub_sign_jwk) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         let hub_enc_json = match serde_json::to_string(&hub_enc_jwk) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         if let Err(e) = db.peers().upsert_peer_key(
             &PeerKeyInput {
@@ -4511,7 +4657,16 @@ fn accept_am2(
         }
         let manifest_json = match serde_json::to_string(&live.signed_manifest) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         let caps: Vec<String> = live
             .manifest_payload
@@ -4546,17 +4701,40 @@ fn accept_am2(
         .map(|l| l.verified_grant.id.clone())
         .or_else(|| verified_grant_pair.as_ref().map(|(_, g)| g.id.clone()))
         .or_else(|| parsed_v1.as_ref().map(|p| p.grant_id.clone()))
-        .unwrap_or_else(|| format!("am2-{}", &hex::encode(Sha256::digest(token.as_bytes()))[..12]));
+        .unwrap_or_else(|| {
+            format!(
+                "am2-{}",
+                &hex::encode(Sha256::digest(token.as_bytes()))[..12]
+            )
+        });
 
     let stored_grant_json = if let Some(ref live) = live_res {
         match serde_json::to_string(&live.signed_grant) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         }
     } else if let Some((ref sg, _)) = verified_grant_pair {
         match serde_json::to_string(sg) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         }
     } else {
         json!({
@@ -4661,7 +4839,9 @@ fn accept_am2(
         println!("      Trust Tier:  {}", trust_tier.as_str());
         println!("      Scopes:      {}", effective_peer_scopes.join(" "));
         if daemon_reloaded {
-            println!("      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed).");
+            println!(
+                "      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed)."
+            );
         }
         if let Some(ref note) = untrusted_note {
             println!(
@@ -4696,7 +4876,10 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
     }
     validate_endpoint_origin(&offer.endpoint).map_err(|e| LiveHandshakeError::Rejected {
         code: "INVALID_ENDPOINT",
-        message: format!("Untrusted endpoint '{}' in hp2p1_ token: {e}", offer.endpoint),
+        message: format!(
+            "Untrusted endpoint '{}' in hp2p1_ token: {e}",
+            offer.endpoint
+        ),
     })?;
     let signing_pk = offer
         .signing_jwk
@@ -4716,10 +4899,11 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
     let raw_map = extract_raw_json_object(HP2P1_PREFIX, token);
     verify_optional_hp2p1_sig(&offer, &signing_pk, raw_map.as_ref())
         .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
-    let exp_ms = parse_rfc3339_millis(&offer.expires_at).map_err(|e| LiveHandshakeError::Rejected {
-        code: "INVALID_TOKEN",
-        message: format!("Invalid expiresAt timestamp: {e}"),
-    })?;
+    let exp_ms =
+        parse_rfc3339_millis(&offer.expires_at).map_err(|e| LiveHandshakeError::Rejected {
+            code: "INVALID_TOKEN",
+            message: format!("Invalid expiresAt timestamp: {e}"),
+        })?;
     if now_unix_ms() > exp_ms {
         return Err(LiveHandshakeError::Rejected {
             code: "TOKEN_EXPIRED",
@@ -4807,12 +4991,11 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
             code: "ENCODE_ERROR",
             message: e.to_string(),
         })?;
-    let enc_jwk_json = serde_json::to_string(&offer.encryption_jwk).map_err(|e| {
-        LiveHandshakeError::Rejected {
+    let enc_jwk_json =
+        serde_json::to_string(&offer.encryption_jwk).map_err(|e| LiveHandshakeError::Rejected {
             code: "ENCODE_ERROR",
             message: e.to_string(),
-        }
-    })?;
+        })?;
     db.peers()
         .upsert_peer_key(
             &PeerKeyInput {
@@ -4845,11 +5028,12 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
             code: "DB_ERROR",
             message: format!("Failed to pin peer encryption JWK: {e}"),
         })?;
-    let alice_grant_json =
-        serde_json::to_string(&live.alice_grant_signed).map_err(|e| LiveHandshakeError::Rejected {
+    let alice_grant_json = serde_json::to_string(&live.alice_grant_signed).map_err(|e| {
+        LiveHandshakeError::Rejected {
             code: "ENCODE_ERROR",
             message: e.to_string(),
-        })?;
+        }
+    })?;
     save_grant_idempotent(
         db,
         &GrantInput {
@@ -4869,11 +5053,12 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
         code: "DB_ERROR",
         message,
     })?;
-    let bob_grant_json =
-        serde_json::to_string(&live.bob_grant_signed).map_err(|e| LiveHandshakeError::Rejected {
+    let bob_grant_json = serde_json::to_string(&live.bob_grant_signed).map_err(|e| {
+        LiveHandshakeError::Rejected {
             code: "ENCODE_ERROR",
             message: e.to_string(),
-        })?;
+        }
+    })?;
     save_grant_idempotent(
         db,
         &GrantInput {
@@ -4946,7 +5131,10 @@ pub(crate) fn live_pair_am2_for_onboard(
     })?;
     validate_endpoint_origin(&invite.router).map_err(|e| LiveHandshakeError::Rejected {
         code: "INVALID_ENDPOINT",
-        message: format!("Untrusted router endpoint '{}' in am2_ bundle: {e}", invite.router),
+        message: format!(
+            "Untrusted router endpoint '{}' in am2_ bundle: {e}",
+            invite.router
+        ),
     })?;
     let admin_pk = invite
         .admin_jwk
@@ -4955,12 +5143,11 @@ pub(crate) fn live_pair_am2_for_onboard(
             code: "INVALID_KEY",
             message: format!("Invalid adminJwk in am2_ bundle: {e}"),
         })?;
-    let parsed_v1 = parse_pairing_code_v1(&invite.pairing_code).map_err(|e| {
-        LiveHandshakeError::Rejected {
+    let parsed_v1 =
+        parse_pairing_code_v1(&invite.pairing_code).map_err(|e| LiveHandshakeError::Rejected {
             code: "INVALID_TOKEN",
             message: format!("Malformed pairingCode in am2_ bundle: {e}"),
-        }
-    })?;
+        })?;
     let raw_map = extract_raw_json_object(AM2_PREFIX, token);
     let verified_grant_pair =
         verify_optional_am2_signed_grant(&admin_pk, Some(&parsed_v1.grant_id), raw_map.as_ref())
@@ -5196,7 +5383,13 @@ pub(crate) fn live_join_url_for_onboard(
     let mut effective_signed = v.signed.clone();
     let mut effective_payload = v.payload.clone();
 
-    match attempt_guest_self_enroll(&base_url, &peer_id, &v.signing_pk, local_node_id, local_keys) {
+    match attempt_guest_self_enroll(
+        &base_url,
+        &peer_id,
+        &v.signing_pk,
+        local_node_id,
+        local_keys,
+    ) {
         Ok(GuestEnrollOutcome::Enrolled {
             preset: _,
             scopes,
@@ -5242,16 +5435,14 @@ pub(crate) fn live_join_url_for_onboard(
 
     let sign_jwk = proto_jwk_to_crypto(&v.payload.identity.signing_jwk);
     let enc_jwk = proto_jwk_to_crypto(&v.payload.identity.encryption_jwk);
-    let sign_json =
-        serde_json::to_string(&sign_jwk).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    let enc_json =
-        serde_json::to_string(&enc_jwk).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
+    let sign_json = serde_json::to_string(&sign_jwk).map_err(|e| LiveHandshakeError::Rejected {
+        code: "ENCODE_ERROR",
+        message: e.to_string(),
+    })?;
+    let enc_json = serde_json::to_string(&enc_jwk).map_err(|e| LiveHandshakeError::Rejected {
+        code: "ENCODE_ERROR",
+        message: e.to_string(),
+    })?;
     db.peers()
         .upsert_peer_key(
             &PeerKeyInput {
@@ -5333,13 +5524,20 @@ struct VerifiedLiveManifest {
     etag: Option<String>,
 }
 
-fn fetch_and_verify_manifest(base_url: &str) -> Result<VerifiedLiveManifest, (&'static str, String)> {
+fn fetch_and_verify_manifest(
+    base_url: &str,
+) -> Result<VerifiedLiveManifest, (&'static str, String)> {
     let manifest_url = format!("{}/v1/manifest", base_url.trim_end_matches('/'));
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
+        .map_err(|e| {
+            (
+                "RUNTIME_ERROR",
+                format!("Failed to start async runtime: {e}"),
+            )
+        })?;
 
     let (body_bytes, etag) = rt.block_on(async {
         let client = HttpClient::new()
@@ -5530,7 +5728,12 @@ fn attempt_guest_self_enroll(
         &x25519_jwk,
         &timestamp,
     )
-    .map_err(|e| ("ENCODE_ERROR", format!("Failed to canonicalize guest-pair proof: {e}")))?;
+    .map_err(|e| {
+        (
+            "ENCODE_ERROR",
+            format!("Failed to canonicalize guest-pair proof: {e}"),
+        )
+    })?;
     let proof_sig = local_keys
         .signing
         .sign_domain_b64("guest-pair", canonical.as_bytes());
@@ -5542,13 +5745,22 @@ fn attempt_guest_self_enroll(
         timestamp,
         proof_sig,
     };
-    let req_bytes = serde_json::to_vec(&req_body)
-        .map_err(|e| ("ENCODE_ERROR", format!("Failed to serialize guest-pair request: {e}")))?;
+    let req_bytes = serde_json::to_vec(&req_body).map_err(|e| {
+        (
+            "ENCODE_ERROR",
+            format!("Failed to serialize guest-pair request: {e}"),
+        )
+    })?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
+        .map_err(|e| {
+            (
+                "RUNTIME_ERROR",
+                format!("Failed to start async runtime: {e}"),
+            )
+        })?;
 
     let (status, body_bytes) = rt.block_on(async {
         let client = HttpClient::new()
@@ -5625,31 +5837,38 @@ fn attempt_guest_self_enroll(
     }
 
     if status != 200 {
-        let (code, detail) = if let Ok(problem) = serde_json::from_slice::<ProblemDetails>(&body_bytes) {
-            let err_code = match (status, problem.error.as_str()) {
-                (_, "peer_key_mismatch") => "PEER_KEY_MISMATCH",
-                (429, _) | (_, "rate_limited") => "RATE_LIMITED",
-                (409, _) => "GUEST_PAIR_CONFLICT",
-                (403, _) | (401, _) => "GUEST_PAIR_REJECTED",
-                _ => "GUEST_PAIR_FAILED",
+        let (code, detail) =
+            if let Ok(problem) = serde_json::from_slice::<ProblemDetails>(&body_bytes) {
+                let err_code = match (status, problem.error.as_str()) {
+                    (_, "peer_key_mismatch") => "PEER_KEY_MISMATCH",
+                    (429, _) | (_, "rate_limited") => "RATE_LIMITED",
+                    (409, _) => "GUEST_PAIR_CONFLICT",
+                    (403, _) | (401, _) => "GUEST_PAIR_REJECTED",
+                    _ => "GUEST_PAIR_FAILED",
+                };
+                let msg = problem
+                    .detail
+                    .unwrap_or_else(|| format!("{} (HTTP {status})", problem.title));
+                (
+                    err_code,
+                    format!("POST {pair_url} rejected ({}): {msg}", problem.error),
+                )
+            } else {
+                let snippet: String = String::from_utf8_lossy(&body_bytes)
+                    .chars()
+                    .take(200)
+                    .collect();
+                let err_code = match status {
+                    409 => "GUEST_PAIR_CONFLICT",
+                    429 => "RATE_LIMITED",
+                    401 | 403 => "GUEST_PAIR_REJECTED",
+                    _ => "GUEST_PAIR_FAILED",
+                };
+                (
+                    err_code,
+                    format!("POST {pair_url} returned HTTP {status}: {snippet}"),
+                )
             };
-            let msg = problem
-                .detail
-                .unwrap_or_else(|| format!("{} (HTTP {status})", problem.title));
-            (err_code, format!("POST {pair_url} rejected ({}): {msg}", problem.error))
-        } else {
-            let snippet: String = String::from_utf8_lossy(&body_bytes).chars().take(200).collect();
-            let err_code = match status {
-                409 => "GUEST_PAIR_CONFLICT",
-                429 => "RATE_LIMITED",
-                401 | 403 => "GUEST_PAIR_REJECTED",
-                _ => "GUEST_PAIR_FAILED",
-            };
-            (
-                err_code,
-                format!("POST {pair_url} returned HTTP {status}: {snippet}"),
-            )
-        };
         return Err((code, detail));
     }
 
@@ -5748,7 +5967,10 @@ fn attempt_guest_self_enroll(
     if now_unix_ms() > exp_ms {
         return Err((
             "MANIFEST_EXPIRED",
-            format!("Hub manifest in /v1/guest/pair expired at {}", manifest_payload.expires_at),
+            format!(
+                "Hub manifest in /v1/guest/pair expired at {}",
+                manifest_payload.expires_at
+            ),
         ));
     }
 
@@ -5944,9 +6166,15 @@ pub(crate) fn attempt_delegated_pair_enroll(
                 let msg = problem
                     .detail
                     .unwrap_or_else(|| format!("{} (HTTP {status})", problem.title));
-                (err_code, format!("POST {pair_url} rejected ({}): {msg}", problem.error))
+                (
+                    err_code,
+                    format!("POST {pair_url} rejected ({}): {msg}", problem.error),
+                )
             } else {
-                let snippet: String = String::from_utf8_lossy(&body_bytes).chars().take(200).collect();
+                let snippet: String = String::from_utf8_lossy(&body_bytes)
+                    .chars()
+                    .take(200)
+                    .collect();
                 let err_code = match status {
                     409 => "DELEGATED_PAIR_CONFLICT",
                     429 => "QUOTA_EXCEEDED",
@@ -6470,11 +6698,29 @@ fn run_join(
 
         let sign_json = match serde_json::to_string(&sign_jwk) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         let enc_json = match serde_json::to_string(&enc_jwk) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
 
         if let Err(e) = db.peers().upsert_peer_key(
@@ -6525,7 +6771,16 @@ fn run_join(
             .collect();
         let manifest_json = match serde_json::to_string(signed_to_cache) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         if let Err(e) = db.peers().cache_manifest(
             &peer_id,
@@ -6661,7 +6916,9 @@ fn run_join(
         }
         println!("      Scopes:      {}", effective_scopes.join(" "));
         if daemon_reloaded {
-            println!("      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed).");
+            println!(
+                "      Daemon:      Live daemon reloaded — peer connected immediately (no restart needed)."
+            );
         }
         print_warnings(&warnings);
         print_next_steps(&next);
@@ -6679,7 +6936,9 @@ const MAX_PAIR_SSH_STDOUT_BYTES: usize = 256 * 1024;
 fn shell_single_quote_strict(raw: &str, label: &str) -> Result<String, String> {
     if raw.is_empty()
         || raw.contains('\'')
-        || raw.chars().any(|c| c.is_control() || c == '\n' || c == '\r')
+        || raw
+            .chars()
+            .any(|c| c.is_control() || c == '\n' || c == '\r')
     {
         return Err(format!(
             "refusing unsafe remote SSH argument for {label}: contains single quote or control characters"
@@ -6739,7 +6998,10 @@ fn build_remote_p2p_invite_cmd(
     match &ssh_ep.bin {
         Some(bin) => {
             validate_ssh_posix_path(bin, "bin").map_err(|e| e.to_string())?;
-            Ok(format!("exec {} {joined}", shell_single_quote_strict(bin, "bin")?))
+            Ok(format!(
+                "exec {} {joined}",
+                shell_single_quote_strict(bin, "bin")?
+            ))
         }
         None => Ok(format!(
             "command -v hyp >/dev/null 2>&1 && exec hyp {joined} || exec \"$HOME/.local/bin/hyp\" {joined}"
@@ -6757,7 +7019,12 @@ fn invoke_remote_ssh_invite(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
+        .map_err(|e| {
+            (
+                "RUNTIME_ERROR",
+                format!("Failed to start async runtime: {e}"),
+            )
+        })?;
 
     let (status_ok, status_code, stdout_bytes, stderr_bytes) = rt.block_on(async {
         use tokio::io::AsyncReadExt;
@@ -6776,14 +7043,14 @@ fn invoke_remote_ssh_invite(
             )
         })?;
 
-        let mut out_pipe = child
-            .stdout
-            .take()
-            .ok_or(("SSH_EXEC_FAILED", "SSH child missing stdout pipe".to_string()))?;
-        let mut err_pipe = child
-            .stderr
-            .take()
-            .ok_or(("SSH_EXEC_FAILED", "SSH child missing stderr pipe".to_string()))?;
+        let mut out_pipe = child.stdout.take().ok_or((
+            "SSH_EXEC_FAILED",
+            "SSH child missing stdout pipe".to_string(),
+        ))?;
+        let mut err_pipe = child.stderr.take().ok_or((
+            "SSH_EXEC_FAILED",
+            "SSH child missing stderr pipe".to_string(),
+        ))?;
 
         let fut = async {
             let mut out_buf = Vec::new();
@@ -6806,10 +7073,12 @@ fn invoke_remote_ssh_invite(
                     format!("Remote SSH invite output exceeded {MAX_PAIR_SSH_STDOUT_BYTES} bytes"),
                 ));
             }
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| ("SSH_EXEC_FAILED", format!("Failed waiting for SSH child: {e}")))?;
+            let status = child.wait().await.map_err(|e| {
+                (
+                    "SSH_EXEC_FAILED",
+                    format!("Failed waiting for SSH child: {e}"),
+                )
+            })?;
             Ok((status.success(), status.code(), out_buf, err_buf))
         };
 
@@ -7095,14 +7364,11 @@ fn run_pair_ssh(
         None
     };
 
-    let local_node_id = match resolve_local_node_id(
-        node_id_arg.as_deref(),
-        &state_dir,
-        existing_db.as_ref(),
-    ) {
-        Ok(id) => id,
-        Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
-    };
+    let local_node_id =
+        match resolve_local_node_id(node_id_arg.as_deref(), &state_dir, existing_db.as_ref()) {
+            Ok(id) => id,
+            Err((exit, code, msg)) => return emit_error(cmd, as_json, exit, code, msg, None),
+        };
 
     if dry_run {
         let preview_remote_id = remote_node_id_arg
@@ -7175,7 +7441,9 @@ fn run_pair_ssh(
                 as_json,
                 EXIT_ERROR,
                 code,
-                format!("Could not reach or verify remote Hyphae node via {canonical_endpoint}: {msg}"),
+                format!(
+                    "Could not reach or verify remote Hyphae node via {canonical_endpoint}: {msg}"
+                ),
                 Some(format!(
                     "Verify passwordless SSH works (`ssh -o BatchMode=yes {} true`) and the remote Hyphae node is running (`hyp node start --profile p2p` or `--peer-socket`).",
                     ssh_ep.target()
@@ -7205,14 +7473,17 @@ fn run_pair_ssh(
             as_json,
             EXIT_ERROR,
             "PEER_ID_CONFLICT",
-            format!("Remote nodeId '{remote_node_id}' is identical to local nodeId '{local_node_id}'"),
+            format!(
+                "Remote nodeId '{remote_node_id}' is identical to local nodeId '{local_node_id}'"
+            ),
             Some("Pass a distinct --node-id for this machine.".to_string()),
         );
     }
 
     let manifest_sign_kid = verified_manifest.signing_pk.kid();
     if let Some(ref db) = existing_db {
-        if let Err((code, msg)) = check_existing_signing_pin(db, &remote_node_id, &manifest_sign_kid)
+        if let Err((code, msg)) =
+            check_existing_signing_pin(db, &remote_node_id, &manifest_sign_kid)
         {
             return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None);
         }
@@ -7381,7 +7652,10 @@ fn run_pair_ssh(
                 EXIT_ERROR,
                 "PAIR_HANDSHAKE_FAILED",
                 msg,
-                Some("Verify the remote node daemon is running and reachable via `hyp connect`.".to_string()),
+                Some(
+                    "Verify the remote node daemon is running and reachable via `hyp connect`."
+                        .to_string(),
+                ),
             );
         }
         Err(LiveHandshakeError::Rejected { code, message }) => {
@@ -7449,11 +7723,29 @@ fn run_pair_ssh(
     let fingerprint = offer_sign_pk.fingerprint();
     let sign_jwk_json = match serde_json::to_string(&offer.signing_jwk) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
     let enc_jwk_json = match serde_json::to_string(&offer.encryption_jwk) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
 
     if let Err(e) = db.peers().upsert_peer_key(
@@ -7499,7 +7791,16 @@ fn run_pair_ssh(
 
     let alice_grant_json = match serde_json::to_string(&live.alice_grant_signed) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
     if let Err(e) = save_grant_idempotent(
         &db,
@@ -7521,7 +7822,16 @@ fn run_pair_ssh(
 
     let bob_grant_json = match serde_json::to_string(&live.bob_grant_signed) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
     if let Err(e) = save_grant_idempotent(
         &db,
@@ -7543,7 +7853,16 @@ fn run_pair_ssh(
 
     let manifest_json = match serde_json::to_string(&live.signed_manifest) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
     let caps: Vec<String> = live
         .manifest_payload
@@ -7682,7 +8001,10 @@ fn run_revoke(
                 "Peer '{peer_id}' is not paired (state database {} does not exist)",
                 db_path.display()
             ),
-            Some(format!("Check paired peers with `hyp status --state-dir {}`.", state_dir.display())),
+            Some(format!(
+                "Check paired peers with `hyp status --state-dir {}`.",
+                state_dir.display()
+            )),
         );
     }
 
@@ -7709,7 +8031,10 @@ fn run_revoke(
                 EXIT_ERROR,
                 "PEER_NOT_FOUND",
                 format!("Peer '{peer_id}' is not paired in {}", db_path.display()),
-                Some(format!("List known peers with `hyp status --state-dir {}`.", state_dir.display())),
+                Some(format!(
+                    "List known peers with `hyp status --state-dir {}`.",
+                    state_dir.display()
+                )),
             );
         }
         Err(e) => {
@@ -7732,7 +8057,10 @@ fn run_revoke(
     }
 
     let now_db = now_ms();
-    if let Err(e) = db.peers().set_peer_status(&peer_id, PeerStatus::Revoked, now_db) {
+    if let Err(e) = db
+        .peers()
+        .set_peer_status(&peer_id, PeerStatus::Revoked, now_db)
+    {
         return emit_error(
             cmd,
             as_json,
@@ -7847,8 +8175,8 @@ fn run_revoke(
         }
     }
 
-    let socket_path = socket_arg
-        .unwrap_or_else(|| resolve_pair_daemon_socket(&state_dir, explicit_state));
+    let socket_path =
+        socket_arg.unwrap_or_else(|| resolve_pair_daemon_socket(&state_dir, explicit_state));
     let reload = try_reload_live_daemon_at_socket(&socket_path);
     warnings.extend(reload.warnings);
     let daemon_reloaded = reload.reloaded;
@@ -7898,12 +8226,19 @@ fn run_revoke(
         if let Some(ref r) = clean_reason {
             println!("      Reason:      {r}");
         }
-        println!("      Grants:      {} revocation(s) recorded", revoked_grants.len());
+        println!(
+            "      Grants:      {} revocation(s) recorded",
+            revoked_grants.len()
+        );
         println!("      Secrets:     {credentials_cleared} credential(s) cleared");
         if daemon_reloaded {
-            println!("      Daemon:      Live daemon reloaded — outbound link dropped immediately.");
+            println!(
+                "      Daemon:      Live daemon reloaded — outbound link dropped immediately."
+            );
         } else {
-            println!("      Daemon:      Live daemon not reachable — run `hyp service restart` to apply if running.");
+            println!(
+                "      Daemon:      Live daemon not reachable — run `hyp service restart` to apply if running."
+            );
         }
         print_warnings(&warnings);
         print_next_steps(&next);
@@ -7968,7 +8303,14 @@ mod tests {
         );
 
         // 3. Offline / non-Running BackendStates MUST be rejected fail-closed
-        for state in ["Stopped", "NeedsLogin", "Starting", "NoState", "running", ""] {
+        for state in [
+            "Stopped",
+            "NeedsLogin",
+            "Starting",
+            "NoState",
+            "running",
+            "",
+        ] {
             let payload = serde_json::to_vec(&json!({
                 "BackendState": state,
                 "Self": { "DNSName": "alice.tail9f3a.ts.net.", "Online": true }
@@ -7990,7 +8332,13 @@ mod tests {
 
         // 5. Injection attempts, malformed hostnames, single-label names, IPv4 literals -> rejected
         let long_label = format!("{}.ts.net.", "a".repeat(64));
-        let long_host = format!("{}.{}.{}.{}.ts.net.", "a".repeat(60), "b".repeat(60), "c".repeat(60), "d".repeat(65));
+        let long_host = format!(
+            "{}.{}.{}.{}.ts.net.",
+            "a".repeat(60),
+            "b".repeat(60),
+            "c".repeat(60),
+            "d".repeat(65)
+        );
         let bad_dns_names = [
             "",
             ".",
@@ -8098,7 +8446,11 @@ mod tests {
 
         // Normal `member` scopes emit zero warnings
         let mut normal_warnings = Vec::new();
-        warn_privileged_token_scopes("offers", &ScopePreset::Member.expand(), &mut normal_warnings);
+        warn_privileged_token_scopes(
+            "offers",
+            &ScopePreset::Member.expand(),
+            &mut normal_warnings,
+        );
         assert!(normal_warnings.is_empty());
     }
 
@@ -8264,13 +8616,15 @@ mod tests {
 
         // 1. Direct pin guard checks:
         //    - Same Router profile & same endpoint (even with trailing slash) -> OK
-        assert!(check_existing_peer_pin(
-            &db,
-            "acme-team",
-            PeerProfile::Router,
-            "https://hub.acme.example/"
-        )
-        .is_ok());
+        assert!(
+            check_existing_peer_pin(
+                &db,
+                "acme-team",
+                PeerProfile::Router,
+                "https://hub.acme.example/"
+            )
+            .is_ok()
+        );
 
         //    - Profile change (Router -> P2p) -> PEER_PROFILE_CONFLICT
         let profile_err = check_existing_peer_pin(
@@ -8336,8 +8690,14 @@ mod tests {
 
         // 3. Also test `accept_am2 --offline` cannot re-point `acme-team` to a different router URL!
         let admin_kp = Ed25519KeyPair::generate().unwrap();
-        let issued = issue_grant_v1(&admin_kp, "bob@laptop", &["messages:send"], 3_600_000, now_unix_ms())
-            .unwrap();
+        let issued = issue_grant_v1(
+            &admin_kp,
+            "bob@laptop",
+            &["messages:send"],
+            3_600_000,
+            now_unix_ms(),
+        )
+        .unwrap();
         let hijacked_am2_val = json!({
             "v": 2,
             "router": "https://evil-hub.attacker.example",
@@ -8407,13 +8767,15 @@ mod tests {
             .peers()
             .set_peer_status("acme-team", PeerStatus::Revoked, now + 1)
             .unwrap();
-        assert!(check_existing_peer_pin(
-            &db_check2,
-            "acme-team",
-            PeerProfile::P2p,
-            "https://new.acme.example"
-        )
-        .is_ok());
+        assert!(
+            check_existing_peer_pin(
+                &db_check2,
+                "acme-team",
+                PeerProfile::P2p,
+                "https://new.acme.example"
+            )
+            .is_ok()
+        );
         assert!(alice_keys.kid().len() > 10);
     }
 }

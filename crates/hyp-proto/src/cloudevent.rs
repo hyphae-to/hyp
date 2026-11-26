@@ -120,7 +120,11 @@ pub enum TraceContextError {
 }
 
 impl TraceParent {
-    pub fn new(trace_id: [u8; 16], parent_id: [u8; 8], sampled: bool) -> Result<Self, TraceContextError> {
+    pub fn new(
+        trace_id: [u8; 16],
+        parent_id: [u8; 8],
+        sampled: bool,
+    ) -> Result<Self, TraceContextError> {
         if trace_id == [0u8; 16] {
             return Err(TraceContextError::ZeroTraceId);
         }
@@ -324,7 +328,8 @@ impl CloudEvent {
 
     /// Sets an extension attribute as a string value.
     pub fn set_extension(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.extensions.insert(key.into(), Value::String(value.into()));
+        self.extensions
+            .insert(key.into(), Value::String(value.into()));
     }
 
     /// Parses the W3C `traceparent` extension attribute, if present.
@@ -347,11 +352,9 @@ impl CloudEvent {
     pub fn provenance(&self) -> Result<Provenance, ProvenanceError> {
         let origin = match self.extensions.get(EXT_ORIGIN) {
             None => None,
-            Some(Value::String(s)) => Some(
-                NodeId::new(s.as_str()).map_err(|_| {
-                    ProvenanceError::InvalidAttribute(format!("invalid hyphaeorigin {s:?}"))
-                })?,
-            ),
+            Some(Value::String(s)) => Some(NodeId::new(s.as_str()).map_err(|_| {
+                ProvenanceError::InvalidAttribute(format!("invalid hyphaeorigin {s:?}"))
+            })?),
             Some(_) => {
                 return Err(ProvenanceError::InvalidAttribute(
                     "hyphaeorigin must be a string".to_string(),
@@ -651,7 +654,8 @@ pub fn check_cloudevent_v2_with_limits(
 
     if let Some(v) = map.get("dataschema") {
         match v.as_str() {
-            Some(s) if !s.is_empty() && !s.chars().any(|c| c.is_control() || c.is_whitespace()) => {}
+            Some(s) if !s.is_empty() && !s.chars().any(|c| c.is_control() || c.is_whitespace()) => {
+            }
             _ => {
                 return Err(CloudEventError::InvalidEvent(
                     "dataschema must be a non-empty URI string".to_string(),
@@ -926,7 +930,11 @@ fn json_utf8_len(value: &Value) -> Result<usize, CloudEventError> {
 }
 
 fn parse_lower_hex_u8(s: &str) -> Option<u8> {
-    if s.len() != 2 || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if s.len() != 2
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return None;
     }
     u8::from_str_radix(s, 16).ok()
@@ -963,11 +971,22 @@ mod tests {
         assert_eq!(child.parent_id, [1, 2, 3, 4, 5, 6, 7, 8]);
 
         // Forbidden version ff, zero trace_id, zero parent_id, uppercase hex.
-        assert!(TraceParent::parse("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_err());
-        assert!(TraceParent::parse("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_err());
-        assert!(TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01").is_err());
-        assert!(TraceParent::parse("00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01").is_err());
-        assert!(TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra").is_err());
+        assert!(
+            TraceParent::parse("ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_err()
+        );
+        assert!(
+            TraceParent::parse("00-00000000000000000000000000000000-00f067aa0ba902b7-01").is_err()
+        );
+        assert!(
+            TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01").is_err()
+        );
+        assert!(
+            TraceParent::parse("00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01").is_err()
+        );
+        assert!(
+            TraceParent::parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra")
+                .is_err()
+        );
     }
 
     #[test]
@@ -977,7 +996,12 @@ mod tests {
         let bob = NodeId::new("bob@laptop").unwrap();
         let carol = NodeId::new("carol@dev").unwrap();
 
-        let mut ev = CloudEvent::new("ev-1", "alice@macbook/claude", TYPE_DM_V1, json!({"text": "hi"}));
+        let mut ev = CloudEvent::new(
+            "ev-1",
+            "alice@macbook/claude",
+            TYPE_DM_V1,
+            json!({"text": "hi"}),
+        );
         let p1 = ev.record_hop(&alice, Some(&hub), DEFAULT_MAX_HOPS).unwrap();
         assert_eq!(p1.hops, 1);
         assert_eq!(p1.origin.as_ref(), Some(&alice));
@@ -996,7 +1020,10 @@ mod tests {
         // Third hop exceeds default max_hops = 2!
         assert!(matches!(
             ev.check_forwarding(&bob, Some(&carol), DEFAULT_MAX_HOPS),
-            Err(ProvenanceError::HopLimitExceeded { hops: 2, max_hops: 2 })
+            Err(ProvenanceError::HopLimitExceeded {
+                hops: 2,
+                max_hops: 2
+            })
         ));
 
         // Even if caller passes max_hops = 99, hard protocol cap 4 is enforced!
@@ -1005,7 +1032,10 @@ mod tests {
         ev.record_hop(&carol, Some(&dave), 99).unwrap();
         assert!(matches!(
             ev.check_forwarding(&dave, None, 99),
-            Err(ProvenanceError::HopLimitExceeded { hops: 4, max_hops: 4 })
+            Err(ProvenanceError::HopLimitExceeded {
+                hops: 4,
+                max_hops: 4
+            })
         ));
     }
 

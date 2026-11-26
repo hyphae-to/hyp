@@ -60,7 +60,9 @@ fn snapshot_canonical_schema(conn: &Connection) -> CanonicalSchema {
             )
             .unwrap();
         let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .unwrap();
         for row in rows {
             let (name, sql) = row.unwrap();
@@ -659,8 +661,8 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
              THIS IS INVALID SQL;",
         ),
     });
-    let err = run_migrations_with(db.connection(), Some(&db_path), &failing_sql_migrations)
-        .unwrap_err();
+    let err =
+        run_migrations_with(db.connection(), Some(&db_path), &failing_sql_migrations).unwrap_err();
     assert!(matches!(err, StoreError::Sqlite(_)));
     assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let partial_exists: Option<i64> = db
@@ -712,8 +714,8 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
             "INSERT INTO publisher_grants (publisher_id, topic) VALUES ('ghost-pub', 'alerts');",
         ),
     });
-    let err = run_migrations_with(db.connection(), Some(&db_path), &fk_violation_migrations)
-        .unwrap_err();
+    let err =
+        run_migrations_with(db.connection(), Some(&db_path), &fk_violation_migrations).unwrap_err();
     assert!(
         matches!(err, StoreError::InvalidState(ref msg) if msg.contains("foreign_key_check")),
         "expected foreign_key_check InvalidState, got: {err:?}"
@@ -732,7 +734,10 @@ fn mid_migration_failure_rolls_back_atomically_and_fk_rebuild_safety() {
         .connection()
         .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(fk_enabled, 1, "PRAGMA foreign_keys must be restored to ON after rollback");
+    assert_eq!(
+        fk_enabled, 1,
+        "PRAGMA foreign_keys must be restored to ON after rollback"
+    );
 
     // 4. Valid `disable_foreign_keys: true` table rebuild succeeds and restores `PRAGMA foreign_keys = ON`.
     let mut fk_rebuild_ok = MIGRATIONS.to_vec();
@@ -858,7 +863,10 @@ fn handle_description_sanitization_and_lifecycle() {
     // Multibyte UTF-8: emojis & CJK (must truncate by Unicode chars without panicking).
     let emojis = "🦀".repeat(220);
     let sanitized_emojis = sanitize_handle_description(Some(&emojis)).unwrap();
-    assert_eq!(sanitized_emojis.chars().count(), MAX_HANDLE_DESCRIPTION_CHARS);
+    assert_eq!(
+        sanitized_emojis.chars().count(),
+        MAX_HANDLE_DESCRIPTION_CHARS
+    );
     assert_eq!(sanitized_emojis.len(), MAX_HANDLE_DESCRIPTION_CHARS * 4);
 
     let cjk = "日本語テスト".repeat(50);
@@ -983,7 +991,10 @@ fn multi_hub_peer_routes_crud_validation_and_revocation_cleanup() {
     ));
 
     // Upsert & update routes.
-    let r1 = db.peers().upsert_peer_route("carol@dev", "hub-a", T0).unwrap();
+    let r1 = db
+        .peers()
+        .upsert_peer_route("carol@dev", "hub-a", T0)
+        .unwrap();
     assert_eq!(
         r1,
         PeerRoute {
@@ -1022,7 +1033,10 @@ fn multi_hub_peer_routes_crud_validation_and_revocation_cleanup() {
         .into_iter()
         .map(|r| r.target_node)
         .collect();
-    assert_eq!(ordered, vec!["alice@mac", "bob@lap", "carol@dev", "dave@box"]);
+    assert_eq!(
+        ordered,
+        vec!["alice@mac", "bob@lap", "carol@dev", "dave@box"]
+    );
 
     // Explicit delete_peer_route & delete_peer_routes_via.
     assert!(db.peers().delete_peer_route("dave@box").unwrap());
@@ -1053,7 +1067,11 @@ fn multi_hub_peer_routes_crud_validation_and_revocation_cleanup() {
     assert_eq!(db.peers().get_peer_route("bob@lap").unwrap(), None);
     assert_eq!(db.peers().get_peer_route("carol@dev").unwrap(), None);
     assert_eq!(
-        db.peers().get_peer_route("dave@box").unwrap().unwrap().via_peer,
+        db.peers()
+            .get_peer_route("dave@box")
+            .unwrap()
+            .unwrap()
+            .via_peer,
         "hub-c"
     );
 

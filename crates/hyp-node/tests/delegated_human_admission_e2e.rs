@@ -194,7 +194,13 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
     let member_scopes = ScopePreset::Member.expand();
     let member_refs: Vec<&str> = member_scopes.iter().map(String::as_str).collect();
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &member_refs, TrustTier::Org, 3_600_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &member_refs,
+            TrustTier::Org,
+            3_600_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&alice_am2).await.unwrap();
 
@@ -248,7 +254,9 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
         .await
         .expect_err("replaying consumed hjoin1_ MUST fail closed");
     match replay_err {
-        NodeError::RemoteProblem(p) => assert_eq!(p.status, 409, "unexpected replay problem: {p:?}"),
+        NodeError::RemoteProblem(p) => {
+            assert_eq!(p.status, 409, "unexpected replay problem: {p:?}")
+        }
         other => panic!("expected 409 on hjoin1_ replay, got {other:?}"),
     }
 
@@ -340,7 +348,12 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
     assert_eq!(pair1_reply.auth_epoch, 1);
 
     // Verify hub DB provenance fields!
-    let p1_row = hub.db().peers().get_peer("philip@macbook").unwrap().unwrap();
+    let p1_row = hub
+        .db()
+        .peers()
+        .get_peer("philip@macbook")
+        .unwrap()
+        .unwrap();
     assert_eq!(p1_row.status, PeerStatus::Active);
     assert_eq!(p1_row.admitted_by_human_id.as_deref(), Some("philip"));
     assert_eq!(p1_row.admitted_auth_epoch, Some(1));
@@ -489,9 +502,12 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(!rem.is_zero(), "SSE stream did not close after cascade revocation");
+            assert!(
+                !rem.is_zero(),
+                "SSE stream did not close after cascade revocation"
+            );
             match timeout(rem, body.frame()).await {
-                Ok(None) => return, // clean EOF!
+                Ok(None) => return,         // clean EOF!
                 Ok(Some(Err(_))) => return, // dropped!
                 Ok(Some(Ok(_))) => continue,
                 Err(_) => panic!("timed out waiting for SSE close after cascade revocation"),
@@ -516,7 +532,11 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
     );
 
     // 13c. Next E2EE Shared KV epoch written by Alice evicts BOTH revoked Philip devices!
-    let active_members = hub.db().peers().list_peers(Some(PeerStatus::Active)).unwrap();
+    let active_members = hub
+        .db()
+        .peers()
+        .list_peers(Some(PeerStatus::Active))
+        .unwrap();
     let active_ids: Vec<String> = active_members.into_iter().map(|p| p.peer_id).collect();
     assert_eq!(active_ids, vec!["alice@macbook".to_string()]);
 
@@ -537,7 +557,11 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
         })
         .await
         .expect("Alice's post-revoke KV write must succeed");
-    assert_eq!(kv_w2.e2ee_epoch, Some(2), "KV epoch must rotate from 1 -> 2 after eviction");
+    assert_eq!(
+        kv_w2.e2ee_epoch,
+        Some(2),
+        "KV epoch must rotate from 1 -> 2 after eviction"
+    );
     assert_zero_plaintext_in_sqlite(hub_dir.path(), post_revoke_secret);
 
     // Neither Philip device can read the new KV entry (bearer revoked + excluded from wrapped epoch)!
@@ -563,7 +587,10 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
         .expect("latest kv epoch exists");
     assert_eq!(latest_epoch.epoch, 2);
     assert!(
-        !latest_epoch.members.iter().any(|m| m.starts_with("philip@")),
+        !latest_epoch
+            .members
+            .iter()
+            .any(|m| m.starts_with("philip@")),
         "revoked Philip devices MUST be evicted from KV epoch {} members: {:?}",
         latest_epoch.epoch,
         latest_epoch.members

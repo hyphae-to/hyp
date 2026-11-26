@@ -33,8 +33,8 @@ use hyp_proto::cloudevent::CloudEvent;
 use hyp_proto::filter::Filter;
 use hyp_proto::scopes::ScopePreset;
 use hyp_store::{
-    DeliveryMode, GateAuditQuery, GateDecision as StoreGateDecision, GateState, NodeDb,
-    TrustTier, now_ms,
+    DeliveryMode, GateAuditQuery, GateDecision as StoreGateDecision, GateState, NodeDb, TrustTier,
+    now_ms,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -87,9 +87,8 @@ async fn send_raw_http(
     let (status, _hdrs, bytes) = HttpClient::collect(resp, 1024 * 1024)
         .await
         .expect("collect response");
-    let val = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-        json!({ "raw": String::from_utf8_lossy(&bytes).to_string() })
-    });
+    let val = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }));
     (status, val)
 }
 
@@ -114,14 +113,16 @@ async fn pair_admin_peer(
         .expect("accept am2 invite");
 }
 
-async fn wait_for_mailbox_count(node: &UnifiedNode, session_id: &str, min_count: usize) -> Vec<hyp_store::MailboxEntry> {
+async fn wait_for_mailbox_count(
+    node: &UnifiedNode,
+    session_id: &str,
+    min_count: usize,
+) -> Vec<hyp_store::MailboxEntry> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let items = {
             let db = node.db();
-            db.local()
-                .peek_inbox(session_id, 50)
-                .unwrap_or_default()
+            db.local().peek_inbox(session_id, 50).unwrap_or_default()
         };
         if items.len() >= min_count {
             return items;
@@ -232,8 +233,12 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     .unwrap();
 
     // Also pair a remote reader subscribed to `webhook-hub.github` over SSE.
-    let reader = UnifiedNode::open(make_node_cfg("reader@laptop", NodeProfile::Local, &reader_dir))
-        .unwrap();
+    let reader = UnifiedNode::open(make_node_cfg(
+        "reader@laptop",
+        NodeProfile::Local,
+        &reader_dir,
+    ))
+    .unwrap();
     register_session_with_handle(&reader, "reader-sess", "dev").await;
     let member_scopes_owned = ScopePreset::Member.expand();
     let member_scopes: Vec<&str> = member_scopes_owned.iter().map(String::as_str).collect();
@@ -330,7 +335,10 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
         &[
             ("x-hub-signature-256", good_gh_sig),
             ("x-github-event", "pull_request".to_string()),
-            ("x-github-delivery", "spoofed-unsigned-delivery-id".to_string()),
+            (
+                "x-github-delivery",
+                "spoofed-unsigned-delivery-id".to_string(),
+            ),
         ],
         Bytes::from(gh_body),
     )
@@ -441,7 +449,8 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     assert_eq!(val["stored"], 2);
 
     // 3. Generic webhook stream: HMAC + X-Webhook-Timestamp binding + deterministic body dedup (B8).
-    let gen_body = br#"{"type":"ci.build.finished","source":"ci/runner","data":{"status":"green"}}"#;
+    let gen_body =
+        br#"{"type":"ci.build.finished","source":"ci/runner","data":{"status":"green"}}"#;
     let now_ts = (now_unix_ms() / 1_000).to_string();
     let stale_ts = ((now_unix_ms() / 1_000) - 900).to_string();
 
@@ -502,7 +511,10 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
         &[
             ("x-webhook-timestamp", now_ts),
             ("x-ci-sig-256", bound_sig),
-            ("x-delivery-id", "spoofed-unsigned-x-delivery-id".to_string()),
+            (
+                "x-delivery-id",
+                "spoofed-unsigned-x-delivery-id".to_string(),
+            ),
         ],
         Bytes::from_static(gen_body),
     )
@@ -622,7 +634,9 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     let local_items = wait_for_mailbox_count(&hub, "local-watcher", 3).await;
     assert_eq!(local_items.len(), 3, "expected 3 local webhook batches");
     assert!(
-        local_items.iter().any(|m| m.text.contains("DiskFull") && !m.text.contains("LowNoise")),
+        local_items
+            .iter()
+            .any(|m| m.text.contains("DiskFull") && !m.text.contains("LowNoise")),
         "filter pushdown should deliver critical DiskFull and exclude info LowNoise"
     );
     for item in &local_items {
@@ -641,7 +655,9 @@ async fn wave3d_5b_compiled_in_webhooks_fail_closed_and_publish_cloudevents() {
     // Remote SSE peer receives the filtered GitHub webhook event!
     let remote_items = wait_for_mailbox_count(&reader, "reader-sess", 1).await;
     assert!(
-        remote_items.iter().any(|m| m.text.contains("Wire webhooks")),
+        remote_items
+            .iter()
+            .any(|m| m.text.contains("Wire webhooks")),
         "remote peer should receive GitHub webhook over SSE"
     );
 
@@ -674,10 +690,14 @@ async fn wave3d_5c_router_dm_works_and_relay_enforces_forwarding_plus_forward_vi
         .await
         .unwrap();
 
-    let laptop = UnifiedNode::open(make_node_cfg("alice@laptop", NodeProfile::Local, &laptop_dir))
-        .unwrap();
-    let server = UnifiedNode::open(make_node_cfg("bob@server", NodeProfile::Local, &server_dir))
-        .unwrap();
+    let laptop = UnifiedNode::open(make_node_cfg(
+        "alice@laptop",
+        NodeProfile::Local,
+        &laptop_dir,
+    ))
+    .unwrap();
+    let server =
+        UnifiedNode::open(make_node_cfg("bob@server", NodeProfile::Local, &server_dir)).unwrap();
     let no_recv = UnifiedNode::open(make_node_cfg(
         "sendonly@bot",
         NodeProfile::Local,
@@ -720,7 +740,9 @@ async fn wave3d_5c_router_dm_works_and_relay_enforces_forwarding_plus_forward_vi
         .expect_err("DM to peer without dm:receive must fail closed");
     let err_str = err.to_string();
     assert!(
-        err_str.contains("403") || err_str.contains("dm:receive") || err_str.contains("not_granted"),
+        err_str.contains("403")
+            || err_str.contains("dm:receive")
+            || err_str.contains("not_granted"),
         "expected 403 dm:receive denial, got: {err_str}"
     );
 
@@ -750,9 +772,12 @@ async fn wave3d_5c_router_dm_works_and_relay_enforces_forwarding_plus_forward_vi
         .await
         .unwrap();
 
-    let caller_star =
-        UnifiedNode::open(make_node_cfg("alice-star@laptop", NodeProfile::Local, &caller_star_dir))
-            .unwrap();
+    let caller_star = UnifiedNode::open(make_node_cfg(
+        "alice-star@laptop",
+        NodeProfile::Local,
+        &caller_star_dir,
+    ))
+    .unwrap();
     pair_admin_peer(&relay_deny, &admin_key, &caller_star, &["*"]).await;
     let deny_link = caller_star.peer_link("relay-deny@p2p").await.unwrap();
     let deny_err = deny_link
@@ -804,9 +829,12 @@ async fn wave3d_5c_router_dm_works_and_relay_enforces_forwarding_plus_forward_vi
         .await
         .unwrap();
 
-    let caller_fwd =
-        UnifiedNode::open(make_node_cfg("alice-fwd@laptop", NodeProfile::Local, &caller_fwd_dir))
-            .unwrap();
+    let caller_fwd = UnifiedNode::open(make_node_cfg(
+        "alice-fwd@laptop",
+        NodeProfile::Local,
+        &caller_fwd_dir,
+    ))
+    .unwrap();
     pair_admin_peer(&relay_allow, &admin_key, &caller_star, &["*"]).await;
     pair_admin_peer(
         &relay_allow,
@@ -894,7 +922,9 @@ async fn wave3d_5c_router_dm_works_and_relay_enforces_forwarding_plus_forward_vi
             event: via_only_ev,
         })
         .await
-        .expect_err("omitted hyphaeorigin with foreign hyphaevia must fail closed without forward:via");
+        .expect_err(
+            "omitted hyphaeorigin with foreign hyphaevia must fail closed without forward:via",
+        );
     assert!(err.to_string().contains("403"), "got: {err}");
 
     // `ForwardingPolicy { max_hops: 0, .. }` clamps effective_max_hops() to 1 so ingest never breaks.
@@ -942,9 +972,15 @@ async fn wave4a_cut_remote_node_update_and_bridges_post_return_404_and_no_capabi
         .unwrap();
     let base = format!("http://{addr}");
 
-    let peer = UnifiedNode::open(make_node_cfg("admin@laptop", NodeProfile::Local, &peer_dir))
-        .unwrap();
-    pair_admin_peer(&hub, &admin_key, &peer, &["*", "bridge:post=telegram:personal"]).await;
+    let peer =
+        UnifiedNode::open(make_node_cfg("admin@laptop", NodeProfile::Local, &peer_dir)).unwrap();
+    pair_admin_peer(
+        &hub,
+        &admin_key,
+        &peer,
+        &["*", "bridge:post=telegram:personal"],
+    )
+    .await;
 
     let client = HttpClient::new().unwrap();
     for (path, body) in [
@@ -1001,10 +1037,14 @@ async fn wave3d_6a_transfer_stage_before_unpack_blocks_quarantines_and_allows() 
     let recv_dir = TempDir::new().unwrap();
     let src_files_dir = TempDir::new().unwrap();
 
-    let sender = UnifiedNode::open(make_node_cfg("sender@laptop", NodeProfile::P2p, &sender_dir))
-        .unwrap();
-    let receiver = UnifiedNode::open(make_node_cfg("recv@server", NodeProfile::P2p, &recv_dir))
-        .unwrap();
+    let sender = UnifiedNode::open(make_node_cfg(
+        "sender@laptop",
+        NodeProfile::P2p,
+        &sender_dir,
+    ))
+    .unwrap();
+    let receiver =
+        UnifiedNode::open(make_node_cfg("recv@server", NodeProfile::P2p, &recv_dir)).unwrap();
     register_session_with_handle(&sender, "s-send", "dev").await;
     register_session_with_handle(&receiver, "s-recv", "ops").await;
 
@@ -1029,11 +1069,7 @@ async fn wave3d_6a_transfer_stage_before_unpack_blocks_quarantines_and_allows() 
         .unwrap();
 
     let (hp2p1, _offer) = receiver
-        .create_p2p_invite(
-            vec!["*".to_string()],
-            vec!["*".to_string()],
-            3_600_000,
-        )
+        .create_p2p_invite(vec!["*".to_string()], vec!["*".to_string()], 3_600_000)
         .unwrap();
     sender
         .accept_p2p_invite(&hp2p1, vec!["*".to_string()])
@@ -1117,7 +1153,10 @@ async fn wave3d_6a_transfer_stage_before_unpack_blocks_quarantines_and_allows() 
     let q_file = quarantine_root
         .join(&q_res.id)
         .join("QUARANTINE_MARKER.txt");
-    assert!(q_file.exists(), "quarantined payload must be isolated in .quarantine/<id>");
+    assert!(
+        q_file.exists(),
+        "quarantined payload must be isolated in .quarantine/<id>"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1194,8 +1233,8 @@ async fn wave3d_6a_transfer_stage_before_unpack_blocks_quarantines_and_allows() 
     let stale_dir = staging_root.join("stale-crash-leftover");
     fs::create_dir_all(&stale_dir).unwrap();
     fs::write(stale_dir.join("halfway.tmp"), b"stale").unwrap();
-    let reopened = UnifiedNode::open(make_node_cfg("recv@server", NodeProfile::P2p, &recv_dir))
-        .unwrap();
+    let reopened =
+        UnifiedNode::open(make_node_cfg("recv@server", NodeProfile::P2p, &recv_dir)).unwrap();
     assert!(
         !stale_dir.exists(),
         "G9: UnifiedNode::open must sweep stale .staging/ leftovers on startup"

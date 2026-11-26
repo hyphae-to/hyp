@@ -421,14 +421,7 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
 
     let app_out = run_hyp_in_pty(
         home,
-        &[
-            "inbox",
-            "approve",
-            &r1,
-            "--state-dir",
-            state_str,
-            "--json",
-        ],
+        &["inbox", "approve", &r1, "--state-dir", state_str, "--json"],
         None,
         Some("y\n"),
     );
@@ -441,14 +434,7 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
 
     let rej_out = run_hyp_in_pty(
         home,
-        &[
-            "inbox",
-            "reject",
-            &r2,
-            "--state-dir",
-            state_str,
-            "--json",
-        ],
+        &["inbox", "reject", &r2, "--state-dir", state_str, "--json"],
         None,
         Some("y\n"),
     );

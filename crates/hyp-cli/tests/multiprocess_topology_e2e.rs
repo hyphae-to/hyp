@@ -485,10 +485,9 @@ fn three_process_hub_alice_bob_e2ee_dm_and_channel_with_zero_hub_plaintext() {
     let bob_sock = PathBuf::from(bob_startup["data"]["socketPath"].as_str().unwrap());
 
     // Verify `node.status.json` also records `connectedPeers`
-    let alice_status_file: Value = serde_json::from_str(
-        &fs::read_to_string(alice_state.join("node.status.json")).unwrap(),
-    )
-    .unwrap();
+    let alice_status_file: Value =
+        serde_json::from_str(&fs::read_to_string(alice_state.join("node.status.json")).unwrap())
+            .unwrap();
     assert_eq!(alice_status_file["connectedPeers"], json!(["acme-team"]));
 
     // Spawn real `hyp mcp` subprocesses against BOTH Alice and Bob daemons!
@@ -507,7 +506,10 @@ fn three_process_hub_alice_bob_e2ee_dm_and_channel_with_zero_hub_plaintext() {
         RPC_TIMEOUT,
     );
     assert!(!a_err, "alice join failed: {a_join}");
-    assert!(a_join.contains("alice@macbook/alice"), "alice join: {a_join}");
+    assert!(
+        a_join.contains("alice@macbook/alice"),
+        "alice join: {a_join}"
+    );
 
     let (b_join, b_err) = bob_mcp.call_verified_claude(
         &bob_home,
@@ -548,7 +550,10 @@ fn three_process_hub_alice_bob_e2ee_dm_and_channel_with_zero_hub_plaintext() {
     );
     assert!(!dm_err, "alice E2EE DM failed: {dm_res}");
     let dm_res_val: Value = serde_json::from_str(&dm_res).expect("dm response JSON");
-    assert_eq!(dm_res_val["encrypted"], true, "DM must be E2EE: {dm_res_val}");
+    assert_eq!(
+        dm_res_val["encrypted"], true,
+        "DM must be E2EE: {dm_res_val}"
+    );
     assert_eq!(dm_res_val["routedVia"], "acme-team");
 
     let (dm_wait_status, dm_wait_json) = bob_wait_dm.wait_json_output(Duration::from_secs(15));
@@ -713,7 +718,10 @@ fn two_process_public_node_onboarding_to_live_hyp_wait_github_stream() {
         .stdin(Stdio::null());
     let mut hub_proc = ManagedProcess::spawn("public.hyphae.to node", &mut hub_cmd);
     let hub_startup = hub_proc.read_json_line(STARTUP_TIMEOUT);
-    assert_eq!(hub_startup["ok"], true, "public node startup: {hub_startup}");
+    assert_eq!(
+        hub_startup["ok"], true,
+        "public node startup: {hub_startup}"
+    );
     assert_eq!(hub_startup["data"]["guestPairingEnabled"], true);
     assert_eq!(hub_startup["data"]["githubPublicEnabled"], true);
     let hub_url = hub_startup["data"]["endpoint"]
@@ -1096,7 +1104,8 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
             "--json",
         ])
         .stdin(Stdio::null());
-    let mut blocked_wait = ManagedProcess::spawn("sec hyp wait (locked down)", &mut blocked_wait_cmd);
+    let mut blocked_wait =
+        ManagedProcess::spawn("sec hyp wait (locked down)", &mut blocked_wait_cmd);
     wait_for_session_live(&sec_sock, "claude:sec-s1", Duration::from_secs(5));
 
     // Send real E2EE-sealed authenticated DM from `ext@peer/outsider` via `ext-hub` -> `sec@box/sec`
@@ -1143,7 +1152,10 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
             .header(header::AUTHORIZATION, auth_hdr)
             .body(Full::new(Bytes::from(req_body)))
             .unwrap();
-        let resp = client.request(req).await.expect("POST /v1/messages to ext-hub");
+        let resp = client
+            .request(req)
+            .await
+            .expect("POST /v1/messages to ext-hub");
         resp.status()
     });
     assert!(
@@ -1441,7 +1453,11 @@ fn legacy_v1_connector_json_and_v1_keystore_upgrade_preserves_identity() {
             .as_str()
             .expect("legacy v1 local daemon must bind local IPC socket"),
     );
-    assert!(sock.exists(), "local IPC socket must exist at {}", sock.display());
+    assert!(
+        sock.exists(),
+        "local IPC socket must exist at {}",
+        sock.display()
+    );
 
     // Verify `hyp status --json` and `hyp doctor --json` preserve exact legacy identity
     for subcmd in ["status", "doctor"] {
@@ -1516,7 +1532,10 @@ fn hyp_secret_and_hyp_kv_forgotten_inputs_and_adversarial_matrix() {
         .output()
         .unwrap();
     assert_eq!(trav.status.code(), Some(2));
-    assert_eq!(parse_json_stdout(&trav)["error"]["code"], "INVALID_SECRET_NAME");
+    assert_eq!(
+        parse_json_stdout(&trav)["error"]["code"],
+        "INVALID_SECRET_NAME"
+    );
 
     // 2. Empty stdin -> fail closed (`EMPTY_SECRET`, exit 1)
     let mut empty_child = isolated_cmd(&home)
@@ -1529,7 +1548,10 @@ fn hyp_secret_and_hyp_kv_forgotten_inputs_and_adversarial_matrix() {
     drop(empty_child.stdin.take());
     let empty_out = empty_child.wait_with_output().unwrap();
     assert_eq!(empty_out.status.code(), Some(1));
-    assert_eq!(parse_json_stdout(&empty_out)["error"]["code"], "EMPTY_SECRET");
+    assert_eq!(
+        parse_json_stdout(&empty_out)["error"]["code"],
+        "EMPTY_SECRET"
+    );
 
     // 3. Oversized >64 KiB stdin -> fail closed (`SECRET_TOO_LARGE`, exit 1)
     let mut huge_child = isolated_cmd(&home)
@@ -1663,13 +1685,22 @@ fn hyp_secret_and_hyp_kv_forgotten_inputs_and_adversarial_matrix() {
     );
 
     let store = SecretStore::new(&state_dir, SecretBackend::File);
-    assert_eq!(&*store.get("foo").expect("read stored foo secret"), foo_secret);
+    assert_eq!(
+        &*store.get("foo").expect("read stored foo secret"),
+        foo_secret
+    );
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let loc = web_json["data"]["location"].as_str().expect("secret file path");
-        let mode = fs::metadata(loc).expect("stat secret file").permissions().mode() & 0o777;
+        let loc = web_json["data"]["location"]
+            .as_str()
+            .expect("secret file path");
+        let mode = fs::metadata(loc)
+            .expect("stat secret file")
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "secret fallback file must be strictly 0600");
     }
 
@@ -1717,7 +1748,11 @@ fn hyp_secret_and_hyp_kv_forgotten_inputs_and_adversarial_matrix() {
             ])
             .output()
             .unwrap();
-        assert_eq!(ttl_out.status.code(), Some(2), "expected exit 2 for {bad_ttl}");
+        assert_eq!(
+            ttl_out.status.code(),
+            Some(2),
+            "expected exit 2 for {bad_ttl}"
+        );
         assert_eq!(parse_json_stdout(&ttl_out)["error"]["code"], "INVALID_TTL");
     }
 
@@ -1819,7 +1854,10 @@ fn hyp_secret_and_hyp_kv_forgotten_inputs_and_adversarial_matrix() {
         .output()
         .unwrap();
     assert_eq!(mallory_del.status.code(), Some(1));
-    assert_eq!(parse_json_stdout(&mallory_del)["error"]["code"], "UNAUTHORIZED");
+    assert_eq!(
+        parse_json_stdout(&mallory_del)["error"]["code"],
+        "UNAUTHORIZED"
+    );
 
     // Confirm KV entry stayed intact at v2 (`bbb222`)
     let get_after = isolated_cmd(&home)
@@ -2360,10 +2398,16 @@ fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
         bad_cfg_path.to_str().unwrap(),
         "--json",
     ]);
-    let mut isolated_daemon = ManagedProcess::spawn("hyp daemon missing-secret plugin", &mut isolated_daemon_cmd);
+    let mut isolated_daemon =
+        ManagedProcess::spawn("hyp daemon missing-secret plugin", &mut isolated_daemon_cmd);
     let bad_json = isolated_daemon.read_json_line(Duration::from_secs(10));
-    assert_eq!(bad_json["ok"], true, "daemon must stay up when one plugin misses a secret: {bad_json}");
-    let warnings = bad_json["warnings"].as_array().expect("startup warnings array");
+    assert_eq!(
+        bad_json["ok"], true,
+        "daemon must stay up when one plugin misses a secret: {bad_json}"
+    );
+    let warnings = bad_json["warnings"]
+        .as_array()
+        .expect("startup warnings array");
     assert!(
         warnings.iter().any(|w| {
             w.as_str()
@@ -2371,7 +2415,9 @@ fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
         }),
         "expected missing secret reference in warnings: {bad_json}"
     );
-    let plugins_arr = bad_json["data"]["plugins"].as_array().expect("plugins statuses");
+    let plugins_arr = bad_json["data"]["plugins"]
+        .as_array()
+        .expect("plugins statuses");
     assert_eq!(plugins_arr.len(), 1);
     assert_eq!(plugins_arr[0]["id"], "webhook");
     assert_eq!(plugins_arr[0]["status"], "skipped");
@@ -2509,7 +2555,10 @@ fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
         RPC_TIMEOUT,
     );
     assert!(!lk_err, "reader link failed: {lk_txt}");
-    assert_eq!(serde_json::from_str::<Value>(&lk_txt).unwrap()["role"], "reader");
+    assert_eq!(
+        serde_json::from_str::<Value>(&lk_txt).unwrap()["role"],
+        "reader"
+    );
 
     // Arm BOTH live `hyp wait` subprocesses (`primary` + `reader`)!
     let spawn_wait = |sess: &str| {
@@ -2591,9 +2640,10 @@ fn node_json_plugins_boot_wiring_secret_resolution_and_bridge_roundtrip() {
         assert_eq!(out["ok"], true);
         let items = out["data"]["items"].as_array().unwrap();
         assert!(
-            items
-                .iter()
-                .any(|i| i["text"].as_str().unwrap_or_default().contains(inbound_marker)),
+            items.iter().any(|i| i["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(inbound_marker)),
             "{label} must receive inbound webhook event: {out}"
         );
     }
@@ -2692,7 +2742,9 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
     {
         let db = NodeDb::open(&db_path).expect("seed base sqlite");
         let now = now_ms();
-        db.local().set_metadata("node_id", "v1@workstation").unwrap();
+        db.local()
+            .set_metadata("node_id", "v1@workstation")
+            .unwrap();
         db.local()
             .register_session("claude:v1-sess", r#"{"kind":"claude"}"#, now)
             .unwrap();
@@ -2700,7 +2752,12 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
             .set_session_handle("claude:v1-sess", Some("legacy-agent"), now)
             .unwrap();
         db.messages()
-            .register_handle("v1@workstation", "legacy-agent", Some("claude:v1-sess"), now)
+            .register_handle(
+                "v1@workstation",
+                "legacy-agent",
+                Some("claude:v1-sess"),
+                now,
+            )
             .unwrap();
         db.peers()
             .upsert_peer(
@@ -2851,7 +2908,10 @@ fn v1_to_v2_sqlite_upgrade_via_compiled_hyp_doctor_creates_backup() {
     assert_eq!(doc_json["ok"], true, "doctor JSON: {doc_json}");
 
     let storage = &doc_json["data"]["storage"];
-    assert_eq!(storage["schemaVersion"], expected_ver, "storage report: {storage}");
+    assert_eq!(
+        storage["schemaVersion"], expected_ver,
+        "storage report: {storage}"
+    );
     assert_eq!(storage["supportedSchemaVersion"], expected_ver);
     assert_eq!(storage["appliedMigrations"], expected_ver);
     assert_eq!(storage["migrationBackups"]["count"], 1);
@@ -3010,7 +3070,8 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
     let expected_sock = expected_cfg_dir.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME);
     let actual_sock = PathBuf::from(startup["data"]["socketPath"].as_str().unwrap());
     assert_eq!(
-        actual_sock, expected_sock,
+        actual_sock,
+        expected_sock,
         "hyp daemon default socket must live at ~/.config/hyphae/{}",
         hyp_harness::sock::DEFAULT_SOCKET_FILENAME
     );
@@ -3164,10 +3225,7 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
         "zero-flag post-tool-use must hold Queue DM until turn boundary: {mid_out}"
     );
 
-    let pre_turn_out = run_zero_flag_hook(
-        "user-prompt-submit",
-        json!({ "session_id": "zero-b" }),
-    );
+    let pre_turn_out = run_zero_flag_hook("user-prompt-submit", json!({ "session_id": "zero-b" }));
     let drained_ctx = pre_turn_out["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap_or_default();
@@ -3180,7 +3238,14 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
     let dm2 = "ZERO_FLAG_WAIT_WAKEUP_SENTINEL_222";
     let mut wait_cmd = isolated_cmd(&home);
     wait_cmd
-        .args(["wait", "--session", "claude:zero-b", "--timeout", "15", "--json"])
+        .args([
+            "wait",
+            "--session",
+            "claude:zero-b",
+            "--timeout",
+            "15",
+            "--json",
+        ])
         .stdin(Stdio::null());
     let mut wait_proc = ManagedProcess::spawn("zero-flag hyp wait", &mut wait_cmd);
     wait_for_session_live(&actual_sock, "claude:zero-b", Duration::from_secs(5));
@@ -3194,7 +3259,10 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
 
     let (wait_status, wait_json) = wait_proc.wait_json_output(Duration::from_secs(12));
     assert_eq!(wait_status.code(), Some(0));
-    assert_eq!(wait_json["ok"], true, "zero-flag hyp wait JSON: {wait_json}");
+    assert_eq!(
+        wait_json["ok"], true,
+        "zero-flag hyp wait JSON: {wait_json}"
+    );
     let wait_items = wait_json["data"]["items"].as_array().unwrap();
     assert!(
         wait_items
@@ -3205,7 +3273,9 @@ fn zero_flag_default_home_onboard_daemon_mcp_hook_wait_roundtrip() {
 
     drop(mcp_stdin);
     assert_eq!(
-        mcp_proc.wait_timeout(Duration::from_secs(5)).and_then(|s| s.code()),
+        mcp_proc
+            .wait_timeout(Duration::from_secs(5))
+            .and_then(|s| s.code()),
         Some(0)
     );
     let _ = daemon_proc.shutdown_gracefully();

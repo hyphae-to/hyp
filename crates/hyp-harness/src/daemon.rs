@@ -26,9 +26,9 @@ use http::{Method, Request, Uri};
 use http_body_util::BodyExt;
 use hyp_crypto::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::human::{
-    EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1,
-    MAX_HUMAN_DRAFT_CONTEXT_CHARS, NodeCertPayloadV1, SignedNodeCertV1, decode_hdrop1,
-    encode_hcert1, is_reserved_secret_name, seal_human_draft, validate_draft_text,
+    EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1, MAX_HUMAN_DRAFT_CONTEXT_CHARS,
+    NodeCertPayloadV1, SignedNodeCertV1, decode_hdrop1, encode_hcert1, is_reserved_secret_name,
+    seal_human_draft, validate_draft_text,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keystore::validate_secret_name;
@@ -365,8 +365,8 @@ impl TransportHints {
                     .as_deref()
                     .and_then(parse_openclaw_agent_id_from_session_key)
             });
-        let cwd = non_empty_str("cwd")
-            .filter(|s| s.len() <= 1024 && !s.chars().any(char::is_control));
+        let cwd =
+            non_empty_str("cwd").filter(|s| s.len() <= 1024 && !s.chars().any(char::is_control));
 
         Self {
             harness,
@@ -769,7 +769,8 @@ impl LocalDaemon {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&addr_file_path, std::fs::Permissions::from_mode(0o600));
+            let _ =
+                std::fs::set_permissions(&addr_file_path, std::fs::Permissions::from_mode(0o600));
         }
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -935,11 +936,7 @@ impl LocalDaemon {
 
     /// Registers a pluggable outbound [`BridgePoster`] for `plugin` (case-insensitive slug).
     /// Also causes `mcp.caps` to advertise `hasPlugins: true` so `hyp_bridge` is surfaced in `tools/list`.
-    pub fn register_bridge_poster(
-        &self,
-        plugin: impl Into<String>,
-        poster: Arc<dyn BridgePoster>,
-    ) {
+    pub fn register_bridge_poster(&self, plugin: impl Into<String>, poster: Arc<dyn BridgePoster>) {
         let key = plugin.into().trim().to_ascii_lowercase();
         if !key.is_empty() {
             self.inner
@@ -1156,8 +1153,7 @@ impl LocalDaemon {
         }
         // U1 (P1): Write a final atomic offline UI snapshot (`daemon.online == false`) right
         // before removing the socket so file-based UIs immediately transition to OFFLINE.
-        if !self.stopped.swap(true, Ordering::SeqCst)
-            && self.inner.node.config().state_dir.exists()
+        if !self.stopped.swap(true, Ordering::SeqCst) && self.inner.node.config().state_dir.exists()
         {
             let _ = self.inner.bump_ui_rev();
             let _ = self.inner.write_ui_state_snapshot_with_online(false);
@@ -1196,7 +1192,9 @@ impl LocalDaemon {
         } = item;
         let now = now_ms();
         let mut gate_downgraded = false;
-        let effective_trust_tier = if kind == MailboxKind::Plugin || origin_node.starts_with("bridge:") {
+        let effective_trust_tier = if kind == MailboxKind::Plugin
+            || origin_node.starts_with("bridge:")
+        {
             GateTrustTier::Bridge
         } else if kind == MailboxKind::Event || raw_has_external_webhook_origin(&source, &text) {
             cap_trust_tier_to_external_webhook(trust_tier)
@@ -1363,7 +1361,14 @@ impl LocalDaemon {
             let db = self.inner.node.db();
             self.inner
                 .delivery
-                .classify_entry(&db, &session_id, &temp_entry, sub_mode, gate_downgraded, now)
+                .classify_entry(
+                    &db,
+                    &session_id,
+                    &temp_entry,
+                    sub_mode,
+                    gate_downgraded,
+                    now,
+                )
                 .map_err(|e| e.to_string())?
         };
 
@@ -1739,7 +1744,10 @@ impl LocalDaemonInner {
             .remove(session_id);
     }
 
-    fn infer_session_harness(session_id: &str, explicit: Option<HarnessKind>) -> Option<HarnessKind> {
+    fn infer_session_harness(
+        session_id: &str,
+        explicit: Option<HarnessKind>,
+    ) -> Option<HarnessKind> {
         if explicit.is_some() {
             return explicit;
         }
@@ -1889,9 +1897,7 @@ impl LocalDaemonInner {
             if !still_current {
                 return;
             }
-            let _ = daemon
-                .flush_session_inner(&sid, bypass_grace)
-                .await;
+            let _ = daemon.flush_session_inner(&sid, bypass_grace).await;
         });
     }
 
@@ -1944,7 +1950,10 @@ impl LocalDaemonInner {
                 return;
             }
             let generation = self.next_seq();
-            map.insert(session_id.to_string(), (next_attempt, generation, fire_at_ms));
+            map.insert(
+                session_id.to_string(),
+                (next_attempt, generation, fire_at_ms),
+            );
             generation
         };
 
@@ -2654,11 +2663,8 @@ impl LocalDaemonInner {
             .get(session_id)
             .cloned();
         if let Some(mut rx) = rx_opt {
-            let _ = tokio::time::timeout(
-                Duration::from_millis(1_500),
-                rx.wait_for(|done| *done),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(Duration::from_millis(1_500), rx.wait_for(|done| *done)).await;
         }
     }
 
@@ -2707,8 +2713,14 @@ impl LocalDaemonInner {
         let origin_low = origin_node.to_ascii_lowercase();
         list.iter()
             .find(|s| {
-                let expected = format!("{}.{}", s.origin_node.to_ascii_lowercase(), s.topic.to_ascii_lowercase());
-                src_low == expected || (origin_low == s.origin_node.to_ascii_lowercase() && src_low.ends_with(&format!(".{}", s.topic.to_ascii_lowercase())))
+                let expected = format!(
+                    "{}.{}",
+                    s.origin_node.to_ascii_lowercase(),
+                    s.topic.to_ascii_lowercase()
+                );
+                src_low == expected
+                    || (origin_low == s.origin_node.to_ascii_lowercase()
+                        && src_low.ends_with(&format!(".{}", s.topic.to_ascii_lowercase())))
             })
             .map(|s| s.urgency)
     }
@@ -2791,9 +2803,8 @@ impl LocalDaemonInner {
                         .is_some()
                 };
                 let active_gate = self.current_gate();
-                let needs_gate = active_gate.is_some()
-                    && entry.reviewed_at.is_none()
-                    && !already_human_verified;
+                let needs_gate =
+                    active_gate.is_some() && entry.reviewed_at.is_none() && !already_human_verified;
 
                 if needs_gate {
                     // G3: Clear any stale cached classification before screening (e.g. after a
@@ -2976,7 +2987,12 @@ impl LocalDaemonInner {
                 }
 
                 if let Some(u) = self
-                    .classify_and_route_pending_entry(session_id, &entry.receipt, gate_downgraded, now)
+                    .classify_and_route_pending_entry(
+                        session_id,
+                        &entry.receipt,
+                        gate_downgraded,
+                        now,
+                    )
                     .await
                 {
                     if u.triggers_delivery_or_digest() {
@@ -3033,16 +3049,17 @@ impl LocalDaemonInner {
         // If the daemon restarted after a metadata-only wake nudge (`sessions.backend_json.nudgePending`),
         // preserve `nudge_pending = true` for notified non-`Notify` items so the woken turn's
         // `before_prompt_build` hook can still drain them cleanly with original urgency.
-        let nudge_pending = if entry.notified && classification.effective_urgency != DeliveryUrgency::Notify {
-            let db = self.node.db();
-            db.local()
-                .get_session(session_id)
-                .ok()
-                .flatten()
-                .is_some_and(|s| backend_json_flag_true(&s.backend_json, "nudgePending"))
-        } else {
-            false
-        };
+        let nudge_pending =
+            if entry.notified && classification.effective_urgency != DeliveryUrgency::Notify {
+                let db = self.node.db();
+                db.local()
+                    .get_session(session_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| backend_json_flag_true(&s.backend_json, "nudgePending"))
+            } else {
+                false
+            };
         self.record_item_meta(
             session_id,
             entry.receipt,
@@ -3249,9 +3266,7 @@ impl LocalDaemonInner {
 
         for entry in pending {
             let meta = meta_snapshot.get(&entry.receipt);
-            let urgency = meta
-                .map(|m| m.urgency)
-                .unwrap_or(policy.default_mode);
+            let urgency = meta.map(|m| m.urgency).unwrap_or(policy.default_mode);
             if urgency == DeliveryUrgency::Mute {
                 continue;
             }
@@ -3287,17 +3302,17 @@ impl LocalDaemonInner {
             }
 
             let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
-            let channel = meta
-                .and_then(|m| m.channel.clone())
-                .or(parsed.channel);
+            let channel = meta.and_then(|m| m.channel.clone()).or(parsed.channel);
             let is_announcement = meta
                 .map(|m| m.is_announcement)
                 .unwrap_or_else(|| self.is_announcement_channel(channel.as_deref()));
 
             let display_source = match human_auth_by_receipt.get(&entry.receipt) {
-                Some((hid_opt, kid_opt)) => {
-                    format_human_verified_source(&entry.source, hid_opt.as_deref(), kid_opt.as_deref())
-                }
+                Some((hid_opt, kid_opt)) => format_human_verified_source(
+                    &entry.source,
+                    hid_opt.as_deref(),
+                    kid_opt.as_deref(),
+                ),
                 None => entry.source,
             };
 
@@ -3474,11 +3489,11 @@ impl LocalDaemonInner {
         }
         let mut patch = Map::new();
         patch.insert("envFileExported".into(), json!(true));
-        let _ = self
-            .node
-            .db()
-            .local()
-            .merge_session_backend(session_id, &Value::Object(patch), now_ms());
+        let _ = self.node.db().local().merge_session_backend(
+            session_id,
+            &Value::Object(patch),
+            now_ms(),
+        );
     }
 
     fn session_requires_wait_token(&self, session_id: &str) -> bool {
@@ -3673,11 +3688,14 @@ impl LocalDaemonInner {
                     .expect("openclaw_service lock poisoned")
                     .as_ref()
                     .map(|s| (s.conn_id, s.tx.clone()));
-                if let (Some((service_conn_id, tx)), Some((session_key, agent_id))) =
-                    (oc_service_entry, self.resolve_openclaw_session_target(session_id))
-                {
+                if let (Some((service_conn_id, tx)), Some((session_key, agent_id))) = (
+                    oc_service_entry,
+                    self.resolve_openclaw_session_target(session_id),
+                ) {
                     if !bypass_activity_grace {
-                        if let Some((act_harness, remaining)) = self.active_session_lease(session_id) {
+                        if let Some((act_harness, remaining)) =
+                            self.active_session_lease(session_id)
+                        {
                             if batch.max_urgency == DeliveryUrgency::Interrupt {
                                 if Self::can_drain_mid_turn(act_harness)
                                     && !self.config.interrupt_hook_grace.is_zero()
@@ -3750,7 +3768,10 @@ impl LocalDaemonInner {
                         }
                         if matches!(
                             ack.reason.as_deref(),
-                            Some(REASON_OPENCLAW_SESSION_MISSING | REASON_OPENCLAW_INVALID_SESSION_KEY)
+                            Some(
+                                REASON_OPENCLAW_SESSION_MISSING
+                                    | REASON_OPENCLAW_INVALID_SESSION_KEY
+                            )
                         ) {
                             self.openclaw_missing_sessions
                                 .lock()
@@ -3797,7 +3818,9 @@ impl LocalDaemonInner {
                     //   - `Queue`: wait for TurnEnd (`Stop` / `agent_end`) or `queue_activity_lease`
                     //     expiry with no more tool calls before firing L2 wake nudge!
                     if !bypass_activity_grace {
-                        if let Some((act_harness, remaining)) = self.active_session_lease(session_id) {
+                        if let Some((act_harness, remaining)) =
+                            self.active_session_lease(session_id)
+                        {
                             if batch.max_urgency == DeliveryUrgency::Interrupt {
                                 if Self::can_drain_mid_turn(act_harness)
                                     && !self.config.interrupt_hook_grace.is_zero()
@@ -3860,7 +3883,9 @@ impl LocalDaemonInner {
                         PushOutcome::Hold { ref reason, .. }
                             if matches!(
                                 reason.as_str(),
-                                "herdr_working" | "herdr_send_guard_refused" | "herdr_agent_not_ready"
+                                "herdr_working"
+                                    | "herdr_send_guard_refused"
+                                    | "herdr_agent_not_ready"
                             ) =>
                         {
                             // Target is actively working or has an in-progress user draft;
@@ -3881,7 +3906,8 @@ impl LocalDaemonInner {
                             // if none delivers, schedule bounded Tier 3 retry before exiting.
                             deferred_transient_hold = true;
                         }
-                        PushOutcome::Hold { ref reason, .. } | PushOutcome::Reject { ref reason, .. } => {
+                        PushOutcome::Hold { ref reason, .. }
+                        | PushOutcome::Reject { ref reason, .. } => {
                             if matches!(
                                 reason.as_str(),
                                 "herdr_target_unavailable"
@@ -3898,7 +3924,9 @@ impl LocalDaemonInner {
                                     | REASON_OPENCLAW_TOKEN_MISSING
                             ) {
                                 terminal_error = Some(reason.clone());
-                                if self.unregister_matching_session_transport(session_id, &transport) {
+                                if self
+                                    .unregister_matching_session_transport(session_id, &transport)
+                                {
                                     let _ = self.write_ui_state_snapshot();
                                 }
                             }
@@ -4045,15 +4073,12 @@ impl LocalDaemonInner {
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
-        let action = args
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                (
-                    "invalid_request".into(),
-                    "Expected action: join | leave | peers | channels | status | drop_link".into(),
-                )
-            })?;
+        let action = args.get("action").and_then(Value::as_str).ok_or_else(|| {
+            (
+                "invalid_request".into(),
+                "Expected action: join | leave | peers | channels | status | drop_link".into(),
+            )
+        })?;
         let has_channel = args
             .get("channel")
             .and_then(Value::as_str)
@@ -4452,8 +4477,7 @@ impl LocalDaemonInner {
                     )
                 }
                 RelaySelection::External(relay_url) => {
-                    let created =
-                        create_external_drop(&self.node, &relay_url, ttl_seconds).await?;
+                    let created = create_external_drop(&self.node, &relay_url, ttl_seconds).await?;
                     spawn_external_drop_watcher(
                         Arc::clone(self),
                         session_id.to_string(),
@@ -4511,9 +4535,8 @@ impl LocalDaemonInner {
             frag.insert("authEpoch".into(), json!(ep));
         }
         if let Some(ref enc_draft) = encrypted_draft {
-            let draft_val = serde_json::to_value(enc_draft).map_err(|e| {
-                ("internal_error".into(), format!("serialize encDraft: {e}"))
-            })?;
+            let draft_val = serde_json::to_value(enc_draft)
+                .map_err(|e| ("internal_error".into(), format!("serialize encDraft: {e}")))?;
             frag.insert("encDraft".into(), draft_val);
         }
         if let Some((ref relay_url, ref drop_id, ref post_cap)) = relay_meta {
@@ -4522,8 +4545,12 @@ impl LocalDaemonInner {
             frag.insert("postCap".into(), json!(post_cap));
         }
 
-        let frag_canon = to_canonical_json(&Value::Object(frag))
-            .map_err(|e| ("internal_error".into(), format!("canonicalize drop fragment: {e}")))?;
+        let frag_canon = to_canonical_json(&Value::Object(frag)).map_err(|e| {
+            (
+                "internal_error".into(),
+                format!("canonicalize drop fragment: {e}"),
+            )
+        })?;
         let frag_encoded = URL_SAFE_NO_PAD.encode(frag_canon.as_bytes());
         let portal_base = hyp_node::engine::resolve_drop_portal_url(
             self.node.config().drop_portal_url.as_deref(),
@@ -4784,25 +4811,26 @@ impl LocalDaemonInner {
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
-        let mode_raw = args
-            .get("mode")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected mode: 'queue' | 'notify'".into()))?;
-        let allow_vips = args
-            .get("focusAllowInterruptVips")
-            .and_then(Value::as_bool);
+        let mode_raw = args.get("mode").and_then(Value::as_str).ok_or_else(|| {
+            (
+                "invalid_request".into(),
+                "Expected mode: 'queue' | 'notify'".into(),
+            )
+        })?;
+        let allow_vips = args.get("focusAllowInterruptVips").and_then(Value::as_bool);
         let extra_rules = parse_rules_arg(args)?;
 
-        let (focus_mode, default_urgency, store_mode) = match mode_raw.trim().to_ascii_lowercase().as_str() {
-            "notify" => (true, DeliveryUrgency::Notify, DeliveryMode::Notify),
-            "queue" | "full" => (false, DeliveryUrgency::Queue, DeliveryMode::Full),
-            other => {
-                return Err((
-                    "invalid_request".into(),
-                    format!("Expected mode 'queue' | 'full' | 'notify', got '{other}'"),
-                ));
-            }
-        };
+        let (focus_mode, default_urgency, store_mode) =
+            match mode_raw.trim().to_ascii_lowercase().as_str() {
+                "notify" => (true, DeliveryUrgency::Notify, DeliveryMode::Notify),
+                "queue" | "full" => (false, DeliveryUrgency::Queue, DeliveryMode::Full),
+                other => {
+                    return Err((
+                        "invalid_request".into(),
+                        format!("Expected mode 'queue' | 'full' | 'notify', got '{other}'"),
+                    ));
+                }
+            };
 
         let now = now_ms();
         let (policy, unread, muted) = {
@@ -4823,7 +4851,9 @@ impl LocalDaemonInner {
                 .map_err(delivery_err_tuple)?;
             for rule in &extra_rules {
                 if rule.delivery == DeliveryUrgency::Mute {
-                    let _ = db.local().add_mute(session_id, &rule.target, session_id, now);
+                    let _ = db
+                        .local()
+                        .add_mute(session_id, &rule.target, session_id, now);
                 }
             }
             let unread = self.effective_pending_count(&db, session_id);
@@ -4858,8 +4888,15 @@ impl LocalDaemonInner {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ("invalid_request".into(), "Expected mute target".into()))?;
-        let scope_arg = args.get("scope").and_then(Value::as_str).unwrap_or("session");
-        let db_scope = if scope_arg == "connector" { "*" } else { session_id };
+        let scope_arg = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("session");
+        let db_scope = if scope_arg == "connector" {
+            "*"
+        } else {
+            session_id
+        };
         let ttl_seconds: Option<u64> = match args.get("ttlSeconds") {
             None | Some(Value::Null) => None,
             Some(v) => match v.as_u64() {
@@ -4926,8 +4963,15 @@ impl LocalDaemonInner {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ("invalid_request".into(), "Expected unmute target".into()))?;
-        let scope_arg = args.get("scope").and_then(Value::as_str).unwrap_or("session");
-        let db_scope = if scope_arg == "connector" { "*" } else { session_id };
+        let scope_arg = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("session");
+        let db_scope = if scope_arg == "connector" {
+            "*"
+        } else {
+            session_id
+        };
 
         let removed = {
             let db = self.node.db();
@@ -5084,7 +5128,10 @@ impl LocalDaemonInner {
             None | Some(Value::Null) => false,
             Some(Value::String(_)) => true,
             Some(_) => {
-                return Err(("invalid_request".into(), "Expected string 'reaction'".into()));
+                return Err((
+                    "invalid_request".into(),
+                    "Expected string 'reaction'".into(),
+                ));
             }
         };
 
@@ -5103,7 +5150,10 @@ impl LocalDaemonInner {
                 .map(PathBuf::from)
                 .collect();
             if paths.is_empty() {
-                return Err(("invalid_request".into(), "Expected non-empty files array".into()));
+                return Err((
+                    "invalid_request".into(),
+                    "Expected non-empty files array".into(),
+                ));
             }
             let (target_node, to_handle) = parse_address(to).ok_or_else(|| {
                 (
@@ -5152,13 +5202,7 @@ impl LocalDaemonInner {
             let (text, reaction) = parse_bridge_text_and_reaction(args)?;
             return self
                 .send_to_bridge(
-                    session_id,
-                    &handle,
-                    raw_plugin,
-                    raw_target,
-                    text,
-                    reaction,
-                    args,
+                    session_id, &handle, raw_plugin, raw_target, text, reaction, args,
                 )
                 .await;
         }
@@ -5218,9 +5262,7 @@ impl LocalDaemonInner {
 
         let rules = parse_rules_arg(args)?;
         let focus_mode_opt = args.get("focusMode").and_then(Value::as_bool);
-        let allow_vips_opt = args
-            .get("focusAllowInterruptVips")
-            .and_then(Value::as_bool);
+        let allow_vips_opt = args.get("focusAllowInterruptVips").and_then(Value::as_bool);
 
         if !rules.is_empty() || focus_mode_opt.is_some() || allow_vips_opt.is_some() {
             let now = now_ms();
@@ -5709,7 +5751,10 @@ impl LocalDaemonInner {
                 };
                 let expected_version = args.get("expectedVersion").and_then(Value::as_u64);
                 let ttl_ms = args.get("ttlMs").and_then(Value::as_i64);
-                let encrypt = args.get("encrypt").and_then(Value::as_bool).unwrap_or(false);
+                let encrypt = args
+                    .get("encrypt")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let allowlist = args.get("allowlist").and_then(Value::as_array).map(|arr| {
                     arr.iter()
                         .filter_map(Value::as_str)
@@ -6137,10 +6182,8 @@ impl LocalDaemonInner {
         let (plugin, target) = parse_bridge_plugin_target(args)?;
         let handle = self.require_session_handle(session_id)?;
         let (text, reaction) = parse_bridge_text_and_reaction(args)?;
-        self.send_to_bridge(
-            session_id, &handle, &plugin, &target, text, reaction, args,
-        )
-        .await
+        self.send_to_bridge(session_id, &handle, &plugin, &target, text, reaction, args)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6355,9 +6398,13 @@ async fn handle_connection<R, W>(
                     let map = daemon.waiters.lock().expect("waiters lock poisoned");
                     !map.get(sid)
                         .is_some_and(|list| list.iter().any(|w| w.id == *wid))
-                }) && pkt.get("type").and_then(Value::as_str) == Some("wait.items");
+                }) && pkt.get("type").and_then(Value::as_str)
+                    == Some("wait.items");
 
-                if write_ndjson_line_async(&mut write_half, &pkt).await.is_err() {
+                if write_ndjson_line_async(&mut write_half, &pkt)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 if is_once_done {
@@ -6562,9 +6609,12 @@ async fn handle_connection<R, W>(
                                 let expires_at = ttl_seconds.map(|secs| {
                                     now.saturating_add((secs as i64).saturating_mul(1_000))
                                 });
-                                match daemon.node.db().local().add_mute_with_expiry(
-                                    "*", target, "cli", now, expires_at,
-                                ) {
+                                match daemon
+                                    .node
+                                    .db()
+                                    .local()
+                                    .add_mute_with_expiry("*", target, "cli", now, expires_at)
+                                {
                                     Ok(rule) => {
                                         if let Some(ttl) = ttl_seconds {
                                             let timer_daemon = Arc::clone(&daemon);
@@ -6695,7 +6745,8 @@ async fn handle_connection<R, W>(
                             break;
                         };
 
-                        if let Err(err_code) = daemon.verify_wait_session_auth(&session_id, &packet) {
+                        if let Err(err_code) = daemon.verify_wait_session_auth(&session_id, &packet)
+                        {
                             let _ = write_ndjson_line_async(
                                 &mut write_half,
                                 &json!({
@@ -6719,7 +6770,11 @@ async fn handle_connection<R, W>(
                         }
                         attached_waiter = Some((session_id.clone(), waiter_id));
                         daemon.mark_session_idle(&session_id);
-                        let _ = daemon.node.db().local().touch_session(&session_id, now_ms());
+                        let _ = daemon
+                            .node
+                            .db()
+                            .local()
+                            .touch_session(&session_id, now_ms());
                         daemon.bump_ui_rev();
 
                         let mode_str = match mode {
@@ -6843,7 +6898,8 @@ async fn handle_connection<R, W>(
                                     bind_channel(&daemon, conn_id, sid, &chan_tx);
                                 } else if let Some(ref cid) = ctx.ephemeral_client_id.clone() {
                                     let sid = format!("claude:{cid}");
-                                    let mut patch = ctx.hints.backend_patch(Some(HarnessKind::Claude));
+                                    let mut patch =
+                                        ctx.hints.backend_patch(Some(HarnessKind::Claude));
                                     patch.insert("channel".into(), json!(true));
                                     let _ = daemon.merge_session_backend_and_index(
                                         &sid,
@@ -6874,7 +6930,10 @@ async fn handle_connection<R, W>(
                                     "hasKv": daemon.has_kv_capability(),
                                 }
                             });
-                            if write_ndjson_line_async(&mut write_half, &resp).await.is_err() {
+                            if write_ndjson_line_async(&mut write_half, &resp)
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -6914,22 +6973,24 @@ async fn handle_connection<R, W>(
                         .await;
 
                         let resp = match resolved_session {
-                            Ok(session_id) => match daemon
-                                .dispatch_tool(&session_id, tool_name, &args)
-                                .await
-                            {
-                                Ok(result) => json!({ "id": req_id, "result": result }),
-                                Err((code, message)) => json!({
-                                    "id": req_id,
-                                    "error": { "code": code, "message": message }
-                                }),
-                            },
+                            Ok(session_id) => {
+                                match daemon.dispatch_tool(&session_id, tool_name, &args).await {
+                                    Ok(result) => json!({ "id": req_id, "result": result }),
+                                    Err((code, message)) => json!({
+                                        "id": req_id,
+                                        "error": { "code": code, "message": message }
+                                    }),
+                                }
+                            }
                             Err((code, message)) => json!({
                                 "id": req_id,
                                 "error": { "code": code, "message": message }
                             }),
                         };
-                        if write_ndjson_line_async(&mut write_half, &resp).await.is_err() {
+                        if write_ndjson_line_async(&mut write_half, &resp)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -7146,7 +7207,10 @@ fn harness_natively_uses_hooks(harness: HarnessKind) -> bool {
     )
 }
 
-fn extract_openclaw_target_from_parts(session_id: &str, backend_json: &str) -> Option<(String, String)> {
+fn extract_openclaw_target_from_parts(
+    session_id: &str,
+    backend_json: &str,
+) -> Option<(String, String)> {
     if !session_id.starts_with("openclaw:") {
         return None;
     }
@@ -7380,10 +7444,7 @@ fn handle_session_start(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Val
         return json!({ "ok": false, "error": err });
     }
 
-    let env_file_exported = packet
-        .get("envFileExported")
-        .and_then(Value::as_bool)
-        == Some(true);
+    let env_file_exported = packet.get("envFileExported").and_then(Value::as_bool) == Some(true);
     let harness = packet
         .get("harness")
         .or_else(|| packet.get("backend"))
@@ -7624,7 +7685,8 @@ fn maybe_spawn_transport_probe(
                     if let Some(ref app) = target.app {
                         herdr_patch.insert("herdrApp".into(), json!(app));
                     }
-                    let _ = daemon_arc.merge_session_backend_and_index(&sid, &herdr_patch, now_ms());
+                    let _ =
+                        daemon_arc.merge_session_backend_and_index(&sid, &herdr_patch, now_ms());
                     if daemon_arc.attach_transport_if_higher_priority(
                         &sid,
                         Arc::new(HerdrTransport::new(target)),
@@ -7658,7 +7720,8 @@ fn maybe_spawn_transport_probe(
                     .or(daemon_arc.config.t3_default_url.as_deref())
                     .or(node_t3.url.as_deref())
                     .unwrap_or(DEFAULT_T3_URL);
-                if let Ok(origin) = normalize_t3_server_url_with_remote(raw_url, node_t3.allow_remote)
+                if let Ok(origin) =
+                    normalize_t3_server_url_with_remote(raw_url, node_t3.allow_remote)
                 {
                     let token =
                         read_t3_secret_for_node(&daemon_arc.node, node_t3.token_secret.as_deref());
@@ -7699,7 +7762,9 @@ fn maybe_spawn_transport_probe(
         // or unreachable `/hooks/*` endpoint; defaults to `POST /hooks/wake` targeting this
         // session's exact `(agentId, sessionKey)` and honors optional `node.json` `"openclaw"`
         // block, including `enabled: false` / `deliveryMode: "inbox"` opt-out).
-        if !attached && is_openclaw && daemon_arc.current_transport_priority(&sid) < PRIORITY_OPENCLAW
+        if !attached
+            && is_openclaw
+            && daemon_arc.current_transport_priority(&sid) < PRIORITY_OPENCLAW
         {
             let oc_cfg = node_json
                 .as_ref()
@@ -7709,7 +7774,13 @@ fn maybe_spawn_transport_probe(
                 let mut target = oc_cfg.to_target();
                 target.state_dir = Some(daemon_arc.node.config().state_dir.clone());
                 target.secret_backend = daemon_arc.node.config().secret_backend;
-                let sess_opt = daemon_arc.node.db().local().get_session(&sid).ok().flatten();
+                let sess_opt = daemon_arc
+                    .node
+                    .db()
+                    .local()
+                    .get_session(&sid)
+                    .ok()
+                    .flatten();
                 target.handle = sess_opt.as_ref().and_then(|s| s.handle.clone());
 
                 let session_key = hints
@@ -7718,7 +7789,9 @@ fn maybe_spawn_transport_probe(
                     .or_else(|| {
                         sess_opt
                             .as_ref()
-                            .and_then(|s| extract_backend_str(&s.backend_json, "openclawSessionKey"))
+                            .and_then(|s| {
+                                extract_backend_str(&s.backend_json, "openclawSessionKey")
+                            })
                             .and_then(|raw| {
                                 let stripped = raw.strip_prefix("openclaw:").unwrap_or(&raw);
                                 validate_openclaw_session_key(stripped).ok()
@@ -7932,7 +8005,13 @@ fn resolve_openclaw_drain_session(
             return None;
         };
         if let Ok(canonical_sid) = canonical_openclaw_session_id(&sk) {
-            if db.local().get_session(&canonical_sid).ok().flatten().is_some() {
+            if db
+                .local()
+                .get_session(&canonical_sid)
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 return Some(canonical_sid);
             }
         }
@@ -7979,10 +8058,7 @@ fn resolve_openclaw_drain_session(
     None
 }
 
-async fn handle_session_idle(
-    daemon: &Arc<LocalDaemonInner>,
-    packet: &Map<String, Value>,
-) -> Value {
+async fn handle_session_idle(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Value>) -> Value {
     let Some(session_id) = packet
         .get("sessionId")
         .and_then(Value::as_str)
@@ -8257,8 +8333,12 @@ fn parse_rules_arg(args: &Map<String, Value>) -> Result<Vec<DeliveryRule>, (Stri
     };
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let rule: DeliveryRule = serde_json::from_value(item.clone())
-            .map_err(|e| ("invalid_request".into(), format!("Invalid delivery rule: {e}")))?;
+        let rule: DeliveryRule = serde_json::from_value(item.clone()).map_err(|e| {
+            (
+                "invalid_request".into(),
+                format!("Invalid delivery rule: {e}"),
+            )
+        })?;
         rule.validate().map_err(delivery_err_tuple)?;
         out.push(rule);
     }
@@ -8275,9 +8355,18 @@ fn parse_inbox_filter_arg(raw: Option<&Value>) -> Result<InboxFilter, (String, S
     let Value::Object(map) = val else {
         return Err(("invalid_filter".into(), "Expected filter object".into()));
     };
-    let from = map.get("from").and_then(Value::as_str).map(ToString::to_string);
-    let node = map.get("node").and_then(Value::as_str).map(ToString::to_string);
-    let topic = map.get("topic").and_then(Value::as_str).map(ToString::to_string);
+    let from = map
+        .get("from")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let node = map
+        .get("node")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let topic = map
+        .get("topic")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     let channel = map
         .get("channel")
         .and_then(Value::as_str)
@@ -8367,7 +8456,10 @@ fn parse_bridge_text_and_reaction(
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(validate_bridge_reaction(s.as_str())?),
         Some(_) => {
-            return Err(("invalid_request".into(), "Expected string 'reaction'".into()));
+            return Err((
+                "invalid_request".into(),
+                "Expected string 'reaction'".into(),
+            ));
         }
     };
     if text.trim().is_empty() && reaction.is_none() {
@@ -8492,8 +8584,12 @@ async fn create_external_drop(
         target_node_id: Some(node.node_id().to_string()),
         burn_after_read: true,
     };
-    let body_bytes = serde_json::to_vec(&req_body)
-        .map_err(|e| ("internal_error".into(), format!("serialize drop request: {e}")))?;
+    let body_bytes = serde_json::to_vec(&req_body).map_err(|e| {
+        (
+            "internal_error".into(),
+            format!("serialize drop request: {e}"),
+        )
+    })?;
     let body_sha = sha256_hex(&body_bytes);
     let ts = now_ms();
     let nonce = uuid_v4();
@@ -8516,25 +8612,42 @@ async fn create_external_drop(
         .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x)
         .header(CONTENT_TYPE, CONTENT_TYPE_JSON)
         .body(full_body(body_bytes))
-        .map_err(|e| ("drop_relay_error".into(), format!("build drop request: {e}")))?;
+        .map_err(|e| {
+            (
+                "drop_relay_error".into(),
+                format!("build drop request: {e}"),
+            )
+        })?;
 
-    let resp = node
-        .http_client()
-        .request(http_req)
-        .await
-        .map_err(|e| ("drop_relay_error".into(), format!("drop relay POST failed: {e}")))?;
-    let (status, _, resp_bytes) = HttpClient::collect(resp, 64 * 1024)
-        .await
-        .map_err(|e| ("drop_relay_error".into(), format!("drop relay read failed: {e}")))?;
+    let resp = node.http_client().request(http_req).await.map_err(|e| {
+        (
+            "drop_relay_error".into(),
+            format!("drop relay POST failed: {e}"),
+        )
+    })?;
+    let (status, _, resp_bytes) = HttpClient::collect(resp, 64 * 1024).await.map_err(|e| {
+        (
+            "drop_relay_error".into(),
+            format!("drop relay read failed: {e}"),
+        )
+    })?;
     if !status.is_success() {
         let msg = String::from_utf8_lossy(&resp_bytes);
         return Err((
             "drop_relay_error".into(),
-            format!("drop relay returned HTTP {}: {}", status.as_u16(), msg.trim()),
+            format!(
+                "drop relay returned HTTP {}: {}",
+                status.as_u16(),
+                msg.trim()
+            ),
         ));
     }
-    serde_json::from_slice::<CreateDropResponse>(&resp_bytes)
-        .map_err(|e| ("drop_relay_error".into(), format!("invalid drop relay response: {e}")))
+    serde_json::from_slice::<CreateDropResponse>(&resp_bytes).map_err(|e| {
+        (
+            "drop_relay_error".into(),
+            format!("invalid drop relay response: {e}"),
+        )
+    })
 }
 
 fn sanitize_notice_label(raw: &str) -> String {
@@ -8575,11 +8688,7 @@ fn parse_human_auth_meta(raw: &str) -> Option<(Option<String>, Option<String>)> 
     Some((human_id, kid))
 }
 
-fn format_human_verified_source(
-    source: &str,
-    human_id: Option<&str>,
-    kid: Option<&str>,
-) -> String {
+fn format_human_verified_source(source: &str, human_id: Option<&str>, kid: Option<&str>) -> String {
     let kid8 = kid.map(|k| k.chars().take(8).collect::<String>());
     match (human_id, kid8) {
         (Some(hid), Some(k8)) => {
@@ -8969,7 +9078,12 @@ async fn fanout_approved_local_ingest(
         };
 
         let approved_event_id = ce.id.clone();
-        if daemon.node.publish_event(&qualified_topic, ce).await.is_err() {
+        if daemon
+            .node
+            .publish_event(&qualified_topic, ce)
+            .await
+            .is_err()
+        {
             continue;
         }
 
@@ -9500,7 +9614,12 @@ impl LocalDaemonInner {
             .lock()
             .expect("session_transports lock poisoned")
             .get(&sess.id)
-            .and_then(|attached| attached.transport.herdr_terminal_id().map(ToString::to_string));
+            .and_then(|attached| {
+                attached
+                    .transport
+                    .herdr_terminal_id()
+                    .map(ToString::to_string)
+            });
         from_transport.or_else(|| {
             extract_backend_str(&sess.backend_json, "herdrTerminalId")
                 .filter(|tid| is_valid_terminal_id(tid))
@@ -9678,13 +9797,14 @@ impl LocalDaemonInner {
     fn build_session_summary_obj(&self, sess: &hyp_store::Session, detail: SummaryDetail) -> Value {
         let node_id = self.node.node_id().as_str();
         let harness = extract_backend_str(&sess.backend_json, "kind")
-            .or_else(|| sess.id.split_once(':').map(|(prefix, _)| prefix.to_string()))
+            .or_else(|| {
+                sess.id
+                    .split_once(':')
+                    .map(|(prefix, _)| prefix.to_string())
+            })
             .unwrap_or_else(|| "unknown".to_string());
         let enrolled = sess.handle.is_some();
-        let address = sess
-            .handle
-            .as_deref()
-            .map(|h| format_address(node_id, h));
+        let address = sess.handle.as_deref().map(|h| format_address(node_id, h));
         let herdr_terminal_id = self.session_herdr_terminal_id(sess);
         let herdr_created_ms = self.session_herdr_created_ms(sess);
         let transport_kind = self.active_transport_kind(&sess.id);
@@ -10664,10 +10784,7 @@ fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
     } else {
         resolved.as_ref().map(|s| s.id.as_str()).unwrap_or("*")
     };
-    let actor = resolved
-        .as_ref()
-        .map(|s| s.id.as_str())
-        .unwrap_or("cli");
+    let actor = resolved.as_ref().map(|s| s.id.as_str()).unwrap_or("cli");
     let now = now_ms();
     let expires_at =
         ttl_seconds.map(|secs| now.saturating_add((secs as i64).saturating_mul(1_000)));
@@ -10849,8 +10966,7 @@ fn handle_session_rule(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -
         .and_then(Value::as_str)
         .map(str::trim);
 
-    let is_remove =
-        remove_flag || raw_delivery.is_some_and(|d| d.eq_ignore_ascii_case("remove"));
+    let is_remove = remove_flag || raw_delivery.is_some_and(|d| d.eq_ignore_ascii_case("remove"));
 
     let now = now_ms();
     if is_remove {
@@ -10915,9 +11031,7 @@ fn handle_session_rule(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -
             }
         };
         if urgency == DeliveryUrgency::Mute {
-            let _ = db
-                .local()
-                .add_mute(&sess.id, &rule.target, &sess.id, now);
+            let _ = db.local().add_mute(&sess.id, &rule.target, &sess.id, now);
         } else {
             let _ = db.local().remove_mute(&sess.id, &rule.target);
         }

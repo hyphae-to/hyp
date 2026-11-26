@@ -8,42 +8,41 @@
 use std::fs;
 use std::io::Write;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use flate2::write::GzEncoder;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use hyp_crypto::CryptoError;
 use hyp_crypto::compat_v1::{
-    create_key_registration_v1, issue_grant_v1, open_v1, parse_pairing_code_v1, seal_v1,
-    sign_binding_v1, verify_entry_v1, verify_key_registration_v1, EntryV1, KeyRegistrationV1,
-    SealInputV1,
+    EntryV1, KeyRegistrationV1, SealInputV1, create_key_registration_v1, issue_grant_v1, open_v1,
+    parse_pairing_code_v1, seal_v1, sign_binding_v1, verify_entry_v1, verify_key_registration_v1,
 };
 use hyp_crypto::e2ee::{
-    create_epoch_bundle, open_channel_message, open_dm, open_epoch_bundle, open_kv_entry,
-    seal_channel_message, seal_dm, seal_kv_entry, ChannelContext, DmContext, EpochMember,
-    EpochScope, KvContext,
+    ChannelContext, DmContext, EpochMember, EpochScope, KvContext, create_epoch_bundle,
+    open_channel_message, open_dm, open_epoch_bundle, open_kv_entry, seal_channel_message, seal_dm,
+    seal_kv_entry,
 };
 use hyp_crypto::hpke;
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{
     Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk, X25519KeyPair, X25519PublicKey,
 };
-use hyp_crypto::keystore::{validate_secret_name, SecretBackend, SecretStore};
+use hyp_crypto::keystore::{SecretBackend, SecretStore, validate_secret_name};
 use hyp_crypto::pairing::{
-    create_p2p_confirmation, create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1,
-    encode_am2, encode_hp2p1, sign_revocation_v2, verify_p2p_confirmation, verify_p2p_response,
-    verify_revocation_v2, AdminInviteV2, GrantV2, P2pOfferToken, P2pPairConfirmation,
-    P2pPairResponse, RevocationV2, AM2_PREFIX, HP2P1_PREFIX,
+    AM2_PREFIX, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2pOfferToken, P2pPairConfirmation,
+    P2pPairResponse, RevocationV2, create_p2p_confirmation, create_p2p_offer, create_p2p_response,
+    decode_am2, decode_hp2p1, encode_am2, encode_hp2p1, sign_revocation_v2,
+    verify_p2p_confirmation, verify_p2p_response, verify_revocation_v2,
 };
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
-#[cfg(unix)]
-use hyp_crypto::transfer::{pack_tar_gz, TarInputEntry};
 use hyp_crypto::transfer::{
-    decrypt_stream_v2, default_stage1_attachment_guard, encrypt_stream_v2, pack_tar_gz_bytes,
-    unpack_tar_gz, StreamEncryptParams, TarPackOptions, TarUnpackOptions, TRANSFER_CHUNK_SIZE,
+    StreamEncryptParams, TRANSFER_CHUNK_SIZE, TarPackOptions, TarUnpackOptions, decrypt_stream_v2,
+    default_stage1_attachment_guard, encrypt_stream_v2, pack_tar_gz_bytes, unpack_tar_gz,
 };
-use hyp_crypto::CryptoError;
+#[cfg(unix)]
+use hyp_crypto::transfer::{TarInputEntry, pack_tar_gz};
 
 fn flip_b64_byte(s: &str, idx: usize, mask: u8) -> String {
     let mut bytes = URL_SAFE_NO_PAD.decode(s).unwrap();
@@ -57,7 +56,8 @@ fn mutation_1bit_flips_across_dm_channel_kv_and_hpke() {
     let bob = NodeIdentityKeys::generate().unwrap();
 
     // 1. HPKE 1-bit flips across enc and ct
-    let (enc, ct) = hpke::seal_base(&bob.encryption.public_key(), b"info", b"aad", b"payload").unwrap();
+    let (enc, ct) =
+        hpke::seal_base(&bob.encryption.public_key(), b"info", b"aad", b"payload").unwrap();
     for pos in [0, 15, 31] {
         let mut bad_enc = enc;
         bad_enc[pos] ^= 0x01;
@@ -76,7 +76,13 @@ fn mutation_1bit_flips_across_dm_channel_kv_and_hpke() {
         sender: "alice/claude",
         recipient: "bob/codex",
     };
-    let dm = seal_dm(&dm_ctx, b"secret", &alice.signing, &bob.encryption.public_key()).unwrap();
+    let dm = seal_dm(
+        &dm_ctx,
+        b"secret",
+        &alice.signing,
+        &bob.encryption.public_key(),
+    )
+    .unwrap();
     for mut_dm in [
         {
             let mut m = dm.clone();
@@ -94,14 +100,34 @@ fn mutation_1bit_flips_across_dm_channel_kv_and_hpke() {
             m
         },
     ] {
-        assert!(open_dm(&mut_dm, &dm_ctx, &alice.signing.public_key(), &bob.encryption).is_err());
+        assert!(
+            open_dm(
+                &mut_dm,
+                &dm_ctx,
+                &alice.signing.public_key(),
+                &bob.encryption
+            )
+            .is_err()
+        );
     }
     // Changing any single AAD field rejects
     for bad_ctx in [
-        DmContext { node_id: "hub2", ..dm_ctx },
-        DmContext { msg_id: "dm-2", ..dm_ctx },
-        DmContext { sender: "eve/claude", ..dm_ctx },
-        DmContext { recipient: "carol/codex", ..dm_ctx },
+        DmContext {
+            node_id: "hub2",
+            ..dm_ctx
+        },
+        DmContext {
+            msg_id: "dm-2",
+            ..dm_ctx
+        },
+        DmContext {
+            sender: "eve/claude",
+            ..dm_ctx
+        },
+        DmContext {
+            recipient: "carol/codex",
+            ..dm_ctx
+        },
     ] {
         assert!(open_dm(&dm, &bad_ctx, &alice.signing.public_key(), &bob.encryption).is_err());
     }
@@ -115,22 +141,27 @@ fn mutation_1bit_flips_across_dm_channel_kv_and_hpke() {
         1,
         "alice",
         &alice.signing,
-        &[EpochMember { node_id: "bob", enc_pk: &bob_pub }],
+        &[EpochMember {
+            node_id: "bob",
+            enc_pk: &bob_pub,
+        }],
     )
     .unwrap();
     // Flip 1 bit in bundle signature -> rejected
     bundle.sig = flip_b64_byte(&bundle.sig, 0, 0x02);
-    assert!(open_epoch_bundle(
-        &bundle,
-        EpochScope::Channel,
-        "hub",
-        "#sec",
-        &alice.signing.public_key(),
-        "bob",
-        &bob.encryption,
-        1
-    )
-    .is_err());
+    assert!(
+        open_epoch_bundle(
+            &bundle,
+            EpochScope::Channel,
+            "hub",
+            "#sec",
+            &alice.signing.public_key(),
+            "bob",
+            &bob.encryption,
+            1
+        )
+        .is_err()
+    );
 
     let ch_ctx = ChannelContext {
         host_node: "hub",
@@ -141,15 +172,22 @@ fn mutation_1bit_flips_across_dm_channel_kv_and_hpke() {
     let ch = seal_channel_message(&ch_ctx, b"alert", &rk, &alice.signing).unwrap();
     let mut ch_bad_nonce = ch.clone();
     ch_bad_nonce.nonce = flip_b64_byte(&ch_bad_nonce.nonce, 0, 0x01);
-    assert!(open_channel_message(&ch_bad_nonce, &ch_ctx, &rk, &alice.signing.public_key(), 1).is_err());
-    assert!(open_channel_message(
-        &ch,
-        &ChannelContext { channel: "#other", ..ch_ctx },
-        &rk,
-        &alice.signing.public_key(),
-        1
-    )
-    .is_err());
+    assert!(
+        open_channel_message(&ch_bad_nonce, &ch_ctx, &rk, &alice.signing.public_key(), 1).is_err()
+    );
+    assert!(
+        open_channel_message(
+            &ch,
+            &ChannelContext {
+                channel: "#other",
+                ..ch_ctx
+            },
+            &rk,
+            &alice.signing.public_key(),
+            1
+        )
+        .is_err()
+    );
 
     let kv_ctx = KvContext {
         host_node: "hub",
@@ -162,7 +200,17 @@ fn mutation_1bit_flips_across_dm_channel_kv_and_hpke() {
     let kv = seal_kv_entry(&kv_ctx, b"val1", &rk, &alice.signing).unwrap();
     let mut kv_bad_ct = kv.clone();
     kv_bad_ct.ct = flip_b64_byte(&kv_bad_ct.ct, 0, 0x01);
-    assert!(open_kv_entry(&kv_bad_ct, &kv_ctx, &rk, &alice.signing.public_key(), 1, None).is_err());
+    assert!(
+        open_kv_entry(
+            &kv_bad_ct,
+            &kv_ctx,
+            &rk,
+            &alice.signing.public_key(),
+            1,
+            None
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -241,15 +289,17 @@ fn mutation_streaming_transfer_edge_boundaries_and_cross_transfer_chunk_swap() {
     let chunk0_wire_len = 4 + TRANSFER_CHUNK_SIZE + 16;
     let mut spliced = ct_a.clone();
     spliced[4..4 + chunk0_wire_len].copy_from_slice(&ct_b[4..4 + chunk0_wire_len]);
-    assert!(decrypt_stream_v2(
-        &hdr_a,
-        &spliced[..],
-        &mut Vec::new(),
-        &sender.signing.public_key(),
-        "bob",
-        &bob.encryption,
-    )
-    .is_err());
+    assert!(
+        decrypt_stream_v2(
+            &hdr_a,
+            &spliced[..],
+            &mut Vec::new(),
+            &sender.signing.public_key(),
+            "bob",
+            &bob.encryption,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -387,16 +437,18 @@ fn mutation_archive_limits_symlinks_nul_duplicates_and_decompression_bomb() {
     let bomb_bytes = bomb_gz.finish().unwrap();
     assert!(bomb_bytes.len() < 32 * 1024);
     let d_bomb = tmp.path().join("raw-bomb");
-    assert!(unpack_tar_gz(
-        &bomb_bytes[..],
-        &d_bomb,
-        &TarUnpackOptions {
-            max_files: 10,
-            max_raw_bytes: 32 * 1024,
-            attachment_guard: Some(&default_stage1_attachment_guard),
-        },
-    )
-    .is_err());
+    assert!(
+        unpack_tar_gz(
+            &bomb_bytes[..],
+            &d_bomb,
+            &TarUnpackOptions {
+                max_files: 10,
+                max_raw_bytes: 32 * 1024,
+                attachment_guard: Some(&default_stage1_attachment_guard),
+            },
+        )
+        .is_err()
+    );
     assert!(!d_bomb.exists());
 }
 
@@ -530,7 +582,8 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
             return Err(CryptoError::InvalidPairing("grant_id mismatch".into()));
         }
         let admin_pk = decoded.admin_jwk.to_ed25519()?;
-        let binding = sign_binding_v1(&issued.grant, &code, &alice.signing, &alice.encryption, now)?;
+        let binding =
+            sign_binding_v1(&issued.grant, &code, &alice.signing, &alice.encryption, now)?;
         let entry = EntryV1 {
             grant: issued.signed.clone(),
             binding,
@@ -579,7 +632,8 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
                 "seed=0x{seed:016x} step={step}: mutated am2_ decoded identically at pos={pos}"
             );
             // Any mutation touching admin_jwk or pairing_code MUST fail redemption.
-            if decoded.admin_jwk != invite.admin_jwk || decoded.pairing_code != invite.pairing_code {
+            if decoded.admin_jwk != invite.admin_jwk || decoded.pairing_code != invite.pairing_code
+            {
                 assert!(
                     redeem_am2(&mutated_token).is_err(),
                     "seed=0x{seed:016x} step={step}: mutated am2_ key/code passed redemption at pos={pos}"
@@ -682,8 +736,11 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
     let orig_secret = URL_SAFE_NO_PAD.decode(&offer.secret).unwrap();
     let orig_sign_x = URL_SAFE_NO_PAD.decode(&offer.signing_jwk.x).unwrap();
     let orig_enc_x = URL_SAFE_NO_PAD.decode(&offer.encryption_jwk.x).unwrap();
-    let total_offer_crypto =
-        orig_secret.len() + orig_sign_x.len() + orig_enc_x.len() + offer.offer_id.len() + offer.node_id.len();
+    let total_offer_crypto = orig_secret.len()
+        + orig_sign_x.len()
+        + orig_enc_x.len()
+        + offer.offer_id.len()
+        + offer.node_id.len();
     for step in 0..72usize {
         let mut pos = rng.gen_usize(total_offer_crypto);
         let bit = (rng.next_u64() % 8) as u8;
@@ -776,9 +833,8 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
     let orig_conf_sig = URL_SAFE_NO_PAD
         .decode(&p2p_conf.alice_grant_to_bob.sig)
         .unwrap();
-    let conf_total = p2p_conf.offer_id.len()
-        + p2p_conf.alice_grant_to_bob.payload.len()
-        + orig_conf_sig.len();
+    let conf_total =
+        p2p_conf.offer_id.len() + p2p_conf.alice_grant_to_bob.payload.len() + orig_conf_sig.len();
     for step in 0..72usize {
         let pos = rng.gen_usize(conf_total);
         let bit = (rng.next_u64() % 8) as u8;
@@ -812,7 +868,10 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
         reason: Some("device_compromised".into()),
     };
     let signed_rev = sign_revocation_v2(&rev, &admin).unwrap();
-    assert_eq!(verify_revocation_v2(&signed_rev, &admin.public_key()).unwrap(), rev);
+    assert_eq!(
+        verify_revocation_v2(&signed_rev, &admin.public_key()).unwrap(),
+        rev
+    );
 
     let orig_rev_sig = URL_SAFE_NO_PAD.decode(&signed_rev.sig).unwrap();
     let rev_total = signed_rev.payload.len() + orig_rev_sig.len();
@@ -882,7 +941,8 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
     }
 
     // Also sweep 64 seeded 1-bit flips across `KeyRegistrationV1`.
-    let kr_v1 = create_key_registration_v1("alice@macbook", &alice.signing, &alice.encryption).unwrap();
+    let kr_v1 =
+        create_key_registration_v1("alice@macbook", &alice.signing, &alice.encryption).unwrap();
     assert!(verify_key_registration_v1("alice@macbook", &kr_v1).is_ok());
     let orig_v1_sig = URL_SAFE_NO_PAD.decode(&kr_v1.proof.sig).unwrap();
     let kr_v1_total = kr_v1.proof.payload.len() + orig_v1_sig.len();

@@ -218,7 +218,10 @@ fn non_tty_security_sensitive_commands_fail_closed_with_zero_mutations() {
         .unwrap();
     assert_non_tty_refused(&lock_out, "hyp gate lock");
     assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
-    assert!(proposal_path.exists(), "gate.proposed.json must remain intact");
+    assert!(
+        proposal_path.exists(),
+        "gate.proposed.json must remain intact"
+    );
 
     // 2. Non-TTY `hyp gate init --lock` fails closed; node.json untouched!
     let init_lock_out = isolated_cmd(home)
@@ -271,7 +274,12 @@ fn non_tty_security_sensitive_commands_fail_closed_with_zero_mutations() {
         let db = NodeDb::open(state_dir.join("node.sqlite")).unwrap();
         let entry = db.local().get_mailbox_entry(&receipt).unwrap().unwrap();
         assert_eq!(entry.gate_state, GateState::Quarantined);
-        assert!(db.local().peek_inbox("claude:tty-test", 10).unwrap().is_empty());
+        assert!(
+            db.local()
+                .peek_inbox("claude:tty-test", 10)
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             db.local()
                 .is_muted("claude:tty-test", &["guest@ext/mallory"])
@@ -431,7 +439,8 @@ fn non_tty_security_sensitive_commands_fail_closed_with_zero_mutations() {
     // 7. Lock node.json in-place via policy signer and verify non-TTY `hyp gate init` (WITHOUT `--lock`)
     //    refuses to silently unlock/overwrite the locked Security Gate!
     let secrets = SecretStore::new(&state_dir, SecretBackend::File);
-    let mut cfg_val: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let mut cfg_val: Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     let mut gate_cfg: SecurityGateConfig = serde_json::from_value(cfg_val["gate"].clone()).unwrap();
     gate_cfg.require_signed_policy = true;
     gate_cfg.policy_signature = None;
@@ -483,8 +492,22 @@ fn cli_has_zero_yes_or_force_bypass_flags_and_enforces_g17_https_urls() {
             "--state-dir",
             state_str,
         ],
-        vec!["inbox", "approve", "rcpt-1", "--yes", "--state-dir", state_str],
-        vec!["inbox", "reject", "rcpt-1", "--force", "--state-dir", state_str],
+        vec![
+            "inbox",
+            "approve",
+            "rcpt-1",
+            "--yes",
+            "--state-dir",
+            state_str,
+        ],
+        vec![
+            "inbox",
+            "reject",
+            "rcpt-1",
+            "--force",
+            "--state-dir",
+            state_str,
+        ],
         vec![
             "auth",
             "add",
@@ -496,7 +519,14 @@ fn cli_has_zero_yes_or_force_bypass_flags_and_enforces_g17_https_urls() {
             "--state-dir",
             state_str,
         ],
-        vec!["auth", "revoke", "kid12345678", "--yes", "--state-dir", state_str],
+        vec![
+            "auth",
+            "revoke",
+            "kid12345678",
+            "--yes",
+            "--state-dir",
+            state_str,
+        ],
     ] {
         let out = isolated_cmd(home).args(&argv).output().unwrap();
         assert_eq!(
@@ -662,10 +692,26 @@ fn pty_gate_lock_and_locked_gate_init_abort_and_confirm_with_summary_diff() {
         assert_eq!(env["ok"], false);
         assert_eq!(env["error"]["code"], "CONFIRMATION_ABORTED");
         assert!(abort.tty.contains("merging staged gate.proposed.json"));
-        assert!(abort.tty.contains("changed: model: claude-haiku-4-5 -> claude-sonnet-4-5"));
-        assert!(abort.tty.contains("changed: auth_header: x-api-key -> bearer"));
-        assert!(abort.tty.contains("changed: secret_name: old-ant-secret -> new-proxy-secret"));
-        assert!(abort.tty.contains("Lock & sign this Security Gate policy? [y/N]:"));
+        assert!(
+            abort
+                .tty
+                .contains("changed: model: claude-haiku-4-5 -> claude-sonnet-4-5")
+        );
+        assert!(
+            abort
+                .tty
+                .contains("changed: auth_header: x-api-key -> bearer")
+        );
+        assert!(
+            abort
+                .tty
+                .contains("changed: secret_name: old-ant-secret -> new-proxy-secret")
+        );
+        assert!(
+            abort
+                .tty
+                .contains("Lock & sign this Security Gate policy? [y/N]:")
+        );
         assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
         assert!(proposal_path.exists());
     }
@@ -713,7 +759,10 @@ fn pty_gate_lock_and_locked_gate_init_abort_and_confirm_with_summary_diff() {
         Some("n\n"),
     );
     assert_eq!(abort_unlock.code, 1, "tty={}", abort_unlock.tty);
-    assert_eq!(abort_unlock.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
+    assert_eq!(
+        abort_unlock.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
     assert!(
         abort_unlock.tty.contains(
             "WARNING: Security Gate is currently LOCKED. Overwriting/unlocking it will disable tamper protection until re-locked. Continue? [y/N]:"
@@ -784,16 +833,17 @@ fn pty_inbox_approve_and_reject_display_metadata_only_abort_and_confirm() {
         Some("n\n"),
     );
     assert_eq!(app_abort.code, 1, "tty={}", app_abort.tty);
-    assert_eq!(app_abort.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
+    assert_eq!(
+        app_abort.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
     assert!(app_abort.tty.contains(&r1));
     assert!(app_abort.tty.contains("guest@ext/alice"));
     assert!(app_abort.tty.contains("Trust Tier:  guest"));
     assert!(app_abort.tty.contains("Quarantined:"));
-    assert!(
-        app_abort
-            .tty
-            .contains(&format!("Approve quarantined item {r1} for delivery? [y/N]:"))
-    );
+    assert!(app_abort.tty.contains(&format!(
+        "Approve quarantined item {r1} for delivery? [y/N]:"
+    )));
     assert!(
         !app_abort.tty.contains(canary_approve),
         "inbox approve confirmation MUST NOT leak raw body: {}",
@@ -826,7 +876,10 @@ fn pty_inbox_approve_and_reject_display_metadata_only_abort_and_confirm() {
         Some("\n"),
     );
     assert_eq!(rej_abort.code, 1, "tty={}", rej_abort.tty);
-    assert_eq!(rej_abort.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
+    assert_eq!(
+        rej_abort.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
     assert!(rej_abort.tty.contains(&r2));
     assert!(rej_abort.tty.contains("evil@ext/mallory"));
     assert!(rej_abort.tty.contains("Trust Tier:  guest"));
@@ -947,7 +1000,10 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
         Some("n\n"),
     );
     assert_eq!(add_abort.code, 1, "tty={}", add_abort.tty);
-    assert_eq!(add_abort.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
+    assert_eq!(
+        add_abort.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
     assert!(add_abort.tty.contains("Security Gate is LOCKED"));
     assert!(
         add_abort.tty.contains(&format!(
@@ -1006,7 +1062,10 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
         Some("n\n"),
     );
     assert_eq!(rev_abort.code, 1, "tty={}", rev_abort.tty);
-    assert_eq!(rev_abort.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
+    assert_eq!(
+        rev_abort.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
     assert!(rev_abort.tty.contains("Bump Epoch: yes (1 -> 2)"));
     assert!(rev_abort.tty.contains("Security Gate is LOCKED"));
     assert!(
@@ -1132,7 +1191,10 @@ fn wave4c_gate_review_json_is_strictly_metadata_only_and_show_body_requires_tty(
     assert_eq!(item["trustTier"], "guest");
     assert_eq!(item["source"], dirty_source);
     assert!(item.get("receivedAt").is_some());
-    assert!(item.get("preview").is_none(), "G6/G10: preview field MUST be removed: {item}");
+    assert!(
+        item.get("preview").is_none(),
+        "G6/G10: preview field MUST be removed: {item}"
+    );
     assert!(item.get("text").is_none());
     assert!(item.get("body").is_none());
 
@@ -1150,7 +1212,10 @@ fn wave4c_gate_review_json_is_strictly_metadata_only_and_show_body_requires_tty(
         .unwrap();
     assert_eq!(bad_combo.status.code(), Some(2));
     let bad_combo_json = parse_json_stdout(&bad_combo);
-    assert_eq!(bad_combo_json["error"]["code"], "SHOW_BODY_FORBIDDEN_WITH_JSON");
+    assert_eq!(
+        bad_combo_json["error"]["code"],
+        "SHOW_BODY_FORBIDDEN_WITH_JSON"
+    );
     assert!(!String::from_utf8_lossy(&bad_combo.stdout).contains(body_canary));
 
     // 3. Non-TTY `hyp gate review --show-body` MUST fail closed with exit 2!
@@ -1171,10 +1236,22 @@ fn wave4c_gate_review_json_is_strictly_metadata_only_and_show_body_requires_tty(
             None,
             None,
         );
-        assert_eq!(pty_meta.code, 0, "stdout={} tty={}", pty_meta.stdout, pty_meta.tty);
+        assert_eq!(
+            pty_meta.code, 0,
+            "stdout={} tty={}",
+            pty_meta.stdout, pty_meta.tty
+        );
         assert!(!pty_meta.stdout.contains(body_canary));
-        assert!(!pty_meta.stdout.contains('\x1b'), "ANSI leaked: {:?}", pty_meta.stdout);
-        assert!(!pty_meta.stdout.contains('\u{202E}'), "BiDi leaked: {:?}", pty_meta.stdout);
+        assert!(
+            !pty_meta.stdout.contains('\x1b'),
+            "ANSI leaked: {:?}",
+            pty_meta.stdout
+        );
+        assert!(
+            !pty_meta.stdout.contains('\u{202E}'),
+            "BiDi leaked: {:?}",
+            pty_meta.stdout
+        );
         assert!(pty_meta.stdout.contains("Trust:    guest"));
 
         let pty_body = run_hyp_in_pty(
@@ -1183,21 +1260,56 @@ fn wave4c_gate_review_json_is_strictly_metadata_only_and_show_body_requires_tty(
             None,
             None,
         );
-        assert_eq!(pty_body.code, 0, "stdout={} tty={}", pty_body.stdout, pty_body.tty);
-        assert!(pty_body.stdout.contains(body_canary), "expected body snippet: {}", pty_body.stdout);
-        assert!(!pty_body.stdout.contains('\x1b'), "ANSI leaked in --show-body: {:?}", pty_body.stdout);
-        assert!(!pty_body.stdout.contains('\u{202E}'), "BiDi leaked in --show-body: {:?}", pty_body.stdout);
+        assert_eq!(
+            pty_body.code, 0,
+            "stdout={} tty={}",
+            pty_body.stdout, pty_body.tty
+        );
+        assert!(
+            pty_body.stdout.contains(body_canary),
+            "expected body snippet: {}",
+            pty_body.stdout
+        );
+        assert!(
+            !pty_body.stdout.contains('\x1b'),
+            "ANSI leaked in --show-body: {:?}",
+            pty_body.stdout
+        );
+        assert!(
+            !pty_body.stdout.contains('\u{202E}'),
+            "BiDi leaked in --show-body: {:?}",
+            pty_body.stdout
+        );
 
         let pty_app = run_hyp_in_pty(
             home,
-            &["inbox", "approve", &receipt, "--state-dir", state_str, "--json"],
+            &[
+                "inbox",
+                "approve",
+                &receipt,
+                "--state-dir",
+                state_str,
+                "--json",
+            ],
             None,
             Some("n\n"),
         );
         assert_eq!(pty_app.code, 1);
-        assert!(!pty_app.tty.contains('\x1b'), "ANSI leaked in inbox approve TTY: {:?}", pty_app.tty);
-        assert!(!pty_app.tty.contains('\u{202E}'), "BiDi leaked in inbox approve TTY: {:?}", pty_app.tty);
-        assert!(!pty_app.tty.contains('\u{2066}'), "BiDi isolate leaked in inbox approve TTY: {:?}", pty_app.tty);
+        assert!(
+            !pty_app.tty.contains('\x1b'),
+            "ANSI leaked in inbox approve TTY: {:?}",
+            pty_app.tty
+        );
+        assert!(
+            !pty_app.tty.contains('\u{202E}'),
+            "BiDi leaked in inbox approve TTY: {:?}",
+            pty_app.tty
+        );
+        assert!(
+            !pty_app.tty.contains('\u{2066}'),
+            "BiDi isolate leaked in inbox approve TTY: {:?}",
+            pty_app.tty
+        );
         assert!(!pty_app.tty.contains(body_canary));
     }
 }
@@ -1271,7 +1383,11 @@ fn wave4c_pty_gate_lock_tamper_banner_weakening_diffs_and_policy_signing_secret_
     assert_eq!(lock1.code, 0, "tty={}", lock1.tty);
     assert!(lock1.tty.contains("Stage 1:"), "tty={}", lock1.tty);
     assert!(lock1.tty.contains("matchers:"), "tty={}", lock1.tty);
-    assert!(lock1.tty.contains("subprocess: args=[--strict]"), "tty={}", lock1.tty);
+    assert!(
+        lock1.tty.contains("subprocess: args=[--strict]"),
+        "tty={}",
+        lock1.tty
+    );
 
     // 2. Reject `gate.proposed.json` that tries to override `policySigningSecret`!
     let proposal_path = state_dir.join("gate.proposed.json");
@@ -1298,18 +1414,30 @@ fn wave4c_pty_gate_lock_tamper_banner_weakening_diffs_and_policy_signing_secret_
         None,
         Some("y\n"),
     );
-    assert_eq!(reject_prop.code, 1, "stdout={} tty={}", reject_prop.stdout, reject_prop.tty);
-    assert_eq!(reject_prop.parse_json()["error"]["code"], "INVALID_GATE_CONFIG");
+    assert_eq!(
+        reject_prop.code, 1,
+        "stdout={} tty={}",
+        reject_prop.stdout, reject_prop.tty
+    );
+    assert_eq!(
+        reject_prop.parse_json()["error"]["code"],
+        "INVALID_GATE_CONFIG"
+    );
     fs::remove_file(&proposal_path).unwrap();
 
     // 3. Tamper locked `node.json` on disk (disable DLP, disable filter, empty matchers, raise threshold)
     //    and verify `hyp gate lock` prints the LOUD tamper banner + weakening highlights BEFORE prompting!
-    let mut cfg_val: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let mut cfg_val: Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     cfg_val["gate"]["stage1"]["outbound_dlp_enabled"] = Value::Bool(false);
     cfg_val["gate"]["filters"][0]["enabled"] = Value::Bool(false);
     cfg_val["gate"]["filters"][0]["matchers"]["trust_tiers"] = serde_json::json!([]);
     cfg_val["gate"]["filters"][0]["adapter"]["threshold"] = serde_json::json!(0.99);
-    fs::write(&config_path, serde_json::to_string_pretty(&cfg_val).unwrap()).unwrap();
+    fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&cfg_val).unwrap(),
+    )
+    .unwrap();
 
     let tampered_lock = run_hyp_in_pty(
         home,
@@ -1326,7 +1454,10 @@ fn wave4c_pty_gate_lock_tamper_banner_weakening_diffs_and_policy_signing_secret_
         Some("n\n"),
     );
     assert_eq!(tampered_lock.code, 1, "tty={}", tampered_lock.tty);
-    assert_eq!(tampered_lock.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
+    assert_eq!(
+        tampered_lock.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
     assert!(
         tampered_lock
             .tty
@@ -1411,9 +1542,20 @@ fn wave4c_pty_auth_init_web_auth_sign_and_emit_sign_hardening() {
         Some("n\n"),
     );
     assert_eq!(web_abort.code, 1, "tty={}", web_abort.tty);
-    assert_eq!(web_abort.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
-    assert!(!web_abort.tty.contains('\x1b'), "ANSI leaked: {:?}", web_abort.tty);
-    assert!(!web_abort.tty.contains('\u{202E}'), "BiDi leaked: {:?}", web_abort.tty);
+    assert_eq!(
+        web_abort.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
+    assert!(
+        !web_abort.tty.contains('\x1b'),
+        "ANSI leaked: {:?}",
+        web_abort.tty
+    );
+    assert!(
+        !web_abort.tty.contains('\u{202E}'),
+        "BiDi leaked: {:?}",
+        web_abort.tty
+    );
     assert!(web_abort.tty.contains("--web"), "tty={}", web_abort.tty);
 
     // 3. `hyp auth sign --kind secret`: PTY prompt NEVER leaks secret body, aborts on `n`, succeeds on `y`!
@@ -1437,10 +1579,23 @@ fn wave4c_pty_auth_init_web_auth_sign_and_emit_sign_hardening() {
         Some("n\n"),
     );
     assert_eq!(sign_abort.code, 1, "tty={}", sign_abort.tty);
-    assert_eq!(sign_abort.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
-    assert!(!sign_abort.tty.contains(secret_body), "secret leaked into TTY prompt!");
-    assert!(!sign_abort.stdout.contains(secret_body), "secret leaked into stdout!");
-    assert!(sign_abort.tty.contains("REDACTED SECRET"), "tty={}", sign_abort.tty);
+    assert_eq!(
+        sign_abort.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
+    assert!(
+        !sign_abort.tty.contains(secret_body),
+        "secret leaked into TTY prompt!"
+    );
+    assert!(
+        !sign_abort.stdout.contains(secret_body),
+        "secret leaked into stdout!"
+    );
+    assert!(
+        sign_abort.tty.contains("REDACTED SECRET"),
+        "tty={}",
+        sign_abort.tty
+    );
 
     let sign_ok = run_hyp_in_pty(
         home,
@@ -1460,7 +1615,11 @@ fn wave4c_pty_auth_init_web_auth_sign_and_emit_sign_hardening() {
         Some(secret_body),
         Some("y\n"),
     );
-    assert_eq!(sign_ok.code, 0, "stdout={} tty={}", sign_ok.stdout, sign_ok.tty);
+    assert_eq!(
+        sign_ok.code, 0,
+        "stdout={} tty={}",
+        sign_ok.stdout, sign_ok.tty
+    );
     assert!(!sign_ok.tty.contains(secret_body));
     assert!(!sign_ok.stdout.contains(secret_body));
     assert!(
@@ -1488,8 +1647,16 @@ fn wave4c_pty_auth_init_web_auth_sign_and_emit_sign_hardening() {
         Some("y\n"),
     );
     assert_eq!(dir_ok.code, 0, "tty={}", dir_ok.tty);
-    assert!(!dir_ok.tty.contains('\x1b'), "ANSI leaked in auth sign TTY: {:?}", dir_ok.tty);
-    assert!(!dir_ok.tty.contains('\u{202E}'), "BiDi leaked in auth sign TTY: {:?}", dir_ok.tty);
+    assert!(
+        !dir_ok.tty.contains('\x1b'),
+        "ANSI leaked in auth sign TTY: {:?}",
+        dir_ok.tty
+    );
+    assert!(
+        !dir_ok.tty.contains('\u{202E}'),
+        "BiDi leaked in auth sign TTY: {:?}",
+        dir_ok.tty
+    );
     assert!(dir_ok.tty.contains("Deploy now v1"), "tty={}", dir_ok.tty);
 
     // 5. `hyp emit --sign`: displays sanitized topic/type/label/note summary, strips ANSI/BiDi, aborts on `n`!
@@ -1514,10 +1681,33 @@ fn wave4c_pty_auth_init_web_auth_sign_and_emit_sign_hardening() {
         Some("n\n"),
     );
     assert_eq!(emit_abort.code, 1, "tty={}", emit_abort.tty);
-    assert_eq!(emit_abort.parse_json()["error"]["code"], "CONFIRMATION_ABORTED");
-    assert!(emit_abort.tty.contains("Topic:      local.ops"), "tty={}", emit_abort.tty);
-    assert!(emit_abort.tty.contains("Label:      prod-op"), "tty={}", emit_abort.tty);
-    assert!(emit_abort.tty.contains("Note:       run migration"), "tty={}", emit_abort.tty);
-    assert!(!emit_abort.tty.contains('\x1b'), "ANSI leaked in emit --sign TTY: {:?}", emit_abort.tty);
-    assert!(!emit_abort.tty.contains('\u{202E}'), "BiDi leaked in emit --sign TTY: {:?}", emit_abort.tty);
+    assert_eq!(
+        emit_abort.parse_json()["error"]["code"],
+        "CONFIRMATION_ABORTED"
+    );
+    assert!(
+        emit_abort.tty.contains("Topic:      local.ops"),
+        "tty={}",
+        emit_abort.tty
+    );
+    assert!(
+        emit_abort.tty.contains("Label:      prod-op"),
+        "tty={}",
+        emit_abort.tty
+    );
+    assert!(
+        emit_abort.tty.contains("Note:       run migration"),
+        "tty={}",
+        emit_abort.tty
+    );
+    assert!(
+        !emit_abort.tty.contains('\x1b'),
+        "ANSI leaked in emit --sign TTY: {:?}",
+        emit_abort.tty
+    );
+    assert!(
+        !emit_abort.tty.contains('\u{202E}'),
+        "BiDi leaked in emit --sign TTY: {:?}",
+        emit_abort.tty
+    );
 }

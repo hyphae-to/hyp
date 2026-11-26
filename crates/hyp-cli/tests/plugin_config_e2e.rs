@@ -190,7 +190,9 @@ while True:
     #[test]
     fn documented_plugins_json_snippets_boot_real_hyp_daemon() {
         let Some(python_bin) = find_python3_binary() else {
-            eprintln!("SKIP documented_plugins_json_snippets_boot_real_hyp_daemon: python3 missing");
+            eprintln!(
+                "SKIP documented_plugins_json_snippets_boot_real_hyp_daemon: python3 missing"
+            );
             return;
         };
 
@@ -248,7 +250,10 @@ while True:
 
                 let cfg_obj = snippet.as_object_mut().unwrap();
                 cfg_obj.insert("v".to_string(), json!(2));
-                cfg_obj.insert("nodeId".to_string(), json!(format!("doc{doc_idx}-{snip_idx}@box")));
+                cfg_obj.insert(
+                    "nodeId".to_string(),
+                    json!(format!("doc{doc_idx}-{snip_idx}@box")),
+                );
                 cfg_obj.insert("profile".to_string(), json!("local"));
                 cfg_obj.insert("stateDir".to_string(), json!(state_dir.to_str().unwrap()));
 
@@ -285,7 +290,9 @@ while True:
     #[test]
     fn command_and_exec_isolation_plaintext_warning_and_crash_loop_status_e2e() {
         let Some(python_bin) = find_python3_binary() else {
-            eprintln!("SKIP command_and_exec_isolation_plaintext_warning_and_crash_loop_status_e2e: python3 missing");
+            eprintln!(
+                "SKIP command_and_exec_isolation_plaintext_warning_and_crash_loop_status_e2e: python3 missing"
+            );
             return;
         };
 
@@ -373,7 +380,10 @@ while True:
         let startup = daemon.read_json_line(Duration::from_secs(15));
 
         // Daemon MUST start cleanly despite malformed entries!
-        assert_eq!(startup["ok"], true, "daemon must survive bad plugin entries: {startup}");
+        assert_eq!(
+            startup["ok"], true,
+            "daemon must survive bad plugin entries: {startup}"
+        );
         let startup_str = startup.to_string();
         assert!(
             !startup_str.contains(plaintext_secret) && !startup_str.contains(stored_crash_secret),
@@ -384,7 +394,9 @@ while True:
         assert!(
             warnings.iter().any(|w| {
                 w.as_str().is_some_and(|s| {
-                    s.contains("TELEGRAM_BOT_TOKEN") && s.contains("plaintext") && s.contains("secret")
+                    s.contains("TELEGRAM_BOT_TOKEN")
+                        && s.contains("plaintext")
+                        && s.contains("secret")
                 })
             }),
             "expected plaintext secret warning: {warnings:?}"
@@ -404,14 +416,26 @@ while True:
                 .find(|p| p.get("id").and_then(Value::as_str) == Some(id))
                 .cloned()
         };
-        assert_eq!(find_plugin(initial_plugins, "cmd-ok").unwrap()["status"], "running");
-        assert_eq!(find_plugin(initial_plugins, "webhook").unwrap()["kind"], "bridge");
-        assert_eq!(find_plugin(initial_plugins, "webhook").unwrap()["status"], "running");
+        assert_eq!(
+            find_plugin(initial_plugins, "cmd-ok").unwrap()["status"],
+            "running"
+        );
+        assert_eq!(
+            find_plugin(initial_plugins, "webhook").unwrap()["kind"],
+            "bridge"
+        );
+        assert_eq!(
+            find_plugin(initial_plugins, "webhook").unwrap()["status"],
+            "running"
+        );
         assert_eq!(
             find_plugin(initial_plugins, "bad-missing-cmd").unwrap()["status"],
             "error"
         );
-        assert_eq!(find_plugin(initial_plugins, "bad-env").unwrap()["status"], "error");
+        assert_eq!(
+            find_plugin(initial_plugins, "bad-env").unwrap()["status"],
+            "error"
+        );
 
         // Poll `node.status.json` until `crasher` transitions to `degraded` (with redacted stderr + restarts)!
         let status_path = state_dir.join("node.status.json");
@@ -467,7 +491,9 @@ while True:
     #[test]
     fn bridge_topics_stay_local_only_from_remote_peers_with_wildcard_stream_scope() {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP bridge_topics_stay_local_only_from_remote_peers_with_wildcard_stream_scope: node missing");
+            eprintln!(
+                "SKIP bridge_topics_stay_local_only_from_remote_peers_with_wildcard_stream_scope: node missing"
+            );
             return;
         };
 
@@ -706,7 +732,10 @@ while True:
             );
             let now = hyp_store::now_ms();
             let _ = db.events().tick(now);
-            let batches = db.events().claim_due_batches("observer@remote", now).unwrap();
+            let batches = db
+                .events()
+                .claim_due_batches("observer@remote", now)
+                .unwrap();
             assert!(
                 batches.is_empty(),
                 "remote peer with stream:subscribe=* MUST receive ZERO private bridge messages: {batches:?}"

@@ -25,16 +25,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, StatusCode, header};
 use http_body_util::{BodyExt, Empty};
+use hyp_crypto::keystore::SecretStore;
+use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_proto::cloudevent::{CloudEvent, check_cloudevent_v2, is_valid_rfc3339_strict};
+use hyp_proto::filter::{DiagnosticCode, DiagnosticSeverity, Filter, SubscriptionDiagnostic};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use hyp_crypto::keystore::SecretStore;
-use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
-use hyp_proto::cloudevent::{CloudEvent, check_cloudevent_v2, is_valid_rfc3339_strict};
-use hyp_proto::filter::{
-    DiagnosticCode, DiagnosticSeverity, Filter, SubscriptionDiagnostic,
-};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, watch};
@@ -121,9 +119,9 @@ impl GitHubPublicConfig {
         store: &SecretStore,
         secret_name: &str,
     ) -> Result<Self, AdapterError> {
-        let token = store
-            .get(secret_name)
-            .map_err(|e| AdapterError::Config(format!("failed to read secret '{secret_name}': {e}")))?;
+        let token = store.get(secret_name).map_err(|e| {
+            AdapterError::Config(format!("failed to read secret '{secret_name}': {e}"))
+        })?;
         self.github_token = Some(token);
         Ok(self)
     }
@@ -137,9 +135,9 @@ impl GitHubPublicConfig {
         secret_name: &str,
     ) -> Result<&mut Self, AdapterError> {
         let canonical = normalize_repo_token_pattern(pattern)?;
-        let token = store
-            .get(secret_name)
-            .map_err(|e| AdapterError::Config(format!("failed to read secret '{secret_name}': {e}")))?;
+        let token = store.get(secret_name).map_err(|e| {
+            AdapterError::Config(format!("failed to read secret '{secret_name}': {e}"))
+        })?;
         self.repo_tokens.insert(canonical, token);
         Ok(self)
     }
@@ -345,7 +343,11 @@ impl GitHubPublicAdapter {
             AdapterError::InvalidInput(format!("invalid GitHub repository '{repo}'"))
         })?;
 
-        self.inner.app_installed.lock().await.insert(canonical.clone());
+        self.inner
+            .app_installed
+            .lock()
+            .await
+            .insert(canonical.clone());
 
         let mut demand = self.inner.demand.lock().await;
         if let Some(entry) = demand.get_mut(&canonical) {
@@ -440,7 +442,9 @@ impl GitHubPublicAdapter {
             .and_then(Value::as_str)
             .and_then(canonicalize_repo)
             .ok_or_else(|| {
-                AdapterError::InvalidInput("App webhook payload missing repository.full_name".into())
+                AdapterError::InvalidInput(
+                    "App webhook payload missing repository.full_name".into(),
+                )
             })?;
 
         if !self.inner.app_installed.lock().await.contains(&repo) {
@@ -451,8 +455,8 @@ impl GitHubPublicAdapter {
 
         let ce_val = serde_json::to_value(&ce)
             .map_err(|e| AdapterError::Internal(format!("CloudEvent serialization failed: {e}")))?;
-        let (validated, _) = check_cloudevent_v2(&ce_val)
-            .map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
+        let (validated, _) =
+            check_cloudevent_v2(&ce_val).map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
 
         // Shared deduplication across ETag polling and App webhook push.
         {
@@ -508,7 +512,9 @@ impl GitHubPublicAdapter {
                 // Transient transport error: fail closed without poisoning the TTL cache.
                 return (
                     false,
-                    Some(format!("failed to verify GitHub repository '{repo}': {err}")),
+                    Some(format!(
+                        "failed to verify GitHub repository '{repo}': {err}"
+                    )),
                 );
             }
         };
@@ -1109,9 +1115,7 @@ async fn run_repo_etag_poller(
                                         set.insert(ev.id.clone())
                                     };
                                     if is_new {
-                                        let _ = host
-                                            .publish_event(&inner.config.topic, ev)
-                                            .await;
+                                        let _ = host.publish_event(&inner.config.topic, ev).await;
                                     }
                                 }
                             }
@@ -1148,7 +1152,11 @@ async fn run_repo_etag_poller(
                     }
                     StatusCode::NOT_FOUND | StatusCode::GONE => {
                         // Invalidate cache if repo vanished or turned private.
-                        inner.repo_cache.write().expect("repo cache lock").remove(&repo);
+                        inner
+                            .repo_cache
+                            .write()
+                            .expect("repo cache lock")
+                            .remove(&repo);
                         poll_base.saturating_mul(5)
                     }
                     _ => poll_base.saturating_mul(2),
@@ -1190,13 +1198,11 @@ fn now_rfc3339_seconds() -> String {
 pub fn normalize_github_api_event(repo_fallback: &str, item: &Value) -> Option<CloudEvent> {
     let obj = item.as_object()?;
     let api_type = obj.get("type").and_then(Value::as_str)?;
-    let event_id = obj
-        .get("id")
-        .and_then(|v| match v {
-            Value::String(s) if !s.is_empty() => Some(s.clone()),
-            Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })?;
+    let event_id = obj.get("id").and_then(|v| match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })?;
 
     let webhook_event = match api_type {
         "PullRequestEvent" => "pull_request",
@@ -1243,10 +1249,7 @@ pub fn normalize_github_api_event(repo_fallback: &str, item: &Value) -> Option<C
     if !synthetic.contains_key("sender") {
         if let Some(actor) = obj.get("actor").and_then(Value::as_object) {
             if let Some(login) = actor.get("login").and_then(Value::as_str) {
-                let actor_type = actor
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("User");
+                let actor_type = actor.get("type").and_then(Value::as_str).unwrap_or("User");
                 synthetic.insert(
                     "sender".to_string(),
                     json!({ "login": login, "type": actor_type }),
@@ -1293,12 +1296,10 @@ pub fn normalize_github_api_event(repo_fallback: &str, item: &Value) -> Option<C
 pub fn normalize_repo_token_pattern(raw: &str) -> Result<String, AdapterError> {
     static OWNER_RE: OnceLock<Regex> = OnceLock::new();
     static REPO_SEG_RE: OnceLock<Regex> = OnceLock::new();
-    let owner_re = OWNER_RE.get_or_init(|| {
-        Regex::new(r"^[A-Za-z0-9_.-]{1,39}$").expect("valid owner regex")
-    });
-    let repo_re = REPO_SEG_RE.get_or_init(|| {
-        Regex::new(r"^[A-Za-z0-9_.-]{1,100}$").expect("valid repo segment regex")
-    });
+    let owner_re =
+        OWNER_RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9_.-]{1,39}$").expect("valid owner regex"));
+    let repo_re = REPO_SEG_RE
+        .get_or_init(|| Regex::new(r"^[A-Za-z0-9_.-]{1,100}$").expect("valid repo segment regex"));
 
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.contains("..") {
@@ -1307,9 +1308,8 @@ pub fn normalize_repo_token_pattern(raw: &str) -> Result<String, AdapterError> {
         )));
     }
 
-    let is_valid_owner = |s: &str| {
-        owner_re.is_match(s) && s != "." && !s.starts_with('.') && !s.contains("..")
-    };
+    let is_valid_owner =
+        |s: &str| owner_re.is_match(s) && s != "." && !s.starts_with('.') && !s.contains("..");
     let is_valid_repo = |s: &str| repo_re.is_match(s) && s != "." && !s.contains("..");
 
     let parts: Vec<&str> = trimmed.split('/').collect();
@@ -1375,7 +1375,10 @@ mod tests {
             canonicalize_repo("Anthropics/Claude-Code"),
             Some("anthropics/claude-code".to_string())
         );
-        assert_eq!(canonicalize_repo("owner/repo.rs"), Some("owner/repo.rs".to_string()));
+        assert_eq!(
+            canonicalize_repo("owner/repo.rs"),
+            Some("owner/repo.rs".to_string())
+        );
         assert_eq!(canonicalize_repo("https://github.com/a/b"), None);
         assert_eq!(canonicalize_repo("a/b/c"), None);
         assert_eq!(canonicalize_repo("../secret"), None);
@@ -1394,10 +1397,7 @@ mod tests {
             normalize_repo_token_pattern("Bayfold/*").unwrap(),
             "bayfold/*"
         );
-        assert_eq!(
-            normalize_repo_token_pattern("Bowd").unwrap(),
-            "bowd/*"
-        );
+        assert_eq!(normalize_repo_token_pattern("Bowd").unwrap(), "bowd/*");
         assert_eq!(
             normalize_repo_token_pattern("acme/.github").unwrap(),
             "acme/.github"
@@ -1444,9 +1444,18 @@ mod tests {
             Zeroizing::new("hyphae_gh_tok_personal_a".to_string()),
         );
 
-        assert_eq!(cfg.token_for_repo("Bayfold/Special"), Some("hyphae_gh_tok_exact_c"));
-        assert_eq!(cfg.token_for_repo("bayfold/other"), Some("hyphae_gh_tok_org_b"));
-        assert_eq!(cfg.token_for_repo("bowd/my-app"), Some("hyphae_gh_tok_personal_a"));
+        assert_eq!(
+            cfg.token_for_repo("Bayfold/Special"),
+            Some("hyphae_gh_tok_exact_c")
+        );
+        assert_eq!(
+            cfg.token_for_repo("bayfold/other"),
+            Some("hyphae_gh_tok_org_b")
+        );
+        assert_eq!(
+            cfg.token_for_repo("bowd/my-app"),
+            Some("hyphae_gh_tok_personal_a")
+        );
         assert_eq!(cfg.token_for_repo("oss/public-repo"), None);
         assert_eq!(cfg.token_for_repo("other-org/priv"), None);
         assert_eq!(cfg.token_for_repo("../bad"), None);
@@ -1461,9 +1470,18 @@ mod tests {
 
         // When default github_token is configured, fallback applies and "*" appears in scopes.
         cfg.github_token = Some(Zeroizing::new("hyphae_gh_tok_default".to_string()));
-        assert_eq!(cfg.token_for_repo("oss/public-repo"), Some("hyphae_gh_tok_default"));
-        assert_eq!(cfg.token_for_repo("bayfold/special"), Some("hyphae_gh_tok_exact_c"));
-        assert_eq!(cfg.token_for_repo("bayfold/other"), Some("hyphae_gh_tok_org_b"));
+        assert_eq!(
+            cfg.token_for_repo("oss/public-repo"),
+            Some("hyphae_gh_tok_default")
+        );
+        assert_eq!(
+            cfg.token_for_repo("bayfold/special"),
+            Some("hyphae_gh_tok_exact_c")
+        );
+        assert_eq!(
+            cfg.token_for_repo("bayfold/other"),
+            Some("hyphae_gh_tok_org_b")
+        );
         assert_eq!(
             cfg.configured_token_scopes(),
             vec![

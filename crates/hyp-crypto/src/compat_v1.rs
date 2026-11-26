@@ -14,10 +14,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -27,8 +27,8 @@ use zeroize::Zeroizing;
 use crate::error::CryptoError;
 use crate::hpke::hkdf_sha256;
 use crate::keys::{
-    decode_raw_key_32, is_raw_key, is_small_order_ed25519_point, Ed25519KeyPair, Ed25519PublicKey,
-    X25519KeyPair, X25519PublicKey,
+    Ed25519KeyPair, Ed25519PublicKey, X25519KeyPair, X25519PublicKey, decode_raw_key_32,
+    is_raw_key, is_small_order_ed25519_point,
 };
 use crate::pairing::is_valid_node_id;
 use crate::rfc3339::{format_rfc3339_millis, parse_rfc3339_millis};
@@ -198,7 +198,12 @@ const V1_BASE_SCOPES: [&str; 7] = [
     "forks:receive",
 ];
 
-const V1_RUNTIME_MODES: [&str; 4] = ["approval-required", "auto-accept-edits", "auto", "full-access"];
+const V1_RUNTIME_MODES: [&str; 4] = [
+    "approval-required",
+    "auto-accept-edits",
+    "auto",
+    "full-access",
+];
 
 /// Expands v1 scope shorthands identically to `expandScopes()` in `src/core/identity/scopes.ts`.
 pub fn expand_scopes_v1(input: &[&str]) -> Result<Vec<String>, CryptoError> {
@@ -219,10 +224,14 @@ pub fn expand_scopes_v1(input: &[&str]) -> Result<Vec<String>, CryptoError> {
                 "forks:send",
                 "forks:receive/full-access",
             ]),
-            "messages:*" => expanded_items.extend_from_slice(&["messages:send", "messages:receive"]),
+            "messages:*" => {
+                expanded_items.extend_from_slice(&["messages:send", "messages:receive"])
+            }
             "events:*" => expanded_items.push("events:subscribe"),
             "files:*" => expanded_items.extend_from_slice(&["files:send", "files:receive"]),
-            "forks:*" => expanded_items.extend_from_slice(&["forks:send", "forks:receive/full-access"]),
+            "forks:*" => {
+                expanded_items.extend_from_slice(&["forks:send", "forks:receive/full-access"])
+            }
             other => expanded_items.push(other),
         }
     }
@@ -484,8 +493,16 @@ pub fn issue_grant_v1(
 }
 
 /// Verifies and decodes a v1 admin-signed `GrantV1`.
-pub fn open_grant_v1(signed: &SignedV1, admin_key: &Ed25519PublicKey) -> Result<GrantV1, CryptoError> {
-    if !verify_payload_v1(SignatureKindV1::Grant, &signed.payload, &signed.sig, admin_key) {
+pub fn open_grant_v1(
+    signed: &SignedV1,
+    admin_key: &Ed25519PublicKey,
+) -> Result<GrantV1, CryptoError> {
+    if !verify_payload_v1(
+        SignatureKindV1::Grant,
+        &signed.payload,
+        &signed.sig,
+        admin_key,
+    ) {
         return Err(CryptoError::InvalidSignature(
             "grant signature does not check against admin key".into(),
         ));
@@ -498,7 +515,9 @@ pub fn open_grant_v1(signed: &SignedV1, admin_key: &Ed25519PublicKey) -> Result<
         || parse_time_v1(&grant.issued_at).is_none()
         || parse_time_v1(&grant.pair_by).is_none()
     {
-        return Err(CryptoError::InvalidPairing("malformed v1 grant payload".into()));
+        return Err(CryptoError::InvalidPairing(
+            "malformed v1 grant payload".into(),
+        ));
     }
     // Reject small-order pairingKey!
     let _ = Ed25519PublicKey::from_b64(&grant.pairing_key)?;
@@ -782,7 +801,10 @@ pub fn read_header_v1(signed: &SignedV1) -> Result<TransferHeaderV1, CryptoError
     let expires = parse_time_v1(&header.expires_at)
         .ok_or_else(|| CryptoError::InvalidTransfer("invalid expiresAt".into()))?;
     let ttl = expires - created;
-    let valid_type = matches!(header.transfer_type.as_str(), "files" | "fork" | "fork.result");
+    let valid_type = matches!(
+        header.transfer_type.as_str(),
+        "files" | "fork" | "fork.result"
+    );
     let handle_ok = match &header.to_handle {
         None => true,
         Some(h) => is_handle_v1(h),
@@ -897,9 +919,7 @@ pub fn open_v1(
             "v1 transfer header is not signed by sender's key".into(),
         ));
     }
-    if ciphertext.len() != header.size
-        || hex::encode(Sha256::digest(ciphertext)) != header.sha256
-    {
+    if ciphertext.len() != header.size || hex::encode(Sha256::digest(ciphertext)) != header.sha256 {
         return Err(CryptoError::InvalidTransfer(
             "v1 ciphertext size or sha256 does not match header".into(),
         ));
@@ -1005,10 +1025,7 @@ pub fn is_safe_hyp1_filename(name: &str) -> bool {
 }
 
 fn sanitize_hyp1_basename(path: &Path) -> String {
-    let raw_base = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let raw_base = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let mut s: String = raw_base
         .chars()
         .map(|c| {
@@ -1038,7 +1055,10 @@ fn sanitize_hyp1_basename(path: &Path) -> String {
     clean[..HYP1_MAX_FILENAME_LEN].to_string()
 }
 
-fn allocate_unique_hyp1_name(base: &str, seen_lower: &mut HashSet<String>) -> Result<String, CryptoError> {
+fn allocate_unique_hyp1_name(
+    base: &str,
+    seen_lower: &mut HashSet<String>,
+) -> Result<String, CryptoError> {
     if seen_lower.insert(base.to_ascii_lowercase()) {
         return Ok(base.to_string());
     }
@@ -1374,7 +1394,14 @@ mod tests {
         let f1 = tmp.path().join("notes.txt");
         fs::write(&f1, b"hello from v1 HYP1").unwrap();
 
-        let packed = pack_hyp1(&[f1.as_path()], Some("claude"), Some("attached"), None, None).unwrap();
+        let packed = pack_hyp1(
+            &[f1.as_path()],
+            Some("claude"),
+            Some("attached"),
+            None,
+            None,
+        )
+        .unwrap();
         let sealed = seal_v1(
             &SealInputV1 {
                 id: "11111111-2222-4333-8444-555555555555",
@@ -1391,14 +1418,21 @@ mod tests {
         )
         .unwrap();
 
-        let (hdr, opened_payload) =
-            open_v1(&sealed.header, &sealed.ciphertext, &sender_sign.public_key(), &recip_enc)
-                .unwrap();
+        let (hdr, opened_payload) = open_v1(
+            &sealed.header,
+            &sealed.ciphertext,
+            &sender_sign.public_key(),
+            &recip_enc,
+        )
+        .unwrap();
         assert_eq!(hdr.from, "alice@macbook");
         let dest = tmp.path().join("out");
         let unpacked = unpack_hyp1(&opened_payload, &dest, None, None).unwrap();
         assert_eq!(unpacked.from_handle.as_deref(), Some("claude"));
         assert_eq!(unpacked.note.as_deref(), Some("attached"));
-        assert_eq!(fs::read(&unpacked.files[0].path).unwrap(), b"hello from v1 HYP1");
+        assert_eq!(
+            fs::read(&unpacked.files[0].path).unwrap(),
+            b"hello from v1 HYP1"
+        );
     }
 }

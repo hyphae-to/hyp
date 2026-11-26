@@ -235,7 +235,8 @@ impl TestMcpClient {
 }
 
 #[tokio::test]
-async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_and_claude_channel() {
+async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_and_claude_channel()
+{
     let hub_dir = TempDir::new().unwrap();
     let alice_dir = TempDir::new().unwrap();
     let bob_dir = TempDir::new().unwrap();
@@ -278,10 +279,22 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_am2, _) = hub
-        .create_admin_invite(&admin_ca, "bob@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
 
     alice_node.accept_am2_invite(&alice_am2).await.unwrap();
@@ -289,22 +302,15 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
 
     // 3. Start TWO standalone native Rust `LocalDaemon` servers!
     // Alice: auto-detects `hasKv = true` from paired `acme-team` manifest!
-    let alice_daemon = LocalDaemon::start(
-        Arc::clone(&alice_node),
-        None,
-        LocalDaemonConfig::default(),
-    )
-    .await
-    .unwrap();
+    let alice_daemon =
+        LocalDaemon::start(Arc::clone(&alice_node), None, LocalDaemonConfig::default())
+            .await
+            .unwrap();
     // Bob: starts with `enable_kv: Some(false)` first to verify 0-token conditional `hyp_kv` suppression?
     // Even better: verify `hasKv: false` on a standalone local daemon below, and give Bob full KV here too!
-    let bob_daemon = LocalDaemon::start(
-        Arc::clone(&bob_node),
-        None,
-        LocalDaemonConfig::default(),
-    )
-    .await
-    .unwrap();
+    let bob_daemon = LocalDaemon::start(Arc::clone(&bob_node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
 
     let alice_sock = alice_daemon.socket_path().to_path_buf();
     let bob_sock = bob_daemon.socket_path().to_path_buf();
@@ -330,7 +336,11 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
 
     // 4b. Unverified tool call fails closed with `caller_unverifiable`!
     let (unv_txt, unv_err) = alice_mcp
-        .call_tool("hyp_mesh", json!({"action": "join", "handle": "spoof"}), None)
+        .call_tool(
+            "hyp_mesh",
+            json!({"action": "join", "handle": "spoof"}),
+            None,
+        )
         .await;
     assert!(unv_err);
     assert!(
@@ -557,7 +567,10 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
         )
         .await;
     assert!(!fm_err, "focus mode failed: {fm_txt}");
-    assert_eq!(serde_json::from_str::<Value>(&fm_txt).unwrap()["focusMode"], true);
+    assert_eq!(
+        serde_json::from_str::<Value>(&fm_txt).unwrap()["focusMode"],
+        true
+    );
 
     let (sub_txt, sub_err) = bob_mcp
         .call_verified_claude(
@@ -597,9 +610,7 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
         let sock_c = bob_sock.clone();
         post_out = tokio::task::spawn_blocking(move || {
             handle_hook_payload(
-                json!({ "session_id": "bob-sess-1" })
-                    .as_object()
-                    .unwrap(),
+                json!({ "session_id": "bob-sess-1" }).as_object().unwrap(),
                 &hook_opts(HarnessKind::Claude, HookEvent::PreInvocation, &sock_c),
             )
         })
@@ -617,7 +628,10 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
         ctx.contains("hyphae notify · 1 unread"),
         "expected slim notify digest, got: {ctx}"
     );
-    assert!(ctx.contains("· 3 muted"), "expected piggybacked muted count: {ctx}");
+    assert!(
+        ctx.contains("· 3 muted"),
+        "expected piggybacked muted count: {ctx}"
+    );
 
     // Full event payload is STILL durable & unread in Bob's inbox, readable + ackable via `hyp_inbox`!
     let (ev_inbox_txt, ev_inbox_err) = bob_mcp
@@ -645,7 +659,12 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
 
     // 9. Switch Bob back to `queue` mode and verify streaming `watch` (`WaitMode::Stream`)!
     let (_, mode_q_err) = bob_mcp
-        .call_verified_claude(&bob_sock, "bob-sess-1", "hyp_inbox", json!({ "mode": "queue" }))
+        .call_verified_claude(
+            &bob_sock,
+            "bob-sess-1",
+            "hyp_inbox",
+            json!({ "mode": "queue" }),
+        )
         .await;
     assert!(!mode_q_err);
 
@@ -685,7 +704,12 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
         .unwrap();
     assert_eq!(w_code, 0);
     let first_watch: Value = serde_json::from_str(w_out.lines().next().unwrap()).unwrap();
-    assert!(first_watch["text"].as_str().unwrap().contains("watch-stream-ping"));
+    assert!(
+        first_watch["text"]
+            .as_str()
+            .unwrap()
+            .contains("watch-stream-ping")
+    );
 
     // 10. `hyp_kv`: Alice writes Shared KV on `acme-team`, Bob reads & lists it!
     let (kv_set_txt, kv_set_err) = alice_mcp
@@ -739,7 +763,10 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
             }),
         )
         .await;
-    assert!(!kv_e2ee_set_err, "encrypted kv set failed: {kv_e2ee_set_txt}");
+    assert!(
+        !kv_e2ee_set_err,
+        "encrypted kv set failed: {kv_e2ee_set_txt}"
+    );
 
     let (kv_e2ee_get_txt, kv_e2ee_get_err) = bob_mcp
         .call_verified_claude(
@@ -754,7 +781,10 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
             }),
         )
         .await;
-    assert!(!kv_e2ee_get_err, "encrypted kv get failed: {kv_e2ee_get_txt}");
+    assert!(
+        !kv_e2ee_get_err,
+        "encrypted kv get failed: {kv_e2ee_get_txt}"
+    );
     let kv_e2ee_get: Value = serde_json::from_str(&kv_e2ee_get_txt).unwrap();
     assert_eq!(
         kv_e2ee_get["entry"]["value"]["token"],
@@ -770,7 +800,11 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
     chan_mcp.initialize().await;
 
     let (ch_join_txt, ch_join_err) = chan_mcp
-        .call_tool("hyp_mesh", json!({ "action": "join", "handle": "chan-bob" }), None)
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "chan-bob" }),
+            None,
+        )
         .await;
     assert!(!ch_join_err, "chan join failed: {ch_join_txt}");
 
@@ -816,7 +850,8 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
 }
 
 #[tokio::test]
-async fn standalone_daemon_omits_hyp_kv_when_no_kv_configured_and_supports_tcp_loopback_connector_addr() {
+async fn standalone_daemon_omits_hyp_kv_when_no_kv_configured_and_supports_tcp_loopback_connector_addr()
+ {
     let dir = TempDir::new().unwrap();
     let mut cfg = NodeConfig::local(NodeId::new("solo@box").unwrap(), dir.path());
     cfg.secret_backend = Some(SecretBackend::File);
@@ -834,7 +869,8 @@ async fn standalone_daemon_omits_hyp_kv_when_no_kv_configured_and_supports_tcp_l
     .await
     .unwrap();
 
-    let resolved_addr = resolve_loopback_addr(&addr_file).expect("connector.addr must be valid loopback");
+    let resolved_addr =
+        resolve_loopback_addr(&addr_file).expect("connector.addr must be valid loopback");
     assert_eq!(Some(resolved_addr), daemon.tcp_addr());
 
     // Direct TCP NDJSON RPC over loopback: `daemon.status` and `mcp.caps` (`hasKv == false`, `hasPlugins == false`).
@@ -937,12 +973,7 @@ async fn local_daemon_integrates_security_gate_quarantine_isolation_and_outbound
 
     // `hyp_inbox(state:"all")` MUST return 0 items (quarantined never leaks!).
     let (all_txt, all_err) = mcp
-        .call_verified_claude(
-            &sock,
-            "guarded-1",
-            "hyp_inbox",
-            json!({ "state": "all" }),
-        )
+        .call_verified_claude(&sock, "guarded-1", "hyp_inbox", json!({ "state": "all" }))
         .await;
     assert!(!all_err, "all query failed: {all_txt}");
     let all_val: Value = serde_json::from_str(&all_txt).unwrap();
@@ -960,8 +991,12 @@ async fn local_daemon_integrates_security_gate_quarantine_isolation_and_outbound
     assert!(q_err, "quarantined state must fail closed, got: {q_txt}");
 
     // `daemon.status` reports `quarantinedCount: 1` for human CLI operators!
-    let st = daemon_rpc_async(&sock, &json!({ "type": "daemon.status" }), Duration::from_secs(2))
-        .await;
+    let st = daemon_rpc_async(
+        &sock,
+        &json!({ "type": "daemon.status" }),
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(st.ok);
     assert_eq!(st.result.unwrap()["quarantinedCount"], 1);
 
@@ -977,7 +1012,10 @@ async fn local_daemon_integrates_security_gate_quarantine_isolation_and_outbound
             }),
         )
         .await;
-    assert!(dlp_err, "outbound DLP must block leaked AWS key, got: {dlp_txt}");
+    assert!(
+        dlp_err,
+        "outbound DLP must block leaked AWS key, got: {dlp_txt}"
+    );
     assert!(dlp_txt.contains("outbound_dlp_blocked"));
 
     mcp.close().await;
@@ -987,10 +1025,10 @@ async fn local_daemon_integrates_security_gate_quarantine_isolation_and_outbound
 
 #[tokio::test]
 async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_rev() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use hyp_harness::daemon::DEFAULT_PEERS_RELOAD_TIMEOUT;
     use hyp_harness::sock::connect_daemon_async;
     use hyp_store::PeerStatus;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let hub_dir = TempDir::new().unwrap();
     let alice_dir = TempDir::new().unwrap();
@@ -998,15 +1036,9 @@ async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_
 
     // 1. Start Team Hub (`acme-reload-hub`) with an Org Admin-CA key.
     let admin_ca = Ed25519KeyPair::generate().unwrap();
-    let mut hub_cfg = NodeConfig::router(
-        NodeId::new("acme-reload-hub").unwrap(),
-        hub_dir.path(),
-    );
+    let mut hub_cfg = NodeConfig::router(NodeId::new("acme-reload-hub").unwrap(), hub_dir.path());
     hub_cfg.secret_backend = Some(SecretBackend::File);
-    hub_cfg.admin_jwk = Some(OkpJwk::new(
-        OkpCurve::Ed25519,
-        &admin_ca.public_key_bytes(),
-    ));
+    hub_cfg.admin_jwk = Some(OkpJwk::new(OkpCurve::Ed25519, &admin_ca.public_key_bytes()));
     let hub = UnifiedNode::open(hub_cfg).unwrap();
     let (_hub_addr, _hub_srv) = Arc::clone(&hub).serve(loopback_zero()).await.unwrap();
 
@@ -1017,7 +1049,13 @@ async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_
     let scopes = ScopePreset::Member.expand();
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice_node.accept_am2_invite(&alice_am2).await.unwrap();
     alice_node
@@ -1030,13 +1068,9 @@ async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_
     let mut bob_cfg = NodeConfig::local(NodeId::new("bob@laptop").unwrap(), bob_dir.path());
     bob_cfg.secret_backend = Some(SecretBackend::File);
     let bob_node = UnifiedNode::open(bob_cfg).unwrap();
-    let bob_daemon = LocalDaemon::start(
-        Arc::clone(&bob_node),
-        None,
-        LocalDaemonConfig::default(),
-    )
-    .await
-    .unwrap();
+    let bob_daemon = LocalDaemon::start(Arc::clone(&bob_node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
     bob_node
         .register_handle("claude:bob-1", "receiver")
         .await
@@ -1086,7 +1120,13 @@ async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_
     // 5. Simulate an out-of-process `hyp pair accept` committing `acme-reload-hub` into Bob's
     //    WAL `node.sqlite` + `SecretStore` WITHOUT restarting `bob_daemon`!
     let (bob_am2, _) = hub
-        .create_admin_invite(&admin_ca, "bob@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     {
         let mut cli_cfg = NodeConfig::local(NodeId::new("bob@laptop").unwrap(), bob_dir.path());
@@ -1157,8 +1197,12 @@ async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_
     );
 
     // 8. Idempotency: calling `peers.reload` a SECOND time MUST NOT spawn duplicate PeerLinks!
-    let resp2 = daemon_rpc_async(&bob_sock, &json!({ "type": "peers.reload" }), Duration::from_secs(2))
-        .await;
+    let resp2 = daemon_rpc_async(
+        &bob_sock,
+        &json!({ "type": "peers.reload" }),
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(resp2.ok, "daemon_rpc_async peers.reload failed: {resp2:?}");
     let res2 = resp2.result.expect("result map");
     assert_eq!(res2["reloaded"], true);
@@ -1206,8 +1250,12 @@ async fn peers_reload_hot_reconciles_new_and_revoked_peers_idempotently_with_ui_
     )
     .await
     .unwrap();
-    let tcp_resp = daemon_rpc_async(&addr_file, &json!({ "type": "peers.reload" }), Duration::from_secs(2))
-        .await;
+    let tcp_resp = daemon_rpc_async(
+        &addr_file,
+        &json!({ "type": "peers.reload" }),
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(tcp_resp.ok, "TCP connector.addr peers.reload must succeed");
     let tcp_res = tcp_resp.result.unwrap();
     assert_eq!(tcp_res["reloaded"], true);

@@ -16,7 +16,7 @@ pub use config::{
     ChannelMode, ChannelPolicy, DEFAULT_DROP_PORTAL_URL, DEFAULT_HYPHAE_VERSION,
     DEFAULT_LOCAL_INGEST_BURST, DEFAULT_LOCAL_INGEST_MAX_PAYLOAD_BYTES,
     DEFAULT_LOCAL_INGEST_MAX_PER_MINUTE, DEFAULT_LOCAL_INGEST_ROUTE_ID, DEFAULT_LOCAL_INGEST_TOPIC,
-    ENV_DROP_PORTAL_URL, E2eePolicy, EscalationConfig, ForwardingMode, ForwardingPolicy,
+    E2eePolicy, ENV_DROP_PORTAL_URL, EscalationConfig, ForwardingMode, ForwardingPolicy,
     ForwardingRule, GuestPairingConfig, KvNamespaceConfig, LocalIngestConfig,
     LocalIngestLimitAction, LocalIngestRoute, NodeConfig, NodeError, NodeProfile, PeerConfig,
     TopicConfig, normalize_drop_portal_url, resolve_drop_portal_url,
@@ -32,16 +32,15 @@ pub use local_ingest::{
     LocalIngestOutcome, LocalIngestServer, MAX_LOCAL_INGEST_LINE_BYTES,
     canonical_local_event_for_signing, send_local_ingest_event,
 };
-pub use server::DEFAULT_PEER_SOCKET_FILENAME;
 pub use node::{
     AuthenticatedPeer, DiscoveredPeerHandle, IngestedHumanDrop, KvWriteRequest, PeerLinkInfo,
     PeerReconcileReport, SendDmResult, SubscribeRequest, SubscribeResult, TransferSendResult,
     UnifiedNode, p2p_offer_secret_name,
 };
 pub use peer_link::{
-    AuthClaimReply, AuthClaimRequest, ChannelDirectoryEntry, ChannelJoinResponse,
-    ChannelsResponse, DelegatedPairReply, DelegatedPairRequest, GuestPairProofPayload,
-    GuestPairReply, GuestPairRequest, HandlesResponse, ManifestFetchOutcome, P2pPairServerReply,
-    PairServerReply, PeerAuth, PeerKeyDirectoryEntry, PeerKeysResponse, PeerLink,
-    guest_pair_proof_canonical,
+    AuthClaimReply, AuthClaimRequest, ChannelDirectoryEntry, ChannelJoinResponse, ChannelsResponse,
+    DelegatedPairReply, DelegatedPairRequest, GuestPairProofPayload, GuestPairReply,
+    GuestPairRequest, HandlesResponse, ManifestFetchOutcome, P2pPairServerReply, PairServerReply,
+    PeerAuth, PeerKeyDirectoryEntry, PeerKeysResponse, PeerLink, guest_pair_proof_canonical,
 };
+pub use server::DEFAULT_PEER_SOCKET_FILENAME;

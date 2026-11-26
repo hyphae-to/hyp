@@ -449,8 +449,7 @@ impl Stage2Guard {
                 } else {
                     format!("{base}/v1/messages")
                 };
-                validate_classifier_endpoint_url(&url)
-                    .map_err(|_| "gate_insecure_endpoint_url")?;
+                validate_classifier_endpoint_url(&url).map_err(|_| "gate_insecure_endpoint_url")?;
                 let body = json!({
                     "model": self.config.model,
                     "max_tokens": self.config.max_output_tokens,
@@ -508,8 +507,7 @@ impl Stage2Guard {
                 } else {
                     format!("{base}/v1beta/models/{model}:generateContent")
                 };
-                validate_classifier_endpoint_url(&url)
-                    .map_err(|_| "gate_insecure_endpoint_url")?;
+                validate_classifier_endpoint_url(&url).map_err(|_| "gate_insecure_endpoint_url")?;
                 let body = json!({
                     "systemInstruction": {
                         "parts": [{ "text": framed.system_prompt }]

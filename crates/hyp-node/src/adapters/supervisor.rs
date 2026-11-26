@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -113,8 +113,7 @@ pub enum HelloMode {
 
 /// Per-spawn environment resolver invoked before every child spawn/respawn to freshly resolve
 /// dynamic values (such as `{ "secret": "<name>" }` references from `SecretStore`).
-pub type EnvResolver =
-    Arc<dyn Fn() -> Result<BTreeMap<String, String>, String> + Send + Sync>;
+pub type EnvResolver = Arc<dyn Fn() -> Result<BTreeMap<String, String>, String> + Send + Sync>;
 
 /// Configuration for a supervised plugin subprocess adapter.
 #[derive(Clone)]
@@ -508,7 +507,10 @@ impl SubprocessSupervisor {
             let Some(conn) = guard.as_ref() else {
                 return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
             };
-            (conn.tx.clone(), conn.detected_protocol.load(Ordering::Acquire))
+            (
+                conn.tx.clone(),
+                conn.detected_protocol.load(Ordering::Acquire),
+            )
         };
 
         let frame = if detected == PROTO_LEGACY_V1 {
@@ -540,7 +542,10 @@ impl SubprocessSupervisor {
             let Some(conn) = guard.as_ref() else {
                 return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
             };
-            (conn.tx.clone(), conn.detected_protocol.load(Ordering::Acquire))
+            (
+                conn.tx.clone(),
+                conn.detected_protocol.load(Ordering::Acquire),
+            )
         };
 
         let frame = if detected == PROTO_LEGACY_V1 {
@@ -671,9 +676,9 @@ mod runtime {
     use serde::Deserialize;
     use serde_json::{Value, json};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
     #[cfg(unix)]
     use tokio::net::UnixStream as TokioUnixStream;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::process::{Child, Command};
     use tokio::sync::{Mutex, Notify, mpsc};
     use tokio::task::JoinHandle;
@@ -729,13 +734,7 @@ mod runtime {
         }
         let cleaned: String = redacted
             .chars()
-            .map(|c| {
-                if c.is_control() && c != '\t' {
-                    ' '
-                } else {
-                    c
-                }
-            })
+            .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
             .collect();
         cleaned.trim().to_string()
     }
@@ -1081,7 +1080,8 @@ mod runtime {
         })?;
         let frame: TcpAuthFrame = serde_json::from_str(line_str).map_err(|_| {
             TcpHandshakeError::AuthFailed(
-                "TCP plugin auth failed: expected {\"type\":\"auth\",\"token\":\"...\"}".to_string(),
+                "TCP plugin auth failed: expected {\"type\":\"auth\",\"token\":\"...\"}"
+                    .to_string(),
             )
         })?;
         if frame.frame_type != "auth" {
@@ -1395,8 +1395,7 @@ mod runtime {
         }
 
         *inner.last_error.write().expect("last_error lock") = Some(degraded_msg.clone());
-        *inner.health.write().expect("health lock") =
-            AdapterHealth::Degraded(degraded_msg.clone());
+        *inner.health.write().expect("health lock") = AdapterHealth::Degraded(degraded_msg.clone());
         host.update_status(&inner.config.id, AdapterHealth::Degraded(degraded_msg))
             .await;
         if let Some(n) = first_ready.take() {
@@ -2273,8 +2272,13 @@ mod runtime {
                     .params
                     .and_then(|raw| serde_json::from_value::<DeliveryFailedParams>(raw).ok());
                 if let Some(df) = parsed {
-                    host.report_delivery_failed(&inner.config.id, &df.target, df.events, &df.reason)
-                        .await;
+                    host.report_delivery_failed(
+                        &inner.config.id,
+                        &df.target,
+                        df.events,
+                        &df.reason,
+                    )
+                    .await;
                     send_frame(
                         out_tx,
                         &PluginFrame::JsonRpcResponse(JsonRpcResponse::ok(
@@ -2344,8 +2348,13 @@ mod runtime {
                     .params
                     .and_then(|raw| serde_json::from_value::<DeliveryFailedParams>(raw).ok())
                 {
-                    host.report_delivery_failed(&inner.config.id, &df.target, df.events, &df.reason)
-                        .await;
+                    host.report_delivery_failed(
+                        &inner.config.id,
+                        &df.target,
+                        df.events,
+                        &df.reason,
+                    )
+                    .await;
                 }
             }
             _ => {}

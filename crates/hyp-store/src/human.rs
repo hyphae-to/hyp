@@ -218,25 +218,24 @@ impl<'a> HumanAuthorityStore<'a> {
             )
             .optional()?;
 
-        let created_at = if let Some((existing_human_id, existing_status, existing_created_at)) =
-            existing
-        {
-            if existing_human_id != input.human_id {
-                return Err(StoreError::IdConflict(format!(
-                    "human authority kid '{}' is already bound to human '{}'",
-                    input.kid, existing_human_id
-                )));
-            }
-            if existing_status == HumanAuthorityStatus::Revoked.as_str() {
-                return Err(StoreError::InvalidState(format!(
-                    "cannot reactivate revoked human authority '{}' kid '{}'",
-                    input.human_id, input.kid
-                )));
-            }
-            existing_created_at
-        } else {
-            now_ms
-        };
+        let created_at =
+            if let Some((existing_human_id, existing_status, existing_created_at)) = existing {
+                if existing_human_id != input.human_id {
+                    return Err(StoreError::IdConflict(format!(
+                        "human authority kid '{}' is already bound to human '{}'",
+                        input.kid, existing_human_id
+                    )));
+                }
+                if existing_status == HumanAuthorityStatus::Revoked.as_str() {
+                    return Err(StoreError::InvalidState(format!(
+                        "cannot reactivate revoked human authority '{}' kid '{}'",
+                        input.human_id, input.kid
+                    )));
+                }
+                existing_created_at
+            } else {
+                now_ms
+            };
 
         tx.conn().execute(
             "INSERT INTO human_authorities
@@ -329,7 +328,10 @@ impl<'a> HumanAuthorityStore<'a> {
     }
 
     /// Lists enrolled human authorities deterministically ordered by `(human_id ASC, kid ASC)`.
-    pub fn list_authorities(&self, include_revoked: bool) -> StoreResult<Vec<HumanAuthorityRecord>> {
+    pub fn list_authorities(
+        &self,
+        include_revoked: bool,
+    ) -> StoreResult<Vec<HumanAuthorityRecord>> {
         let sql = if include_revoked {
             "SELECT human_id, kid, label, role, jwk_json, enc_jwk_json, prf_salt, auth_epoch, status,
                     created_at, revoked_at, revocation_json
@@ -543,12 +545,11 @@ impl<'a> HumanAuthorityStore<'a> {
 
     /// Returns the earliest `expires_at` across all stored claim nonces, or `None` if empty.
     pub fn next_nonce_expiry_deadline_ms(&self) -> StoreResult<Option<i64>> {
-        let deadline: Option<i64> = self
-            .db
-            .conn()
-            .query_row("SELECT MIN(expires_at) FROM human_claim_nonces", [], |row| {
-                row.get(0)
-            })?;
+        let deadline: Option<i64> = self.db.conn().query_row(
+            "SELECT MIN(expires_at) FROM human_claim_nonces",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(deadline)
     }
 

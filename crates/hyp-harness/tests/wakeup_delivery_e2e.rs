@@ -390,9 +390,7 @@ async fn test2_tier3_bounded_hold_retry_queue_and_hook_cancellation() {
             origin_node: node.node_id().to_string(),
             item_id: format!("retry-item-{}", uuid_v4()),
             source: "local.schedule".to_string(),
-            text: format!(
-                "{UNTRUSTED_PROVENANCE}\nAuto-deliver after transient busy Hold"
-            ),
+            text: format!("{UNTRUSTED_PROVENANCE}\nAuto-deliver after transient busy Hold"),
             kind: MailboxKind::Event,
             trust_tier: GateTrustTier::SelfHost,
         })
@@ -640,7 +638,11 @@ async fn test3_local_ingest_socket_wakes_hyp_stream_subscriber_end_to_end() {
     )
     .await
     .expect("send unsigned local ingest event");
-    assert_eq!(unsigned_receipt["ok"], json!(true), "receipt: {unsigned_receipt}");
+    assert_eq!(
+        unsigned_receipt["ok"],
+        json!(true),
+        "receipt: {unsigned_receipt}"
+    );
     assert_eq!(unsigned_receipt["topic"], "local.schedule");
     assert_eq!(unsigned_receipt["trustTier"], "external-webhook");
     assert_eq!(unsigned_receipt["matchedSubscribers"], json!(1));
@@ -697,9 +699,10 @@ async fn test3_local_ingest_socket_wakes_hyp_stream_subscriber_end_to_end() {
     };
     let canon = canonical_local_event_for_signing(&signed_ce).expect("canonicalize CE");
     let sig_attr = sign_local_ingest_event(&human_signer, &canon);
-    signed_ce
-        .extensions
-        .insert(EXT_LOCAL_EVENT_SIG.to_string(), Value::String(sig_attr.clone()));
+    signed_ce.extensions.insert(
+        EXT_LOCAL_EVENT_SIG.to_string(),
+        Value::String(sig_attr.clone()),
+    );
 
     let mut signed_wire = serde_json::to_value(&signed_ce).unwrap();
     signed_wire
@@ -710,7 +713,11 @@ async fn test3_local_ingest_socket_wakes_hyp_stream_subscriber_end_to_end() {
     let signed_receipt = send_local_ingest_event(&ingest_endpoint, &signed_wire)
         .await
         .expect("send signed local ingest event");
-    assert_eq!(signed_receipt["ok"], json!(true), "signed receipt: {signed_receipt}");
+    assert_eq!(
+        signed_receipt["ok"],
+        json!(true),
+        "signed receipt: {signed_receipt}"
+    );
     assert_eq!(signed_receipt["trustTier"], "human-verified");
     assert_eq!(signed_receipt["verifiedHumanKid"], human_signer.kid());
     assert_eq!(signed_receipt["verifiedHumanId"], human_id);
@@ -752,10 +759,10 @@ async fn test3_local_ingest_socket_wakes_hyp_stream_subscriber_end_to_end() {
         .as_object_mut()
         .unwrap()
         .insert(EXT_LOCAL_EVENT_SIG.to_string(), Value::String(bad_sig));
-    bad_wire
-        .as_object_mut()
-        .unwrap()
-        .insert("id".to_string(), json!(format!("ce-tampered-{}", uuid_v4())));
+    bad_wire.as_object_mut().unwrap().insert(
+        "id".to_string(),
+        json!(format!("ce-tampered-{}", uuid_v4())),
+    );
 
     let bad_receipt = send_local_ingest_event(&ingest_endpoint, &bad_wire)
         .await
@@ -854,7 +861,9 @@ async fn test4_mesh_drop_link_encrypted_draft_roundtrip_and_fail_closed_guards()
 
     let url = link_val["url"].as_str().expect("drop URL");
     assert!(
-        !url.contains("checkout-api") && !url.contains("Approve deploy") && !url.contains("PR #412"),
+        !url.contains("checkout-api")
+            && !url.contains("Approve deploy")
+            && !url.contains("PR #412"),
         "ZERO-LEAK VIOLATION: plaintext draft appeared in drop URL!"
     );
 
@@ -949,7 +958,10 @@ async fn test4_mesh_drop_link_encrypted_draft_roundtrip_and_fail_closed_guards()
             }),
         )
         .await;
-    assert!(bidi_err, "BiDi override in draft must fail closed: {bidi_txt}");
+    assert!(
+        bidi_err,
+        "BiDi override in draft must fail closed: {bidi_txt}"
+    );
 
     let (_, empty_err) = client
         .call_verified_claude(
@@ -1125,7 +1137,10 @@ async fn test4_mesh_drop_link_encrypted_draft_roundtrip_and_fail_closed_guards()
             }),
         )
         .await;
-    assert!(!fresh_err, "fresh directive drop_link without draft failed: {fresh_txt}");
+    assert!(
+        !fresh_err,
+        "fresh directive drop_link without draft failed: {fresh_txt}"
+    );
     let fresh_val: Value = serde_json::from_str(&fresh_txt).unwrap();
     assert_eq!(fresh_val["hasEncryptedDraft"], json!(false));
 
@@ -1216,7 +1231,11 @@ async fn test_mesh_drop_link_secret_zero_leak_and_burn() {
     let sid = "claude:ops-s1";
 
     // 1. Fail-closed guards: reserved secret names & insecure remote http:// relay MUST fail!
-    for reserved in ["gate-policy-hmac-key", "node-sign-primary", "human-admin-root"] {
+    for reserved in [
+        "gate-policy-hmac-key",
+        "node-sign-primary",
+        "human-admin-root",
+    ] {
         let (err_txt, is_err) = client
             .call_verified_claude(
                 &sock,
@@ -1229,7 +1248,10 @@ async fn test_mesh_drop_link_secret_zero_leak_and_burn() {
                 }),
             )
             .await;
-        assert!(is_err, "reserved secret '{reserved}' must fail closed: {err_txt}");
+        assert!(
+            is_err,
+            "reserved secret '{reserved}' must fail closed: {err_txt}"
+        );
         assert!(
             err_txt.to_ascii_lowercase().contains("reserved"),
             "expected reserved error for '{reserved}', got: {err_txt}"
@@ -1248,7 +1270,10 @@ async fn test_mesh_drop_link_secret_zero_leak_and_burn() {
             }),
         )
         .await;
-    assert!(bad_relay_err, "remote http:// relay must fail closed: {bad_relay_txt}");
+    assert!(
+        bad_relay_err,
+        "remote http:// relay must fail closed: {bad_relay_txt}"
+    );
 
     // 2. Request a Verified Secret Drop link via `hyp_mesh({ action: "drop_link" })`.
     let (link_txt, link_err) = client
@@ -1340,8 +1365,12 @@ async fn test_mesh_drop_link_secret_zero_leak_and_burn() {
         }),
         body: secret_canary.to_string(),
     };
-    let envelope = seal_human_drop(&claim, &human_admin, &node.identity().encryption.public_key())
-        .expect("seal secret drop");
+    let envelope = seal_human_drop(
+        &claim,
+        &human_admin,
+        &node.identity().encryption.public_key(),
+    )
+    .expect("seal secret drop");
     let body_json = to_canonical_json(&envelope).unwrap();
 
     let http_client = HttpClient::new().unwrap();
@@ -1440,8 +1469,12 @@ async fn test_mesh_drop_link_secret_zero_leak_and_burn() {
         secret_spec: None,
         body: "Proceed with production rollout v0.5.0".to_string(),
     };
-    let dir_env = seal_human_drop(&dir_claim, &human_admin, &node.identity().encryption.public_key())
-        .expect("seal directive");
+    let dir_env = seal_human_drop(
+        &dir_claim,
+        &human_admin,
+        &node.identity().encryption.public_key(),
+    )
+    .expect("seal directive");
     let hdrop1 = encode_hdrop1(&dir_env).unwrap();
     let ingest_res = rpc(
         &sock,
@@ -1451,7 +1484,11 @@ async fn test_mesh_drop_link_secret_zero_leak_and_burn() {
         }),
     )
     .await;
-    assert!(ingest_res.ok, "drop.ingest IPC failed: {:?}", ingest_res.error);
+    assert!(
+        ingest_res.ok,
+        "drop.ingest IPC failed: {:?}",
+        ingest_res.error
+    );
     let ingested = ingest_res.result.unwrap();
     assert_eq!(ingested["kind"], "directive");
     assert_eq!(ingested["humanId"], human_id);
@@ -1485,7 +1522,9 @@ async fn test_mesh_drop_link_secret_zero_leak_and_burn() {
     assert_eq!(off_val["ok"], json!(true));
     assert_eq!(off_val["offline"], json!(true));
     let off_url = off_val["url"].as_str().unwrap();
-    let off_b64 = off_url.strip_prefix("https://hyphae.to/drop#drop=").unwrap();
+    let off_b64 = off_url
+        .strip_prefix("https://hyphae.to/drop#drop=")
+        .unwrap();
     let off_frag: Value =
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(off_b64).unwrap()).unwrap();
     assert_eq!(off_frag["v"], json!(1));
@@ -1583,11 +1622,12 @@ exit 0
         }
 
         fn call_args(&self, call_num: usize) -> Vec<String> {
-            let argc: usize = fs::read_to_string(self.calls_dir.join(format!("call_{call_num}_argc")))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            let argc: usize =
+                fs::read_to_string(self.calls_dir.join(format!("call_{call_num}_argc")))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
             (0..argc)
                 .map(|i| {
                     fs::read_to_string(self.calls_dir.join(format!("call_{call_num}_arg_{i}.txt")))
@@ -1891,9 +1931,17 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     assert!(nudge_xport.take().is_empty());
     tokio::time::sleep(Duration::from_millis(140)).await;
     let int_nudges = nudge_xport.take();
-    assert_eq!(int_nudges.len(), 1, "Interrupt grace expiry must fire L2 fallback");
+    assert_eq!(
+        int_nudges.len(),
+        1,
+        "Interrupt grace expiry must fire L2 fallback"
+    );
     assert_eq!(int_nudges[0].0, PushMode::Interrupt);
-    assert!(int_nudges[0].1.starts_with("<hyphae-wake count=\"1\" handle=\"worker\" urgency=\"interrupt\">"));
+    assert!(
+        int_nudges[0]
+            .1
+            .starts_with("<hyphae-wake count=\"1\" handle=\"worker\" urgency=\"interrupt\">")
+    );
     assert!(!int_nudges[0].1.contains("URGENT_FALLBACK_BODY"));
 
     // TurnStart (`UserPromptSubmit`) drains the `NudgePending` Interrupt cleanly -> 0 unread!
@@ -1929,7 +1977,10 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     )
     .await;
     assert_eq!(post_q, json!({}), "PostToolUse must hold Queue DM mid-turn");
-    assert!(nudge_xport.take().is_empty(), "Active lease must defer Queue nudge");
+    assert!(
+        nudge_xport.take().is_empty(),
+        "Active lease must defer Queue nudge"
+    );
     let stop_q = run_h(
         HarnessKind::Claude,
         HookEvent::Stop,
@@ -1942,7 +1993,10 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     );
     assert_eq!(node.db().local().pending_count(sid).unwrap(), 0);
     tokio::time::sleep(Duration::from_millis(220)).await;
-    assert!(nudge_xport.take().is_empty(), "Stop drain must leave 0 nudges");
+    assert!(
+        nudge_xport.take().is_empty(),
+        "Stop drain must leave 0 nudges"
+    );
 
     // 4. ACTIVE + QUEUE with missed Stop -> activity lease expires (180ms) -> fires XML Queue nudge!
     let _ = run_h(
@@ -1966,9 +2020,17 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     assert!(nudge_xport.take().is_empty());
     tokio::time::sleep(Duration::from_millis(240)).await;
     let q_nudges = nudge_xport.take();
-    assert_eq!(q_nudges.len(), 1, "Activity lease expiry must fire Queue fallback nudge");
+    assert_eq!(
+        q_nudges.len(),
+        1,
+        "Activity lease expiry must fire Queue fallback nudge"
+    );
     assert_eq!(q_nudges[0].0, PushMode::Queue);
-    assert!(q_nudges[0].1.starts_with("<hyphae-wake count=\"1\" handle=\"worker\" urgency=\"queue\">"));
+    assert!(
+        q_nudges[0]
+            .1
+            .starts_with("<hyphae-wake count=\"1\" handle=\"worker\" urgency=\"queue\">")
+    );
     // Drain it via TurnStart so inbox is clean for Notify test.
     let pre_q = run_h(
         HarnessKind::Claude,
@@ -1979,7 +2041,12 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     assert!(pre_q.to_string().contains("QUEUED_LEASE_FALLBACK"));
     // End turn cleanly -> Idle.
     assert_eq!(
-        run_h(HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "fsm-1" })).await,
+        run_h(
+            HarnessKind::Claude,
+            HookEvent::Stop,
+            json!({ "session_id": "fsm-1" })
+        )
+        .await,
         json!({})
     );
 
@@ -2013,7 +2080,12 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
         "PostToolUse must stay silent on Notify"
     );
     assert_eq!(
-        run_h(HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "fsm-1" })).await,
+        run_h(
+            HarnessKind::Claude,
+            HookEvent::Stop,
+            json!({ "session_id": "fsm-1" })
+        )
+        .await,
         json!({}),
         "Stop must NEVER force a continuation turn for a Notify-only digest"
     );
@@ -2031,7 +2103,8 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
 
     // 6. OpenClaw observational `agent_end` flips Active -> Idle immediately and flushes held Queue nudge!
     let oc_sid = "openclaw:oc-fsm";
-    node.register_session(oc_sid, "{\"kind\":\"openclaw\"}").unwrap();
+    node.register_session(oc_sid, "{\"kind\":\"openclaw\"}")
+        .unwrap();
     node.db()
         .local()
         .set_session_handle(oc_sid, Some("claw"), now_ms())
@@ -2058,7 +2131,10 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
         })
         .await
         .unwrap();
-    assert!(oc_xport.take().is_empty(), "Active OpenClaw defers Queue during turn");
+    assert!(
+        oc_xport.take().is_empty(),
+        "Active OpenClaw defers Queue during turn"
+    );
 
     // Observational `agent_end` flips Idle immediately (well before 180ms lease) and flushes!
     let end_res = run_h(
@@ -2081,7 +2157,11 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
         1,
         "OpenClaw agent_end must immediately flush deferred Queue wake nudge"
     );
-    assert!(oc_nudges[0].1.starts_with("<hyphae-wake count=\"1\" handle=\"claw\" urgency=\"queue\">"));
+    assert!(
+        oc_nudges[0]
+            .1
+            .starts_with("<hyphae-wake count=\"1\" handle=\"claw\" urgency=\"queue\">")
+    );
 
     daemon.stop().await;
     node.shutdown();

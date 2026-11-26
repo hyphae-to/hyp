@@ -219,7 +219,10 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream"]);
+    assert_eq!(
+        names,
+        vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream"]
+    );
 
     // Verify unverified tool call fails closed with `caller_unverifiable`
     let unverified = mcp.rpc(

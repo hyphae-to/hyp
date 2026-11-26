@@ -90,7 +90,9 @@ pub fn validate_filter_plugin_endpoint_url(config: &FilterPluginConfig) -> Resul
 }
 
 /// Instantiates a built-in [`FilterPlugin`] from a validated [`FilterPluginConfig`].
-pub fn build_filter_plugin(config: &FilterPluginConfig) -> Result<Arc<dyn FilterPlugin>, GateError> {
+pub fn build_filter_plugin(
+    config: &FilterPluginConfig,
+) -> Result<Arc<dyn FilterPlugin>, GateError> {
     config.validate()?;
     validate_filter_plugin_endpoint_url(config)?;
     match &config.adapter {
@@ -652,10 +654,7 @@ impl HttpClassifierPlugin {
             if let Some(lbl) = label {
                 categories.push(lbl);
             }
-            let reason = format!(
-                "classifier_flagged:{:.2}>={:.2}",
-                score, self.threshold
-            );
+            let reason = format!("classifier_flagged:{:.2}>={:.2}", score, self.threshold);
             let decision = match self.on_flagged {
                 Stage2ErrorAction::Quarantine => GateDecision::Quarantine {
                     reason,

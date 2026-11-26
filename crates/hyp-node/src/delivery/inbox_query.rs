@@ -11,9 +11,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent};
 use hyp_proto::filter::{Filter as ProtoFilter, matches_filters};
-use hyp_store::{
-    GateState, MailboxEntry, MailboxInsert, MailboxKind, MailboxPutResult, NodeDb,
-};
+use hyp_store::{GateState, MailboxEntry, MailboxInsert, MailboxKind, MailboxPutResult, NodeDb};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -240,7 +238,10 @@ pub fn save_session_policy(
 }
 
 /// Loads a session's persisted [`SessionDeliveryPolicy`] (or `SessionDeliveryPolicy::default()`).
-pub fn load_session_policy(db: &NodeDb, session_id: &str) -> Result<SessionDeliveryPolicy, DeliveryError> {
+pub fn load_session_policy(
+    db: &NodeDb,
+    session_id: &str,
+) -> Result<SessionDeliveryPolicy, DeliveryError> {
     let key = format!("{META_POLICY_PREFIX}{session_id}");
     match db.local().get_metadata(&key)? {
         Some(raw) => Ok(serde_json::from_str(&raw)?),
@@ -269,7 +270,12 @@ pub fn archive_muted_entry(
         let _ = db
             .local()
             .record_delivery(&insert.origin_node, &insert.item_id, "muted", now_ms);
-        append_receipt_index(db, META_MUTED_INDEX_PREFIX, &insert.session_id, &[receipt.clone()])?;
+        append_receipt_index(
+            db,
+            META_MUTED_INDEX_PREFIX,
+            &insert.session_id,
+            &[receipt.clone()],
+        )?;
     }
     Ok(res)
 }
@@ -288,7 +294,12 @@ pub fn move_pending_to_muted(
     let _ = db
         .local()
         .record_delivery(&entry.origin_node, &entry.item_id, "muted", now_ms);
-    append_receipt_index(db, META_MUTED_INDEX_PREFIX, session_id, &[entry.receipt.clone()])?;
+    append_receipt_index(
+        db,
+        META_MUTED_INDEX_PREFIX,
+        session_id,
+        &[entry.receipt.clone()],
+    )?;
     Ok(())
 }
 
@@ -413,7 +424,10 @@ pub fn query_inbox(
             }
         }
     } else {
-        if matches!(query.state, InboxStateFilter::Unread | InboxStateFilter::All) {
+        if matches!(
+            query.state,
+            InboxStateFilter::Unread | InboxStateFilter::All
+        ) {
             let pending = db.local().peek_inbox(session_id, 10_000)?;
             for entry in pending {
                 if entry.gate_state != GateState::Pending {
@@ -440,7 +454,10 @@ pub fn query_inbox(
                 }
             }
         }
-        if matches!(query.state, InboxStateFilter::Delivered | InboxStateFilter::All) {
+        if matches!(
+            query.state,
+            InboxStateFilter::Delivered | InboxStateFilter::All
+        ) {
             for r in &delivered_receipts {
                 if muted_set.contains(r) {
                     continue;
@@ -570,10 +587,7 @@ const fn is_agent_visible_gate_state(state: GateState) -> bool {
     matches!(state, GateState::Pending | GateState::Delivered)
 }
 
-fn read_human_verified_meta(
-    db: &NodeDb,
-    receipt: &str,
-) -> (bool, Option<String>, Option<String>) {
+fn read_human_verified_meta(db: &NodeDb, receipt: &str) -> (bool, Option<String>, Option<String>) {
     let raw = match db.human().get_mailbox_human_auth(receipt) {
         Ok(Some(raw)) => raw,
         _ => return (false, None, None),
@@ -707,9 +721,7 @@ fn matches_from_pattern(pat: &str, parsed: &ParsedMailboxSource) -> bool {
         return src_low.starts_with(prefix)
             || addr_low.as_deref().is_some_and(|a| a.starts_with(prefix));
     }
-    src_low == pat
-        || addr_low.as_deref() == Some(pat)
-        || handle_low.as_deref() == Some(pat)
+    src_low == pat || addr_low.as_deref() == Some(pat) || handle_low.as_deref() == Some(pat)
 }
 
 fn matches_ce_filters(
@@ -736,8 +748,14 @@ fn matches_ce_filters(
 
     // 2. Otherwise synthesize a CloudEvent projection of the mailbox entry.
     let mut extensions = BTreeMap::new();
-    extensions.insert("origin".to_string(), Value::String(entry.origin_node.clone()));
-    extensions.insert("kind".to_string(), Value::String(entry.kind.as_str().to_string()));
+    extensions.insert(
+        "origin".to_string(),
+        Value::String(entry.origin_node.clone()),
+    );
+    extensions.insert(
+        "kind".to_string(),
+        Value::String(entry.kind.as_str().to_string()),
+    );
     if let Some(ref ch) = parsed.channel {
         extensions.insert("channel".to_string(), Value::String(ch.clone()));
     }

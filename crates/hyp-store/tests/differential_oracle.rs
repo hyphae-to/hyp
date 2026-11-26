@@ -95,7 +95,12 @@ fn archive_muted_in_store(db: &NodeDb, insert: &MailboxInsert, now_ms: i64) -> M
 }
 
 /// Moves an already-pending mailbox item into the silent `muted` archive.
-fn move_pending_to_muted_in_store(db: &NodeDb, session_id: &str, entry: &MailboxEntry, now_ms: i64) {
+fn move_pending_to_muted_in_store(
+    db: &NodeDb,
+    session_id: &str,
+    entry: &MailboxEntry,
+    now_ms: i64,
+) {
     let acked = db
         .local()
         .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now_ms)
@@ -113,7 +118,10 @@ fn query_muted_in_store(db: &NodeDb, session_id: &str) -> Vec<MailboxEntry> {
     for r in load_muted_index(db, session_id) {
         if let Some(entry) = db.local().get_mailbox_entry(&r).unwrap() {
             if entry.session_id == session_id
-                && !matches!(entry.gate_state, GateState::Quarantined | GateState::Rejected)
+                && !matches!(
+                    entry.gate_state,
+                    GateState::Quarantined | GateState::Rejected
+                )
             {
                 out.push(entry);
             }
@@ -691,7 +699,9 @@ impl MemoryOracle {
             .collect();
         pending_indices
             .sort_by_key(|&i| (self.batches[i].closed_at.unwrap_or(0), self.batches[i].id));
-        let excess = pending_indices.len().saturating_sub(self.max_pending_batches);
+        let excess = pending_indices
+            .len()
+            .saturating_sub(self.max_pending_batches);
         for drop_i in pending_indices.into_iter().take(excess) {
             self.batches[drop_i].state = BatchState::Dropped;
             self.batches[drop_i].settled_at = Some(now_ms);
@@ -928,7 +938,11 @@ impl MemoryOracle {
             .filter(|l| l.plugin == plugin && l.target == target)
             .cloned()
             .collect();
-        out.sort_by(|a, b| a.linked_at.cmp(&b.linked_at).then(a.session_id.cmp(&b.session_id)));
+        out.sort_by(|a, b| {
+            a.linked_at
+                .cmp(&b.linked_at)
+                .then(a.session_id.cmp(&b.session_id))
+        });
         out
     }
 
@@ -944,8 +958,10 @@ impl MemoryOracle {
     }
 
     fn set_plugin_target(&mut self, handoff: &PluginTargetHandoff) {
-        self.plugin_targets
-            .insert((handoff.plugin.clone(), handoff.target.clone()), handoff.clone());
+        self.plugin_targets.insert(
+            (handoff.plugin.clone(), handoff.target.clone()),
+            handoff.clone(),
+        );
     }
 
     fn remove_plugin_target(&mut self, plugin: &str, target: &str) -> bool {
@@ -1002,7 +1018,10 @@ fn run_differential_seed(seed: u64, steps: usize) {
     let kv_keys = ["plan/a", "plan/b", "lock/x", "state/y"];
     let writers = ["alice", "bob", "carol"];
 
-    for (sid, kind) in [("sess-0", r#"{"kind":"claude"}"#), ("sess-1", r#"{"kind":"codex"}"#)] {
+    for (sid, kind) in [
+        ("sess-0", r#"{"kind":"claude"}"#),
+        ("sess-1", r#"{"kind":"codex"}"#),
+    ] {
         db.local().register_session(sid, kind, now_ms).unwrap();
         oracle.register_session(sid, kind, now_ms);
     }
@@ -1013,7 +1032,10 @@ fn run_differential_seed(seed: u64, steps: usize) {
         origin_node: "local".into(),
         topic: "kv".into(),
         subscriber: "sess-0".into(),
-        filters: vec![Filter::exact("ns", "shared"), Filter::prefix("key", "plan/")],
+        filters: vec![
+            Filter::exact("ns", "shared"),
+            Filter::prefix("key", "plan/"),
+        ],
         coalesce_seconds: 0,
         max_batch_age_ms: None,
         max_wakes_per_hour: Some(50),
@@ -1132,8 +1154,7 @@ fn run_differential_seed(seed: u64, steps: usize) {
                     expected_version,
                 };
                 let real_res = db.kv().delete(&input, now_ms);
-                let oracle_res =
-                    oracle.kv_delete(&input, now_ms, &format!("oracle-kv-del-{step}"));
+                let oracle_res = oracle.kv_delete(&input, now_ms, &format!("oracle-kv-del-{step}"));
                 match (&real_res, &oracle_res) {
                     (Ok(r), Ok(deleted)) => assert_eq!(
                         r.deleted, *deleted,
@@ -1178,7 +1199,10 @@ fn run_differential_seed(seed: u64, steps: usize) {
                 let handle = handles[rng.gen_range(0..handles.len())];
                 let ch = channels[rng.gen_range(0..channels.len())];
                 if rng.gen_bool(0.7) {
-                    let real_ok = db.channels().join("acme-team", ch, node, handle, now_ms).is_ok();
+                    let real_ok = db
+                        .channels()
+                        .join("acme-team", ch, node, handle, now_ms)
+                        .is_ok();
                     let oracle_ok = oracle.channel_join("acme-team", ch, node, handle);
                     assert_eq!(
                         real_ok, oracle_ok,
@@ -1251,11 +1275,8 @@ fn run_differential_seed(seed: u64, steps: usize) {
                     event_history.push(fresh.clone());
                     fresh
                 };
-                let real_res = db
-                    .events()
-                    .ingest("acme-team", "github", "gh", &ev, now_ms);
-                let oracle_res =
-                    oracle.event_ingest("acme-team", "github", "gh", &ev, now_ms);
+                let real_res = db.events().ingest("acme-team", "github", "gh", &ev, now_ms);
+                let oracle_res = oracle.event_ingest("acme-team", "github", "gh", &ev, now_ms);
                 match (&real_res, &oracle_res) {
                     (Ok(r), Ok((dedup, matched))) => {
                         assert_eq!(
@@ -1331,10 +1352,7 @@ fn run_differential_seed(seed: u64, steps: usize) {
                 } else {
                     let r = db.local().remove_mute(scope, pat).unwrap();
                     let o = oracle.mutes.remove(&(scope.into(), pat.into()));
-                    assert_eq!(
-                        r, o,
-                        "seed=0x{seed:016x} step={step}: remove_mute mismatch"
-                    );
+                    assert_eq!(r, o, "seed=0x{seed:016x} step={step}: remove_mute mismatch");
                 }
             }
 
@@ -1393,8 +1411,8 @@ fn run_differential_seed(seed: u64, steps: usize) {
                     } else {
                         GateState::Pending
                     };
-                    let oracle_full =
-                        gate_state == GateState::Pending && oracle.pending_count(&sid) >= MAILBOX_MAX_PENDING;
+                    let oracle_full = gate_state == GateState::Pending
+                        && oracle.pending_count(&sid) >= MAILBOX_MAX_PENDING;
                     let res = db
                         .local()
                         .put_in_mailbox(
@@ -1440,7 +1458,9 @@ fn run_differential_seed(seed: u64, steps: usize) {
                             });
                         }
                         MailboxPutResult::Duplicate => {
-                            panic!("seed=0x{seed:016x} step={step}: unexpected Duplicate for unique {item_id}");
+                            panic!(
+                                "seed=0x{seed:016x} step={step}: unexpected Duplicate for unique {item_id}"
+                            );
                         }
                     }
                 }

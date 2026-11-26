@@ -341,9 +341,7 @@ pub fn normalize_t3_server_url_with_remote(
             return Err(INVALID_URL_ERR.to_string());
         };
         let ipv6_str = &rest[..close_bracket];
-        let ipv6: Ipv6Addr = ipv6_str
-            .parse()
-            .map_err(|_| INVALID_URL_ERR.to_string())?;
+        let ipv6: Ipv6Addr = ipv6_str.parse().map_err(|_| INVALID_URL_ERR.to_string())?;
         let after_bracket = &rest[close_bracket + 1..];
         let port = parse_optional_port(after_bracket)?;
         (format!("[{ipv6}]"), port)
@@ -492,7 +490,10 @@ pub fn resolve_t3_thread_by_provider_session(
 
     let query_result: rusqlite::Result<()> = (|| {
         if has_v2_threads
-            && table_exists(&conn, "orchestration_v2_projection_provider_session_bindings")
+            && table_exists(
+                &conn,
+                "orchestration_v2_projection_provider_session_bindings",
+            )
         {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT b.thread_id
@@ -501,7 +502,8 @@ pub fn resolve_t3_thread_by_provider_session(
                  WHERE b.provider_session_id = ?1
                    AND t.deleted_at IS NULL AND t.archived_at IS NULL",
             )?;
-            let rows = stmt.query_map([provider_session_id], |row| row.get::<_, Option<String>>(0))?;
+            let rows =
+                stmt.query_map([provider_session_id], |row| row.get::<_, Option<String>>(0))?;
             for r in rows {
                 if let Some(tid) = r? {
                     if !tid.is_empty() {
@@ -519,7 +521,8 @@ pub fn resolve_t3_thread_by_provider_session(
                  WHERE (p.provider_thread_id = ?1 OR p.provider_session_id = ?1)
                    AND t.deleted_at IS NULL AND t.archived_at IS NULL",
             )?;
-            let rows = stmt.query_map([provider_session_id], |row| row.get::<_, Option<String>>(0))?;
+            let rows =
+                stmt.query_map([provider_session_id], |row| row.get::<_, Option<String>>(0))?;
             for r in rows {
                 if let Some(tid) = r? {
                     if !tid.is_empty() {
@@ -539,7 +542,8 @@ pub fn resolve_t3_thread_by_provider_session(
                  WHERE (s.provider_session_id = ?1 OR s.provider_thread_id = ?1)
                    AND t.deleted_at IS NULL AND t.archived_at IS NULL",
             )?;
-            let rows = stmt.query_map([provider_session_id], |row| row.get::<_, Option<String>>(0))?;
+            let rows =
+                stmt.query_map([provider_session_id], |row| row.get::<_, Option<String>>(0))?;
             for r in rows {
                 if let Some(tid) = r? {
                     if !tid.is_empty() {
@@ -670,11 +674,7 @@ fn escape_sql_like(raw: &str) -> String {
 /// Single-shot read-only lookup for an in-flight T3 tool call matching both `call_id`
 /// and the normalized Hyphae tool name in `orchestration_v2_projection_turn_items` or
 /// `projection_thread_activities`.
-pub fn lookup_t3_call_once(
-    base_dir: &Path,
-    call_id: &str,
-    tool: &str,
-) -> T3ThreadLookupResult {
+pub fn lookup_t3_call_once(base_dir: &Path, call_id: &str, tool: &str) -> T3ThreadLookupResult {
     let Some(normalized_tool) = normalize_mesh_tool_name(tool) else {
         return Err(T3LookupError::CallerUnverifiable(format!(
             "Unknown mesh tool {tool}"
@@ -1008,7 +1008,11 @@ pub async fn probe_t3_server_with_remote(
 
     let authenticated = serde_json::from_slice::<Value>(&bytes)
         .ok()
-        .and_then(|v| v.as_object().and_then(|o| o.get("authenticated")).and_then(Value::as_bool))
+        .and_then(|v| {
+            v.as_object()
+                .and_then(|o| o.get("authenticated"))
+                .and_then(Value::as_bool)
+        })
         .unwrap_or(false);
 
     T3ProbeResult {
@@ -1071,7 +1075,11 @@ fn percent_encode_query_component(raw: &str) -> String {
     out
 }
 
-fn header_has_token_ignore_case(headers: &http::HeaderMap, name: header::HeaderName, token: &str) -> bool {
+fn header_has_token_ignore_case(
+    headers: &http::HeaderMap,
+    name: header::HeaderName,
+    token: &str,
+) -> bool {
     headers.get_all(name).iter().any(|val| {
         val.to_str().is_ok_and(|s| {
             s.split(',')
@@ -1157,16 +1165,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClientStream<S> {
 
         loop {
             let mut hdr = [0u8; 2];
-            self.io
-                .read_exact(&mut hdr)
-                .await
-                .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        WsError::Closed
-                    } else {
-                        WsError::Io(e.to_string())
-                    }
-                })?;
+            self.io.read_exact(&mut hdr).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    WsError::Closed
+                } else {
+                    WsError::Io(e.to_string())
+                }
+            })?;
 
             let fin = (hdr[0] & 0x80) != 0;
             let rsv = hdr[0] & 0x70;
@@ -1175,7 +1180,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClientStream<S> {
             let len_code = hdr[1] & 0x7f;
 
             if rsv != 0 {
-                return Err(WsError::Protocol("Non-zero RSV bits without extension".into()));
+                return Err(WsError::Protocol(
+                    "Non-zero RSV bits without extension".into(),
+                ));
             }
             if masked {
                 return Err(WsError::Protocol(
@@ -1296,7 +1303,9 @@ fn decode_ws_data_message(opcode: u8, payload: Vec<u8>) -> Result<WsMessage, WsE
             Ok(WsMessage::Text(text))
         }
         0x2 => Ok(WsMessage::Binary(payload)),
-        _ => Err(WsError::Protocol(format!("Unexpected data opcode {opcode}"))),
+        _ => Err(WsError::Protocol(format!(
+            "Unexpected data opcode {opcode}"
+        ))),
     }
 }
 
@@ -1340,10 +1349,13 @@ fn parse_effect_exit(msg: &Map<String, Value>) -> T3RpcResponse {
                 match entry_obj.get("_tag").and_then(Value::as_str) {
                     Some("Fail") => {
                         if let Some(err_obj) = entry_obj.get("error").and_then(Value::as_object) {
-                            let inner = err_obj
-                                .get("cause")
-                                .and_then(Value::as_object)
-                                .and_then(|c| c.get("cause").and_then(Value::as_object).or(Some(c)));
+                            let inner =
+                                err_obj
+                                    .get("cause")
+                                    .and_then(Value::as_object)
+                                    .and_then(|c| {
+                                        c.get("cause").and_then(Value::as_object).or(Some(c))
+                                    });
                             return T3RpcResponse {
                                 ok: false,
                                 value: None,
@@ -1413,11 +1425,7 @@ struct T3WsRpcClient {
 }
 
 impl T3WsRpcClient {
-    async fn connect(
-        origin: &str,
-        token: &str,
-        timeout: Duration,
-    ) -> Result<Self, &'static str> {
+    async fn connect(origin: &str, token: &str, timeout: Duration) -> Result<Self, &'static str> {
         let deadline = Instant::now() + timeout;
         let client = build_http1_client();
 
@@ -1425,8 +1433,8 @@ impl T3WsRpcClient {
         let ticket_uri: Uri = format!("{origin}/api/auth/websocket-ticket")
             .parse()
             .map_err(|_| "t3_server_unreachable")?;
-        let auth_header = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| "t3_auth_failed")?;
+        let auth_header =
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| "t3_auth_failed")?;
         let ticket_req = Request::builder()
             .method(Method::POST)
             .uri(ticket_uri)
@@ -1633,15 +1641,15 @@ impl T3Transport {
     pub async fn deliver_detailed(&self, text: &str, mode: PushMode) -> T3DeliveryDetail {
         let origin =
             match normalize_t3_server_url_with_remote(&self.target.server_url, self.allow_remote) {
-            Ok(o) => o,
-            Err(_) => {
-                return T3DeliveryDetail {
-                    outcome: PushOutcome::reject("t3_invalid_server_url"),
-                    interrupted: false,
-                    dispatch_mode: None,
-                };
-            }
-        };
+                Ok(o) => o,
+                Err(_) => {
+                    return T3DeliveryDetail {
+                        outcome: PushOutcome::reject("t3_invalid_server_url"),
+                        interrupted: false,
+                        dispatch_mode: None,
+                    };
+                }
+            };
 
         let Some(token) = resolve_bearer_token(&self.target) else {
             return T3DeliveryDetail {
@@ -1662,9 +1670,7 @@ impl T3Transport {
             }
         };
 
-        let detail = self
-            .execute_rpc_delivery(&mut client, text, mode)
-            .await;
+        let detail = self.execute_rpc_delivery(&mut client, text, mode).await;
         client.close().await;
         detail
     }
@@ -1779,10 +1785,7 @@ impl T3Transport {
     }
 }
 
-fn select_dispatch_mode(
-    projection: &Map<String, Value>,
-    mode: PushMode,
-) -> (T3DispatchMode, bool) {
+fn select_dispatch_mode(projection: &Map<String, Value>, mode: PushMode) -> (T3DispatchMode, bool) {
     let active_run = projection
         .get("runs")
         .and_then(Value::as_array)
@@ -2035,9 +2038,7 @@ mod tests {
         // Spawn peer verifying client masking across 7-bit, 16-bit, and >65535 (64-bit) frames,
         // then sending fragmented text with an interleaved Ping frame, then an oversized frame header.
         let server_task = tokio::spawn(async move {
-            async fn read_client_masked_frame(
-                io: &mut tokio::io::DuplexStream,
-            ) -> (u8, Vec<u8>) {
+            async fn read_client_masked_frame(io: &mut tokio::io::DuplexStream) -> (u8, Vec<u8>) {
                 let mut hdr = [0u8; 2];
                 io.read_exact(&mut hdr).await.unwrap();
                 let opcode = hdr[0] & 0x0f;
@@ -2128,7 +2129,9 @@ mod tests {
         let store = SecretStore::new(dir.path(), SecretBackend::File);
         store.set("t3-auth-token", "auth-ok").unwrap();
         store.set("t3-session-token", "session-ok").unwrap();
-        store.set("node-sign-priv", "SENSITIVE_PRIVATE_KEY").unwrap();
+        store
+            .set("node-sign-priv", "SENSITIVE_PRIVATE_KEY")
+            .unwrap();
 
         assert!(is_allowed_t3_token_secret("t3-auth-token"));
         assert!(is_allowed_t3_token_secret("t3-session-token"));

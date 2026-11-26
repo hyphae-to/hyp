@@ -57,7 +57,11 @@ impl DeliveryEngine {
     }
 
     /// Loads or returns the cached [`SessionDeliveryPolicy`] for `session_id`.
-    pub fn policy(&self, db: &NodeDb, session_id: &str) -> Result<SessionDeliveryPolicy, DeliveryError> {
+    pub fn policy(
+        &self,
+        db: &NodeDb,
+        session_id: &str,
+    ) -> Result<SessionDeliveryPolicy, DeliveryError> {
         {
             let guard = self.policies.lock().expect("policies lock poisoned");
             if let Some(p) = guard.get(session_id) {

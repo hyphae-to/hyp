@@ -4,7 +4,7 @@
 //! - v2 Direct P2P Mutual Pairing (`hp2p1_`) with 160-bit pairing secret,
 //!   HKDF binding MAC, Ed25519 self-sig, and zero-TOFU embedded OKP JWKs.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -36,9 +36,7 @@ pub fn is_valid_node_id(id: &str) -> bool {
         return false;
     }
     bytes.iter().all(|&b| {
-        b.is_ascii_lowercase()
-            || b.is_ascii_digit()
-            || matches!(b, b'@' | b'.' | b'_' | b'-')
+        b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'@' | b'.' | b'_' | b'-')
     })
 }
 
@@ -169,8 +167,22 @@ fn contains_forbidden_ssh_chars(s: &str) -> bool {
             || c.is_whitespace()
             || matches!(
                 c,
-                '\'' | '"' | '`' | ';' | '|' | '$' | '(' | ')' | '<' | '>' | '*' | '\\' | '#'
-                    | '!' | '{' | '}' | '%'
+                '\'' | '"'
+                    | '`'
+                    | ';'
+                    | '|'
+                    | '$'
+                    | '('
+                    | ')'
+                    | '<'
+                    | '>'
+                    | '*'
+                    | '\\'
+                    | '#'
+                    | '!'
+                    | '{'
+                    | '}'
+                    | '%'
             )
     })
 }
@@ -498,7 +510,10 @@ pub struct GrantV2 {
     pub pairing_key: Option<OkpJwk>,
     #[serde(rename = "subjectSigningJwk", skip_serializing_if = "Option::is_none")]
     pub subject_signing_jwk: Option<OkpJwk>,
-    #[serde(rename = "subjectEncryptionJwk", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "subjectEncryptionJwk",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub subject_encryption_jwk: Option<OkpJwk>,
     #[serde(rename = "issuedAt")]
     pub issued_at: String,
@@ -669,7 +684,10 @@ fn validate_admin_invite(invite: &AdminInviteV2) -> Result<(), CryptoError> {
 pub fn encode_am2(invite: &AdminInviteV2) -> Result<String, CryptoError> {
     validate_admin_invite(invite)?;
     let canon = to_canonical_json(invite)?;
-    Ok(format!("{AM2_PREFIX}{}", URL_SAFE_NO_PAD.encode(canon.as_bytes())))
+    Ok(format!(
+        "{AM2_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(canon.as_bytes())
+    ))
 }
 
 /// Decodes and strictly validates an `am2_<base64url>` invite string.
@@ -951,7 +969,10 @@ pub fn create_p2p_offer(
 pub fn encode_hp2p1(offer: &P2pOfferToken) -> Result<String, CryptoError> {
     validate_p2p_offer(offer)?;
     let canon = to_canonical_json(offer)?;
-    Ok(format!("{HP2P1_PREFIX}{}", URL_SAFE_NO_PAD.encode(canon.as_bytes())))
+    Ok(format!(
+        "{HP2P1_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(canon.as_bytes())
+    ))
 }
 
 /// Decodes and strictly validates an `hp2p1_<base64url>` pairing offer token.
@@ -1057,7 +1078,11 @@ pub fn verify_p2p_response(
     let bob_encryption_pk = body.bob_encryption_jwk.to_x25519()?;
 
     // 3. Verify Bob's Ed25519 self-signature over the response payload.
-    bob_signing_pk.verify_domain_b64("p2p-self", response.payload.as_bytes(), &response.self_sig)?;
+    bob_signing_pk.verify_domain_b64(
+        "p2p-self",
+        response.payload.as_bytes(),
+        &response.self_sig,
+    )?;
 
     // 4. Verify Bob's grant to Alice was signed by Bob's signing key and targets Alice.
     let bob_grant_to_alice = verify_grant_v2(&body.bob_grant_to_alice, &bob_signing_pk)?;
@@ -1120,7 +1145,8 @@ mod tests {
     #[test]
     fn am2_encode_decode_and_t3mp1_fingerprint_check() {
         let admin = Ed25519KeyPair::generate().unwrap();
-        let issued = issue_grant_v1(&admin, "alice@macbook", &["*"], 60_000, now_unix_ms()).unwrap();
+        let issued =
+            issue_grant_v1(&admin, "alice@macbook", &["*"], 60_000, now_unix_ms()).unwrap();
 
         let invite = AdminInviteV2 {
             v: 2,
@@ -1272,7 +1298,10 @@ mod tests {
         let args3 = ep3.build_ssh_args();
         assert!(args3.windows(2).any(|w| w == ["-p", "2222"]));
 
-        let ep4 = parse_ssh_endpoint("ssh://ops@solace:2222?stateDir=/var/lib/hyphae&bin=/usr/local/bin/hyp").unwrap();
+        let ep4 = parse_ssh_endpoint(
+            "ssh://ops@solace:2222?stateDir=/var/lib/hyphae&bin=/usr/local/bin/hyp",
+        )
+        .unwrap();
         assert_eq!(ep4.state_dir.as_deref(), Some("/var/lib/hyphae"));
         assert_eq!(ep4.bin.as_deref(), Some("/usr/local/bin/hyp"));
         assert_eq!(

@@ -9,11 +9,11 @@
 #[allow(dead_code)]
 #[path = "../src/config_file.rs"]
 mod config_file;
+#[path = "../src/exec_cmd.rs"]
+mod exec_cmd;
 #[allow(dead_code)]
 #[path = "../src/ui.rs"]
 mod ui;
-#[path = "../src/exec_cmd.rs"]
-mod exec_cmd;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -236,9 +236,17 @@ fn differential_scrubber_matches_reference_across_all_chunk_sizes_and_random_spl
     corpus.extend_from_slice(b"aws/key+with=pad & space?x=1|");
     corpus.extend_from_slice(STANDARD.encode(b"aws/key+with=pad & space?x=1").as_bytes());
     corpus.push(b'|');
-    corpus.extend_from_slice(STANDARD_NO_PAD.encode(b"aws/key+with=pad & space?x=1").as_bytes());
+    corpus.extend_from_slice(
+        STANDARD_NO_PAD
+            .encode(b"aws/key+with=pad & space?x=1")
+            .as_bytes(),
+    );
     corpus.push(b'|');
-    corpus.extend_from_slice(URL_SAFE_NO_PAD.encode(b"aws/key+with=pad & space?x=1").as_bytes());
+    corpus.extend_from_slice(
+        URL_SAFE_NO_PAD
+            .encode(b"aws/key+with=pad & space?x=1")
+            .as_bytes(),
+    );
     corpus.push(b'|');
     corpus.extend_from_slice(percent_encode("aws/key+with=pad & space?x=1").as_bytes());
     corpus.push(b'|');
@@ -298,10 +306,14 @@ fn differential_scrubber_matches_reference_across_all_chunk_sizes_and_random_spl
         let mut actual = Vec::new();
         let mut offset = 0;
         while offset < corpus.len() {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let step = ((seed >> 33) % 23) as usize; // includes 0-byte empty chunks!
             let end = (offset + step).min(corpus.len());
-            scrubber.process_chunk(&corpus[offset..end], &mut actual).unwrap();
+            scrubber
+                .process_chunk(&corpus[offset..end], &mut actual)
+                .unwrap();
             offset = end;
         }
         scrubber.finish(&mut actual).unwrap();
@@ -430,16 +442,9 @@ fn simulated_main_cli_debug_assert_and_parsing_edge_cases() {
     );
 
     // Without `--`, trailing_var_arg still captures hyphenated child args after command name
-    let no_sep = SimCli::try_parse_from([
-        "hyp",
-        "exec",
-        "--env",
-        "K=sec-a",
-        "echo",
-        "-n",
-        "--flag",
-    ])
-    .expect("parse without --");
+    let no_sep =
+        SimCli::try_parse_from(["hyp", "exec", "--env", "K=sec-a", "echo", "-n", "--flag"])
+            .expect("parse without --");
     let SimCommands::Exec(args2) = no_sep.command;
     assert_eq!(args2.command, vec!["echo", "-n", "--flag"]);
 }
@@ -458,13 +463,19 @@ fn fail_closed_validation_blocks_all_dangerous_env_vars_and_bad_syntax() {
     ];
     for bad in invalid_syntax {
         let err = validate_env_var_name(bad).unwrap_err();
-        assert_eq!(err.0, "INVALID_ENV_VAR", "expected INVALID_ENV_VAR for {bad:?}");
+        assert_eq!(
+            err.0, "INVALID_ENV_VAR",
+            "expected INVALID_ENV_VAR for {bad:?}"
+        );
     }
     // Boundary: exactly 128 chars is valid.
     assert!(validate_env_var_name(&"A".repeat(128)).is_ok());
 
     // Missing `=` in binding fails closed.
-    assert_eq!(parse_env_binding("API_KEY").unwrap_err().0, "INVALID_ENV_SPEC");
+    assert_eq!(
+        parse_env_binding("API_KEY").unwrap_err().0,
+        "INVALID_ENV_SPEC"
+    );
 
     // Accidentally pasted raw secret value (uppercase/symbols) MUST NOT be echoed back in stderr!
     let accidental_secret = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz123456";
@@ -545,7 +556,12 @@ fn run_exec_fails_closed_on_missing_secret_reserved_secret_dangerous_env_and_dup
     }
 
     // 2. Dangerous env var blocked with EXIT_USAGE (2).
-    for danger in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HYPHAE_SOCKET"] {
+    for danger in [
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "PATH",
+        "HYPHAE_SOCKET",
+    ] {
         let out = CaptureWriter::new();
         let err = CaptureWriter::new();
         let code = run_exec_with_writers(
@@ -564,8 +580,14 @@ fn run_exec_fails_closed_on_missing_secret_reserved_secret_dangerous_env_and_dup
 
     // 3. Duplicate env var (exact & case-insensitive) blocked with EXIT_USAGE (2).
     for dup_pair in [
-        vec!["API_KEY=valid-app-secret".to_string(), "API_KEY=valid-app-secret".to_string()],
-        vec!["api_key=valid-app-secret".to_string(), "API_KEY=valid-app-secret".to_string()],
+        vec![
+            "API_KEY=valid-app-secret".to_string(),
+            "API_KEY=valid-app-secret".to_string(),
+        ],
+        vec![
+            "api_key=valid-app-secret".to_string(),
+            "API_KEY=valid-app-secret".to_string(),
+        ],
     ] {
         let out = CaptureWriter::new();
         let err = CaptureWriter::new();
@@ -714,7 +736,9 @@ fn wave4c_exec_blocks_hyphae_infrastructure_secrets_referenced_in_node_json() {
 
     let store = SecretStore::new(&state_dir, SecretBackend::File);
     for name in blocked_infra {
-        store.set(name, &format!("infra-secret-val-{name}")).unwrap();
+        store
+            .set(name, &format!("infra-secret-val-{name}"))
+            .unwrap();
     }
     store
         .set("user-app-stripe-key", "sk-user-app-only-99999")
@@ -977,10 +1001,7 @@ fn e2e_subprocess_propagates_exact_exit_code_and_unix_signal_and_config_state_di
             env: vec!["K=exit-secret".to_string()],
             state_dir: Some(custom_state),
             config: None,
-            command: vec![
-                "/bin/echo".to_string(),
-                "$(id);$K".to_string(),
-            ],
+            command: vec!["/bin/echo".to_string(), "$(id);$K".to_string()],
         },
         out3.clone(),
         err3.clone(),
@@ -1022,7 +1043,9 @@ fn e2e_run_exec_entrypoint_and_config_errors_and_broken_pipe() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let store = SecretStore::new(&state_dir, SecretBackend::File);
-    store.set("direct-key", "direct-entry-secret-12345").unwrap();
+    store
+        .set("direct-key", "direct-entry-secret-12345")
+        .unwrap();
 
     // 1. Direct `run_exec` entrypoint with silent child verifying secret injection & exit code.
     #[cfg(unix)]
@@ -1097,4 +1120,3 @@ fn e2e_run_exec_entrypoint_and_config_errors_and_broken_pipe() {
     )
     .expect("BrokenPipe should terminate stream cleanly");
 }
-

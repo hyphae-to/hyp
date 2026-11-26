@@ -24,9 +24,9 @@ use clap::Subcommand;
 use http::{Method, Request, header};
 use http_body_util::{BodyExt, Full};
 use hyp_crypto::human::{
-    EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1,
-    MAX_HUMAN_DRAFT_CONTEXT_CHARS, SignedNodeCertV1, decode_hdrop1, encode_hcert1,
-    is_reserved_secret_name, seal_human_draft, validate_draft_text,
+    EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1, MAX_HUMAN_DRAFT_CONTEXT_CHARS,
+    SignedNodeCertV1, decode_hdrop1, encode_hcert1, is_reserved_secret_name, seal_human_draft,
+    validate_draft_text,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{NodeIdentityKeys, OkpJwk};
@@ -293,7 +293,10 @@ fn is_loopback_host(host: &str) -> bool {
 fn is_loopback_url(url: &str) -> bool {
     url.parse::<http::Uri>()
         .ok()
-        .and_then(|u| u.authority().map(|a| is_loopback_host(&a.host().to_ascii_lowercase())))
+        .and_then(|u| {
+            u.authority()
+                .map(|a| is_loopback_host(&a.host().to_ascii_lowercase()))
+        })
         .unwrap_or(false)
 }
 
@@ -346,8 +349,8 @@ fn open_node_and_optional_gate(
     let mut node_cfg = NodeConfig::new(node_id, profile, state_dir);
     node_cfg.secret_backend = Some(secrets.backend());
 
-    let node = UnifiedNode::open(node_cfg)
-        .map_err(|e| format!("failed to open UnifiedNode: {e}"))?;
+    let node =
+        UnifiedNode::open(node_cfg).map_err(|e| format!("failed to open UnifiedNode: {e}"))?;
 
     let gate = match loaded.as_ref().and_then(|c| c.raw.get("gate")) {
         Some(gate_val) => {
@@ -406,8 +409,7 @@ fn run_drop_create(
     }
 
     // Fail-closed security invariant #1: secrets MUST NEVER carry draft or context prefill.
-    if kind == CliDropKind::Secret
-        && (draft_arg.is_some() || draft_stdin || context_arg.is_some())
+    if kind == CliDropKind::Secret && (draft_arg.is_some() || draft_stdin || context_arg.is_some())
     {
         return emit_error(
             cmd,
@@ -463,7 +465,14 @@ fn run_drop_create(
 
     if let Some(ref text) = draft_text {
         if let Err(e) = validate_draft_text(text) {
-            return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_DRAFT", e.to_string(), None);
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_DRAFT",
+                e.to_string(),
+                None,
+            );
         }
         if let Some(ref ctx) = context_arg {
             if let Err(e) = validate_draft_text(ctx) {
@@ -524,7 +533,9 @@ fn run_drop_create(
                     as_json,
                     EXIT_USAGE,
                     "RESERVED_SECRET_NAME",
-                    format!("Reserved system secret name '{name}' is permanently blocked for human drops"),
+                    format!(
+                        "Reserved system secret name '{name}' is permanently blocked for human drops"
+                    ),
                     None,
                 );
             }
@@ -791,10 +802,7 @@ fn run_drop_create(
             }
         };
         let created = match rt.block_on(create_relay_drop_slot(
-            base_url,
-            &node_id,
-            &identity,
-            ttl_secs,
+            base_url, &node_id, &identity, ttl_secs,
         )) {
             Ok(c) => c,
             Err(e) => {
@@ -804,7 +812,10 @@ fn run_drop_create(
                     EXIT_ERROR,
                     "RELAY_CREATE_FAILED",
                     e,
-                    Some("Re-run with --offline to generate an offline hdrop1_ invite URL.".to_string()),
+                    Some(
+                        "Re-run with --offline to generate an offline hdrop1_ invite URL."
+                            .to_string(),
+                    ),
                 );
             }
         };
@@ -883,7 +894,9 @@ fn run_drop_create(
     if let Some(ref sealed_draft) = encrypted_draft {
         let draft_val = match serde_json::to_value(sealed_draft) {
             Ok(v) => v,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None);
+            }
         };
         frag.insert("encDraft".to_string(), draft_val);
     }
@@ -898,10 +911,7 @@ fn run_drop_create(
     );
 
     let next = if relay_url.is_some() && drop_id.is_some() {
-        vec![format!(
-            "hyp drop wait --state-dir {}",
-            state_dir.display()
-        )]
+        vec![format!("hyp drop wait --state-dir {}", state_dir.display())]
     } else {
         vec![format!(
             "Paste the sealed hdrop1_ token from your phone into: hyp drop ingest --state-dir {}",
@@ -982,10 +992,13 @@ async fn create_relay_drop_slot(
         .body(Full::new(Bytes::from(body_bytes)))
         .map_err(|e| format!("failed to build POST /v1/drops request: {e}"))?;
 
-    let resp = tokio::time::timeout(Duration::from_secs(RELAY_HTTP_TIMEOUT_SECS), client.request(req))
-        .await
-        .map_err(|_| format!("POST {url} timed out after {RELAY_HTTP_TIMEOUT_SECS}s"))?
-        .map_err(|e| format!("POST {url} failed: {e}"))?;
+    let resp = tokio::time::timeout(
+        Duration::from_secs(RELAY_HTTP_TIMEOUT_SECS),
+        client.request(req),
+    )
+    .await
+    .map_err(|_| format!("POST {url} timed out after {RELAY_HTTP_TIMEOUT_SECS}s"))?
+    .map_err(|e| format!("POST {url} failed: {e}"))?;
 
     let status = resp.status();
     let bytes = collect_bounded_body(resp.into_body(), MAX_RELAY_JSON_BYTES).await?;
@@ -1076,9 +1089,7 @@ fn run_drop_wait(
                     None,
                 );
             }
-            let matched = saved_last
-                .as_ref()
-                .is_some_and(|s| s.drop_id == trimmed);
+            let matched = saved_last.as_ref().is_some_and(|s| s.drop_id == trimmed);
             (trimmed, matched)
         }
         None => match saved_last {
@@ -1146,7 +1157,10 @@ fn run_drop_wait(
             EXIT_USAGE,
             "MISSING_RELAY",
             "No --relay URL specified and no dropRelayUrl configured in node.json",
-            Some("Pass --relay https://<your-relay> or run `hyp relay set https://<your-relay>`.".to_string()),
+            Some(
+                "Pass --relay https://<your-relay> or run `hyp relay set https://<your-relay>`."
+                    .to_string(),
+            ),
         );
     };
     let relay_url = match validate_relay_url(&relay_raw) {
@@ -1447,8 +1461,8 @@ async fn wait_and_ingest_drop(
     // Burn drop ciphertext from Drop Relay RAM immediately after verified ingestion.
     let ack_path = format!("/v1/drops/{encoded_id}/ack");
     let ack_url = format!("{relay_base}{ack_path}");
-    let ack_body = serde_json::to_vec(&json!({ "seq": seq, "burn": true }))
-        .map_err(|e| e.to_string())?;
+    let ack_body =
+        serde_json::to_vec(&json!({ "seq": seq, "burn": true })).map_err(|e| e.to_string())?;
     let mut ack_builder = Request::builder()
         .method(Method::POST)
         .uri(&ack_url)
@@ -1563,8 +1577,17 @@ fn run_drop_ingest(
     };
 
     match rt.block_on(node.ingest_human_drop_token(&token, gate.as_ref(), overwrite)) {
-        Ok(ingested) => emit_ingested_drop_ok(cmd, as_json, &ingested, None, None, None, Vec::new()),
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "DROP_INGEST_FAILED", e.to_string(), None),
+        Ok(ingested) => {
+            emit_ingested_drop_ok(cmd, as_json, &ingested, None, None, None, Vec::new())
+        }
+        Err(e) => emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "DROP_INGEST_FAILED",
+            e.to_string(),
+            None,
+        ),
     }
 }
 
@@ -1618,7 +1641,10 @@ fn emit_ingested_drop_ok(
         print_json(&envelope);
     } else {
         println!("OK    {summary}");
-        println!("      Human:     {} (kid={}, role={})", ingested.human_id, ingested.kid, ingested.role);
+        println!(
+            "      Human:     {} (kid={}, role={})",
+            ingested.human_id, ingested.kid, ingested.role
+        );
         if let Some(ref s) = ingested.secret_name {
             println!("      Secret:    {s} (stored securely; value redacted)");
         }
@@ -1649,7 +1675,10 @@ fn run_relay_set(
                 EXIT_USAGE,
                 "INVALID_RELAY_URL",
                 e,
-                Some("Pass an https:// URL (e.g. hyp relay set https://drop.example.com).".to_string()),
+                Some(
+                    "Pass an https:// URL (e.g. hyp relay set https://drop.example.com)."
+                        .to_string(),
+                ),
             );
         }
     };
@@ -1668,7 +1697,10 @@ fn run_relay_set(
         .map(ToOwned::to_owned)
         .unwrap_or_else(default_node_id);
     ensure_v2_node_json_defaults(&mut cfg_map, &node_id, NodeProfile::Local, &state_dir);
-    cfg_map.insert("dropRelayUrl".to_string(), Value::String(normalized.clone()));
+    cfg_map.insert(
+        "dropRelayUrl".to_string(),
+        Value::String(normalized.clone()),
+    );
 
     if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
@@ -1782,8 +1814,14 @@ fn run_relay_status(
             ok: true,
             command: cmd.to_string(),
             summary: Some(match configured_url.as_deref() {
-                Some(u) => format!("Drop Relay configured: {u} (local hosted={})", local_relay.enabled),
-                None => format!("No remote dropRelayUrl configured (local hosted={})", local_relay.enabled),
+                Some(u) => format!(
+                    "Drop Relay configured: {u} (local hosted={})",
+                    local_relay.enabled
+                ),
+                None => format!(
+                    "No remote dropRelayUrl configured (local hosted={})",
+                    local_relay.enabled
+                ),
             }),
             data: Some(json!({
                 "configPath": config_path.display().to_string(),
@@ -1815,11 +1853,17 @@ fn run_relay_status(
         println!("Hyphae Drop Relay Status");
         println!(
             "  Remote URL:  {}",
-            configured_url.as_deref().unwrap_or("(not configured; offline mode)")
+            configured_url
+                .as_deref()
+                .unwrap_or("(not configured; offline mode)")
         );
         println!(
             "  Local Host:  {} (maxMemoryMb={}, ttl={}s..{}s)",
-            if local_relay.enabled { "enabled" } else { "disabled" },
+            if local_relay.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             local_relay.max_memory_mb,
             local_relay.default_ttl_seconds,
             local_relay.max_ttl_seconds
@@ -1834,13 +1878,17 @@ fn run_relay_status(
                         "               activeDrops={}, bufferedBytes={}, activeSseStreams={}",
                         dr.get("activeDrops").and_then(Value::as_u64).unwrap_or(0),
                         dr.get("bufferedBytes").and_then(Value::as_u64).unwrap_or(0),
-                        dr.get("activeSseStreams").and_then(Value::as_u64).unwrap_or(0),
+                        dr.get("activeSseStreams")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
                     );
                 }
             } else {
                 println!(
                     "  Health:      UNREACHABLE ({target}): {}",
-                    p.get("error").and_then(Value::as_str).unwrap_or("request failed")
+                    p.get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request failed")
                 );
             }
         }
@@ -1863,8 +1911,11 @@ async fn probe_relay_health(base_url: &str) -> Value {
         Ok(r) => r,
         Err(e) => return json!({ "url": url, "reachable": false, "error": e.to_string() }),
     };
-    match tokio::time::timeout(Duration::from_secs(RELAY_PROBE_TIMEOUT_SECS), client.request(req))
-        .await
+    match tokio::time::timeout(
+        Duration::from_secs(RELAY_PROBE_TIMEOUT_SECS),
+        client.request(req),
+    )
+    .await
     {
         Ok(Ok(resp)) => {
             let status = resp.status().as_u16();
@@ -1897,7 +1948,9 @@ async fn collect_bounded_body(
         let frame = frame_res.map_err(|e| format!("HTTP body read error: {e}"))?;
         if let Some(chunk) = frame.data_ref() {
             if out.len().saturating_add(chunk.len()) > max_bytes {
-                return Err(format!("HTTP response exceeded {max_bytes} byte safety cap"));
+                return Err(format!(
+                    "HTTP response exceeded {max_bytes} byte safety cap"
+                ));
             }
             out.extend_from_slice(chunk);
         }

@@ -651,7 +651,13 @@ async fn statusline_security_fuzzing_and_ansi_injection_stripping() {
     // `hyp inspect` text output MUST also strip every injected sequence!
     let inspect = run_hyp_with_stdin(
         dir.path(),
-        &["inspect", "--socket", &mock_str, "--session", "claude:evil-ansi-1"],
+        &[
+            "inspect",
+            "--socket",
+            &mock_str,
+            "--session",
+            "claude:evil-ansi-1",
+        ],
         b"",
         &[],
     )
@@ -1019,7 +1025,12 @@ async fn inspect_and_session_controls_e2e_and_watch_stream() {
     assert_eq!(final_sess["counts"]["subscriptions"], 0);
     assert_eq!(final_sess["counts"]["mutedRules"], 0);
     assert_eq!(final_sess["counts"]["channels"], 1);
-    assert!(final_sess["details"]["rules"].as_array().unwrap().is_empty());
+    assert!(
+        final_sess["details"]["rules"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(final_sess["details"]["channels"], json!(["#ops"]));
 
     // `hyp inspect --all --json` returns sessions array
@@ -1108,9 +1119,11 @@ async fn statusline_surfaces_global_quarantine_and_qualified_leave_targets_local
 
     let sid_a = "claude:sess-a";
     let sid_b = "claude:sess-b";
-    node.register_session(sid_a, r#"{"kind":"claude"}"#).unwrap();
+    node.register_session(sid_a, r#"{"kind":"claude"}"#)
+        .unwrap();
     node.register_handle(sid_a, "alice").await.unwrap();
-    node.register_session(sid_b, r#"{"kind":"claude"}"#).unwrap();
+    node.register_session(sid_b, r#"{"kind":"claude"}"#)
+        .unwrap();
     node.register_handle(sid_b, "bob").await.unwrap();
 
     // U3: Put a quarantined item in session B ONLY -> session A's `hyp statusline` must STILL alert!
@@ -1181,7 +1194,14 @@ async fn statusline_surfaces_global_quarantine_and_qualified_leave_targets_local
 
     let inspect_after = run_hyp_with_stdin(
         dir.path(),
-        &["inspect", "--session", sid_a, "--socket", &sock_str, "--json"],
+        &[
+            "inspect",
+            "--session",
+            sid_a,
+            "--socket",
+            &sock_str,
+            "--json",
+        ],
         b"",
         &[],
     )

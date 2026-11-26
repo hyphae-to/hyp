@@ -323,7 +323,12 @@ impl TestMcpClient {
         tool_name: &str,
         mut arguments: Value,
     ) -> (String, bool) {
-        let call_id = format!("{}_{}_{}", harness.as_str(), raw_session_id, self.next_id + 1);
+        let call_id = format!(
+            "{}_{}_{}",
+            harness.as_str(),
+            raw_session_id,
+            self.next_id + 1
+        );
         match harness {
             HarnessKind::Antigravity => {
                 self.call_verified_antigravity(sock, raw_session_id, tool_name, arguments)
@@ -448,12 +453,8 @@ impl TestMcpClient {
                 )
                 .await;
                 assert_eq!(pre, json!({}));
-                self.call_tool(
-                    tool_name,
-                    arguments,
-                    Some(json!({ "toolCallId": call_id })),
-                )
-                .await
+                self.call_tool(tool_name, arguments, Some(json!({ "toolCallId": call_id })))
+                    .await
             }
             HarnessKind::T3 => {
                 let pre = run_hook(

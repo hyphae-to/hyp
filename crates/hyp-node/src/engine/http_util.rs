@@ -257,7 +257,9 @@ pub fn parse_if_match_version(headers: &HeaderMap) -> Result<Option<u64>, NodeEr
 /// Parses an RFC 9110 `Retry-After` delta-seconds header into milliseconds.
 pub fn parse_retry_after_ms(headers: &HeaderMap) -> Option<u64> {
     let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
-    raw.parse::<u64>().ok().map(|secs| secs.saturating_mul(1000))
+    raw.parse::<u64>()
+        .ok()
+        .map(|secs| secs.saturating_mul(1000))
 }
 
 // ============================================================================
@@ -292,7 +294,10 @@ impl SseEvent {
     pub fn encode(&self) -> String {
         let mut out = String::new();
         if let Some(id) = &self.id {
-            let clean: String = id.chars().filter(|&c| c != '\n' && c != '\r' && c != '\0').collect();
+            let clean: String = id
+                .chars()
+                .filter(|&c| c != '\n' && c != '\r' && c != '\0')
+                .collect();
             out.push_str("id: ");
             out.push_str(&clean);
             out.push('\n');
@@ -595,11 +600,10 @@ impl HttpClient {
     /// [`Self::request_for_endpoint`] with an origin-form request URI.
     pub async fn request(&self, req: Request<BoxedBody>) -> Result<Response<Incoming>, NodeError> {
         if req.uri().scheme_str() == Some("ssh") {
-            let authority = req
-                .uri()
-                .authority()
-                .map(|a| a.as_str())
-                .ok_or_else(|| NodeError::Http("ssh:// request URI missing authority".into()))?;
+            let authority =
+                req.uri().authority().map(|a| a.as_str()).ok_or_else(|| {
+                    NodeError::Http("ssh:// request URI missing authority".into())
+                })?;
             let base = format!("ssh://{authority}");
             let ssh = parse_ssh_endpoint(&base)?;
             return self.request_ssh_inner(&ssh, req, true, None).await;
@@ -686,7 +690,9 @@ impl HttpClient {
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
         let origin_uri: http::Uri = path_and_query.parse().map_err(|e| {
-            NodeError::Http(format!("invalid HTTP/1.1 request target '{path_and_query}': {e}"))
+            NodeError::Http(format!(
+                "invalid HTTP/1.1 request target '{path_and_query}': {e}"
+            ))
         })?;
         *req.uri_mut() = origin_uri;
 
@@ -716,12 +722,14 @@ impl HttpClient {
             ))
         })?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            NodeError::Http("SSH child process missing stdin pipe".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            NodeError::Http("SSH child process missing stdout pipe".into())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| NodeError::Http("SSH child process missing stdin pipe".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| NodeError::Http("SSH child process missing stdout pipe".into()))?;
         let stderr_pipe = child.stderr.take();
 
         let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -891,7 +899,10 @@ mod tests {
         assert!(!etag_matches_if_none_match(&headers, "\"other\""));
 
         let mut kv_headers = HeaderMap::new();
-        kv_headers.insert(IF_MATCH, HeaderValue::from_str(&format_version_etag(7)).unwrap());
+        kv_headers.insert(
+            IF_MATCH,
+            HeaderValue::from_str(&format_version_etag(7)).unwrap(),
+        );
         assert_eq!(parse_if_match_version(&kv_headers).unwrap(), Some(7));
 
         kv_headers.insert(IF_MATCH, HeaderValue::from_static("W/\"12\""));

@@ -239,8 +239,8 @@ impl Address {
         };
         let node_part = &value[..slash];
         let handle_part = &value[slash + 1..];
-        let node_id = NodeId::new(node_part)
-            .map_err(|_| AddressError::InvalidAddress(value.to_string()))?;
+        let node_id =
+            NodeId::new(node_part).map_err(|_| AddressError::InvalidAddress(value.to_string()))?;
         let handle = Handle::new(handle_part)
             .map_err(|_| AddressError::InvalidAddress(value.to_string()))?;
         Ok(Self { node_id, handle })
@@ -542,8 +542,8 @@ impl QualifiedKvPath {
         } else if let Some(rest) = input.strip_prefix("kv/") {
             (default_node.clone(), rest)
         } else if let Some((head, rest)) = input.split_once(".kv/") {
-            let node_id = NodeId::new(head)
-                .map_err(|_| AddressError::InvalidKvPath(input.to_string()))?;
+            let node_id =
+                NodeId::new(head).map_err(|_| AddressError::InvalidKvPath(input.to_string()))?;
             (NodeScope::from_node_id(node_id), rest)
         } else {
             return Err(AddressError::InvalidKvPath(input.to_string()));
@@ -590,7 +590,8 @@ mod tests {
         );
         assert_eq!(resolved.topic.as_str(), "github");
 
-        let resolved2 = resolve_topic("alice.smith@macbook.ci.builds", &peers, &local_default).unwrap();
+        let resolved2 =
+            resolve_topic("alice.smith@macbook.ci.builds", &peers, &local_default).unwrap();
         assert_eq!(
             resolved2.node,
             NodeScope::Remote(NodeId::new("alice.smith@macbook").unwrap())
@@ -602,8 +603,16 @@ mod tests {
         assert_eq!(local.topic.as_str(), "github-public");
 
         // Shorthand falls back to default_node.
-        let bare = resolve_topic("github", &peers, &NodeScope::Remote(NodeId::new("acme-team").unwrap())).unwrap();
-        assert_eq!(bare.node, NodeScope::Remote(NodeId::new("acme-team").unwrap()));
+        let bare = resolve_topic(
+            "github",
+            &peers,
+            &NodeScope::Remote(NodeId::new("acme-team").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            bare.node,
+            NodeScope::Remote(NodeId::new("acme-team").unwrap())
+        );
         assert_eq!(bare.topic.as_str(), "github");
     }
 
@@ -646,7 +655,9 @@ mod tests {
         let br_remote = QualifiedBridgeTarget::parse("acme-team/slack:C01234").unwrap();
         assert_eq!(br_remote.to_string(), "acme-team/slack:C01234");
 
-        let kv = QualifiedKvPath::resolve("public.hyphae.to.kv/deploys/checkout/v2", &NodeScope::Local).unwrap();
+        let kv =
+            QualifiedKvPath::resolve("public.hyphae.to.kv/deploys/checkout/v2", &NodeScope::Local)
+                .unwrap();
         assert_eq!(
             kv.node,
             NodeScope::Remote(NodeId::new("public.hyphae.to").unwrap())

@@ -663,8 +663,7 @@ impl PeerLink {
             .client
             .request_for_endpoint(&self.endpoint, req)
             .await?;
-        let (status, _headers, bytes) =
-            HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
+        let (status, _headers, bytes) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if !status.is_success() {
             return Err(HttpClient::decode_error_response(status, &bytes));
         }
@@ -687,8 +686,7 @@ impl PeerLink {
             .client
             .request_for_endpoint(&self.endpoint, req)
             .await?;
-        let (status, headers, bytes) =
-            HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
+        let (status, headers, bytes) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if status == StatusCode::NOT_MODIFIED {
             return Ok(ManifestFetchOutcome::NotModified);
         }
@@ -796,7 +794,10 @@ impl PeerLink {
         Ok(resp.get("left").and_then(|v| v.as_bool()).unwrap_or(false))
     }
 
-    pub async fn list_channels(&self, channel: Option<&str>) -> Result<ChannelsResponse, NodeError> {
+    pub async fn list_channels(
+        &self,
+        channel: Option<&str>,
+    ) -> Result<ChannelsResponse, NodeError> {
         let path = match channel {
             Some(ch) => format!("/v1/channels?channel={}", percent_encode(ch)),
             None => "/v1/channels".to_string(),
@@ -829,8 +830,9 @@ impl PeerLink {
         if let Some(ep) = epoch {
             path.push_str(&format!("&epoch={ep}"));
         }
-        let resp: ChannelEpochResponse =
-            self.send_json::<(), _>(Method::GET, &path, None, &[]).await?;
+        let resp: ChannelEpochResponse = self
+            .send_json::<(), _>(Method::GET, &path, None, &[])
+            .await?;
         Ok(resp.epoch)
     }
 
@@ -848,8 +850,9 @@ impl PeerLink {
         if let Some(ep) = epoch {
             path.push_str(&format!("&epoch={ep}"));
         }
-        let resp: KvEpochResponse =
-            self.send_json::<(), _>(Method::GET, &path, None, &[]).await?;
+        let resp: KvEpochResponse = self
+            .send_json::<(), _>(Method::GET, &path, None, &[])
+            .await?;
         Ok(resp.epoch)
     }
 
@@ -892,7 +895,11 @@ impl PeerLink {
         body: &KvSetBody,
         if_match_version: Option<u64>,
     ) -> Result<KvEntry, NodeError> {
-        let path = format!("/v1/kv/{}/{}", percent_encode(namespace), encode_kv_key_path(key));
+        let path = format!(
+            "/v1/kv/{}/{}",
+            percent_encode(namespace),
+            encode_kv_key_path(key)
+        );
         let etag_owned = if_match_version.map(format_version_etag);
         let mut headers = Vec::new();
         if let Some(ref etag) = etag_owned {
@@ -903,8 +910,15 @@ impl PeerLink {
     }
 
     pub async fn kv_get(&self, namespace: &str, key: &str) -> Result<Option<KvEntry>, NodeError> {
-        let path = format!("/v1/kv/{}/{}", percent_encode(namespace), encode_kv_key_path(key));
-        match self.send_json::<(), KvEntry>(Method::GET, &path, None, &[]).await {
+        let path = format!(
+            "/v1/kv/{}/{}",
+            percent_encode(namespace),
+            encode_kv_key_path(key)
+        );
+        match self
+            .send_json::<(), KvEntry>(Method::GET, &path, None, &[])
+            .await
+        {
             Ok(entry) => Ok(Some(entry)),
             Err(NodeError::RemoteProblem(p)) if p.status == 404 => Ok(None),
             Err(err) => Err(err),
@@ -917,7 +931,11 @@ impl PeerLink {
         key: &str,
         expected_version: Option<u64>,
     ) -> Result<KvDeleteResult, NodeError> {
-        let path = format!("/v1/kv/{}/{}", percent_encode(namespace), encode_kv_key_path(key));
+        let path = format!(
+            "/v1/kv/{}/{}",
+            percent_encode(namespace),
+            encode_kv_key_path(key)
+        );
         let body = KvDeleteBody { expected_version };
         let etag_owned = expected_version.map(format_version_etag);
         let mut headers = Vec::new();
@@ -937,8 +955,9 @@ impl PeerLink {
         if let Some(p) = prefix {
             path.push_str(&format!("?prefix={}", percent_encode(p)));
         }
-        let resp: KvListResponse =
-            self.send_json::<(), _>(Method::GET, &path, None, &[]).await?;
+        let resp: KvListResponse = self
+            .send_json::<(), _>(Method::GET, &path, None, &[])
+            .await?;
         Ok(resp.entries)
     }
 
@@ -991,8 +1010,7 @@ impl PeerLink {
             .client
             .request_for_endpoint(&self.endpoint, req)
             .await?;
-        let (status, _headers, bytes) =
-            HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
+        let (status, _headers, bytes) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if !status.is_success() {
             return Err(HttpClient::decode_error_response(status, &bytes));
         }
@@ -1175,7 +1193,8 @@ pub fn spawn_sse_worker(
                             if *shutdown_rx.borrow() { break; }
                         }
                     }
-                    auth_backoff_ms = (auth_backoff_ms.saturating_mul(2)).min(SSE_AUTH_MAX_BACKOFF_MS);
+                    auth_backoff_ms =
+                        (auth_backoff_ms.saturating_mul(2)).min(SSE_AUTH_MAX_BACKOFF_MS);
                 }
                 Ok(resp) => {
                     let retry_ms = parse_retry_after_ms(resp.headers()).unwrap_or(backoff_ms);

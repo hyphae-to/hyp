@@ -220,8 +220,8 @@ pub struct LoadedNodeFile {
 
 /// Reads a JSON file into `serde_json::Value`.
 pub fn read_json_value(path: &Path) -> Result<Value, String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     serde_json::from_str(&raw).map_err(|e| format!("invalid JSON in {}: {e}", path.display()))
 }
 
@@ -232,7 +232,10 @@ pub fn read_json_object_or_empty(path: &Path) -> Result<Map<String, Value>, Stri
     }
     match read_json_value(path)? {
         Value::Object(map) => Ok(map),
-        _ => Err(format!("expected top-level JSON object in {}", path.display())),
+        _ => Err(format!(
+            "expected top-level JSON object in {}",
+            path.display()
+        )),
     }
 }
 
@@ -288,9 +291,10 @@ pub fn load_node_or_legacy_config(path: &Path) -> Result<LoadedNodeFile, String>
         });
 
     let bind_addr = match bind_str {
-        Some(ref s) => Some(s.parse::<SocketAddr>().map_err(|e| {
-            format!("invalid listen.bind '{s}' in {}: {e}", path.display())
-        })?),
+        Some(ref s) => Some(
+            s.parse::<SocketAddr>()
+                .map_err(|e| format!("invalid listen.bind '{s}' in {}: {e}", path.display()))?,
+        ),
         None => None,
     };
 
@@ -343,10 +347,7 @@ pub fn load_node_or_legacy_config(path: &Path) -> Result<LoadedNodeFile, String>
 }
 
 /// Resolves the canonical node ID from config, `node.sqlite` metadata, or fallback default.
-pub fn resolve_effective_node_id(
-    loaded: Option<&LoadedNodeFile>,
-    db: Option<&NodeDb>,
-) -> String {
+pub fn resolve_effective_node_id(loaded: Option<&LoadedNodeFile>, db: Option<&NodeDb>) -> String {
     if let Some(cfg) = loaded {
         if let Some(ref id) = cfg.node_id {
             if !id.is_empty() {

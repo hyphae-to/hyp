@@ -284,7 +284,8 @@ impl Stage1Engine {
                 ctx.sender.as_str()
             };
             for rel_path in &ctx.transfer_paths {
-                if let Err(reason) = self.check_transfer_attachment(peer_id, ctx.trust_tier, rel_path)
+                if let Err(reason) =
+                    self.check_transfer_attachment(peer_id, ctx.trust_tier, rel_path)
                 {
                     return Stage1Outcome::block(
                         format!("blocked_attachment:{reason}"),
@@ -444,9 +445,12 @@ fn is_sensitive_config_or_hook_path(lower_path: &str) -> bool {
     if segments.windows(2).any(|w| w == [".git", "hooks"]) {
         return true;
     }
-    segments
-        .iter()
-        .any(|&seg| matches!(seg, ".claude" | ".agents" | ".codex" | ".cursor" | ".vscode"))
+    segments.iter().any(|&seg| {
+        matches!(
+            seg,
+            ".claude" | ".agents" | ".codex" | ".cursor" | ".vscode"
+        )
+    })
 }
 
 fn rate_limit_sender_key(ctx: &InboundContext) -> String {
@@ -534,10 +538,7 @@ fn builtin_dlp_rules() -> Vec<CompiledDlpRule> {
             r"\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{20,}\b",
         ),
         // PEM-encoded private keys (RSA, EC, OPENSSH, PKCS8, DSA, PGP, etc.).
-        (
-            "pem_private_key",
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
-        ),
+        ("pem_private_key", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
         // JSON Web Tokens (`header.payload.signature` starting with base64url `{"...`).
         (
             "jwt_token",

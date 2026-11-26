@@ -83,19 +83,14 @@ fn build_rs_pinned_digests_and_tree_hashes_match_sha2_crate_and_crlf_invariance(
     assert_eq!(PINNED_PLUGIN_FILES.len(), 28);
     let plugins_dir = repo_root().join("plugins");
 
-    for (spec, (exp_id, exp_kind, exp_count)) in
-        PINNED_PLUGINS.iter().zip(expected_plugins.iter())
+    for (spec, (exp_id, exp_kind, exp_count)) in PINNED_PLUGINS.iter().zip(expected_plugins.iter())
     {
         assert_eq!(spec.id, *exp_id);
         assert_eq!(spec.kind, *exp_kind);
         assert_eq!(spec.files.len(), *exp_count);
         assert_eq!(spec.tree_sha256.len(), 64);
 
-        let pairs: Vec<(&str, &str)> = spec
-            .files
-            .iter()
-            .map(|f| (f.rel_path, f.sha256))
-            .collect();
+        let pairs: Vec<(&str, &str)> = spec.files.iter().map(|f| (f.rel_path, f.sha256)).collect();
         assert_eq!(
             spec.tree_sha256,
             compute_tree_sha256(&pairs),
@@ -562,7 +557,10 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert!(list_out.status.success());
     let list_json: Value = serde_json::from_slice(&list_out.stdout).expect("parse list json");
     assert_eq!(list_json["ok"], true);
-    assert_eq!(list_json["data"]["plugins"].as_array().map(Vec::len), Some(9));
+    assert_eq!(
+        list_json["data"]["plugins"].as_array().map(Vec::len),
+        Some(9)
+    );
 
     // 2. Install telegram, claude-panel, and herdr-mod via --from-dir.
     for name in ["telegram", "claude-panel", "herdr-mod"] {
@@ -591,9 +589,18 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert!(state_dir.join("plugins/installed.json").is_file());
     assert!(state_dir.join("plugins/telegram/index.mjs").is_file());
     assert!(state_dir.join("plugins/sdk/client.mjs").is_file());
-    assert!(home.join(".claude/skills/hyphae-panel/hooks/register.tsx").is_file());
-    assert!(home.join(".config/herdr-app/mods/hyphae-pane/pill.js").is_file());
-    assert!(home.join(".config/herdr-app/mods/hyphae-panel/main.js").is_file());
+    assert!(
+        home.join(".claude/skills/hyphae-panel/hooks/register.tsx")
+            .is_file()
+    );
+    assert!(
+        home.join(".config/herdr-app/mods/hyphae-pane/pill.js")
+            .is_file()
+    );
+    assert!(
+        home.join(".config/herdr-app/mods/hyphae-panel/main.js")
+            .is_file()
+    );
 
     // 3. `hyp plugin verify` & `hyp doctor` pass cleanly when all are up_to_date.
     let ver_ok = run(
@@ -770,7 +777,10 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
             offline_state.to_str().unwrap(),
             "--json",
         ],
-        &[("HYPHAE_PLUGINS_URL", Some("http://127.0.0.1:1/unreachable.tar.gz"))],
+        &[(
+            "HYPHAE_PLUGINS_URL",
+            Some("http://127.0.0.1:1/unreachable.tar.gz"),
+        )],
     );
     assert_eq!(
         offline_setup.status.code(),
@@ -786,7 +796,11 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert!(offline_home.join(".claude/settings.json").is_file());
     assert!(offline_home.join(".claude/commands/hyphae.md").is_file());
     assert!(!offline_home.join(".config/herdr/hyphae.json").exists());
-    assert!(offline_home.join(".config/herdr/skills/hyphae/SKILL.md").is_file());
+    assert!(
+        offline_home
+            .join(".config/herdr/skills/hyphae/SKILL.md")
+            .is_file()
+    );
     // Non-Rust UI mods were skipped gracefully with actionable next commands!
     let next_steps: Vec<String> = offline_json["next"]
         .as_array()
@@ -795,11 +809,15 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
         .filter_map(|v| v.as_str().map(ToOwned::to_owned))
         .collect();
     assert!(
-        next_steps.iter().any(|s| s.contains("hyp plugin install claude-panel")),
+        next_steps
+            .iter()
+            .any(|s| s.contains("hyp plugin install claude-panel")),
         "expected `hyp plugin install claude-panel` in next: {next_steps:?}"
     );
     assert!(
-        next_steps.iter().any(|s| s.contains("hyp plugin install herdr-mod")),
+        next_steps
+            .iter()
+            .any(|s| s.contains("hyp plugin install herdr-mod")),
         "expected `hyp plugin install herdr-mod` in next: {next_steps:?}"
     );
 
@@ -837,7 +855,10 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
             offline_state.to_str().unwrap(),
             "--json",
         ],
-        &[("HYPHAE_PLUGINS_URL", Some("http://127.0.0.1:1/unreachable.tar.gz"))],
+        &[(
+            "HYPHAE_PLUGINS_URL",
+            Some("http://127.0.0.1:1/unreachable.tar.gz"),
+        )],
     );
     assert_eq!(
         cached_setup.status.code(),
@@ -846,8 +867,16 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
         String::from_utf8_lossy(&cached_setup.stdout),
         String::from_utf8_lossy(&cached_setup.stderr)
     );
-    assert!(offline_home.join(".claude/skills/hyphae-panel/hooks/register.tsx").is_file());
-    assert!(offline_home.join(".config/herdr-app/mods/hyphae-pane/pill.js").is_file());
+    assert!(
+        offline_home
+            .join(".claude/skills/hyphae-panel/hooks/register.tsx")
+            .is_file()
+    );
+    assert!(
+        offline_home
+            .join(".config/herdr-app/mods/hyphae-pane/pill.js")
+            .is_file()
+    );
 
     // 8. Tampered --plugins-dir during `hyp setup` MUST FAIL CLOSED (never ignored as offline)!
     let tampered_dir = tmp.path().join("tampered-plugins");

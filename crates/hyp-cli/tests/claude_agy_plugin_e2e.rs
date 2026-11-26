@@ -90,7 +90,11 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
     // 4. All 4 slash commands + README + SKILL.md
     let expected_commands = [
         ("hyphae.md", "hyp inspect --json", "!hyp ui"),
-        ("hyphae-subs.md", "hyp session unsubscribe", "hyp session rule"),
+        (
+            "hyphae-subs.md",
+            "hyp session unsubscribe",
+            "hyp session rule",
+        ),
         ("hyphae-focus.md", "hyp session focus", "focusMode"),
         ("hyphae-mute.md", "hyp session mute", "hyp session unmute"),
     ];
@@ -122,15 +126,13 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
             "{file} must never reference --value"
         );
         assert!(
-            !content.contains("hp2p1_")
-                && !content.contains("am2_")
-                && !content.contains("t3mp1_"),
+            !content.contains("hp2p1_") && !content.contains("am2_") && !content.contains("t3mp1_"),
             "{file} must never embed raw pairing token prefixes"
         );
     }
 
-    let readme =
-        fs::read_to_string(plugin_dir.join("README.md")).expect("read plugins/claude-code/README.md");
+    let readme = fs::read_to_string(plugin_dir.join("README.md"))
+        .expect("read plugins/claude-code/README.md");
     assert!(readme.contains("hyp setup --harness claude --statusline"));
     assert!(readme.contains("hyp setup --harness claude --restore-statusline"));
     assert!(readme.contains("!hyp ui"));
@@ -273,8 +275,8 @@ fn claude_statusline_fresh_idempotent_and_slash_commands() {
     ] {
         let installed = fs::read_to_string(home.join(".claude/commands").join(file))
             .unwrap_or_else(|e| panic!("missing ~/.claude/commands/{file}: {e}"));
-        let canonical = fs::read_to_string(claude_plugin_dir().join("commands").join(file))
-            .unwrap();
+        let canonical =
+            fs::read_to_string(claude_plugin_dir().join("commands").join(file)).unwrap();
         assert_eq!(installed, canonical);
     }
 
@@ -484,7 +486,10 @@ fn claude_statusline_chains_existing_custom_bar_and_restores_verbatim() {
             .unwrap();
     assert_eq!(restored["statusLine"], original_bar);
     assert_eq!(restored["theme"], "solarized");
-    assert!(!chain_file.exists(), "chain file must be deleted on restore");
+    assert!(
+        !chain_file.exists(),
+        "chain file must be deleted on restore"
+    );
 
     // 5. Re-running --restore-statusline when user has non-Hyphae statusLine leaves it untouched!
     let restore_again = isolated_cmd(&home)
@@ -783,12 +788,7 @@ fn doctor_warns_on_missing_chain_file_and_setup_rejects_conflicting_flags() {
         .find(|c| c["name"] == "statusline:claude")
         .expect("statusline:claude check");
     assert_eq!(claude_check["status"], "warn");
-    assert!(
-        claude_check["detail"]
-            .as_str()
-            .unwrap()
-            .contains("missing")
-    );
+    assert!(claude_check["detail"].as_str().unwrap().contains("missing"));
     assert!(
         claude_check["fix"]
             .as_str()
@@ -867,8 +867,7 @@ fn herdr_mod_setup_respects_symlinks_supports_clone_layout_and_doctor_detection(
         }))
         .unwrap();
         fs::write(&target_layout, &original_custom).unwrap();
-        std::os::unix::fs::symlink(&target_layout, layouts_dir.join("herdr-folders.json"))
-            .unwrap();
+        std::os::unix::fs::symlink(&target_layout, layouts_dir.join("herdr-folders.json")).unwrap();
         fs::write(
             herdr_app.join("shared.json"),
             serde_json::to_string_pretty(&json!({ "layout": "herdr-folders" })).unwrap(),
@@ -898,7 +897,10 @@ fn herdr_mod_setup_respects_symlinks_supports_clone_layout_and_doctor_detection(
         );
         let sym_json = parse_json_stdout(&sym_out);
         assert_eq!(sym_json["ok"], true);
-        assert_eq!(sym_json["data"]["herdrMod"]["layoutAction"], "skipped_symlink");
+        assert_eq!(
+            sym_json["data"]["herdrMod"]["layoutAction"],
+            "skipped_symlink"
+        );
         assert!(
             !sym_json["warnings"].as_array().unwrap().is_empty(),
             "symlink refusal should emit an actionable warning"

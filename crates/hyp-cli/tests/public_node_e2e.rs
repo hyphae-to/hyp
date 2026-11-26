@@ -22,19 +22,10 @@ use std::time::{Duration, Instant};
 use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::{Bytes, Incoming};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyp_crypto::keys::NodeIdentityKeys;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
-use hyp_node::adapters::{
-    GitHubPublicAdapter, GitHubPublicConfig, compute_hmac_sha256_header,
-};
+use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig, compute_hmac_sha256_header};
 use hyp_node::engine::http_util::SseParser;
 use hyp_node::engine::{
     GuestPairRequest, GuestPairingConfig, NodeConfig, UnifiedNode, guest_pair_proof_canonical,
@@ -42,6 +33,13 @@ use hyp_node::engine::{
 use hyp_proto::address::NodeId;
 use hyp_proto::manifest::SignedNodeManifest;
 use hyp_store::{AckOutcome, DueBatch};
+use hyper::body::{Bytes, Incoming};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -312,7 +310,8 @@ async fn send_json_request(
         builder = builder.header(CONTENT_TYPE, "application/json");
     }
     if let Some((node_id, keys)) = auth {
-        let header_val = ed25519_auth_header(node_id, keys, method.as_str(), path_and_query, &raw_bytes);
+        let header_val =
+            ed25519_auth_header(node_id, keys, method.as_str(), path_and_query, &raw_bytes);
         builder = builder.header(AUTHORIZATION, header_val);
     }
     for &(k, v) in extra_headers {
@@ -446,7 +445,10 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
     assert_eq!(startup_env["data"]["nodeId"], "public.hyphae.to");
     assert_eq!(startup_env["data"]["guestPairingEnabled"], true);
     assert_eq!(startup_env["data"]["githubPublicEnabled"], true);
-    let hub_url = startup_env["data"]["endpoint"].as_str().unwrap().to_string();
+    let hub_url = startup_env["data"]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let hub_pid = startup_env["data"]["pid"].as_u64().unwrap();
     // Missing optional github-public-token emits a concise warning instead of failing startup!
     assert!(
@@ -462,8 +464,16 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
     let client = make_full_client();
 
     // Verify unauthenticated GET /v1/health
-    let (health_status, _, health_json) =
-        send_json_request(&client, &hub_url, Method::GET, "/v1/health", None, None, &[]).await;
+    let (health_status, _, health_json) = send_json_request(
+        &client,
+        &hub_url,
+        Method::GET,
+        "/v1/health",
+        None,
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(health_status, StatusCode::OK);
     assert_eq!(health_json["ok"], true);
     assert_eq!(health_json["nodeId"], "public.hyphae.to");
@@ -764,8 +774,16 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut observed_304 = false;
     while Instant::now() < deadline {
-        let (_, _, h) =
-            send_json_request(&client, &hub_url, Method::GET, "/v1/health", None, None, &[]).await;
+        let (_, _, h) = send_json_request(
+            &client,
+            &hub_url,
+            Method::GET,
+            "/v1/health",
+            None,
+            None,
+            &[],
+        )
+        .await;
         if h["githubPublic"]["polls304"].as_u64().unwrap_or(0) >= 1 {
             assert_eq!(h["githubPublic"]["activePollers"], 1);
             assert!(h["githubPublic"]["polls200"].as_u64().unwrap_or(0) >= 1);
@@ -826,8 +844,16 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
     .await;
     assert_eq!(sub2_status, StatusCode::OK);
 
-    let (_, _, health_shared) =
-        send_json_request(&client, &hub_url, Method::GET, "/v1/health", None, None, &[]).await;
+    let (_, _, health_shared) = send_json_request(
+        &client,
+        &hub_url,
+        Method::GET,
+        "/v1/health",
+        None,
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(
         health_shared["githubPublic"]["activePollers"], 1,
         "2nd subscriber to same repo MUST share the exact same deduplicated ETag poller"
@@ -869,7 +895,10 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
     )
     .await;
     assert_eq!(verify_orig_status, StatusCode::OK);
-    assert_eq!(verify_orig_body["subscriptions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        verify_orig_body["subscriptions"].as_array().unwrap().len(),
+        1
+    );
 
     // 4i. Unsubscribe BOTH laptops and verify clean teardown (`activePollers == 0`)!
     let (del1_status, _, del1_body) = send_json_request(
@@ -886,8 +915,16 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
     assert_eq!(del1_body["deleted"], true);
 
     // Still 1 poller while laptop 2 remains subscribed!
-    let (_, _, health_mid) =
-        send_json_request(&client, &hub_url, Method::GET, "/v1/health", None, None, &[]).await;
+    let (_, _, health_mid) = send_json_request(
+        &client,
+        &hub_url,
+        Method::GET,
+        "/v1/health",
+        None,
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(health_mid["githubPublic"]["activePollers"], 1);
 
     let (del2_status, _, del2_body) = send_json_request(
@@ -907,15 +944,26 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
     let teardown_deadline = Instant::now() + Duration::from_secs(4);
     let mut torn_down = false;
     while Instant::now() < teardown_deadline {
-        let (_, _, h) =
-            send_json_request(&client, &hub_url, Method::GET, "/v1/health", None, None, &[]).await;
+        let (_, _, h) = send_json_request(
+            &client,
+            &hub_url,
+            Method::GET,
+            "/v1/health",
+            None,
+            None,
+            &[],
+        )
+        .await;
         if h["githubPublic"]["activePollers"] == 0 {
             torn_down = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    assert!(torn_down, "expected activePollers == 0 after grace window teardown");
+    assert!(
+        torn_down,
+        "expected activePollers == 0 after grace window teardown"
+    );
 
     // Drop SSE stream before shutdown.
     drop(sse_body);
@@ -930,8 +978,15 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
             .expect("send SIGTERM");
         assert!(kill_status.success());
         let exit_status = child.wait().expect("wait for graceful exit");
-        assert_eq!(exit_status.code(), Some(0), "expected clean exit code 0 on SIGTERM");
-        assert!(!hub_state.join("node.pid").exists(), "node.pid should be cleaned up");
+        assert_eq!(
+            exit_status.code(),
+            Some(0),
+            "expected clean exit code 0 on SIGTERM"
+        );
+        assert!(
+            !hub_state.join("node.pid").exists(),
+            "node.pid should be cleaned up"
+        );
         assert!(
             !hub_state.join("node.status.json").exists(),
             "node.status.json should be cleaned up"
@@ -958,10 +1013,8 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
     // 1. Default `UnifiedNode` has `guest_pairing.enabled == false` -> 404 on `/v1/guest/pair`
     //    and 404 on `/v1/webhooks/github-app`!
     let disabled_dir = tempfile::tempdir().unwrap();
-    let mut disabled_cfg = NodeConfig::router(
-        NodeId::new("private.local").unwrap(),
-        disabled_dir.path(),
-    );
+    let mut disabled_cfg =
+        NodeConfig::router(NodeId::new("private.local").unwrap(), disabled_dir.path());
     disabled_cfg.secret_backend = Some(SecretBackend::File);
     let disabled_node = UnifiedNode::open(disabled_cfg).unwrap();
     let (disabled_addr, disabled_srv) = Arc::clone(&disabled_node)
@@ -1007,10 +1060,7 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
     // 2. Hardened public hub with `max_repos_per_guest: 2`, `max_joins_per_minute: 2`,
     //    and GitHub App webhook secret configured!
     let pub_dir = tempfile::tempdir().unwrap();
-    let mut pub_cfg = NodeConfig::router(
-        NodeId::new("pub-sec.local").unwrap(),
-        pub_dir.path(),
-    );
+    let mut pub_cfg = NodeConfig::router(NodeId::new("pub-sec.local").unwrap(), pub_dir.path());
     pub_cfg.secret_backend = Some(SecretBackend::File);
     pub_cfg.guest_pairing = GuestPairingConfig {
         enabled: true,
@@ -1040,8 +1090,14 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
         })
         .unwrap(),
     );
-    adapter.register_app_installation("acme/open").await.unwrap();
-    pub_node.attach_github_public(Arc::clone(&adapter)).await.unwrap();
+    adapter
+        .register_app_installation("acme/open")
+        .await
+        .unwrap();
+    pub_node
+        .attach_github_public(Arc::clone(&adapter))
+        .await
+        .unwrap();
 
     let (pub_addr, pub_srv) = Arc::clone(&pub_node)
         .serve("127.0.0.1:0".parse().unwrap())
@@ -1076,7 +1132,9 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
         &NodeIdentityKeys::generate().unwrap(),
         format_rfc3339_millis(now_unix_ms()),
     );
-    bad_sig_req.proof_sig = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+    bad_sig_req.proof_sig =
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .to_string();
     let (st_badsig, _, _) = send_json_request(
         &client,
         &pub_url,
@@ -1250,8 +1308,16 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
     assert_eq!(ok_wh_body["ok"], true);
     assert_eq!(ok_wh_body["status"], "published");
 
-    let (_, _, h) =
-        send_json_request(&client, &pub_url, Method::GET, "/v1/health", None, None, &[]).await;
+    let (_, _, h) = send_json_request(
+        &client,
+        &pub_url,
+        Method::GET,
+        "/v1/health",
+        None,
+        None,
+        &[],
+    )
+    .await;
     assert_eq!(h["githubPublic"]["appWebhooksPublished"], 1);
 
     pub_node.shutdown_adapters().await;
@@ -1358,10 +1424,10 @@ async fn node_start_repo_tokens_warnings_plaintext_fail_closed_and_gate_auth_hea
         "expected isolated missing-secret warning for bayfold/*, got {warnings:?}"
     );
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("Multiple enabled github-public sources found")
-                && w.contains("sources[0].repoTokens")),
+        warnings.iter().any(
+            |w| w.contains("Multiple enabled github-public sources found")
+                && w.contains("sources[0].repoTokens")
+        ),
         "expected duplicate github-public source warning, got {warnings:?}"
     );
 
@@ -1416,7 +1482,11 @@ async fn node_start_repo_tokens_warnings_plaintext_fail_closed_and_gate_auth_hea
         .env("HOME", tmp.path())
         .output()
         .expect("run hyp node start with plaintext repoTokens");
-    assert_ne!(bad_out.status.code(), Some(0), "plaintext repoTokens must fail closed");
+    assert_ne!(
+        bad_out.status.code(),
+        Some(0),
+        "plaintext repoTokens must fail closed"
+    );
     let bad_env: Value = serde_json::from_slice(&bad_out.stdout).unwrap();
     assert_eq!(bad_env["ok"], false);
     assert_eq!(bad_env["error"]["code"], "CONFIG_ERROR");

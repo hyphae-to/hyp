@@ -121,7 +121,12 @@ impl JsonRpcResponse {
         }
     }
 
-    pub fn err(id: Option<RpcId>, code: i32, message: impl Into<String>, data: Option<Value>) -> Self {
+    pub fn err(
+        id: Option<RpcId>,
+        code: i32,
+        message: impl Into<String>,
+        data: Option<Value>,
+    ) -> Self {
         Self {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id,
@@ -314,8 +319,8 @@ pub fn decode_frame(line: &str) -> Result<PluginFrame, FrameError> {
                     .map_err(|e| FrameError::InvalidFrame(e.to_string()))?;
                 return Ok(PluginFrame::JsonRpcRequest(req));
             }
-            let notif: JsonRpcNotification = serde_json::from_value(val)
-                .map_err(|e| FrameError::InvalidFrame(e.to_string()))?;
+            let notif: JsonRpcNotification =
+                serde_json::from_value(val).map_err(|e| FrameError::InvalidFrame(e.to_string()))?;
             return Ok(PluginFrame::JsonRpcNotification(notif));
         }
 
@@ -329,8 +334,8 @@ pub fn decode_frame(line: &str) -> Result<PluginFrame, FrameError> {
                 "JSON-RPC response must contain an id field".to_string(),
             ));
         }
-        let resp: JsonRpcResponse = serde_json::from_value(val)
-            .map_err(|e| FrameError::InvalidFrame(e.to_string()))?;
+        let resp: JsonRpcResponse =
+            serde_json::from_value(val).map_err(|e| FrameError::InvalidFrame(e.to_string()))?;
         return Ok(PluginFrame::JsonRpcResponse(resp));
     }
 
@@ -532,14 +537,22 @@ mod tests {
 
     #[test]
     fn enforces_64kib_cap_and_bounded_line_splitter() {
-        let huge = format!(r#"{{"type":"event","to":"a","event":"{}"}}"#, "x".repeat(MAX_FRAME_BYTES));
+        let huge = format!(
+            r#"{{"type":"event","to":"a","event":"{}"}}"#,
+            "x".repeat(MAX_FRAME_BYTES)
+        );
         assert!(matches!(
             decode_frame(&huge),
             Err(FrameError::FrameTooLarge { .. })
         ));
 
         // Invalid JSON-RPC response with both result and error fails closed.
-        assert!(decode_frame(r#"{"jsonrpc":"2.0","id":1,"result":1,"error":{"code":-1,"message":"x"}}"#).is_err());
+        assert!(
+            decode_frame(
+                r#"{"jsonrpc":"2.0","id":1,"result":1,"error":{"code":-1,"message":"x"}}"#
+            )
+            .is_err()
+        );
 
         let mut splitter = LineSplitter::new(16, false);
         let mut lines = Vec::new();

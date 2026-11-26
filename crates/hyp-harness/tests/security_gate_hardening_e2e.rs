@@ -27,6 +27,7 @@ use hyp_harness::mcp::McpOptions;
 use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_async};
 use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::engine::{NodeConfig, UnifiedNode};
+use hyp_node::gates::SecurityGatePipeline;
 use hyp_node::gates::plugins::{BoxFuture, FilterPlugin};
 use hyp_node::gates::policy::{
     FilterPluginKind, GateDecision, InboundContext, RateLimitAction, RateLimitConfig,
@@ -34,7 +35,6 @@ use hyp_node::gates::policy::{
     sign_gate_policy,
 };
 use hyp_node::gates::stage2::FilterOutcome;
-use hyp_node::gates::SecurityGatePipeline;
 use hyp_proto::address::NodeId;
 use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
 use hyp_store::{
@@ -368,8 +368,9 @@ async fn g2_local_webhook_events_and_plugins_never_bypass_stage2_as_selfhost() {
         "local.github Event must screen as ExternalWebhook: {seen:?}"
     );
     assert!(
-        seen.iter()
-            .any(|(src, tier, _)| src == "local.telegram" && *tier == GateTrustTier::ExternalWebhook),
+        seen.iter().any(
+            |(src, tier, _)| src == "local.telegram" && *tier == GateTrustTier::ExternalWebhook
+        ),
         "local.telegram Event must screen as ExternalWebhook: {seen:?}"
     );
     assert!(
@@ -422,18 +423,23 @@ async fn g2_local_webhook_events_and_plugins_never_bypass_stage2_as_selfhost() {
             now_ms(),
         )
         .unwrap();
-    let drain2 = rpc(&sock2, &json!({ "type": "mailbox.drain", "sessionId": sid })).await;
+    let drain2 = rpc(
+        &sock2,
+        &json!({ "type": "mailbox.drain", "sessionId": sid }),
+    )
+    .await;
     assert!(drain2.ok);
     assert!(
-        drain2.result.unwrap()["items"].as_array().unwrap().is_empty(),
+        drain2.result.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
         "tampered gate MUST quarantine local-origin webhook Event fail-closed"
     );
     let q_all = node.db().local().list_quarantined(Some(sid), 50).unwrap();
     assert!(
-        q_all
-            .iter()
-            .any(|e| e.item_id == "gh-tampered-1"
-                && e.gate_reason.as_deref() == Some("gate_policy_tampered")),
+        q_all.iter().any(|e| e.item_id == "gh-tampered-1"
+            && e.gate_reason.as_deref() == Some("gate_policy_tampered")),
         "local webhook Event must be quarantined with gate_policy_tampered"
     );
     daemon2.stop().await;
@@ -513,9 +519,7 @@ async fn g3_slow_stage2_mid_await_arrival_never_delivers_ungated_and_no_double_c
     });
 
     // Wait deterministically until Item A has ENTERED the 160ms Stage 2 await!
-    slow_filter
-        .wait_entered(1, Duration::from_secs(3))
-        .await;
+    slow_filter.wait_entered(1, Duration::from_secs(3)).await;
 
     // 2. MID-AWAIT: Insert malicious Item B raw into SQLite AND launch concurrent `mailbox.drain`
     //    AND `hyp_inbox` (via MCP verified call) against the SAME session!
@@ -663,9 +667,8 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
         max_burst: 1,
         refill_per_min: 120,
     };
-    let pipeline = Arc::new(
-        SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap(),
-    );
+    let pipeline =
+        Arc::new(SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap());
 
     let daemon = LocalDaemon::start(
         Arc::clone(&node),
@@ -795,7 +798,10 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
                 && r.receipt_id.as_deref() == Some(receipt_m2.as_str())
                 && r.categories.contains(&"gate.held".to_string())
                 && r.reason.as_deref().unwrap_or("").contains("rate_limited")
-                && r.reason.as_deref().unwrap_or("").contains("retry_after_ms=")
+                && r.reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("retry_after_ms=")
         }),
         "G4 VIOLATION: Hold verdict must write immutable gate_audit row: {audit_rows:?}"
     );
@@ -835,7 +841,10 @@ async fn g4_rate_limit_hold_retains_audits_and_auto_retries_delivery() {
         })
         .await
         .unwrap();
-    assert!(r_b2.is_none(), "2nd immediate bridge message should hit Hold");
+    assert!(
+        r_b2.is_none(),
+        "2nd immediate bridge message should hit Hold"
+    );
 
     // Wait for automatic retry to deliver the held bridge message!
     let after_bridge_retry = transport.wait_for_count(4, Duration::from_secs(3)).await;
@@ -1105,14 +1114,22 @@ async fn hub_relayed_org_event_and_webhook_origin_capped_to_external_webhook_and
     assert!(!rendered.contains("via message envelope"));
 
     let seen = filter.seen_snapshot();
-    assert_eq!(seen.len(), 2, "both hub event & external-webhook item must hit Stage 2: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        2,
+        "both hub event & external-webhook item must hit Stage 2: {seen:?}"
+    );
     assert!(
         seen.iter()
             .all(|(_, tier, _)| *tier == GateTrustTier::ExternalWebhook),
         "all hub-relayed events/webhooks must be capped to ExternalWebhook: {seen:?}"
     );
     assert_eq!(
-        node.db().local().list_quarantined(Some(sid), 20).unwrap().len(),
+        node.db()
+            .local()
+            .list_quarantined(Some(sid), 20)
+            .unwrap()
+            .len(),
         2
     );
 
@@ -1230,15 +1247,13 @@ async fn g3_coalesce_over_approved_human_verified_row_rescreens_and_quarantines(
     let drain = rpc(&sock, &json!({ "type": "mailbox.drain", "sessionId": sid })).await;
     assert!(drain.ok);
     assert!(
-        drain.result.unwrap()["items"].as_array().unwrap().is_empty(),
+        drain.result.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
         "G3 VIOLATION: coalesced malicious payload bypassed gate via stale reviewed_at/human_auth_json!"
     );
-    let entry = node
-        .db()
-        .local()
-        .get_mailbox_entry(&rcpt)
-        .unwrap()
-        .unwrap();
+    let entry = node.db().local().get_mailbox_entry(&rcpt).unwrap().unwrap();
     assert_eq!(entry.gate_state, GateState::Quarantined);
     assert!(
         node.db()

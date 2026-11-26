@@ -95,17 +95,15 @@ impl BurstTracker {
         // Trip (or extend) Noisy Mode when exceeding `max_events_per_window`.
         if events_in_window > config.max_events_per_window {
             let until = now_ms.saturating_add(cooldown_ms);
-            entry.noisy_until_ms = Some(
-                entry
-                    .noisy_until_ms
-                    .map_or(until, |prev| prev.max(until)),
-            );
+            entry.noisy_until_ms = Some(entry.noisy_until_ms.map_or(until, |prev| prev.max(until)));
         }
 
         let noisy_mode = entry.noisy_until_ms.is_some_and(|until| now_ms < until);
         let (effective_urgency, demoted) = if noisy_mode
-            && matches!(base_urgency, DeliveryUrgency::Interrupt | DeliveryUrgency::Queue)
-        {
+            && matches!(
+                base_urgency,
+                DeliveryUrgency::Interrupt | DeliveryUrgency::Queue
+            ) {
             (DeliveryUrgency::Notify, true)
         } else {
             (base_urgency, false)
@@ -145,7 +143,12 @@ impl BurstTracker {
 
     /// Returns `true` if `source_key` is allowed to emit a delivery/digest at `now_ms`
     /// under `min_delivery_interval_secs` (always `true` when not in Noisy Mode).
-    pub fn can_deliver(&self, source_key: &str, config: &BurstProtectionConfig, now_ms: i64) -> bool {
+    pub fn can_deliver(
+        &self,
+        source_key: &str,
+        config: &BurstProtectionConfig,
+        now_ms: i64,
+    ) -> bool {
         let key = normalize_source_key(source_key);
         let Some(state) = self.sources.get(&key) else {
             return true;
@@ -216,14 +219,16 @@ mod tests {
 
         let t0 = 1_000_000;
         for i in 0..3 {
-            let a = tracker.record_and_evaluate("ci-bot", DeliveryUrgency::Queue, &cfg, t0 + i * 1_000);
+            let a =
+                tracker.record_and_evaluate("ci-bot", DeliveryUrgency::Queue, &cfg, t0 + i * 1_000);
             assert!(!a.noisy_mode);
             assert!(!a.demoted);
             assert_eq!(a.effective_urgency, DeliveryUrgency::Queue);
         }
 
         // 4th event within 60s exceeds max_events_per_window=3 -> Noisy Mode!
-        let tripped = tracker.record_and_evaluate("ci-bot", DeliveryUrgency::Interrupt, &cfg, t0 + 4_000);
+        let tripped =
+            tracker.record_and_evaluate("ci-bot", DeliveryUrgency::Interrupt, &cfg, t0 + 4_000);
         assert!(tripped.noisy_mode);
         assert!(tripped.demoted);
         assert_eq!(tripped.effective_urgency, DeliveryUrgency::Notify);

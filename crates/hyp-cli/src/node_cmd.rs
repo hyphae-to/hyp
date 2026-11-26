@@ -248,7 +248,14 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     let node_id = match NodeId::new(&node_id_raw) {
         Ok(id) => id,
         Err(e) => {
-            return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_NODE_ID", e.to_string(), None);
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_USAGE,
+                "INVALID_NODE_ID",
+                e.to_string(),
+                None,
+            );
         }
     };
 
@@ -266,13 +273,17 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     });
 
     let bind_addr: Option<SocketAddr> = match args.bind {
-        Some(ref raw) if raw.trim().eq_ignore_ascii_case("none") || raw.trim().eq_ignore_ascii_case("off") => {
+        Some(ref raw)
+            if raw.trim().eq_ignore_ascii_case("none")
+                || raw.trim().eq_ignore_ascii_case("off") =>
+        {
             None
         }
-        Some(ref raw) => match raw.parse::<SocketAddr>() {
-            Ok(a) => Some(a),
-            Err(e) => {
-                return emit_error(
+        Some(ref raw) => {
+            match raw.parse::<SocketAddr>() {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    return emit_error(
                     cmd,
                     as_json,
                     EXIT_USAGE,
@@ -280,10 +291,13 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     format!("Invalid --bind '{raw}': {e}"),
                     Some("Use <ip>:<port>, e.g. 127.0.0.1:8790 (or 'none' for SSH-only peer.sock)".to_string()),
                 );
+                }
             }
-        },
+        }
         None => loaded.as_ref().and_then(|c| c.bind_addr).or_else(|| {
-            if !explicit_ssh_only_config && matches!(profile, NodeProfile::Router | NodeProfile::P2p) {
+            if !explicit_ssh_only_config
+                && matches!(profile, NodeProfile::Router | NodeProfile::P2p)
+            {
                 Some("127.0.0.1:8790".parse().expect("valid default bind"))
             } else {
                 None
@@ -313,7 +327,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 };
                 (Some(resolved), true)
             }
-            _ if matches!(profile, NodeProfile::Router | NodeProfile::P2p) || explicit_ssh_only_config => {
+            _ if matches!(profile, NodeProfile::Router | NodeProfile::P2p)
+                || explicit_ssh_only_config =>
+            {
                 (
                     Some(state_dir.join(DEFAULT_PEER_SOCKET_FILENAME)),
                     bind_addr.is_none(),
@@ -432,7 +448,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     as_json,
                     EXIT_ERROR,
                     "CONFIG_ERROR",
-                    format!("Invalid deliveryRetry config in {}: {e}", cfg.path.display()),
+                    format!(
+                        "Invalid deliveryRetry config in {}: {e}",
+                        cfg.path.display()
+                    ),
                     None,
                 );
             }
@@ -448,11 +467,18 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                             as_json,
                             EXIT_ERROR,
                             "CONFIG_ERROR",
-                            format!("dropRelay.maxMemoryMb in {} must be >= 1", cfg.path.display()),
+                            format!(
+                                "dropRelay.maxMemoryMb in {} must be >= 1",
+                                cfg.path.display()
+                            ),
                             None,
                         );
                     }
-                    if dr.allowed_origins.iter().any(|o| o.trim() == "*" || o.trim().eq_ignore_ascii_case("null")) {
+                    if dr
+                        .allowed_origins
+                        .iter()
+                        .any(|o| o.trim() == "*" || o.trim().eq_ignore_ascii_case("null"))
+                    {
                         return emit_error(
                             cmd,
                             as_json,
@@ -577,11 +603,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
         // Parse optional `pairing.adminKey` (OKP Ed25519 JWK object, 43-char base64url raw pubkey,
         // or `{ "secret": "<name>" }` reference) so `POST /v1/pair` can verify Org Admin-CA `am2_` grants.
-        if let Some(admin_key_val) = cfg
-            .raw
-            .get("pairing")
-            .and_then(|p| p.get("adminKey"))
-        {
+        if let Some(admin_key_val) = cfg.raw.get("pairing").and_then(|p| p.get("adminKey")) {
             match parse_pairing_admin_key(admin_key_val, &secrets, &mut startup_warnings) {
                 Ok(maybe_jwk) => node_cfg.admin_jwk = maybe_jwk,
                 Err(e) => {
@@ -657,9 +679,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                             node_cfg.topics.push(TopicConfig {
                                 topic: gh.topic.clone(),
                                 kind: Some("github-webhook".to_string()),
-                                description: Some(
-                                    "GitHub webhook CloudEvents stream".to_string(),
-                                ),
+                                description: Some("GitHub webhook CloudEvents stream".to_string()),
                                 metadata: None,
                                 has_provisioned_publisher: true,
                             });
@@ -814,10 +834,12 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
     };
 
-    let legacy_warning = loaded
-        .as_ref()
-        .filter(|c| c.is_legacy_v1)
-        .map(|c| format!("Loaded legacy v1 config {}; consider migrating to node.json.", c.path.display()));
+    let legacy_warning = loaded.as_ref().filter(|c| c.is_legacy_v1).map(|c| {
+        format!(
+            "Loaded legacy v1 config {}; consider migrating to node.json.",
+            c.path.display()
+        )
+    });
 
     let state_dir_for_probe = state_dir.clone();
     let res = rt.block_on(async move {
@@ -1264,18 +1286,15 @@ struct NodeCmdPeersReloader {
 impl PeersReloader for NodeCmdPeersReloader {
     fn reload_peers<'a>(&'a self) -> DaemonBoxFuture<'a, Result<PeerReconcileReport, String>> {
         Box::pin(async move {
-            let report = self.node.reconcile_peers(DEFAULT_PEERS_RELOAD_TIMEOUT).await;
+            let report = self
+                .node
+                .reconcile_peers(DEFAULT_PEERS_RELOAD_TIMEOUT)
+                .await;
             {
-                let mut guard = self
-                    .status_doc
-                    .lock()
-                    .expect("status_doc lock poisoned");
+                let mut guard = self.status_doc.lock().expect("status_doc lock poisoned");
                 if let Some((ref path, ref mut doc)) = *guard {
                     if let Some(obj) = doc.as_object_mut() {
-                        obj.insert(
-                            "connectedPeers".to_string(),
-                            json!(report.connected_peers),
-                        );
+                        obj.insert("connectedPeers".to_string(), json!(report.connected_peers));
                     }
                     let _ = write_atomic_json(path, doc, true);
                 }
@@ -1434,8 +1453,8 @@ fn parse_ed25519_jwk_str_or_b64(raw: &str, context: &str) -> Result<ProtoOkpJwk,
         return Err(format!("{context} cannot be empty"));
     }
     if trimmed.starts_with('{') {
-        let val: Value = serde_json::from_str(trimmed)
-            .map_err(|e| format!("invalid JSON in {context}: {e}"))?;
+        let val: Value =
+            serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON in {context}: {e}"))?;
         return parse_ed25519_jwk_object(&val, context);
     }
     if trimmed.len() != 43 {
@@ -1630,8 +1649,8 @@ fn parse_trusted_proxies_array(val: &Value, field: &str) -> Result<Vec<String>, 
             .as_str()
             .ok_or_else(|| format!("{field} entries must be IP/CIDR strings"))?
             .trim();
-        let _ = validate_trusted_proxy_cidr(s)
-            .map_err(|e| format!("invalid entry in {field}: {e}"))?;
+        let _ =
+            validate_trusted_proxy_cidr(s).map_err(|e| format!("invalid entry in {field}: {e}"))?;
         out.push(s.to_string());
     }
     Ok(out)
@@ -1765,10 +1784,7 @@ fn parse_webhook_sources(
 
         match kind {
             "github-webhook" => {
-                let raw_id = obj
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("github");
+                let raw_id = obj.get("id").and_then(Value::as_str).unwrap_or("github");
                 let id = validate_webhook_source_id(raw_id, "sources[github-webhook].id")?;
                 if !gh_ids.insert(id.clone()) {
                     return Err(format!("duplicate github-webhook source id '{id}'"));
@@ -1803,9 +1819,7 @@ fn parse_webhook_sources(
                     )
                 })?;
                 let secret = secrets.get(&secret_name).map_err(|e| {
-                    format!(
-                        "failed to load secret '{secret_name}' for github-webhook '{id}': {e}"
-                    )
+                    format!("failed to load secret '{secret_name}' for github-webhook '{id}': {e}")
                 })?;
                 if secret.is_empty() {
                     return Err(format!(
@@ -1964,10 +1978,7 @@ fn parse_webhook_sources(
                     .get("topic")
                     .and_then(Value::as_str)
                     .unwrap_or("webhook");
-                let raw_id = obj
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(fallback_id);
+                let raw_id = obj.get("id").and_then(Value::as_str).unwrap_or(fallback_id);
                 let id = validate_webhook_source_id(raw_id, "sources[webhook-stream].id")?;
                 if !gen_ids.insert(id.clone()) {
                     return Err(format!("duplicate webhook-stream source id '{id}'"));
@@ -2002,9 +2013,7 @@ fn parse_webhook_sources(
                     )
                 })?;
                 let secret = secrets.get(&secret_name).map_err(|e| {
-                    format!(
-                        "failed to load secret '{secret_name}' for webhook-stream '{id}': {e}"
-                    )
+                    format!("failed to load secret '{secret_name}' for webhook-stream '{id}': {e}")
                 })?;
                 if secret.is_empty() {
                     return Err(format!(
@@ -2116,9 +2125,7 @@ fn parse_github_public_source(
         if let Some(max_pollers_val) = obj.get("maxActivePollers") {
             if !max_pollers_val.is_null() {
                 let Some(n) = max_pollers_val.as_u64() else {
-                    return Err(
-                        "sources[].maxActivePollers must be a positive integer".to_string()
-                    );
+                    return Err("sources[].maxActivePollers must be a positive integer".to_string());
                 };
                 if n == 0 {
                     return Err("sources[].maxActivePollers must be >= 1".to_string());
@@ -2157,10 +2164,9 @@ fn parse_github_public_source(
                 })?;
                 let mut seen_patterns: HashSet<String> = HashSet::new();
                 for (raw_pattern, secret_val) in repo_tokens_obj {
-                    let canonical =
-                        normalize_repo_token_pattern(raw_pattern).map_err(|e| {
-                            format!("invalid sources[].repoTokens pattern '{raw_pattern}': {e}")
-                        })?;
+                    let canonical = normalize_repo_token_pattern(raw_pattern).map_err(|e| {
+                        format!("invalid sources[].repoTokens pattern '{raw_pattern}': {e}")
+                    })?;
                     if !seen_patterns.insert(canonical.clone()) {
                         return Err(format!(
                             "duplicate normalized sources[].repoTokens pattern '{canonical}' (from '{raw_pattern}')"
@@ -2868,10 +2874,7 @@ mod plugin_runtime {
 
         pub(super) fn flush_to_status_doc(&self) {
             let latest = self.snapshot();
-            let mut guard = self
-                .status_doc
-                .lock()
-                .expect("status_doc lock poisoned");
+            let mut guard = self.status_doc.lock().expect("status_doc lock poisoned");
             if let Some((ref path, ref mut doc)) = *guard {
                 if let Some(obj) = doc.as_object_mut() {
                     obj.insert("plugins".to_string(), Value::Array(latest));
@@ -3496,8 +3499,10 @@ mod tests {
             "expected isolated missing-secret warning, got {warnings:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("Multiple enabled github-public sources found")
-                && w.contains("sources[0].repoTokens")),
+            warnings.iter().any(
+                |w| w.contains("Multiple enabled github-public sources found")
+                    && w.contains("sources[0].repoTokens")
+            ),
             "expected duplicate github-public source warning, got {warnings:?}"
         );
         // Never leak raw secret material into warnings.
@@ -3586,10 +3591,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_plugins_config_accepts_command_alias_isolates_errors_warns_plaintext_and_infers_webhook_kind() {
+    fn parse_plugins_config_accepts_command_alias_isolates_errors_warns_plaintext_and_infers_webhook_kind()
+     {
         let tmp = tempfile::tempdir().expect("tempdir");
         let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
-        secrets.set("tg-secret", "123456:REAL_BOT_SECRET_VAL").unwrap();
+        secrets
+            .set("tg-secret", "123456:REAL_BOT_SECRET_VAL")
+            .unwrap();
 
         let plugins = json!([
             // 1. Documented "command" alias (no "exec")
@@ -3667,11 +3675,19 @@ mod tests {
             &mut skipped,
         );
 
-        assert_eq!(parsed.len(), 3, "expected 3 valid plugins, got {}", parsed.len());
+        assert_eq!(
+            parsed.len(),
+            3,
+            "expected 3 valid plugins, got {}",
+            parsed.len()
+        );
         assert_eq!(parsed[0].config.id, "telegram");
         assert_eq!(parsed[0].config.exec, "/usr/bin/env");
         assert_eq!(parsed[0].config.kind, AdapterKind::Bridge);
-        assert!(!parsed[0].expose_topic, "bridge topics must default local-only");
+        assert!(
+            !parsed[0].expose_topic,
+            "bridge topics must default local-only"
+        );
         assert!(
             parsed[0]
                 .config
@@ -3689,9 +3705,9 @@ mod tests {
             "expected warning when exec & command differ: {warnings:?}"
         );
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("SLACK_BOT_TOKEN") && w.contains("plaintext") && w.contains("secret")),
+            warnings.iter().any(|w| w.contains("SLACK_BOT_TOKEN")
+                && w.contains("plaintext")
+                && w.contains("secret")),
             "expected plaintext secret warning for SLACK_BOT_TOKEN: {warnings:?}"
         );
         assert!(
@@ -3711,7 +3727,11 @@ mod tests {
         assert!(parsed[2].has_webhook_post_url);
 
         // Verify isolated errors vs skipped missing secret
-        assert_eq!(skipped.len(), 5, "expected 5 skipped/error entries: {skipped:?}");
+        assert_eq!(
+            skipped.len(),
+            5,
+            "expected 5 skipped/error entries: {skipped:?}"
+        );
         let by_id = |id: &str| {
             skipped
                 .iter()

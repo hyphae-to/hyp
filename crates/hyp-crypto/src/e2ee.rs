@@ -3,7 +3,7 @@
 //! - `channel.e2ee.v1`: Signed Epoch Room Keys (HPKE-wrapped per member) + AES-256-GCM + Ed25519 + anti-rollback
 //! - `kv.e2ee.v1`: Namespace Epoch Room Keys + AES-256-GCM with structured KV AAD + Ed25519 + version/epoch anti-rollback
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -364,10 +364,8 @@ fn epoch_wrap_aad(
     recipient_kid: &str,
     members_hash: &str,
 ) -> Vec<u8> {
-    format!(
-        "{host_node}\n{resource}\n{epoch}\n{member_node_id}\n{recipient_kid}\n{members_hash}"
-    )
-    .into_bytes()
+    format!("{host_node}\n{resource}\n{epoch}\n{member_node_id}\n{recipient_kid}\n{members_hash}")
+        .into_bytes()
 }
 
 /// Mints a fresh 256-bit room key for `epoch`, wraps it via RFC 9180 HPKE for each member,
@@ -411,7 +409,14 @@ pub fn create_epoch_bundle(
 
     let mut wraps = Vec::with_capacity(member_pairs.len());
     for (node_id, recipient_kid, enc_pk) in &member_pairs {
-        let aad = epoch_wrap_aad(host_node, resource, epoch, node_id, recipient_kid, &members_hash);
+        let aad = epoch_wrap_aad(
+            host_node,
+            resource,
+            epoch,
+            node_id,
+            recipient_kid,
+            &members_hash,
+        );
         let (enc, ct) = hpke::seal_base(enc_pk, &info, &aad, &*raw_key)?;
         wraps.push(WrappedMemberKey {
             node_id: node_id.clone(),
@@ -434,7 +439,13 @@ pub fn create_epoch_bundle(
     };
 
     let signed = creator_signing.sign_jcs("epoch-key", &payload)?;
-    Ok((RoomEpochKey { epoch, key: raw_key }, signed))
+    Ok((
+        RoomEpochKey {
+            epoch,
+            key: raw_key,
+        },
+        signed,
+    ))
 }
 
 /// Rotates an existing room key strictly to `prev_epoch + 1` for the updated member list.
@@ -1039,8 +1050,13 @@ mod tests {
             sender: "alice@macbook/claude",
             recipient: "bob@laptop/codex",
         };
-        let env = seal_dm(&ctx, b"secret deploy token", &alice.signing, &bob.encryption.public_key())
-            .unwrap();
+        let env = seal_dm(
+            &ctx,
+            b"secret deploy token",
+            &alice.signing,
+            &bob.encryption.public_key(),
+        )
+        .unwrap();
         let opened = open_dm(&env, &ctx, &alice.signing.public_key(), &bob.encryption).unwrap();
         assert_eq!(opened.as_slice(), b"secret deploy token");
 
@@ -1087,8 +1103,14 @@ mod tests {
             "alice@macbook",
             &alice.signing,
             &[
-                EpochMember { node_id: "alice@macbook", enc_pk: &alice_pub },
-                EpochMember { node_id: "bob@laptop", enc_pk: &bob_pub },
+                EpochMember {
+                    node_id: "alice@macbook",
+                    enc_pk: &alice_pub,
+                },
+                EpochMember {
+                    node_id: "bob@laptop",
+                    enc_pk: &bob_pub,
+                },
             ],
         )
         .unwrap();
@@ -1107,17 +1129,19 @@ mod tests {
         assert_eq!(bob_rk1.key_bytes(), rk1.key_bytes());
 
         // Carol cannot unwrap epoch 1
-        assert!(open_epoch_bundle(
-            &bundle1,
-            EpochScope::Channel,
-            "acme-team",
-            "#incidents",
-            &alice.signing.public_key(),
-            "carol@dev",
-            &carol.encryption,
-            1,
-        )
-        .is_err());
+        assert!(
+            open_epoch_bundle(
+                &bundle1,
+                EpochScope::Channel,
+                "acme-team",
+                "#incidents",
+                &alice.signing.public_key(),
+                "carol@dev",
+                &carol.encryption,
+                1,
+            )
+            .is_err()
+        );
 
         // Channel message in epoch 1
         let ch_ctx = ChannelContext {
@@ -1126,15 +1150,11 @@ mod tests {
             msg_id: "ch-1",
             sender: "alice@macbook/claude",
         };
-        let ch_env = seal_channel_message(&ch_ctx, b"p0 outage in checkout", &rk1, &alice.signing).unwrap();
-        let ch_pt = open_channel_message(
-            &ch_env,
-            &ch_ctx,
-            &bob_rk1,
-            &alice.signing.public_key(),
-            1,
-        )
-        .unwrap();
+        let ch_env =
+            seal_channel_message(&ch_ctx, b"p0 outage in checkout", &rk1, &alice.signing).unwrap();
+        let ch_pt =
+            open_channel_message(&ch_env, &ch_ctx, &bob_rk1, &alice.signing.public_key(), 1)
+                .unwrap();
         assert_eq!(ch_pt.as_slice(), b"p0 outage in checkout");
 
         // Rotate to epoch 2: Alice + Carol (Bob removed!)
@@ -1146,25 +1166,33 @@ mod tests {
             "alice@macbook",
             &alice.signing,
             &[
-                EpochMember { node_id: "alice@macbook", enc_pk: &alice_pub },
-                EpochMember { node_id: "carol@dev", enc_pk: &carol_pub },
+                EpochMember {
+                    node_id: "alice@macbook",
+                    enc_pk: &alice_pub,
+                },
+                EpochMember {
+                    node_id: "carol@dev",
+                    enc_pk: &carol_pub,
+                },
             ],
         )
         .unwrap();
         assert_eq!(rk2.epoch(), 2);
 
         // Bob cannot open epoch 2 bundle
-        assert!(open_epoch_bundle(
-            &bundle2,
-            EpochScope::Channel,
-            "acme-team",
-            "#incidents",
-            &alice.signing.public_key(),
-            "bob@laptop",
-            &bob.encryption,
-            2,
-        )
-        .is_err());
+        assert!(
+            open_epoch_bundle(
+                &bundle2,
+                EpochScope::Channel,
+                "acme-team",
+                "#incidents",
+                &alice.signing.public_key(),
+                "bob@laptop",
+                &bob.encryption,
+                2,
+            )
+            .is_err()
+        );
 
         // Rollback attempt: presenting bundle1 when min_expected_epoch = 2 fails closed!
         assert!(matches!(
@@ -1189,7 +1217,10 @@ mod tests {
             1,
             "alice@macbook",
             &alice.signing,
-            &[EpochMember { node_id: "alice@macbook", enc_pk: &alice_pub }],
+            &[EpochMember {
+                node_id: "alice@macbook",
+                enc_pk: &alice_pub,
+            }],
         )
         .unwrap();
         let kv_ctx = KvContext {
@@ -1202,19 +1233,43 @@ mod tests {
         };
         let kv_env = seal_kv_entry(&kv_ctx, b"deadbeef", &kv_rk, &alice.signing).unwrap();
         assert_eq!(
-            open_kv_entry(&kv_env, &kv_ctx, &kv_rk, &alice.signing.public_key(), 1, Some(5))
-                .unwrap()
-                .as_slice(),
+            open_kv_entry(
+                &kv_env,
+                &kv_ctx,
+                &kv_rk,
+                &alice.signing.public_key(),
+                1,
+                Some(5)
+            )
+            .unwrap()
+            .as_slice(),
             b"deadbeef"
         );
         // Version rollback (max_seen_version = 6 > envelope.version = 5) fails closed
         assert!(matches!(
-            open_kv_entry(&kv_env, &kv_ctx, &kv_rk, &alice.signing.public_key(), 1, Some(6)),
+            open_kv_entry(
+                &kv_env,
+                &kv_ctx,
+                &kv_rk,
+                &alice.signing.public_key(),
+                1,
+                Some(6)
+            ),
             Err(CryptoError::ReplayOrRollback(_))
         ));
         // Key swap attack fails closed
         let mut swapped = kv_ctx;
         swapped.key = "payments/sha";
-        assert!(open_kv_entry(&kv_env, &swapped, &kv_rk, &alice.signing.public_key(), 1, None).is_err());
+        assert!(
+            open_kv_entry(
+                &kv_env,
+                &swapped,
+                &kv_rk,
+                &alice.signing.public_key(),
+                1,
+                None
+            )
+            .is_err()
+        );
     }
 }

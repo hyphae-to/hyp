@@ -15,10 +15,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -300,7 +300,8 @@ pub fn decrypt_stream_v2<R: Read, W: Write>(
     my_enc_kp: &X25519KeyPair,
 ) -> Result<TransferStreamHeaderV2, CryptoError> {
     // 1. Verify sender Ed25519 signature FIRST!
-    let header: TransferStreamHeaderV2 = sender_signing_pk.verify_signed("transfer", signed_header)?;
+    let header: TransferStreamHeaderV2 =
+        sender_signing_pk.verify_signed("transfer", signed_header)?;
 
     if header.v != 2 || header.suite != SUITE_TRANSFER_STREAM_V2 {
         return Err(CryptoError::InvalidTransfer(
@@ -566,8 +567,13 @@ pub fn default_stage1_attachment_guard(rel_path: &str) -> Result<(), String> {
         }
     }
     for &seg in &segments {
-        if matches!(seg, ".claude" | ".agents" | ".codex" | ".cursor" | ".vscode") {
-            return Err(format!("blocked agent config directory '{seg}' in '{rel_path}'"));
+        if matches!(
+            seg,
+            ".claude" | ".agents" | ".codex" | ".cursor" | ".vscode"
+        ) {
+            return Err(format!(
+                "blocked agent config directory '{seg}' in '{rel_path}'"
+            ));
         }
     }
 
@@ -604,7 +610,10 @@ pub fn default_stage1_attachment_guard(rel_path: &str) -> Result<(), String> {
 /// Strictly validates a relative POSIX tar archive path.
 /// Rejects empty paths, leading `/`, `\`, NUL bytes, control chars, `.` or `..` segments,
 /// Windows drive prefixes (`C:`), and trailing slashes for regular files.
-pub fn validate_tar_archive_path(path: &str, allow_trailing_slash: bool) -> Result<String, CryptoError> {
+pub fn validate_tar_archive_path(
+    path: &str,
+    allow_trailing_slash: bool,
+) -> Result<String, CryptoError> {
     if path.is_empty() || path.len() > 4096 {
         return Err(CryptoError::UnsafeArchiveEntry(
             "archive path is empty or too long".into(),
@@ -652,7 +661,8 @@ pub fn validate_tar_archive_path(path: &str, allow_trailing_slash: bool) -> Resu
             )));
         }
         // Reject Windows drive prefix like `C:`
-        if part.len() >= 2 && part.as_bytes()[1] == b':' && part.as_bytes()[0].is_ascii_alphabetic() {
+        if part.len() >= 2 && part.as_bytes()[1] == b':' && part.as_bytes()[0].is_ascii_alphabetic()
+        {
             return Err(CryptoError::UnsafeArchiveEntry(format!(
                 "drive-qualified path rejected: '{path}'"
             )));
@@ -699,7 +709,11 @@ impl<W: Write> Write for HashingWriter<W> {
 fn write_octal(field: &mut [u8], val: u64) -> Result<(), CryptoError> {
     // Write NUL-terminated octal value fitting in `field.len() - 1` digits.
     let width = field.len() - 1;
-    let max_val = if width >= 21 { u64::MAX } else { (1u64 << (width * 3)) - 1 };
+    let max_val = if width >= 21 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 3)) - 1
+    };
     if val > max_val {
         return Err(CryptoError::InvalidTransfer(format!(
             "tar octal field overflow for value {val}"
@@ -711,7 +725,12 @@ fn write_octal(field: &mut [u8], val: u64) -> Result<(), CryptoError> {
     Ok(())
 }
 
-fn build_ustar_header(name: &str, size: u64, typeflag: u8, mode: u64) -> Result<[u8; TAR_BLOCK_SIZE], CryptoError> {
+fn build_ustar_header(
+    name: &str,
+    size: u64,
+    typeflag: u8,
+    mode: u64,
+) -> Result<[u8; TAR_BLOCK_SIZE], CryptoError> {
     let mut header = [0u8; TAR_BLOCK_SIZE];
     let name_bytes = name.as_bytes();
     let copy_len = name_bytes.len().min(100);
@@ -753,8 +772,7 @@ fn write_tar_entry_stream<W: Write, R: Read>(
     mut src: R,
 ) -> Result<String, CryptoError> {
     // Emit PAX extended header if path > 100 bytes, non-ASCII, or size > 8 GiB.
-    let needs_pax =
-        archive_path.len() > 100 || !archive_path.is_ascii() || size > 0o77777777777;
+    let needs_pax = archive_path.len() > 100 || !archive_path.is_ascii() || size > 0o77777777777;
     if needs_pax {
         let mut pax_data = String::new();
         pax_data.push_str(&format_pax_record("path", archive_path));
@@ -1111,10 +1129,9 @@ fn parse_pax_records(data: &[u8]) -> Result<PaxOverrides, CryptoError> {
         size: None,
     };
     while pos < data.len() {
-        let space = data[pos..]
-            .iter()
-            .position(|&b| b == b' ')
-            .ok_or_else(|| CryptoError::InvalidTransfer("malformed PAX record (missing space)".into()))?;
+        let space = data[pos..].iter().position(|&b| b == b' ').ok_or_else(|| {
+            CryptoError::InvalidTransfer("malformed PAX record (missing space)".into())
+        })?;
         let len_str = std::str::from_utf8(&data[pos..pos + space])
             .map_err(|_| CryptoError::InvalidTransfer("malformed PAX length".into()))?;
         let rec_len: usize = len_str
@@ -1395,7 +1412,9 @@ fn unpack_tar_gz_inner<R: Read>(
         if rem != 0 {
             let mut pad = [0u8; TAR_BLOCK_SIZE];
             if !read_exact_or_bomb(&mut stream, &mut pad[..TAR_BLOCK_SIZE - rem])? {
-                return Err(CryptoError::InvalidTransfer("truncated tar block padding".into()));
+                return Err(CryptoError::InvalidTransfer(
+                    "truncated tar block padding".into(),
+                ));
             }
         }
 
@@ -1551,53 +1570,61 @@ mod tests {
 
         // Mallory cannot decrypt
         let mut out_m = Vec::new();
-        assert!(decrypt_stream_v2(
-            &signed,
-            &ciphertext[..],
-            &mut out_m,
-            &sender.signing.public_key(),
-            "mallory@evil",
-            &mallory.encryption,
-        )
-        .is_err());
+        assert!(
+            decrypt_stream_v2(
+                &signed,
+                &ciphertext[..],
+                &mut out_m,
+                &sender.signing.public_key(),
+                "mallory@evil",
+                &mallory.encryption,
+            )
+            .is_err()
+        );
 
         // 1-bit flip in ciphertext fails
         let mut flipped = ciphertext.clone();
         flipped[100] ^= 0x01;
-        assert!(decrypt_stream_v2(
-            &signed,
-            &flipped[..],
-            &mut Vec::new(),
-            &sender.signing.public_key(),
-            "alice@macbook",
-            &alice.encryption,
-        )
-        .is_err());
+        assert!(
+            decrypt_stream_v2(
+                &signed,
+                &flipped[..],
+                &mut Vec::new(),
+                &sender.signing.public_key(),
+                "alice@macbook",
+                &alice.encryption,
+            )
+            .is_err()
+        );
 
         // Truncated stream (drop final chunk) fails
         let chunk0_and_1_end = 4 + 2 * (4 + TRANSFER_CHUNK_SIZE + GCM_TAG_LEN);
-        assert!(decrypt_stream_v2(
-            &signed,
-            &ciphertext[..chunk0_and_1_end],
-            &mut Vec::new(),
-            &sender.signing.public_key(),
-            "alice@macbook",
-            &alice.encryption,
-        )
-        .is_err());
+        assert!(
+            decrypt_stream_v2(
+                &signed,
+                &ciphertext[..chunk0_and_1_end],
+                &mut Vec::new(),
+                &sender.signing.public_key(),
+                "alice@macbook",
+                &alice.encryption,
+            )
+            .is_err()
+        );
 
         // Extended stream (trailing byte after final chunk) fails
         let mut extended = ciphertext.clone();
         extended.push(0x00);
-        assert!(decrypt_stream_v2(
-            &signed,
-            &extended[..],
-            &mut Vec::new(),
-            &sender.signing.public_key(),
-            "alice@macbook",
-            &alice.encryption,
-        )
-        .is_err());
+        assert!(
+            decrypt_stream_v2(
+                &signed,
+                &extended[..],
+                &mut Vec::new(),
+                &sender.signing.public_key(),
+                "alice@macbook",
+                &alice.encryption,
+            )
+            .is_err()
+        );
 
         // Reordered chunks (swap chunk 0 and chunk 1) fails
         let c_len = 4 + TRANSFER_CHUNK_SIZE + GCM_TAG_LEN;
@@ -1606,15 +1633,17 @@ mod tests {
         let c1 = ciphertext[4 + c_len..4 + 2 * c_len].to_vec();
         reordered[4..4 + c_len].copy_from_slice(&c1);
         reordered[4 + c_len..4 + 2 * c_len].copy_from_slice(&c0);
-        assert!(decrypt_stream_v2(
-            &signed,
-            &reordered[..],
-            &mut Vec::new(),
-            &sender.signing.public_key(),
-            "alice@macbook",
-            &alice.encryption,
-        )
-        .is_err());
+        assert!(
+            decrypt_stream_v2(
+                &signed,
+                &reordered[..],
+                &mut Vec::new(),
+                &sender.signing.public_key(),
+                "alice@macbook",
+                &alice.encryption,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1648,8 +1677,14 @@ mod tests {
 
         assert_eq!(unpacked.compressed_digest, packed.digest);
         assert_eq!(unpacked.files.len(), 2);
-        assert_eq!(fs::read(&unpacked.files[0].disk_path).unwrap(), b"hello world");
-        assert_eq!(fs::read(&unpacked.files[1].disk_path).unwrap(), b"long path via PAX");
+        assert_eq!(
+            fs::read(&unpacked.files[0].disk_path).unwrap(),
+            b"hello world"
+        );
+        assert_eq!(
+            fs::read(&unpacked.files[1].disk_path).unwrap(),
+            b"long path via PAX"
+        );
 
         #[cfg(unix)]
         {
@@ -1714,12 +1749,20 @@ mod tests {
         // 4. Hardlink & FIFO rejected
         let hardlink_tar = make_raw_tar_gz(&[("hl", b'1', b"")]);
         assert!(matches!(
-            unpack_tar_gz(&hardlink_tar[..], &tmp.path().join("d4"), &TarUnpackOptions::default()),
+            unpack_tar_gz(
+                &hardlink_tar[..],
+                &tmp.path().join("d4"),
+                &TarUnpackOptions::default()
+            ),
             Err(CryptoError::UnsafeArchiveEntry(_))
         ));
         let fifo_tar = make_raw_tar_gz(&[("pipe", b'6', b"")]);
         assert!(matches!(
-            unpack_tar_gz(&fifo_tar[..], &tmp.path().join("d5"), &TarUnpackOptions::default()),
+            unpack_tar_gz(
+                &fifo_tar[..],
+                &tmp.path().join("d5"),
+                &TarUnpackOptions::default()
+            ),
             Err(CryptoError::UnsafeArchiveEntry(_))
         ));
 
@@ -1735,7 +1778,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(bomb_archive.len() < 8 * 1024, "bomb should be highly compressed");
+        assert!(
+            bomb_archive.len() < 8 * 1024,
+            "bomb should be highly compressed"
+        );
         let d6 = tmp.path().join("d6");
         assert!(matches!(
             unpack_tar_gz(
@@ -1752,7 +1798,12 @@ mod tests {
         assert!(!d6.exists());
 
         // 6. Stage 1 attachment guard blocks `.sh` and `.git/hooks/pre-commit` with full cleanup!
-        for blocked_name in ["install.sh", ".git/hooks/pre-commit", "payload.dmg", "evil.exe"] {
+        for blocked_name in [
+            "install.sh",
+            ".git/hooks/pre-commit",
+            "payload.dmg",
+            "evil.exe",
+        ] {
             let mut buf = Vec::new();
             pack_tar_gz_bytes(
                 &[("readme.txt", b"hi"), (blocked_name, b"#!/bin/sh")],
@@ -1760,7 +1811,9 @@ mod tests {
                 TarPackOptions::default(),
             )
             .unwrap();
-            let d = tmp.path().join(format!("blocked-{}", blocked_name.replace(['/', '.'], "_")));
+            let d = tmp
+                .path()
+                .join(format!("blocked-{}", blocked_name.replace(['/', '.'], "_")));
             assert!(matches!(
                 unpack_tar_gz(
                     &buf[..],
@@ -1772,7 +1825,10 @@ mod tests {
                 ),
                 Err(CryptoError::AttachmentBlocked(_))
             ));
-            assert!(!d.exists(), "blocked attachment must wipe dest_dir immediately");
+            assert!(
+                !d.exists(),
+                "blocked attachment must wipe dest_dir immediately"
+            );
         }
     }
 }

@@ -221,9 +221,10 @@ impl ChannelPolicy {
     pub fn is_authorized_writer(&self, node_id: &str, address: Option<&str>) -> bool {
         match self.mode {
             ChannelMode::Open => true,
-            ChannelMode::Announcement => self.writers.iter().any(|w| {
-                w == node_id || address.is_some_and(|addr| w == addr)
-            }),
+            ChannelMode::Announcement => self
+                .writers
+                .iter()
+                .any(|w| w == node_id || address.is_some_and(|addr| w == addr)),
         }
     }
 
@@ -572,11 +573,7 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     /// Creates a `NodeConfig` for a given `node_id`, `profile`, and `state_dir`.
-    pub fn new(
-        node_id: NodeId,
-        profile: NodeProfile,
-        state_dir: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(node_id: NodeId, profile: NodeProfile, state_dir: impl Into<PathBuf>) -> Self {
         Self {
             node_id,
             profile,
@@ -648,7 +645,10 @@ impl NodeConfig {
 /// Normalizes IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) into plain `IpAddr::V4`.
 pub fn normalize_ip_addr(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     }
 }
@@ -702,7 +702,9 @@ impl TrustedProxyCidr {
                     let prefix: u32 = match prefix_opt {
                         Some(p) => {
                             let p6: u32 = p.parse().map_err(|_| {
-                                format!("invalid IPv6 prefix length '{p}' in trustedProxies '{raw}'")
+                                format!(
+                                    "invalid IPv6 prefix length '{p}' in trustedProxies '{raw}'"
+                                )
                             })?;
                             if !(96..=128).contains(&p6) {
                                 return Err(format!(
@@ -988,7 +990,13 @@ impl NodeError {
                 } else {
                     400
                 };
-                ProblemDetails::new(e.code(), e.code(), "Invalid CloudEvent", status, e.to_string())
+                ProblemDetails::new(
+                    e.code(),
+                    e.code(),
+                    "Invalid CloudEvent",
+                    status,
+                    e.to_string(),
+                )
             }
             Self::Filter(e) => ProblemDetails::new(
                 "invalid_filter",
@@ -1104,9 +1112,7 @@ fn store_error_to_problem(err: &StoreError) -> ProblemDetails {
             "checkpoint-rollback",
             "Directory Checkpoint Rollback",
             409,
-            format!(
-                "Authority '{authority_id}' presented checkpoint {received} < {expected_min}."
-            ),
+            format!("Authority '{authority_id}' presented checkpoint {received} < {expected_min}."),
         ),
         StoreError::EpochConflict { scope, message } => ProblemDetails::new(
             "epoch_conflict",
@@ -1279,10 +1285,7 @@ pub fn normalize_drop_portal_url(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("dropPortalUrl must not be empty".to_string());
     }
-    if trimmed
-        .chars()
-        .any(|c| c.is_control() || c.is_whitespace())
-    {
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err("dropPortalUrl must not contain whitespace or control characters".to_string());
     }
     if trimmed.contains('#') || trimmed.contains('?') {

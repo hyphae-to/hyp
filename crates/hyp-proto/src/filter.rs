@@ -101,14 +101,20 @@ fn check_filter(value: &Value, path: &str, depth: usize) -> Result<Filter, Filte
     if map.len() != 1 {
         return Err(FilterError::new(
             path,
-            format!("a filter must have exactly one key of {}", DIALECTS.join(", ")),
+            format!(
+                "a filter must have exactly one key of {}",
+                DIALECTS.join(", ")
+            ),
         ));
     }
     let (dialect, body) = map.iter().next().expect("map.len() == 1");
     if !DIALECTS.contains(&dialect.as_str()) {
         return Err(FilterError::new(
             path,
-            format!("a filter must have exactly one key of {}", DIALECTS.join(", ")),
+            format!(
+                "a filter must have exactly one key of {}",
+                DIALECTS.join(", ")
+            ),
         ));
     }
     let at = format!("{path}.{dialect}");
@@ -151,10 +157,16 @@ fn check_filter(value: &Value, path: &str, depth: usize) -> Result<Filter, Filte
         }
         "all" | "any" => {
             let Value::Array(children) = body else {
-                return Err(FilterError::new(at, "expected a non-empty array of filters"));
+                return Err(FilterError::new(
+                    at,
+                    "expected a non-empty array of filters",
+                ));
             };
             if children.is_empty() {
-                return Err(FilterError::new(at, "expected a non-empty array of filters"));
+                return Err(FilterError::new(
+                    at,
+                    "expected a non-empty array of filters",
+                ));
             }
             let mut parsed = Vec::with_capacity(children.len());
             for (idx, child) in children.iter().enumerate() {
@@ -209,8 +221,8 @@ impl CompiledFilters {
 
 /// Validates and compiles a `Vec<Filter>` into `CompiledFilters`.
 pub fn compile_filters(filters: Vec<Filter>) -> Result<CompiledFilters, FilterError> {
-    let as_value = serde_json::to_value(&filters)
-        .map_err(|e| FilterError::new("filters", e.to_string()))?;
+    let as_value =
+        serde_json::to_value(&filters).map_err(|e| FilterError::new("filters", e.to_string()))?;
     let validated = validate_filters(&as_value)?;
     Ok(CompiledFilters { filters: validated })
 }
@@ -512,7 +524,9 @@ fn collect_deduped_branches(local_subs: &[LocalSubscription]) -> (Vec<Filter>, V
         } else {
             // Keep as its own top-level AND list (valid as long as the local sub itself was valid).
             let key = jcs_key_for_list(&sub.filters);
-            standalone_by_jcs.entry(key).or_insert_with(|| sub.filters.clone());
+            standalone_by_jcs
+                .entry(key)
+                .or_insert_with(|| sub.filters.clone());
         }
     }
 
@@ -1280,7 +1294,10 @@ mod tests {
         for (idx, shard) in plan.shards.iter().enumerate() {
             assert!(shard.id.ends_with(&format!(":{idx}")));
             let val = serde_json::to_value(&shard.filters).unwrap();
-            assert!(validate_filters(&val).is_ok(), "shard {idx} failed validation");
+            assert!(
+                validate_filters(&val).is_ok(),
+                "shard {idx} failed validation"
+            );
         }
 
         // Superset soundness invariant: every event matching ANY local sub must match >= 1 shard!
@@ -1331,24 +1348,31 @@ mod tests {
 
         // Unprovisioned topic.
         let d_unknown = diagnose_subscription("linear", &[], &catalog);
-        assert!(d_unknown
-            .iter()
-            .any(|d| d.code == DiagnosticCode::UnprovisionedTopic
-                && d.severity == DiagnosticSeverity::Error));
+        assert!(
+            d_unknown
+                .iter()
+                .any(|d| d.code == DiagnosticCode::UnprovisionedTopic
+                    && d.severity == DiagnosticSeverity::Error)
+        );
 
         // Invalid github subject filter.
-        let d_subj = diagnose_subscription("github", &[exact("subject", "acme/checkout")], &catalog);
-        assert!(d_subj
-            .iter()
-            .any(|d| d.code == DiagnosticCode::InvalidGithubSubjectFilter
-                && d.severity == DiagnosticSeverity::Error));
+        let d_subj =
+            diagnose_subscription("github", &[exact("subject", "acme/checkout")], &catalog);
+        assert!(
+            d_subj
+                .iter()
+                .any(|d| d.code == DiagnosticCode::InvalidGithubSubjectFilter
+                    && d.severity == DiagnosticSeverity::Error)
+        );
 
         // Unmonitored repo.
         let d_unmon = diagnose_subscription("github", &[exact("repo", "other/repo")], &catalog);
-        assert!(d_unmon
-            .iter()
-            .any(|d| d.code == DiagnosticCode::UnmonitoredRepo
-                && d.severity == DiagnosticSeverity::Error));
+        assert!(
+            d_unmon
+                .iter()
+                .any(|d| d.code == DiagnosticCode::UnmonitoredRepo
+                    && d.severity == DiagnosticSeverity::Error)
+        );
 
         // Valid filter + negated unmonitored repo produces zero errors.
         let d_ok = diagnose_subscription(

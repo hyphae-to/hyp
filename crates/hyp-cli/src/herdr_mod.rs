@@ -249,7 +249,10 @@ pub fn install_herdr_mod(
 fn validate_clone_layout_name(name: &str) -> Result<(), String> {
     let trimmed = name.trim();
     if trimmed.is_empty()
-        || !trimmed.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        || !trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
         || !trimmed
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
@@ -805,7 +808,8 @@ mod tests {
         fs::create_dir_all(herdr_home.join("layouts")).unwrap();
         fs::write(
             herdr_home.join("shared.json"),
-            serde_json::to_string(&json!({ "layout": active_layout, "sidebar.width": 280 })).unwrap(),
+            serde_json::to_string(&json!({ "layout": active_layout, "sidebar.width": 280 }))
+                .unwrap(),
         )
         .unwrap();
         fs::write(
@@ -830,7 +834,11 @@ mod tests {
         let external_layout = external_repo.join("herdr-folders.json");
         let original = serde_json::to_string_pretty(&sample_layout("pane")).unwrap();
         fs::write(&external_layout, &original).unwrap();
-        symlink(&external_layout, herdr_home.join("layouts").join("herdr-folders.json")).unwrap();
+        symlink(
+            &external_layout,
+            herdr_home.join("layouts").join("herdr-folders.json"),
+        )
+        .unwrap();
 
         let outcome = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
 
@@ -868,7 +876,10 @@ mod tests {
         let skipped = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
 
         assert_eq!(skipped.layout_action, LayoutAction::SkippedSymlink);
-        assert_eq!(fs::read_to_string(&external_custom).unwrap(), original_custom);
+        assert_eq!(
+            fs::read_to_string(&external_custom).unwrap(),
+            original_custom
+        );
         assert!(
             skipped
                 .warnings
@@ -878,13 +889,10 @@ mod tests {
             skipped.warnings
         );
         assert!(
-            skipped
-                .notes
-                .iter()
-                .any(|n| n.contains("pill.js")
-                    && n.contains("renderHyphaePill")
-                    && n.contains("mods/folder-pane/")
-                    && n.contains("hyphae-panel")),
+            skipped.notes.iter().any(|n| n.contains("pill.js")
+                && n.contains("renderHyphaePill")
+                && n.contains("mods/folder-pane/")
+                && n.contains("hyphae-panel")),
             "note must guide pill.js composition + hyphae-panel: {:?}",
             skipped.notes
         );
@@ -973,7 +981,8 @@ mod tests {
         .unwrap();
         assert_eq!(forced.layout_action, LayoutAction::Patched);
         assert!(forced.backup_path.as_ref().is_some_and(|p| p.is_file()));
-        let patched: Value = serde_json::from_str(&fs::read_to_string(&layout_path).unwrap()).unwrap();
+        let patched: Value =
+            serde_json::from_str(&fs::read_to_string(&layout_path).unwrap()).unwrap();
         assert_eq!(
             patched["children"][0]["children"][0]["content"]["pane"]["header"]["content"]["mod"],
             "hyphae-pane"
@@ -995,7 +1004,8 @@ mod tests {
         assert_eq!(first.layout_action, LayoutAction::Patched);
         assert!(first.backup_path.as_ref().is_some_and(|p| p.is_file()));
 
-        let patched: Value = serde_json::from_str(&fs::read_to_string(&layout_path).unwrap()).unwrap();
+        let patched: Value =
+            serde_json::from_str(&fs::read_to_string(&layout_path).unwrap()).unwrap();
         assert_eq!(
             patched["children"][0]["children"][0]["content"]["pane"]["header"]["content"]["mod"],
             "hyphae-pane"
@@ -1112,7 +1122,8 @@ mod tests {
 
         let added = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
         assert_eq!(added.keys_action, "added");
-        let keys_after: Value = serde_json::from_str(&fs::read_to_string(&keys_path).unwrap()).unwrap();
+        let keys_after: Value =
+            serde_json::from_str(&fs::read_to_string(&keys_path).unwrap()).unwrap();
         assert_eq!(keys_after["global"]["cmd-shift-h"], "mod.open:hyphae-panel");
         assert_eq!(keys_after["global"]["cmd-t"], "tab.new");
         assert_eq!(keys_after["terminal"]["cmd-c"], "terminal.copy");
@@ -1128,7 +1139,8 @@ mod tests {
         .unwrap();
         let preserved = install_herdr_mod(tmp.path(), test_opts(&tmp)).unwrap();
         assert_eq!(preserved.keys_action, "preserved");
-        let keys_final: Value = serde_json::from_str(&fs::read_to_string(&keys_path).unwrap()).unwrap();
+        let keys_final: Value =
+            serde_json::from_str(&fs::read_to_string(&keys_path).unwrap()).unwrap();
         assert_eq!(keys_final["global"]["cmd-shift-h"], "mod.open:my-history");
     }
 

@@ -189,11 +189,7 @@ impl<'a> KvStore<'a> {
                         if input.writer_id != owner {
                             return Err(StoreError::Unauthorized(format!(
                                 "writer '{}' is not the owner '{}' of '{}/{}/{}'",
-                                input.writer_id,
-                                owner,
-                                input.host_node,
-                                input.namespace,
-                                input.key
+                                input.writer_id, owner, input.host_node, input.namespace, input.key
                             )));
                         }
                         if let Some(exp) = input.expected_version {
@@ -589,7 +585,9 @@ impl<'a> KvStore<'a> {
             )));
         }
         if input.epoch == 0 {
-            return Err(StoreError::InvalidInput("kv epoch must be >= 1".to_string()));
+            return Err(StoreError::InvalidInput(
+                "kv epoch must be >= 1".to_string(),
+            ));
         }
         let mut sorted_members = input.members.clone();
         sorted_members.sort();
@@ -617,7 +615,10 @@ impl<'a> KvStore<'a> {
             }
             return Err(StoreError::EpochConflict {
                 scope: format!("{}/kv/{}", input.host_node, input.namespace),
-                message: format!("epoch {} already exists with different content", input.epoch),
+                message: format!(
+                    "epoch {} already exists with different content",
+                    input.epoch
+                ),
             });
         }
 
@@ -667,11 +668,7 @@ impl<'a> KvStore<'a> {
     }
 
     /// Returns the latest E2EE epoch for `(host_node, namespace)`.
-    pub fn latest_epoch(
-        &self,
-        host_node: &str,
-        namespace: &str,
-    ) -> StoreResult<Option<KvEpoch>> {
+    pub fn latest_epoch(&self, host_node: &str, namespace: &str) -> StoreResult<Option<KvEpoch>> {
         self.db
             .conn()
             .query_row(

@@ -34,10 +34,10 @@ use hyp_crypto::compat_v1::{
     PairingCodeV1, derive_pairing_key_v1, format_pairing_code_v1, parse_pairing_code_v1,
 };
 use hyp_crypto::e2ee::{
-    ChannelContext, ChannelEnvelopeV1, DmContext, DmEnvelopeV1, EpochMember, EpochScope,
-    KvContext, KvEnvelopeV1, RoomEpochKey, SignedEpochKeyBundle, create_epoch_bundle,
-    open_channel_message, open_dm, open_epoch_bundle, open_kv_entry, rotate_epoch_bundle,
-    seal_channel_message, seal_dm, seal_kv_entry,
+    ChannelContext, ChannelEnvelopeV1, DmContext, DmEnvelopeV1, EpochMember, EpochScope, KvContext,
+    KvEnvelopeV1, RoomEpochKey, SignedEpochKeyBundle, create_epoch_bundle, open_channel_message,
+    open_dm, open_epoch_bundle, open_kv_entry, rotate_epoch_bundle, seal_channel_message, seal_dm,
+    seal_kv_entry,
 };
 use hyp_crypto::human::{
     DelegatedPairProofV1, HumanDropEnvelopeV1, HumanDropKind, HumanRevocationPayloadV1,
@@ -78,8 +78,8 @@ use hyp_proto::filter::{
 };
 use hyp_proto::manifest::{
     AdvertisedKvNamespace, AdvertisedResources, AdvertisedTopic, CapabilityToken, E2eePolicy,
-    ManifestIdentity, ManifestPolicy, NegotiatedSession, NodeManifestPayload,
-    PeerCapabilitiesView, PeerTrustHistory, SignedNodeManifest, negotiate_capabilities,
+    ManifestIdentity, ManifestPolicy, NegotiatedSession, NodeManifestPayload, PeerCapabilitiesView,
+    PeerTrustHistory, SignedNodeManifest, negotiate_capabilities,
 };
 use hyp_proto::problem::ProblemDetails;
 use hyp_proto::scopes::{
@@ -91,12 +91,12 @@ use hyp_store::{
     GateAuditInput, GateDecision as StoreGateDecision, GateDirection, GateState, GrantDirection,
     GrantInput, GrantRecord, HandleRecord, HumanAuthorityInput, HumanAuthorityRecord,
     HumanAuthorityRole, HumanAuthorityStatus, HumanClaimKind, HumanDelegationPolicyInput,
-    HumanNodeCertInput, IngestResult, KeyStatus, KeyUse, KvDeleteInput,
-    KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, MailboxEntry, MailboxInsert,
-    MailboxKind, MailboxPutOptions, MailboxPutResult, ManifestCacheUpdate, MessageRecord, NodeDb,
-    PeerInput, PeerKeyInput, PeerRecord, PeerStatus, PostChannelInput, PostChannelResult, Session,
-    StoreError, Subscription, SubscriptionSpec, TransferRecord, TransferSubmit, TrustTier,
-    UpstreamPushdownInput, WriteModel, format_address, now_ms, parse_address, sha256_hex, uuid_v4,
+    HumanNodeCertInput, IngestResult, KeyStatus, KeyUse, KvDeleteInput, KvDeleteResult, KvEntry,
+    KvEpoch, KvEpochInput, KvSetInput, MailboxEntry, MailboxInsert, MailboxKind, MailboxPutOptions,
+    MailboxPutResult, ManifestCacheUpdate, MessageRecord, NodeDb, PeerInput, PeerKeyInput,
+    PeerRecord, PeerStatus, PostChannelInput, PostChannelResult, Session, StoreError, Subscription,
+    SubscriptionSpec, TransferRecord, TransferSubmit, TrustTier, UpstreamPushdownInput, WriteModel,
+    format_address, now_ms, parse_address, sha256_hex, uuid_v4,
 };
 
 use crate::adapters::github_public::canonicalize_repo;
@@ -111,13 +111,7 @@ use crate::engine::config::{
     store_ce_to_proto, store_filter_to_proto,
 };
 use crate::engine::drop_relay::DropRelay;
-use crate::engine::http_util::{
-    HttpClient, compute_etag, full_body,
-};
-use crate::gates::{
-    GateDecision, InboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
-    VerifiedHumanClaim,
-};
+use crate::engine::http_util::{HttpClient, compute_etag, full_body};
 use crate::engine::peer_link::{
     AuthClaimReply, AuthClaimRequest, ChannelDirectoryEntry, ChannelJoinResponse,
     ChannelPostRequest, DelegatedPairReply, DelegatedPairRequest, GuestPairReply, GuestPairRequest,
@@ -126,6 +120,10 @@ use crate::engine::peer_link::{
     PostMessageRequest, PublishEventRequest, PutChannelEpochRequest, PutKeyRequest,
     PutKvEpochRequest, PutSubscriptionsRequest, SubscriptionInputWire, guest_pair_proof_canonical,
     http_auth_signing_input, spawn_sse_worker,
+};
+use crate::gates::{
+    GateDecision, InboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
+    VerifiedHumanClaim,
 };
 
 const MANIFEST_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -146,13 +144,30 @@ pub struct AuthenticatedPeer {
 /// handlers and pulled outbound-only SSE `/v1/inbox` delivery (`P1-6`, `P1-18`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerAction<'a> {
-    DmSend { to_addr: &'a str },
-    ChannelPost { channel: &'a str },
-    TransferSend { to_node: &'a str, bytes: Option<u64> },
-    StreamPublish { topic: &'a str },
-    StreamDeliver { topic: &'a str },
-    KvRead { namespace: &'a str, key: &'a str },
-    KvWrite { namespace: &'a str, key: &'a str },
+    DmSend {
+        to_addr: &'a str,
+    },
+    ChannelPost {
+        channel: &'a str,
+    },
+    TransferSend {
+        to_node: &'a str,
+        bytes: Option<u64>,
+    },
+    StreamPublish {
+        topic: &'a str,
+    },
+    StreamDeliver {
+        topic: &'a str,
+    },
+    KvRead {
+        namespace: &'a str,
+        key: &'a str,
+    },
+    KvWrite {
+        namespace: &'a str,
+        key: &'a str,
+    },
 }
 
 /// Summary returned after pairing and activating a `PeerLink`.
@@ -919,7 +934,11 @@ impl UnifiedNode {
 
     /// Sets and persists the access policy for `channel` (e.g. `ChannelPolicy::announcement(...)`)
     /// in `node.sqlite`, bumping the node's monotonic manifest version.
-    pub fn set_channel_policy(&self, channel: &str, policy: ChannelPolicy) -> Result<(), NodeError> {
+    pub fn set_channel_policy(
+        &self,
+        channel: &str,
+        policy: ChannelPolicy,
+    ) -> Result<(), NodeError> {
         let normalized = Channel::normalize(channel)?.into_inner();
         {
             let db = self.db();
@@ -1052,7 +1071,9 @@ impl UnifiedNode {
         backend_json: &str,
     ) -> Result<Session, NodeError> {
         let db = self.db();
-        Ok(db.local().register_session(session_id, backend_json, now_ms())?)
+        Ok(db
+            .local()
+            .register_session(session_id, backend_json, now_ms())?)
     }
 
     /// Enrolls a local handle for `session_id` and syncs local handles to every active `PeerLink`.
@@ -1081,7 +1102,8 @@ impl UnifiedNode {
             if db.local().get_session(session_id)?.is_none() {
                 db.local().register_session(session_id, "{}", now)?;
             }
-            db.local().set_session_handle(session_id, Some(handle), now)?;
+            db.local()
+                .set_session_handle(session_id, Some(handle), now)?;
             let rec = db.messages().register_handle_with_description(
                 self.config.node_id.as_str(),
                 handle,
@@ -1345,9 +1367,7 @@ impl UnifiedNode {
                             topics.push(AdvertisedTopic {
                                 topic: wh_topic.to_string(),
                                 kind: Some("github-webhook".to_string()),
-                                description: Some(
-                                    "GitHub webhook CloudEvents stream".to_string(),
-                                ),
+                                description: Some("GitHub webhook CloudEvents stream".to_string()),
                             });
                         }
                     }
@@ -1421,7 +1441,9 @@ impl UnifiedNode {
                 let mut channel_set: BTreeSet<String> = BTreeSet::new();
                 {
                     let db = self.db();
-                    if let Ok(list) = db.channels().list_channels(Some(self.config.node_id.as_str()))
+                    if let Ok(list) = db
+                        .channels()
+                        .list_channels(Some(self.config.node_id.as_str()))
                     {
                         for c in list {
                             channel_set.insert(c.channel);
@@ -1774,8 +1796,7 @@ impl UnifiedNode {
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let has_any_ed25519_hdr =
-            sig_hdr.is_some() || ts_hdr.is_some() || nonce_hdr.is_some();
+        let has_any_ed25519_hdr = sig_hdr.is_some() || ts_hdr.is_some() || nonce_hdr.is_some();
 
         let Some(raw_auth) = headers.get(AUTHORIZATION) else {
             if !has_any_ed25519_hdr {
@@ -1831,12 +1852,12 @@ impl UnifiedNode {
                     }
                 }
                 if let Some(ref kid) = binding.sign_kid {
-                    let key_active = db
-                        .peers()
-                        .get_peer_key(&binding.peer_id, kid)?
-                        .is_some_and(|k| {
-                            k.key_use == KeyUse::Signing && k.status == KeyStatus::Active
-                        });
+                    let key_active =
+                        db.peers()
+                            .get_peer_key(&binding.peer_id, kid)?
+                            .is_some_and(|k| {
+                                k.key_use == KeyUse::Signing && k.status == KeyStatus::Active
+                            });
                     if !key_active {
                         return Err(NodeError::Unauthorized(
                             "bearer credential signing key is no longer active".into(),
@@ -1860,9 +1881,8 @@ impl UnifiedNode {
                 let nonce = nonce_hdr.ok_or_else(|| {
                     NodeError::Unauthorized("missing X-Hyphae-Nonce header".into())
                 })?;
-                let sig = sig_hdr.ok_or_else(|| {
-                    NodeError::Unauthorized("missing X-Hyphae-Sig header".into())
-                })?;
+                let sig = sig_hdr
+                    .ok_or_else(|| NodeError::Unauthorized("missing X-Hyphae-Sig header".into()))?;
                 let _ = self.verify_ed25519_http_auth(
                     claimed_node,
                     ts_str,
@@ -2505,11 +2525,8 @@ impl UnifiedNode {
 
         // N1: Invalidate all previously issued bearer tokens for this peer on pair/re-pair.
         let _ = self.invalidate_peer_bearer_tokens(&binding.node_id)?;
-        let auth_credential = self.issue_peer_bearer_token(
-            &binding.node_id,
-            Some(&grant.id),
-            Some(&sign_kid),
-        )?;
+        let auth_credential =
+            self.issue_peer_bearer_token(&binding.node_id, Some(&grant.id), Some(&sign_kid))?;
         let caller = AuthenticatedPeer {
             peer_id: binding.node_id,
             scopes: ScopeSet::from_strings(&expanded_scopes),
@@ -2739,9 +2756,8 @@ impl UnifiedNode {
         let admin_pk = proto_jwk_to_crypto(admin_proto_jwk).to_ed25519()?;
         let now = now_ms();
 
-        let signed_invite = decode_hjoin1(&req.hjoin1).map_err(|e| {
-            NodeError::BadRequest(format!("invalid hjoin1_ invite token: {e}"))
-        })?;
+        let signed_invite = decode_hjoin1(&req.hjoin1)
+            .map_err(|e| NodeError::BadRequest(format!("invalid hjoin1_ invite token: {e}")))?;
         let invite = verify_human_invite(&signed_invite, &admin_pk, now).map_err(|e| {
             NodeError::Unauthorized(format!("hjoin1_ invite verification failed: {e}"))
         })?;
@@ -2778,8 +2794,8 @@ impl UnifiedNode {
             ));
         }
 
-        let (human_pk, _human_enc_pk) =
-            verify_human_invite_claim(&req.claim, &req.claim_sig, now).map_err(|e| {
+        let (human_pk, _human_enc_pk) = verify_human_invite_claim(&req.claim, &req.claim_sig, now)
+            .map_err(|e| {
                 NodeError::Unauthorized(format!("human invite claim signature invalid: {e}"))
             })?;
 
@@ -2798,15 +2814,16 @@ impl UnifiedNode {
             .unwrap_or("passkey-delegated")
             .to_string();
         let invite_expires_ms = parse_rfc3339_millis(&invite.expires_at)?;
-        let validated_scopes = validate_delegated_human_scopes(&invite.scopes).map_err(|e| {
-            NodeError::BadRequest(format!("invalid delegated invite scopes: {e}"))
-        })?;
+        let validated_scopes = validate_delegated_human_scopes(&invite.scopes)
+            .map_err(|e| NodeError::BadRequest(format!("invalid delegated invite scopes: {e}")))?;
 
         {
             let db = self.db();
 
             // Anti-hijack fail-closed: refuse enrolling a different key or resurrecting a revoked key.
-            let existing_for_human = db.human().list_authorities_for_human(&invite.human_id, true)?;
+            let existing_for_human = db
+                .human()
+                .list_authorities_for_human(&invite.human_id, true)?;
             for existing in &existing_for_human {
                 if existing.kid != kid {
                     return Err(NodeError::HumanKeyMismatch(format!(
@@ -2973,9 +2990,8 @@ impl UnifiedNode {
         let authority_pk = authority_jwk.to_ed25519()?;
         let required_epoch = min_auth_epoch.max(authority.auth_epoch);
 
-        let cert = verify_node_cert(&signed_cert, &authority_pk, now, required_epoch).map_err(
-            |e| NodeError::Unauthorized(format!("hcert1_ verification failed: {e}")),
-        )?;
+        let cert = verify_node_cert(&signed_cert, &authority_pk, now, required_epoch)
+            .map_err(|e| NodeError::Unauthorized(format!("hcert1_ verification failed: {e}")))?;
 
         if cert.human_id != authority.human_id {
             return Err(NodeError::Unauthorized(
@@ -3156,8 +3172,7 @@ impl UnifiedNode {
 
         // Invalidate stale bearer tokens and issue a fresh bearer credential.
         let _ = self.invalidate_peer_bearer_tokens(&req.node_id)?;
-        let auth_credential =
-            self.issue_peer_bearer_token(&req.node_id, None, Some(&sign_kid))?;
+        let auth_credential = self.issue_peer_bearer_token(&req.node_id, None, Some(&sign_kid))?;
 
         let caller = AuthenticatedPeer {
             peer_id: req.node_id.clone(),
@@ -3424,8 +3439,7 @@ impl UnifiedNode {
             .http_client
             .request_for_endpoint(&invite.router, http_req)
             .await?;
-        let (status, _headers, body) =
-            HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
+        let (status, _headers, body) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if !status.is_success() {
             return Err(HttpClient::decode_error_response(status, &body));
         }
@@ -3677,16 +3691,12 @@ impl UnifiedNode {
             //   2. Existing peer is an Active P2P peer, AND
             //   3. Existing pinned signing & encryption JWKs are identical to Bob's presented JWKs.
             let existing_peer = db.peers().get_peer(&verified.bob_node_id)?;
-            let existing_sign_keys = db.peers().list_peer_keys(
-                &verified.bob_node_id,
-                Some(KeyUse::Signing),
-                true,
-            )?;
-            let existing_enc_keys = db.peers().list_peer_keys(
-                &verified.bob_node_id,
-                Some(KeyUse::Encryption),
-                true,
-            )?;
+            let existing_sign_keys =
+                db.peers()
+                    .list_peer_keys(&verified.bob_node_id, Some(KeyUse::Signing), true)?;
+            let existing_enc_keys =
+                db.peers()
+                    .list_peer_keys(&verified.bob_node_id, Some(KeyUse::Encryption), true)?;
 
             if existing_peer.is_some()
                 || !existing_sign_keys.is_empty()
@@ -3936,8 +3946,7 @@ impl UnifiedNode {
             .http_client
             .request_for_endpoint(&offer.endpoint, http_req)
             .await?;
-        let (status, _headers, body) =
-            HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
+        let (status, _headers, body) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if !status.is_success() {
             return Err(HttpClient::decode_error_response(status, &body));
         }
@@ -3954,7 +3963,8 @@ impl UnifiedNode {
         // Pin Alice's JWKs from the OOB `hp2p1_` offer BEFORE verifying Alice's manifest!
         let alice_sign_pk = offer.signing_jwk.to_ed25519()?;
         let alice_enc_pk = offer.encryption_jwk.to_x25519()?;
-        let cred_ref = self.save_peer_auth_credential(&offer.node_id, &server_reply.auth_credential)?;
+        let cred_ref =
+            self.save_peer_auth_credential(&offer.node_id, &server_reply.auth_credential)?;
 
         {
             let db = self.db();
@@ -4058,8 +4068,7 @@ impl UnifiedNode {
             }
         };
 
-        self.activate_peer_link(peer_id, endpoint, negotiated)
-            .await
+        self.activate_peer_link(peer_id, endpoint, negotiated).await
     }
 
     async fn activate_peer_link(
@@ -4125,9 +4134,7 @@ impl UnifiedNode {
         let link = self.require_peer_link(peer_id).await?;
         let cached_etag = {
             let db = self.db();
-            db.peers()
-                .get_peer(peer_id)?
-                .and_then(|p| p.manifest_etag)
+            db.peers().get_peer(peer_id)?.and_then(|p| p.manifest_etag)
         };
         match link.fetch_manifest(cached_etag.as_deref()).await? {
             ManifestFetchOutcome::NotModified => Ok((true, None)),
@@ -4140,8 +4147,7 @@ impl UnifiedNode {
             ManifestFetchOutcome::LegacyV1 {
                 keys_endpoint_present,
             } => {
-                let negotiated =
-                    self.negotiate_legacy_v1_peer(peer_id, keys_endpoint_present)?;
+                let negotiated = self.negotiate_legacy_v1_peer(peer_id, keys_endpoint_present)?;
                 link.set_negotiated(negotiated.clone());
                 Ok((false, Some(negotiated)))
             }
@@ -4303,9 +4309,7 @@ impl UnifiedNode {
                         ));
                     }
                     Ok((pid, ep, Err(_))) => {
-                        warnings.push(format!(
-                            "Peer '{pid}' ({ep}) timed out during auto-connect"
-                        ));
+                        warnings.push(format!("Peer '{pid}' ({ep}) timed out during auto-connect"));
                     }
                     Err(e) => {
                         warnings.push(format!("Peer auto-connect task failed: {e}"));
@@ -4512,9 +4516,7 @@ impl UnifiedNode {
 
         let learned_via = {
             let db = self.db();
-            db.peers()
-                .get_peer_route(target_node)?
-                .map(|r| r.via_peer)
+            db.peers().get_peer_route(target_node)?.map(|r| r.via_peer)
         };
         if let Some(via_peer) = learned_via {
             if let Some(via_link) = self.active_peer_link(&via_peer).await {
@@ -4526,9 +4528,7 @@ impl UnifiedNode {
             self.refresh_routes_from_connected_peers().await;
             let refreshed_via = {
                 let db = self.db();
-                db.peers()
-                    .get_peer_route(target_node)?
-                    .map(|r| r.via_peer)
+                db.peers().get_peer_route(target_node)?.map(|r| r.via_peer)
             };
             if let Some(via_peer) = refreshed_via {
                 if let Some(via_link) = self.active_peer_link(&via_peer).await {
@@ -4687,13 +4687,13 @@ impl UnifiedNode {
             return self.list_directory_keys(filter_node);
         }
         if let Some(target) = filter_node {
-            let is_self_or_hub =
-                target == caller.peer_id || target == self.config.node_id.as_str();
+            let is_self_or_hub = target == caller.peer_id || target == self.config.node_id.as_str();
             let scoped_peer_lookup = caller.trust_tier != TrustTier::Guest
                 && (caller.scopes.may_dm_send(target)
                     || caller.scopes.may_send_files(target, None));
-            let shared_channel_member =
-                !is_self_or_hub && !scoped_peer_lookup && self.peers_share_authorized_channel(caller, target)?;
+            let shared_channel_member = !is_self_or_hub
+                && !scoped_peer_lookup
+                && self.peers_share_authorized_channel(caller, target)?;
             if is_self_or_hub || scoped_peer_lookup || shared_channel_member {
                 return self.list_directory_keys(Some(target));
             }
@@ -5076,7 +5076,8 @@ impl UnifiedNode {
         // Determine routing host node (context bound into HPKE info + AEAD AAD + Ed25519 sig)
         // and check E2EE capability requirement fail-closed!
         let (routing_host, use_e2ee) = if let Some(ref link) = outbound_link {
-            let supports_e2ee = self.peer_supports_cap(link.peer_id(), &CapabilityToken::DmE2eeV1, Some(link));
+            let supports_e2ee =
+                self.peer_supports_cap(link.peer_id(), &CapabilityToken::DmE2eeV1, Some(link));
             let policy = self.effective_e2ee_policy_for_peer(link.peer_id());
             if policy == E2eePolicy::Required && !supports_e2ee {
                 return Err(NodeError::CapabilityUnsupported(Box::new(
@@ -5087,7 +5088,10 @@ impl UnifiedNode {
                         "unknown",
                         Some("2.0.0"),
                         true,
-                        Some(&format!("Upgrade peer '{}' to support dm.e2ee.v1", link.peer_id())),
+                        Some(&format!(
+                            "Upgrade peer '{}' to support dm.e2ee.v1",
+                            link.peer_id()
+                        )),
                     ),
                 )));
             }
@@ -5107,7 +5111,10 @@ impl UnifiedNode {
                 )));
             }
             let policy = self.effective_e2ee_policy_for_peer(target_node.as_str());
-            (self.config.node_id.to_string(), policy != E2eePolicy::Disabled)
+            (
+                self.config.node_id.to_string(),
+                policy != E2eePolicy::Disabled,
+            )
         };
 
         let (wire_text, content_type) = if use_e2ee {
@@ -5255,10 +5262,10 @@ impl UnifiedNode {
                 // Case B — Non-router (`Local`/`P2p`) relaying to a 3rd node, OR Router transit-
                 // forwarding to a non-direct 3rd node: require BOTH local `forwarding` allowlist
                 // AND caller's explicit `forward:via=<target>` grant.
-                let policy_ok = self
-                    .config
-                    .forwarding
-                    .permits(&caller.peer_id, &to_node_owned, "dm");
+                let policy_ok =
+                    self.config
+                        .forwarding
+                        .permits(&caller.peer_id, &to_node_owned, "dm");
                 let scope_ok = caller.scopes.may_forward_via(&to_node_owned);
                 self.require_scope(
                     caller,
@@ -5394,12 +5401,13 @@ impl UnifiedNode {
 
                     // Defense-in-depth: on read-only announcement channels, verify the Ed25519
                     // sender is in the channel's authorized `writers` list!
-                    if let Some(policy) = self.resolve_channel_policy_for_inbound(
-                        origin_node,
-                        channel,
-                        origin_link.as_ref(),
-                    )
-                    .await
+                    if let Some(policy) = self
+                        .resolve_channel_policy_for_inbound(
+                            origin_node,
+                            channel,
+                            origin_link.as_ref(),
+                        )
+                        .await
                     {
                         if policy.mode == ChannelMode::Announcement
                             && !policy.is_authorized_writer(sender_node, Some(&msg.from_addr))
@@ -5429,13 +5437,8 @@ impl UnifiedNode {
                         msg_id: logical_msg_id,
                         sender: &msg.from_addr,
                     };
-                    let pt_bytes = open_channel_message(
-                        &env,
-                        &ctx,
-                        &room_key,
-                        &sender_sign_pk,
-                        min_epoch,
-                    )?;
+                    let pt_bytes =
+                        open_channel_message(&env, &ctx, &room_key, &sender_sign_pk, min_epoch)?;
                     let pt = String::from_utf8(pt_bytes.to_vec()).map_err(|_| {
                         NodeError::BadRequest("decrypted channel message is not valid UTF-8".into())
                     })?;
@@ -5470,8 +5473,7 @@ impl UnifiedNode {
                         sender: &msg.from_addr,
                         recipient: &msg.to_addr,
                     };
-                    let pt_bytes =
-                        open_dm(&env, &ctx, &sender_sign_pk, &self.identity.encryption)?;
+                    let pt_bytes = open_dm(&env, &ctx, &sender_sign_pk, &self.identity.encryption)?;
                     let pt = String::from_utf8(pt_bytes.to_vec()).map_err(|_| {
                         NodeError::BadRequest("decrypted DM is not valid UTF-8".into())
                     })?;
@@ -5615,10 +5617,8 @@ impl UnifiedNode {
                 )?
             };
             let policy = self.get_channel_policy(&channel);
-            let can_post = policy.is_authorized_writer(
-                self.config.node_id.as_str(),
-                Some(&membership.address),
-            );
+            let can_post = policy
+                .is_authorized_writer(self.config.node_id.as_str(), Some(&membership.address));
             return Ok(ChannelJoinResponse {
                 host_node: membership.host_node,
                 channel: membership.channel,
@@ -5731,7 +5731,10 @@ impl UnifiedNode {
             if !caller.scopes.may_channel_join(&ch) {
                 continue;
             }
-            let policy = policies.get(&ch).cloned().unwrap_or_else(ChannelPolicy::open);
+            let policy = policies
+                .get(&ch)
+                .cloned()
+                .unwrap_or_else(ChannelPolicy::open);
             let members = members_by_ch.get(&ch).cloned().unwrap_or_default();
             let can_post = caller.scopes.may_channel_post(&ch)
                 && policy.node_can_post(&caller.peer_id, &caller_addrs);
@@ -5822,9 +5825,7 @@ impl UnifiedNode {
             .fetch_channel_member_nodes(host_node, channel, link.as_ref())
             .await?;
         let prev_epoch = if let Some(ref l) = link {
-            l.get_channel_epoch(channel, None)
-                .await?
-                .map(|e| e.epoch)
+            l.get_channel_epoch(channel, None).await?.map(|e| e.epoch)
         } else {
             self.db()
                 .channels()
@@ -6373,9 +6374,7 @@ impl UnifiedNode {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let nid = parse_address(trimmed)
-                        .map(|(n, _)| n)
-                        .unwrap_or(trimmed);
+                    let nid = parse_address(trimmed).map(|(n, _)| n).unwrap_or(trimmed);
                     members.insert(nid.to_string());
                 }
                 return members.into_iter().collect();
@@ -6393,11 +6392,15 @@ impl UnifiedNode {
                         p.profile == hyp_store::PeerProfile::Router
                             || p.manifest_json
                                 .as_deref()
-                                .and_then(|raw| serde_json::from_str::<SignedNodeManifest>(raw).ok())
+                                .and_then(|raw| {
+                                    serde_json::from_str::<SignedNodeManifest>(raw).ok()
+                                })
                                 .and_then(|s| {
                                     serde_json::from_str::<NodeManifestPayload>(&s.payload).ok()
                                 })
-                                .is_some_and(|m| m.profile == hyp_proto::manifest::NodeProfile::Router)
+                                .is_some_and(|m| {
+                                    m.profile == hyp_proto::manifest::NodeProfile::Router
+                                })
                     })
             };
 
@@ -6832,7 +6835,9 @@ impl UnifiedNode {
         let entry_opt = if let Some(ref l) = link {
             l.kv_get(namespace, key).await?
         } else {
-            self.db().kv().get(&resolved_host, namespace, key, now_ms())?
+            self.db()
+                .kv()
+                .get(&resolved_host, namespace, key, now_ms())?
         };
         let Some(entry) = entry_opt else {
             return Ok(None);
@@ -7160,7 +7165,9 @@ impl UnifiedNode {
     ) -> Result<hyp_store::TransferSubmitResult, NodeError> {
         self.require_scope(
             caller,
-            caller.scopes.may_send_files(to_node, Some(blob.len() as u64)),
+            caller
+                .scopes
+                .may_send_files(to_node, Some(blob.len() as u64)),
             &format!("files:send={to_node}"),
         )?;
 
@@ -7179,9 +7186,7 @@ impl UnifiedNode {
         let submit_res = {
             let db = self.db();
             if let Some(h) = to_handle {
-                let _ = db
-                    .local()
-                    .set_metadata(&format!("transfer_handle:{id}"), h);
+                let _ = db.local().set_metadata(&format!("transfer_handle:{id}"), h);
             }
             db.transfers().submit(
                 &TransferSubmit {
@@ -7390,9 +7395,9 @@ impl UnifiedNode {
                     let blocked_reason = match err {
                         NodeError::Crypto(hyp_crypto::CryptoError::AttachmentBlocked(ref msg))
                         | NodeError::Crypto(hyp_crypto::CryptoError::UnsafeArchiveEntry(ref msg))
-                        | NodeError::Crypto(hyp_crypto::CryptoError::ArchiveLimitExceeded(ref msg)) => {
-                            Some(msg.clone())
-                        }
+                        | NodeError::Crypto(hyp_crypto::CryptoError::ArchiveLimitExceeded(
+                            ref msg,
+                        )) => Some(msg.clone()),
                         _ => None,
                     };
                     if let Some(msg) = blocked_reason {
@@ -7539,10 +7544,8 @@ impl UnifiedNode {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(
-                            &quarantine_dir,
-                            fs::Permissions::from_mode(0o700),
-                        );
+                        let _ =
+                            fs::set_permissions(&quarantine_dir, fs::Permissions::from_mode(0o700));
                     }
                     return Ok(quarantine_dir);
                 }
@@ -7625,7 +7628,9 @@ impl UnifiedNode {
         };
         let mut local_adapter_diags = Vec::new();
         if let Some(ref adapter) = local_gh_adapter {
-            let diags = adapter.validate_subscription(&topic_str, &req.filters).await;
+            let diags = adapter
+                .validate_subscription(&topic_str, &req.filters)
+                .await;
             if let Some(first_err) = diags
                 .iter()
                 .find(|d| d.severity == DiagnosticSeverity::Error)
@@ -7708,7 +7713,10 @@ impl UnifiedNode {
                 )?;
             }
             // Remove stale shards if shard count shrank.
-            for existing in db.events().list_upstream_pushdowns(Some(&origin_node_str))? {
+            for existing in db
+                .events()
+                .list_upstream_pushdowns(Some(&origin_node_str))?
+            {
                 if existing.topic == topic_str && (existing.shard_index as usize) >= shard_count {
                     let _ = db.events().delete_upstream_pushdown(&existing.id);
                 }
@@ -7862,7 +7870,10 @@ impl UnifiedNode {
             .collect();
 
         for sub in &req.subscriptions {
-            match caller.scopes.check_stream_subscribe(&sub.topic, &sub.filters) {
+            match caller
+                .scopes
+                .check_stream_subscribe(&sub.topic, &sub.filters)
+            {
                 Ok(approval) => {
                     if caller.trust_tier == TrustTier::Guest {
                         let Some(confined_repos) =
@@ -8145,7 +8156,12 @@ impl UnifiedNode {
                 && t.has_provisioned_publisher
                 && matches!(
                     t.kind.as_deref(),
-                    Some("github-public" | "github-webhook" | "prometheus-webhook" | "webhook-stream")
+                    Some(
+                        "github-public"
+                            | "github-webhook"
+                            | "prometheus-webhook"
+                            | "webhook-stream"
+                    )
                 )
         })
     }
@@ -9134,10 +9150,9 @@ impl UnifiedNode {
                         rendered_text: Some(body),
                         human_auth: Some(verified_claim),
                     };
-                    let eval = g
-                        .evaluate_inbound(&ctx, now)
-                        .await
-                        .map_err(|e| NodeError::Unauthorized(format!("security gate error: {e}")))?;
+                    let eval = g.evaluate_inbound(&ctx, now).await.map_err(|e| {
+                        NodeError::Unauthorized(format!("security gate error: {e}"))
+                    })?;
                     match eval.decision {
                         GateDecision::Allow {
                             downgraded_to_notify,
@@ -9163,9 +9178,12 @@ impl UnifiedNode {
                             retry_after_ms,
                         } => Err(NodeError::RateLimited {
                             detail: reason,
-                            retry_after_secs: Some((retry_after_ms.saturating_add(999) / 1_000).max(1)),
+                            retry_after_secs: Some(
+                                (retry_after_ms.saturating_add(999) / 1_000).max(1),
+                            ),
                         }),
-                        GateDecision::Block { reason } | GateDecision::Quarantine { reason, .. } => {
+                        GateDecision::Block { reason }
+                        | GateDecision::Quarantine { reason, .. } => {
                             Err(NodeError::Unauthorized(reason))
                         }
                     }
@@ -9257,7 +9275,8 @@ impl UnifiedNode {
         let signed_json = serde_json::to_string(signed)?;
         let active_issuer = {
             let db = self.db();
-            db.human().get_active_authority_by_kid(&preview.issuer_kid)?
+            db.human()
+                .get_active_authority_by_kid(&preview.issuer_kid)?
         };
         let issuer = match active_issuer {
             Some(rec) => rec,
@@ -9302,7 +9321,9 @@ impl UnifiedNode {
         let jwk: CryptoOkpJwk = serde_json::from_str(&issuer.jwk_json)?;
         let issuer_pk = jwk.to_ed25519()?;
         let verified = verify_human_revocation(signed, &issuer_pk).map_err(|e| {
-            NodeError::Unauthorized(format!("human revocation signature verification failed: {e}"))
+            NodeError::Unauthorized(format!(
+                "human revocation signature verification failed: {e}"
+            ))
         })?;
 
         let db = self.db();
@@ -9578,15 +9599,19 @@ fn peer_may_advertise_indirect_routes(peer: &PeerRecord) -> bool {
 }
 
 fn peer_has_any_kv_read(scopes: &ScopeSet) -> bool {
-    scopes.raw_scopes().iter().any(|s| {
-        s == "*" || s == "kv:*" || s == "kv:read" || s.starts_with("kv:read=")
-    })
+    scopes
+        .raw_scopes()
+        .iter()
+        .any(|s| s == "*" || s == "kv:*" || s == "kv:read" || s.starts_with("kv:read="))
 }
 
 fn extract_signed_human_revocation(data: &Value) -> Result<SignedHumanRevocationV1, NodeError> {
     let candidate = if data.get("payload").is_some() && data.get("sig").is_some() {
         data.clone()
-    } else if let Some(inner) = data.get("revocation").or_else(|| data.get("signedRevocation")) {
+    } else if let Some(inner) = data
+        .get("revocation")
+        .or_else(|| data.get("signedRevocation"))
+    {
         inner.clone()
     } else {
         return Err(NodeError::BadRequest(
@@ -9742,7 +9767,9 @@ fn parse_bearer_token_binding(raw: &str) -> Result<BearerTokenBinding, NodeError
             issued_at: None,
         })
     } else {
-        Err(NodeError::Unauthorized("empty bearer credential binding".into()))
+        Err(NodeError::Unauthorized(
+            "empty bearer credential binding".into(),
+        ))
     }
 }
 

@@ -86,13 +86,38 @@ fn published_linux_tar_targets_from_workflow(workflow_text: &str) -> BTreeSet<St
 #[test]
 fn all_seven_providers_generate_valid_uid10001_readable_configs_and_boot_cleanly() {
     let cases: &[(&str, &str, &str, &str)] = &[
-        ("docker", "acme-docker", "docker.acme.example", "0.0.0.0:8790"),
+        (
+            "docker",
+            "acme-docker",
+            "docker.acme.example",
+            "0.0.0.0:8790",
+        ),
         ("fly", "acme-fly", "acme-fly.fly.dev", "0.0.0.0:8790"),
         ("vps", "acme-vps", "vps.acme.example", "127.0.0.1:8790"),
-        ("drop-relay", "drop-relay", "drop.acme.example", "0.0.0.0:8790"),
-        ("public-node", "public.hyphae.to", "public.hyphae.to", "127.0.0.1:8790"),
-        ("tailscale", "alice-tailnet", "hyphae.example.ts.net", "127.0.0.1:8790"),
-        ("cloudflare", "homelab-cf", "cf.acme.example", "127.0.0.1:8790"),
+        (
+            "drop-relay",
+            "drop-relay",
+            "drop.acme.example",
+            "0.0.0.0:8790",
+        ),
+        (
+            "public-node",
+            "public.hyphae.to",
+            "public.hyphae.to",
+            "127.0.0.1:8790",
+        ),
+        (
+            "tailscale",
+            "alice-tailnet",
+            "hyphae.example.ts.net",
+            "127.0.0.1:8790",
+        ),
+        (
+            "cloudflare",
+            "homelab-cf",
+            "cf.acme.example",
+            "127.0.0.1:8790",
+        ),
     ];
 
     for &(provider, node_id, domain, expected_bind) in cases {
@@ -168,7 +193,10 @@ fn all_seven_providers_generate_valid_uid10001_readable_configs_and_boot_cleanly
         );
         assert_eq!(cfg_val["listen"]["publicUrl"], format!("https://{domain}"));
         assert_eq!(cfg_val["stateDir"], "/var/lib/hyphae");
-        if matches!(provider, "docker" | "fly" | "vps" | "tailscale" | "cloudflare") {
+        if matches!(
+            provider,
+            "docker" | "fly" | "vps" | "tailscale" | "cloudflare"
+        ) {
             assert_eq!(
                 cfg_val["sources"][0]["topic"], "github-webhooks",
                 "{provider}: Team Hub webhook source must use isolated topic 'github-webhooks'"
@@ -282,7 +310,9 @@ fn fly_and_drop_relay_kits_bind_0000_copy_node_json_and_honor_custom_ports() {
         fly_df.contains("/usr/local/bin/hyphae-entrypoint.sh")
             && fly_df.contains("chown -R 10001:10001")
             && fly_df.contains("chmod 0700")
-            && fly_df.contains("exec setpriv --reuid=10001 --regid=10001 --init-groups /usr/local/bin/hyp"),
+            && fly_df.contains(
+                "exec setpriv --reuid=10001 --regid=10001 --init-groups /usr/local/bin/hyp"
+            ),
         "OR2: Fly Dockerfile must fix root-owned [[mounts]] volume and drop to UID 10001:10001 via setpriv:\n{fly_df}"
     );
     assert!(
@@ -293,7 +323,9 @@ fn fly_and_drop_relay_kits_bind_0000_copy_node_json_and_honor_custom_ports() {
         !fly_df.contains("USER 10001:10001"),
         "OR2: Fly Dockerfile must start as root briefly to chown mounted volume before dropping via setpriv:\n{fly_df}"
     );
-    assert!(fly_df.contains("CMD [\"node\", \"start\", \"--config\", \"/etc/hyphae/node.json\", \"--no-local-socket\"]"));
+    assert!(fly_df.contains(
+        "CMD [\"node\", \"start\", \"--config\", \"/etc/hyphae/node.json\", \"--no-local-socket\"]"
+    ));
 
     // 2. Fly kit with `--enable-drop-relay`
     let fly_relay_dir = home.join("fly-relay-kit");
@@ -560,7 +592,11 @@ fn checked_in_deploy_dockerfile_and_dockerignore_cover_all_build_rs_and_include_
         if let Some(pos) = line.find("../../") {
             let rest = &line[pos + 6..];
             if let Some(dir) = rest.split('/').next() {
-                if !dir.is_empty() && dir.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                if !dir.is_empty()
+                    && dir
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
                     external_dirs.insert(dir.to_string());
                 }
             }
@@ -596,9 +632,18 @@ fn checked_in_deploy_dockerfile_and_dockerignore_cover_all_build_rs_and_include_
     }
 
     // Sanity check: we expect at least plugins, skills, scripts from current sources.
-    assert!(external_dirs.contains("plugins"), "expected plugins in {external_dirs:?}");
-    assert!(external_dirs.contains("skills"), "expected skills in {external_dirs:?}");
-    assert!(external_dirs.contains("scripts"), "expected scripts in {external_dirs:?}");
+    assert!(
+        external_dirs.contains("plugins"),
+        "expected plugins in {external_dirs:?}"
+    );
+    assert!(
+        external_dirs.contains("skills"),
+        "expected skills in {external_dirs:?}"
+    );
+    assert!(
+        external_dirs.contains("scripts"),
+        "expected scripts in {external_dirs:?}"
+    );
 
     // Every required workspace manifest + crate + external compile-time directory MUST be copied
     // in `deploy/Dockerfile` and MUST NOT be excluded by `.dockerignore`.
@@ -712,13 +757,16 @@ fn d8_team_hub_kits_document_admin_pubkey_and_live_hub_loads_it_on_first_boot() 
             assert!(
                 readme.contains("sudo -u hyphae")
                     && readme.contains("HYPHAE_SECRET_BACKEND=file")
-                    && readme.contains("hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae"),
+                    && readme
+                        .contains("hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae"),
                 "OR3: {provider} README must run secret set as hyphae user:\n{readme}"
             );
             assert!(
                 next_steps.iter().any(|s| s.contains("sudo -u hyphae")
                     && s.contains("HYPHAE_SECRET_BACKEND=file")
-                    && s.contains("hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae")),
+                    && s.contains(
+                        "hyp secret set hyphae-admin-pubkey --state-dir /var/lib/hyphae"
+                    )),
                 "OR3: {provider} next steps must run secret set as hyphae user: {next_steps:?}"
             );
         }
@@ -729,7 +777,10 @@ fn d8_team_hub_kits_document_admin_pubkey_and_live_hub_loads_it_on_first_boot() 
     for (label, extra_args) in [
         ("public-node", vec!["deploy", "init", "public-node"]),
         ("drop-relay", vec!["deploy", "init", "drop-relay"]),
-        ("docker-p2p", vec!["deploy", "init", "docker", "--profile", "p2p"]),
+        (
+            "docker-p2p",
+            vec!["deploy", "init", "docker", "--profile", "p2p"],
+        ),
     ] {
         let kit_dir = home.join(format!("non-team-{label}"));
         let mut args: Vec<&str> = extra_args;
@@ -776,7 +827,10 @@ fn d8_team_hub_kits_document_admin_pubkey_and_live_hub_loads_it_on_first_boot() 
     let admin_jwk = &invite_env["data"]["adminJwk"];
     assert_eq!(admin_jwk["kty"], "OKP");
     assert_eq!(admin_jwk["crv"], "Ed25519");
-    assert!(admin_jwk.get("d").is_none(), "adminJwk must be strictly public");
+    assert!(
+        admin_jwk.get("d").is_none(),
+        "adminJwk must be strictly public"
+    );
     let admin_jwk_json = serde_json::to_string(admin_jwk).unwrap();
 
     let mut set_proc = isolated_cmd(home)

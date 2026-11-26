@@ -22,9 +22,9 @@ use std::fs;
 #[cfg(unix)]
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 #[cfg(unix)]
 use std::process::{Command, Output};
-use std::process::Stdio;
 #[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
@@ -198,7 +198,11 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
     ];
 
     for path in &expected_paths {
-        assert!(path.is_file(), "expected installed skill at {}", path.display());
+        assert!(
+            path.is_file(),
+            "expected installed skill at {}",
+            path.display()
+        );
         let written = fs::read_to_string(path).expect("read installed skill");
         assert_eq!(
             written,
@@ -252,7 +256,13 @@ fn install_skill_handles_bare_gemini_directory_for_antigravity() {
 }
 
 #[cfg(unix)]
-fn write_executable_shim(bin_dir: &Path, name: &str, expected_skill: &Path, capture_file: &Path, exit_code: i32) {
+fn write_executable_shim(
+    bin_dir: &Path,
+    name: &str,
+    expected_skill: &Path,
+    capture_file: &Path,
+    exit_code: i32,
+) {
     use std::os::unix::fs::PermissionsExt;
 
     let script_path = bin_dir.join(name);
@@ -280,8 +290,20 @@ fn write_executable_shim(bin_dir: &Path, name: &str, expected_skill: &Path, capt
 #[test]
 fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
     let cases: &[(&str, &str, &str, Option<&str>, i32)] = &[
-        ("claude", "claude", ".claude/skills/hyphae-setup/SKILL.md", None, 0),
-        ("codex", "codex", ".codex/skills/hyphae-setup/SKILL.md", None, 0),
+        (
+            "claude",
+            "claude",
+            ".claude/skills/hyphae-setup/SKILL.md",
+            None,
+            0,
+        ),
+        (
+            "codex",
+            "codex",
+            ".codex/skills/hyphae-setup/SKILL.md",
+            None,
+            0,
+        ),
         (
             "agy",
             "agy",
@@ -296,8 +318,20 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
             Some("--prompt"),
             0,
         ),
-        ("cursor", "cursor-agent", ".cursor/skills/hyphae-setup/SKILL.md", None, 0),
-        ("gemini", "gemini", ".gemini/skills/hyphae-setup/SKILL.md", Some("-i"), 7),
+        (
+            "cursor",
+            "cursor-agent",
+            ".cursor/skills/hyphae-setup/SKILL.md",
+            None,
+            0,
+        ),
+        (
+            "gemini",
+            "gemini",
+            ".gemini/skills/hyphae-setup/SKILL.md",
+            Some("-i"),
+            7,
+        ),
     ];
 
     let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
@@ -347,7 +381,11 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
         );
 
         if let Some(flag) = expected_flag {
-            assert_eq!(lines.get(1).copied(), Some("ARGC=2"), "case {assist_arg}: {captured}");
+            assert_eq!(
+                lines.get(1).copied(),
+                Some("ARGC=2"),
+                "case {assist_arg}: {captured}"
+            );
             assert_eq!(
                 lines.get(2).copied(),
                 Some(format!("ARG={flag}").as_str()),
@@ -360,7 +398,11 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
                 "case {assist_arg} prompt missing skill reference: {prompt_line}"
             );
         } else {
-            assert_eq!(lines.get(1).copied(), Some("ARGC=1"), "case {assist_arg}: {captured}");
+            assert_eq!(
+                lines.get(1).copied(),
+                Some("ARGC=1"),
+                "case {assist_arg}: {captured}"
+            );
             let prompt_line = lines.get(2).copied().unwrap_or("");
             assert!(
                 prompt_line.contains("hyphae-setup")
@@ -459,9 +501,15 @@ fn non_interactive_onboard_preserves_backward_compatibility_and_never_hangs() {
         String::from_utf8_lossy(&plain_out.stderr)
     );
     let stdout = String::from_utf8_lossy(&plain_out.stdout);
-    assert!(stdout.contains("Onboarded Hyphae v2 Node"), "stdout={stdout}");
+    assert!(
+        stdout.contains("Onboarded Hyphae v2 Node"),
+        "stdout={stdout}"
+    );
     // Concise default Next steps (no redundant --config / --state-dir flags when using default paths).
-    assert!(stdout.contains("hyp status\n") || stdout.contains("hyp status\r\n"), "stdout={stdout}");
+    assert!(
+        stdout.contains("hyp status\n") || stdout.contains("hyp status\r\n"),
+        "stdout={stdout}"
+    );
     assert!(
         !stdout.contains("hyp status --state-dir"),
         "default onboard should emit concise Next steps without redundant --state-dir: {stdout}"
@@ -534,7 +582,10 @@ fn setup_codex_and_claude_write_descriptive_status_messages_and_replace_unnamed_
             .unwrap();
 
     // Unrelated user hook preserved, old unnamed Hyphae hook replaced (exact count == 2: custom + new Hyphae).
-    assert_eq!(codex_hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        codex_hooks["hooks"]["PreToolUse"].as_array().unwrap().len(),
+        2
+    );
 
     for (event, expected_msg) in [
         ("SessionStart", "Hyphae · Register session"),
@@ -677,9 +728,21 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
             Some("SKILL_PREEXISTED=1"),
             "hyphae-setup/SKILL.md must be installed BEFORE `hc run` executes"
         );
-        assert_eq!(lines.get(1).copied(), Some("ARGC=8"), "captured:\n{captured}");
-        assert_eq!(lines.get(2).copied(), Some("ARG=run"), "captured:\n{captured}");
-        assert_eq!(lines.get(3).copied(), Some("ARG=--bg"), "captured:\n{captured}");
+        assert_eq!(
+            lines.get(1).copied(),
+            Some("ARGC=8"),
+            "captured:\n{captured}"
+        );
+        assert_eq!(
+            lines.get(2).copied(),
+            Some("ARG=run"),
+            "captured:\n{captured}"
+        );
+        assert_eq!(
+            lines.get(3).copied(),
+            Some("ARG=--bg"),
+            "captured:\n{captured}"
+        );
         assert_eq!(
             lines.get(4).copied(),
             Some("ARG=--outlive-parent"),
@@ -850,7 +913,11 @@ fn assist_openclaw_and_t3_install_skill_and_emit_structured_manual_guide() {
         "missing prompt in JSON: {oc_json}"
     );
     let oc_skill = home_oc.join(".openclaw/skills/hyphae-setup/SKILL.md");
-    assert!(oc_skill.is_file(), "expected OpenClaw skill at {}", oc_skill.display());
+    assert!(
+        oc_skill.is_file(),
+        "expected OpenClaw skill at {}",
+        oc_skill.display()
+    );
     assert_eq!(fs::read_to_string(&oc_skill).unwrap(), canonical);
 
     // 1b. OpenClaw plain non-TTY flow also exits 0 and prints the 2-step guide.

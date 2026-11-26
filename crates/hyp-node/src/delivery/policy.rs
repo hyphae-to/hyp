@@ -285,7 +285,11 @@ impl DeliveryRule {
             }
             if let Some(node_prefix) = prefix.strip_suffix('.') {
                 // `<node>.*` matches any stream/topic on `<node>`
-                if origin == node_prefix && (topic.is_some() || ctx.kind == MailboxKind::Event || ctx.kind == MailboxKind::Kv) {
+                if origin == node_prefix
+                    && (topic.is_some()
+                        || ctx.kind == MailboxKind::Event
+                        || ctx.kind == MailboxKind::Kv)
+                {
                     return Some((3, prefix.len()));
                 }
                 if source.starts_with(prefix) {
@@ -521,7 +525,10 @@ impl SessionDeliveryPolicy {
         };
 
         if gate_downgraded_to_notify
-            && matches!(resolved, DeliveryUrgency::Interrupt | DeliveryUrgency::Queue)
+            && matches!(
+                resolved,
+                DeliveryUrgency::Interrupt | DeliveryUrgency::Queue
+            )
         {
             DeliveryUrgency::Notify
         } else {
@@ -675,10 +682,18 @@ impl ParsedMailboxSource {
     /// Stable normalized source key for per-source burst tracking.
     pub fn burst_source_key(&self) -> String {
         if let Some(ref ch) = self.channel {
-            return format!("{}/{}", self.origin_node.to_ascii_lowercase(), ch.to_ascii_lowercase());
+            return format!(
+                "{}/{}",
+                self.origin_node.to_ascii_lowercase(),
+                ch.to_ascii_lowercase()
+            );
         }
         if let Some(ref t) = self.topic {
-            return format!("{}.{}", self.origin_node.to_ascii_lowercase(), t.to_ascii_lowercase());
+            return format!(
+                "{}.{}",
+                self.origin_node.to_ascii_lowercase(),
+                t.to_ascii_lowercase()
+            );
         }
         if let Some(ref br) = self.bridge {
             return br.to_ascii_lowercase();
@@ -714,7 +729,8 @@ mod tests {
             .with_rule("#deploys", DeliveryUrgency::Mute)
             .with_rule("public.hyphae.to.*", DeliveryUrgency::Notify);
 
-        let oncall = ParsedMailboxSource::parse("acme-team", "ops@host/oncall", MailboxKind::Message);
+        let oncall =
+            ParsedMailboxSource::parse("acme-team", "ops@host/oncall", MailboxKind::Message);
         assert_eq!(
             policy.resolve_urgency(&oncall.as_context(), None, false),
             DeliveryUrgency::Interrupt
@@ -728,7 +744,8 @@ mod tests {
         );
 
         // Normal peer demoted to Notify in Focus Mode.
-        let alice = ParsedMailboxSource::parse("acme-team", "alice@mac/claude", MailboxKind::Message);
+        let alice =
+            ParsedMailboxSource::parse("acme-team", "alice@mac/claude", MailboxKind::Message);
         assert_eq!(
             policy.resolve_urgency(&alice.as_context(), None, false),
             DeliveryUrgency::Notify

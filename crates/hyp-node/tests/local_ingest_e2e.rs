@@ -160,8 +160,12 @@ async fn default_socket_permissions_cloudevent_shorthand_and_stream_wakeup() {
     {
         let db = node.db();
         let now = now_ms();
-        db.local().register_session("claude:morning", "{}", now).unwrap();
-        db.local().register_session("claude:nightly", "{}", now).unwrap();
+        db.local()
+            .register_session("claude:morning", "{}", now)
+            .unwrap();
+        db.local()
+            .register_session("claude:nightly", "{}", now)
+            .unwrap();
     }
     let sub_morning = node
         .subscribe_local_or_remote(SubscribeRequest {
@@ -229,7 +233,10 @@ async fn default_socket_permissions_cloudevent_shorthand_and_stream_wakeup() {
     )
     .await
     .unwrap();
-    assert_eq!(shorthand_receipt["ok"], true, "receipt: {shorthand_receipt}");
+    assert_eq!(
+        shorthand_receipt["ok"], true,
+        "receipt: {shorthand_receipt}"
+    );
     assert_eq!(shorthand_receipt["topic"], "local.schedule");
     assert_eq!(shorthand_receipt["route"], "default-schedule");
     assert_eq!(shorthand_receipt["trustTier"], "external-webhook");
@@ -292,7 +299,10 @@ async fn default_socket_permissions_cloudevent_shorthand_and_stream_wakeup() {
 
     // Clean stop removes socket from disk.
     server.stop().await;
-    assert!(!endpoint.exists(), "stop() must clean up ingest socket file");
+    assert!(
+        !endpoint.exists(),
+        "stop() must clean up ingest socket file"
+    );
     node.shutdown();
 }
 
@@ -544,15 +554,25 @@ async fn rate_and_burst_limits_drop_and_coalesce() {
     assert_eq!(receipt3["error"], "rate_limited");
     assert_eq!(receipt3["action"], "drop");
     assert!(receipt3["retryAfterMs"].as_u64().unwrap() > 0);
-    assert_eq!(node_drop.peek_local_inbox("claude:drop", 20).unwrap().len(), 2);
+    assert_eq!(
+        node_drop.peek_local_inbox("claude:drop", 20).unwrap().len(),
+        2
+    );
 
     // After 31 seconds (refill_per_min = 2 -> 1 token every 30s), next event succeeds.
     let r4 = srv_drop
-        .ingest_local_event(&json!({ "id": "drop-4", "note": "four" }), None, t0 + 31_000)
+        .ingest_local_event(
+            &json!({ "id": "drop-4", "note": "four" }),
+            None,
+            t0 + 31_000,
+        )
         .await
         .unwrap();
     assert_eq!(r4.id, "drop-4");
-    assert_eq!(node_drop.peek_local_inbox("claude:drop", 20).unwrap().len(), 3);
+    assert_eq!(
+        node_drop.peek_local_inbox("claude:drop", 20).unwrap().len(),
+        3
+    );
 
     srv_drop.stop().await;
     node_drop.shutdown();
@@ -612,7 +632,10 @@ async fn rate_and_burst_limits_drop_and_coalesce() {
             )
             .await
             .unwrap();
-        assert!(ci.coalesced, "event {i} should be coalesced under rate limit");
+        assert!(
+            ci.coalesced,
+            "event {i} should be coalesced under rate limit"
+        );
         assert_eq!(ci.coalesce_key.as_deref(), Some("cron:heartbeat"));
     }
 
@@ -628,7 +651,10 @@ async fn rate_and_burst_limits_drop_and_coalesce() {
         "bursty flood must collapse into 1 mailbox row, got {}",
         pending_ex.len()
     );
-    assert_eq!(pending_ex[0].coalesce_key.as_deref(), Some("cron:heartbeat"));
+    assert_eq!(
+        pending_ex[0].coalesce_key.as_deref(),
+        Some("cron:heartbeat")
+    );
     assert_eq!(pending_ex[0].missed_count, 4);
     assert!(pending_ex[0].entry.text.contains("tick-5"));
 
@@ -809,8 +835,12 @@ async fn hyphaesig_upgrades_trust_and_fails_closed_on_tamper_unsigned_or_revoked
     gate_cfg.policy_signature = Some(sig);
 
     let gate = Arc::new(
-        SecurityGatePipeline::new(gate_cfg.clone(), open_gate_db(&dir), Some(Arc::clone(&secrets)))
-            .unwrap(),
+        SecurityGatePipeline::new(
+            gate_cfg.clone(),
+            open_gate_db(&dir),
+            Some(Arc::clone(&secrets)),
+        )
+        .unwrap(),
     );
     assert!(!gate.is_policy_tampered());
 
@@ -860,7 +890,10 @@ async fn hyphaesig_upgrades_trust_and_fails_closed_on_tamper_unsigned_or_revoked
     let signed_ok = send_local_ingest_event(endpoint, &signed_wire)
         .await
         .unwrap();
-    assert_eq!(signed_ok["ok"], true, "valid hyphaesig must pass: {signed_ok}");
+    assert_eq!(
+        signed_ok["ok"], true,
+        "valid hyphaesig must pass: {signed_ok}"
+    );
     assert_eq!(signed_ok["trustTier"], "human-verified");
     assert_eq!(signed_ok["verifiedHumanKid"], alice_kp.kid());
     assert_eq!(signed_ok["verifiedHumanId"], "alice");
@@ -929,9 +962,10 @@ async fn hyphaesig_upgrades_trust_and_fails_closed_on_tamper_unsigned_or_revoked
             ..LocalIngestRoute::default_schedule_route()
         }],
     };
-    let strict_srv = LocalIngestServer::start(Arc::clone(&node), Some(Arc::clone(&gate)), strict_cfg)
-        .await
-        .unwrap();
+    let strict_srv =
+        LocalIngestServer::start(Arc::clone(&node), Some(Arc::clone(&gate)), strict_cfg)
+            .await
+            .unwrap();
     let unsigned_strict = send_local_ingest_event(
         strict_srv.endpoint_path(),
         &json!({ "id": "unsigned-strict-1", "note": "hello" }),
@@ -995,8 +1029,10 @@ async fn hyphaesig_upgrades_trust_and_fails_closed_on_tamper_unsigned_or_revoked
         json!({ "note": "signed by bob under tampered gate" }),
     );
     bob_ce.time = Some(format_rfc3339_millis(now_ms()));
-    let bob_sig =
-        sign_local_ingest_event(&bob_kp, &canonical_local_event_for_signing(&bob_ce).unwrap());
+    let bob_sig = sign_local_ingest_event(
+        &bob_kp,
+        &canonical_local_event_for_signing(&bob_ce).unwrap(),
+    );
     bob_ce.set_extension(EXT_LOCAL_EVENT_SIG, bob_sig);
     let mut bob_wire = serde_json::to_value(&bob_ce).unwrap();
     bob_wire
@@ -1250,12 +1286,10 @@ async fn framing_fuzz_serde_defaults_disabled_config_and_active_socket_guard() {
     assert_eq!(arr_resp["ok"], false);
     assert_eq!(arr_resp["error"], "invalid_event");
 
-    let bad_sig_type = send_local_ingest_event(
-        &endpoint,
-        &json!({ "note": "hi", "hyphaesig": 12345 }),
-    )
-    .await
-    .unwrap();
+    let bad_sig_type =
+        send_local_ingest_event(&endpoint, &json!({ "note": "hi", "hyphaesig": 12345 }))
+            .await
+            .unwrap();
     assert_eq!(bad_sig_type["ok"], false);
     assert_eq!(bad_sig_type["error"], "invalid_signature");
 

@@ -264,8 +264,9 @@ pub fn parse_fast_path_args(rest: &[String]) -> Result<StatuslineArgs, String> {
         } else if let Some((_, val)) = take_flag_value(rest, &mut i, "--socket")? {
             out.socket = Some(PathBuf::from(val));
         } else if let Some((_, val)) = take_flag_value(rest, &mut i, "--when-unenrolled")? {
-            out.when_unenrolled = WhenUnenrolled::parse(&val)
-                .ok_or_else(|| format!("Invalid --when-unenrolled '{val}' (expected hide or dim)"))?;
+            out.when_unenrolled = WhenUnenrolled::parse(&val).ok_or_else(|| {
+                format!("Invalid --when-unenrolled '{val}' (expected hide or dim)")
+            })?;
         } else if let Some((_, val)) = take_flag_value(rest, &mut i, "--chain-file")? {
             out.chain_file = Some(PathBuf::from(val));
         } else {
@@ -496,7 +497,9 @@ fn execute_chain_file(path: &Path, stdin_bytes: &[u8]) -> Option<String> {
     let stdout_handle = child.stdout.take().map(|stdout| {
         thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = stdout.take(MAX_CHAIN_OUTPUT_BYTES as u64).read_to_end(&mut buf);
+            let _ = stdout
+                .take(MAX_CHAIN_OUTPUT_BYTES as u64)
+                .read_to_end(&mut buf);
             buf
         })
     });
@@ -540,9 +543,7 @@ fn color_enabled(plain_flag: bool) -> bool {
     if plain_flag {
         return false;
     }
-    std::env::var("NO_COLOR")
-        .ok()
-        .is_none_or(|v| v.is_empty())
+    std::env::var("NO_COLOR").ok().is_none_or(|v| v.is_empty())
 }
 
 /// Formats the Hyphae statusline pill from a `session.summary` response result.
@@ -950,10 +951,8 @@ mod tests {
         );
 
         // Injection inside session_id is rejected by is_valid_session_id
-        let inj = parse_statusline_stdin(
-            StatuslineHarness::Claude,
-            br#"{"session_id":"$(whoami)"}"#,
-        );
+        let inj =
+            parse_statusline_stdin(StatuslineHarness::Claude, br#"{"session_id":"$(whoami)"}"#);
         assert_eq!(inj.session_id, None);
     }
 
@@ -1038,7 +1037,10 @@ mod tests {
 
     #[test]
     fn unenrolled_hide_vs_dim_and_offline_behavior() {
-        assert_eq!(format_statusline_pill(None, WhenUnenrolled::Hide, false), None);
+        assert_eq!(
+            format_statusline_pill(None, WhenUnenrolled::Hide, false),
+            None
+        );
         assert_eq!(
             format_statusline_pill(None, WhenUnenrolled::Dim, false).as_deref(),
             Some("hyphae: offline")

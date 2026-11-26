@@ -637,8 +637,8 @@ pub fn load_receipts(state_dir: &Path) -> Result<PluginReceiptsFile, String> {
             path.display()
         ));
     }
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let parsed: PluginReceiptsFile = serde_json::from_str(&raw)
         .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))?;
     Ok(parsed)
@@ -746,7 +746,11 @@ fn primary_script_display(plugin_id: &str, target_roots: &[PathBuf]) -> String {
     };
     match plugin_id {
         SDK_PLUGIN_ID => first.join("client.mjs").display().to_string(),
-        CLAUDE_PANEL_ID => first.join("hooks").join("register.tsx").display().to_string(),
+        CLAUDE_PANEL_ID => first
+            .join("hooks")
+            .join("register.tsx")
+            .display()
+            .to_string(),
         CLAUDE_CODE_ID | HERDR_MOD_ID => first.display().to_string(),
         _ => first.join("index.mjs").display().to_string(),
     }
@@ -812,12 +816,7 @@ fn inspect_plugin_file(
                 );
             }
             if !meta.file_type().is_file() {
-                return (
-                    true,
-                    false,
-                    None,
-                    Some("not a regular file".to_string()),
-                );
+                return (true, false, None, Some("not a regular file".to_string()));
             }
             match read_regular_file_checked(path) {
                 Ok(bytes) => {
@@ -848,10 +847,7 @@ fn check_claude_panel_wrappers(target_root: &Path) -> Option<String> {
         let p = target_root.join(rel);
         match fs::symlink_metadata(&p) {
             Err(_) => {
-                return Some(format!(
-                    "missing claude-panel wrapper file {}",
-                    p.display()
-                ));
+                return Some(format!("missing claude-panel wrapper file {}", p.display()));
             }
             Ok(meta) => {
                 if meta.file_type().is_symlink() || !meta.file_type().is_file() {
@@ -999,7 +995,8 @@ fn inspect_plugin(
                         first_detail = Some(wrapper_err);
                     }
                     all_file_records.extend(root_records);
-                    overall_status = Some(merge_plugin_status(overall_status, PluginStatus::Corrupt));
+                    overall_status =
+                        Some(merge_plugin_status(overall_status, PluginStatus::Corrupt));
                     continue;
                 }
             }
@@ -1187,12 +1184,7 @@ pub fn detect_node_path(home_override: Option<&Path>) -> Option<String> {
                 .join(bin_name),
         );
         fallback_candidates.push(home.join(".asdf").join("shims").join(bin_name));
-        fallback_candidates.push(
-            home.join(".fnm")
-                .join("current")
-                .join("bin")
-                .join(bin_name),
-        );
+        fallback_candidates.push(home.join(".fnm").join("current").join("bin").join(bin_name));
 
         let nvm_dir = home.join(".nvm").join("versions").join("node");
         if let Ok(entries) = fs::read_dir(&nvm_dir) {
@@ -1461,11 +1453,7 @@ async fn download_plugin_archive(
 pub fn redact_source_location(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
-        let cut = raw
-            .find('?')
-            .into_iter()
-            .chain(raw.find('#'))
-            .min();
+        let cut = raw.find('?').into_iter().chain(raw.find('#')).min();
         match cut {
             Some(idx) => raw[..idx].to_string(),
             None => raw.to_string(),
@@ -1879,10 +1867,7 @@ fn write_plugin_to_targets(
                             fs::remove_file(&mod_dir).map_err(|e| {
                                 PluginInstallError::new(
                                     "IO_ERROR",
-                                    format!(
-                                        "failed to remove symlink {}: {e}",
-                                        mod_dir.display()
-                                    ),
+                                    format!("failed to remove symlink {}: {e}", mod_dir.display()),
                                 )
                             })?;
                         } else {
@@ -1961,7 +1946,9 @@ fn reload_hint_for_plugin(plugin_id: &str) -> &'static str {
         HERDR_MOD_ID => {
             "Herdr hot-reloads updated hyphae-pane/hyphae-panel mods automatically via FSEvents."
         }
-        _ => "Run `hyp service restart --json` so running bridge subprocesses load updated scripts.",
+        _ => {
+            "Run `hyp service restart --json` so running bridge subprocesses load updated scripts."
+        }
     }
 }
 
@@ -1983,7 +1970,12 @@ pub fn install_claude_panel_for_profiles(
     if dry_run {
         let mut planned = Vec::new();
         for root in &target_roots {
-            planned.push(root.join(".claude-plugin").join("plugin.json").display().to_string());
+            planned.push(
+                root.join(".claude-plugin")
+                    .join("plugin.json")
+                    .display()
+                    .to_string(),
+            );
             planned.push(root.join("hooks").join("hooks.json").display().to_string());
             for entry in spec.files {
                 planned.push(
@@ -2015,7 +2007,12 @@ pub fn install_claude_panel_for_profiles(
     if all_up_to_date {
         let mut files = Vec::new();
         for root in &target_roots {
-            files.push(root.join(".claude-plugin").join("plugin.json").display().to_string());
+            files.push(
+                root.join(".claude-plugin")
+                    .join("plugin.json")
+                    .display()
+                    .to_string(),
+            );
             files.push(root.join("hooks").join("hooks.json").display().to_string());
             for entry in spec.files {
                 files.push(
@@ -2039,11 +2036,10 @@ pub fn install_claude_panel_for_profiles(
         resolve_and_verify_files(state_dir, &required, source)?;
     let files = write_plugin_to_targets(spec, &target_roots, &verified_files, true)?;
 
-    let mut receipts = load_receipts(state_dir)
-        .map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
+    let mut receipts =
+        load_receipts(state_dir).map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
     record_receipt(&mut receipts, spec, &target_roots);
-    save_receipts(state_dir, &receipts)
-        .map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
+    save_receipts(state_dir, &receipts).map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
 
     Ok(HarnessPluginInstallReport {
         files,
@@ -2117,11 +2113,10 @@ pub fn install_herdr_mod_files(
         resolve_and_verify_files(state_dir, &required, source)?;
     let files = write_plugin_to_targets(spec, &target_roots, &verified_files, true)?;
 
-    let mut receipts = load_receipts(state_dir)
-        .map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
+    let mut receipts =
+        load_receipts(state_dir).map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
     record_receipt(&mut receipts, spec, &target_roots);
-    save_receipts(state_dir, &receipts)
-        .map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
+    save_receipts(state_dir, &receipts).map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
 
     Ok(HarnessPluginInstallReport {
         files,
@@ -2323,8 +2318,8 @@ fn run_plugin_list(
             &receipts,
         );
         let installed = insp.status != PluginStatus::NotInstalled;
-        let verified = insp.status == PluginStatus::UpToDate
-            && (!is_bridge_consumer(spec.id) || sdk_verified);
+        let verified =
+            insp.status == PluginStatus::UpToDate && (!is_bridge_consumer(spec.id) || sdk_verified);
         if installed {
             installed_count += 1;
             match insp.status {
@@ -2406,9 +2401,7 @@ fn run_plugin_list(
 
     let mut next = Vec::new();
     if installed_count == 0 {
-        next.push(
-            "hyp plugin install <telegram|slack|claude-panel|herdr-mod> --json".to_string(),
-        );
+        next.push("hyp plugin install <telegram|slack|claude-panel|herdr-mod> --json".to_string());
     } else {
         if outdated_count > 0 {
             next.push("hyp plugin update --all --json".to_string());
@@ -2526,9 +2519,7 @@ fn run_plugin_install(
     };
 
     // Expand bridge installs to also ensure `sdk` is installed & verified alongside them.
-    let needs_sdk = requested_targets
-        .iter()
-        .any(|s| is_bridge_consumer(s.id));
+    let needs_sdk = requested_targets.iter().any(|s| is_bridge_consumer(s.id));
     let mut install_specs: Vec<&'static PinnedPluginSpec> = Vec::new();
     let mut seen_ids: BTreeSet<&'static str> = BTreeSet::new();
     if needs_sdk && seen_ids.insert(SDK_PLUGIN_ID) {
@@ -2562,7 +2553,10 @@ fn run_plugin_install(
                         spec.id,
                         insp.detail.as_deref().unwrap_or("modified")
                     ),
-                    Some(format!("Re-run with: hyp plugin install {} --force", spec.id)),
+                    Some(format!(
+                        "Re-run with: hyp plugin install {} --force",
+                        spec.id
+                    )),
                 );
             }
         }
@@ -2606,21 +2600,24 @@ fn run_plugin_install(
         }
     }
 
-    let (source_kind, source_detail, verified_files) =
-        match resolve_and_verify_files(&state_dir, &required_entries, source) {
-            Ok(res) => res,
-            Err(err) => {
-                let fix = if err.is_offline_download_error() {
-                    Some(
+    let (source_kind, source_detail, verified_files) = match resolve_and_verify_files(
+        &state_dir,
+        &required_entries,
+        source,
+    ) {
+        Ok(res) => res,
+        Err(err) => {
+            let fix = if err.is_offline_download_error() {
+                Some(
                         "Check network access or pass --archive <path-to-plugins.tar.gz> / --from-dir <plugins-dir>."
                             .to_string(),
                     )
-                } else {
-                    None
-                };
-                return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, fix);
-            }
-        };
+            } else {
+                None
+            };
+            return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, fix);
+        }
+    };
 
     // ALL required files passed constant-time SHA-256 verification. Now write atomically!
     for spec in &install_specs {
@@ -2669,7 +2666,9 @@ fn run_plugin_install(
     }
 
     let mut warnings = Vec::new();
-    let has_bridge = requested_targets.iter().any(|s| s.kind == PluginKind::Bridge);
+    let has_bridge = requested_targets
+        .iter()
+        .any(|s| s.kind == PluginKind::Bridge);
     if has_bridge && node_path.is_none() {
         warnings.push(
             "Node.js (24+) was not detected in PATH; install Node.js 24+ before enabling external bridge plugins in node.json."
@@ -2729,7 +2728,11 @@ fn run_plugin_install(
     } else {
         println!("OK    {summary}");
         if needs_sdk {
-            println!("      SDK:   {} ({})", sdk_dest.display(), &sdk_mjs_sha[..16]);
+            println!(
+                "      SDK:   {} ({})",
+                sdk_dest.display(),
+                &sdk_mjs_sha[..16]
+            );
         }
         for rec in &installed_records {
             println!(
@@ -2935,9 +2938,7 @@ fn run_plugin_update(
                 up_to_date.len(),
                 modified_skipped.len()
             )
-        } else if up_to_date.is_empty()
-            && modified_skipped.is_empty()
-            && corrupt_skipped.is_empty()
+        } else if up_to_date.is_empty() && modified_skipped.is_empty() && corrupt_skipped.is_empty()
         {
             "No installed official plugins found to update (0 downloads, 0 writes)".to_string()
         } else {
@@ -2950,7 +2951,10 @@ fn run_plugin_update(
         };
 
         if dry_run && !planned.is_empty() {
-            next.insert(0, "Re-run without --dry-run to apply plugin updates.".to_string());
+            next.insert(
+                0,
+                "Re-run without --dry-run to apply plugin updates.".to_string(),
+            );
         }
 
         if as_json {
@@ -3069,7 +3073,11 @@ fn run_plugin_update(
         println!("OK    {summary}");
         for name in &updated_names {
             if let Some(spec) = pinned_spec_for(name) {
-                println!("      updated  {:<13} tree {}", name, &spec.tree_sha256[..12]);
+                println!(
+                    "      updated  {:<13} tree {}",
+                    name,
+                    &spec.tree_sha256[..12]
+                );
             }
         }
         print_warnings(&warnings);
@@ -3087,13 +3095,11 @@ fn remove_plugin_on_disk(plugin_id: &str, target_roots: &[PathBuf]) -> Result<bo
                 let mod_dir = root.join(sub);
                 if let Ok(meta) = fs::symlink_metadata(&mod_dir) {
                     if meta.file_type().is_symlink() {
-                        fs::remove_file(&mod_dir).map_err(|e| {
-                            format!("Failed to remove {}: {e}", mod_dir.display())
-                        })?;
+                        fs::remove_file(&mod_dir)
+                            .map_err(|e| format!("Failed to remove {}: {e}", mod_dir.display()))?;
                     } else {
-                        fs::remove_dir_all(&mod_dir).map_err(|e| {
-                            format!("Failed to remove {}: {e}", mod_dir.display())
-                        })?;
+                        fs::remove_dir_all(&mod_dir)
+                            .map_err(|e| format!("Failed to remove {}: {e}", mod_dir.display()))?;
                     }
                     removed_any = true;
                 }
@@ -3169,12 +3175,8 @@ fn plugin_config_entry_matches(
         if let Some(args) = obj.get("args").and_then(Value::as_array) {
             for arg in args {
                 if let Some(s) = arg.as_str() {
-                    if arg_points_into_plugin_dir(
-                        s,
-                        &target_dir,
-                        canon_target_dir.as_deref(),
-                        home,
-                    ) {
+                    if arg_points_into_plugin_dir(s, &target_dir, canon_target_dir.as_deref(), home)
+                    {
                         return Some(entry_id.unwrap_or(target_id).to_string());
                     }
                 }
@@ -3473,7 +3475,10 @@ fn run_plugin_verify(
                     f.reason
                         .clone()
                         .unwrap_or_else(|| "SHA-256 verification failed".to_string()),
-                    Some(format!("Reinstall with: hyp plugin install {} --force", spec.id)),
+                    Some(format!(
+                        "Reinstall with: hyp plugin install {} --force",
+                        spec.id
+                    )),
                 ));
             }
         }
@@ -3484,7 +3489,10 @@ fn run_plugin_verify(
                 insp.detail
                     .clone()
                     .unwrap_or_else(|| "plugin integrity check failed".to_string()),
-                Some(format!("Reinstall with: hyp plugin install {} --force", spec.id)),
+                Some(format!(
+                    "Reinstall with: hyp plugin install {} --force",
+                    spec.id
+                )),
             ));
         }
 
@@ -3584,11 +3592,17 @@ fn run_plugin_verify(
     }
 
     let failed_files = records.iter().filter(|r| !r.verified).count();
-    let failed_checks = checks.iter().filter(|c| c.status == CheckStatus::Fail).count();
+    let failed_checks = checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Fail)
+        .count();
     let all_ok = failed_files == 0 && failed_checks == 0;
 
     let summary = if plugin_reports.is_empty() {
-        format!("No official plugins installed under {}", plugins_dir.display())
+        format!(
+            "No official plugins installed under {}",
+            plugins_dir.display()
+        )
     } else if all_ok {
         format!(
             "All {} installed plugin file(s) across {} plugin(s) verified against compile-time SHA-256 digests",
@@ -3605,7 +3619,10 @@ fn run_plugin_verify(
 
     let mut next = Vec::new();
     if !all_ok {
-        if plugin_reports.iter().any(|p| p.status == PluginStatus::Outdated) {
+        if plugin_reports
+            .iter()
+            .any(|p| p.status == PluginStatus::Outdated)
+        {
             next.push("hyp plugin update --all --json".to_string());
         } else {
             next.push("hyp plugin install all --force --json".to_string());
@@ -3738,11 +3755,8 @@ mod tests {
 
         // Verify per-plugin tree_sha256 deterministically.
         for spec in PINNED_PLUGINS {
-            let pairs: Vec<(&str, &str)> = spec
-                .files
-                .iter()
-                .map(|f| (f.rel_path, f.sha256))
-                .collect();
+            let pairs: Vec<(&str, &str)> =
+                spec.files.iter().map(|f| (f.rel_path, f.sha256)).collect();
             let recomputed = compute_tree_sha256(&pairs);
             assert_eq!(
                 spec.tree_sha256, recomputed,
@@ -4170,11 +4184,27 @@ mod tests {
         assert!(state_dir.join("plugins/telegram/index.mjs").is_file());
         assert!(state_dir.join("plugins/sdk/client.mjs").is_file());
         assert!(state_dir.join("plugins/sdk/client.py").is_file());
-        assert!(state_dir.join("plugins/claude-code/.claude-plugin/icon.png").is_file());
-        assert!(home.join(".claude/skills/hyphae-panel/hooks/register.tsx").is_file());
-        assert!(home.join(".claude/skills/hyphae-panel/.claude-plugin/plugin.json").is_file());
-        assert!(home.join(".config/herdr-app/mods/hyphae-pane/pill.js").is_file());
-        assert!(home.join(".config/herdr-app/mods/hyphae-panel/main.js").is_file());
+        assert!(
+            state_dir
+                .join("plugins/claude-code/.claude-plugin/icon.png")
+                .is_file()
+        );
+        assert!(
+            home.join(".claude/skills/hyphae-panel/hooks/register.tsx")
+                .is_file()
+        );
+        assert!(
+            home.join(".claude/skills/hyphae-panel/.claude-plugin/plugin.json")
+                .is_file()
+        );
+        assert!(
+            home.join(".config/herdr-app/mods/hyphae-pane/pill.js")
+                .is_file()
+        );
+        assert!(
+            home.join(".config/herdr-app/mods/hyphae-panel/main.js")
+                .is_file()
+        );
 
         // Verify passes across ALL 9 plugins!
         assert_eq!(
@@ -4432,7 +4462,12 @@ mod tests {
             }),
             ExitCode::from(EXIT_OK)
         );
-        assert!(!fs::symlink_metadata(&target_main).unwrap().file_type().is_symlink());
+        assert!(
+            !fs::symlink_metadata(&target_main)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read(&decoy).unwrap(), b"console.log('decoy');\n");
     }
 

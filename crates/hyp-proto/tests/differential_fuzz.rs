@@ -11,8 +11,7 @@
 use std::collections::BTreeMap;
 
 use hyp_proto::address::{
-    LOCAL_NODE_ID, NodeId, NodeScope, QualifiedTopic, Topic, resolve_topic,
-    validate_new_peer_alias,
+    LOCAL_NODE_ID, NodeId, NodeScope, QualifiedTopic, Topic, resolve_topic, validate_new_peer_alias,
 };
 use hyp_proto::cloudevent::CloudEvent;
 use hyp_proto::filter::{
@@ -280,10 +279,7 @@ fn random_heavy_filter_list(rng: &mut StdRng, sub_idx: usize, include_core: bool
     let repo_vals = FILTER_KEY_VALUES[0].1;
     let chosen_repo = repo_vals[rng.gen_range(0..repo_vals.len())];
     let mut filters = vec![
-        Filter::Any(vec![
-            Filter::Exact(data_map),
-            random_leaf_filter(rng),
-        ]),
+        Filter::Any(vec![Filter::Exact(data_map), random_leaf_filter(rng)]),
         Filter::Not(Box::new(exact_f(
             "data.excluded_tag",
             &format!("never-{sub_idx:03}-{}", "z".repeat(64)),
@@ -350,12 +346,16 @@ fn fuzz_pushdown_compiler_superset_invariant_500_asts() {
             let force_fallback = step >= 525;
             (0..sub_count)
                 .map(|i| {
-                    let mut filters = random_heavy_filter_list(&mut rng, step * 100 + i, !force_fallback);
+                    let mut filters =
+                        random_heavy_filter_list(&mut rng, step * 100 + i, !force_fallback);
                     if force_fallback {
                         // Unique long `repo` values on every sub so even CoreRoutingOnly exceeds 8 shards.
                         filters.push(exact_f(
                             "repo",
-                            &format!("org-{step:03}/very-long-unique-repo-name-{i:04}-{}", "r".repeat(900)),
+                            &format!(
+                                "org-{step:03}/very-long-unique-repo-name-{i:04}-{}",
+                                "r".repeat(900)
+                            ),
                         ));
                     }
                     LocalSubscription {
@@ -669,7 +669,8 @@ fn fuzz_dotted_node_id_longest_prefix_resolution() {
                 panic!("seed=0x{seed:016x} step={step}: local topic {local_input:?} failed: {e}")
             });
         assert_eq!(
-            local_resolved.node, NodeScope::Local,
+            local_resolved.node,
+            NodeScope::Local,
             "seed=0x{seed:016x} step={step}: local. prefix hijacked by peer for {local_input:?}"
         );
         assert_eq!(
@@ -799,7 +800,14 @@ fn fuzz_v1_v2_scopes_never_escalate_restricted_privileges() {
         ScopePreset::Member,
         ScopePreset::Full,
     ];
-    let probe_plugins = ["slack", "telegram", "whatsapp", "webhook", "prometheus", "*"];
+    let probe_plugins = [
+        "slack",
+        "telegram",
+        "whatsapp",
+        "webhook",
+        "prometheus",
+        "*",
+    ];
     let probe_targets = ["ops", "general", "C01234", "alerts", "*"];
     let probe_nodes = [
         "acme-team",
@@ -827,8 +835,8 @@ fn fuzz_v1_v2_scopes_never_escalate_restricted_privileges() {
         }
         let extra_count = rng.gen_range(1..=8);
         for _ in 0..extra_count {
-            let tok = NON_RESTRICTED_SCOPE_TOKENS
-                [rng.gen_range(0..NON_RESTRICTED_SCOPE_TOKENS.len())];
+            let tok =
+                NON_RESTRICTED_SCOPE_TOKENS[rng.gen_range(0..NON_RESTRICTED_SCOPE_TOKENS.len())];
             valid_tokens.push(tok.to_string());
         }
 
@@ -902,7 +910,9 @@ fn fuzz_v1_v2_scopes_never_escalate_restricted_privileges() {
         let size = rng.gen_range(1u64..=10_000_000);
 
         assert!(
-            !guest_ro.may_dm_send_any() && !guest_ro.may_dm_send(&target) && !guest_ro.may_dm_receive(),
+            !guest_ro.may_dm_send_any()
+                && !guest_ro.may_dm_send(&target)
+                && !guest_ro.may_dm_receive(),
             "seed=0x{seed:016x} step={step}: guest-ro granted DM privilege for {target}"
         );
         assert!(

@@ -33,16 +33,16 @@ use serde_json::Value;
 use serde_json::json;
 #[cfg(unix)]
 use std::fs;
-#[cfg(unix)]
-use std::io::{self, IsTerminal, Read, Write};
 #[cfg(not(unix))]
 use std::io::{self, IsTerminal};
 #[cfg(unix)]
+use std::io::{self, IsTerminal, Read, Write};
+#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::ExitCode;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
-use std::process::ExitCode;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
@@ -341,11 +341,7 @@ fn parse_session_view(val: &Value) -> SessionView {
     let compact_bridge_labels: Vec<String> = val
         .get("bridges")
         .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|b| clean_opt_str(Some(b)))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|b| clean_opt_str(Some(b))).collect())
         .unwrap_or_default();
 
     if bridges.is_empty() && !compact_bridge_labels.is_empty() {
@@ -401,7 +397,10 @@ fn parse_session_view(val: &Value) -> SessionView {
         .unwrap_or_default();
 
     let mut rules_and_mutes = Vec::new();
-    if let Some(mutes) = details.and_then(|d| d.get("mutes")).and_then(Value::as_array) {
+    if let Some(mutes) = details
+        .and_then(|d| d.get("mutes"))
+        .and_then(Value::as_array)
+    {
         for m in mutes {
             rules_and_mutes.push(RuleOrMuteRow::Mute {
                 pattern: clean_str_or(m.get("pattern"), ""),
@@ -410,7 +409,10 @@ fn parse_session_view(val: &Value) -> SessionView {
             });
         }
     }
-    if let Some(rules) = details.and_then(|d| d.get("rules")).and_then(Value::as_array) {
+    if let Some(rules) = details
+        .and_then(|d| d.get("rules"))
+        .and_then(Value::as_array)
+    {
         for r in rules {
             rules_and_mutes.push(RuleOrMuteRow::Rule {
                 target: clean_str_or(r.get("target"), ""),
@@ -924,11 +926,7 @@ fn render_tab_bar(state: &UiState, cols: usize, use_color: bool) -> String {
         }
     }
 
-    if use_color {
-        built_styled
-    } else {
-        built_plain
-    }
+    if use_color { built_styled } else { built_plain }
 }
 
 fn render_active_tab_body(
@@ -958,12 +956,22 @@ fn render_active_tab_body(
             cols,
             use_color,
         ),
-        UiTab::Queue => {
-            render_queue_tab(sess, state.selected_row, state.updated_at, budget, cols, use_color)
-        }
-        UiTab::RulesAndMutes => {
-            render_rules_tab(sess, state.selected_row, state.updated_at, budget, cols, use_color)
-        }
+        UiTab::Queue => render_queue_tab(
+            sess,
+            state.selected_row,
+            state.updated_at,
+            budget,
+            cols,
+            use_color,
+        ),
+        UiTab::RulesAndMutes => render_rules_tab(
+            sess,
+            state.selected_row,
+            state.updated_at,
+            budget,
+            cols,
+            use_color,
+        ),
         UiTab::MeshAndChannels => render_mesh_tab(
             &state.daemon,
             sess,
@@ -1112,7 +1120,12 @@ fn render_subs_tab(
                 filt
             )
         };
-        out.push(render_selectable_row(&line, abs_idx == selected, cols, use_color));
+        out.push(render_selectable_row(
+            &line,
+            abs_idx == selected,
+            cols,
+            use_color,
+        ));
     }
     out
 }
@@ -1128,7 +1141,10 @@ fn render_queue_tab(
     let mut out = Vec::new();
     if sess.queued_items.is_empty() {
         out.push(style_wrap(
-            &truncate_plain("Queue empty — zero pending items (metadata-only view).", cols),
+            &truncate_plain(
+                "Queue empty — zero pending items (metadata-only view).",
+                cols,
+            ),
             "2",
             use_color,
         ));
@@ -1169,7 +1185,12 @@ fn render_queue_tab(
                 state_lbl
             )
         };
-        out.push(render_selectable_row(&line, abs_idx == selected, cols, use_color));
+        out.push(render_selectable_row(
+            &line,
+            abs_idx == selected,
+            cols,
+            use_color,
+        ));
     }
     out
 }
@@ -1185,7 +1206,10 @@ fn render_rules_tab(
     let mut out = Vec::new();
     if sess.rules_and_mutes.is_empty() {
         out.push(style_wrap(
-            &truncate_plain("No delivery rules or mutes active. Press `m` to mute all.", cols),
+            &truncate_plain(
+                "No delivery rules or mutes active. Press `m` to mute all.",
+                cols,
+            ),
             "2",
             use_color,
         ));
@@ -1238,7 +1262,12 @@ fn render_rules_tab(
                 age
             )
         };
-        out.push(render_selectable_row(&line, abs_idx == selected, cols, use_color));
+        out.push(render_selectable_row(
+            &line,
+            abs_idx == selected,
+            cols,
+            use_color,
+        ));
     }
     out
 }
@@ -1314,7 +1343,12 @@ fn render_mesh_tab(
                     ch.mode
                 )
             };
-            out.push(render_selectable_row(&line, abs_idx == selected, cols, use_color));
+            out.push(render_selectable_row(
+                &line,
+                abs_idx == selected,
+                cols,
+                use_color,
+            ));
         }
     }
 
@@ -1367,7 +1401,8 @@ fn render_status_line(state: &UiState, cols: usize, use_color: bool) -> String {
 
     let q = state.effective_quarantined();
     if q > 0 {
-        let msg = format!("⚠ {q} item(s) quarantined by Local Security Gate — run `hyp gate review`");
+        let msg =
+            format!("⚠ {q} item(s) quarantined by Local Security Gate — run `hyp gate review`");
         return style_wrap(&truncate_plain(&msg, cols), "1;31", use_color);
     }
 
@@ -1987,10 +2022,8 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
                     WatchEvent::Disconnected { reason, attempt } => {
                         state.daemon.online = false;
                         state.watch_status = WatchStatus::Reconnecting { attempt };
-                        state.status_message = Some((
-                            format!("OFFLINE (reconnecting…) · {reason}"),
-                            true,
-                        ));
+                        state.status_message =
+                            Some((format!("OFFLINE (reconnecting…) · {reason}"), true));
                         dirty = true;
                     }
                 }
@@ -2348,7 +2381,10 @@ mod tests {
         assert_eq!(watch_reconnect_backoff(3), Duration::from_millis(2_000));
         assert_eq!(watch_reconnect_backoff(4), Duration::from_millis(5_000));
         assert_eq!(watch_reconnect_backoff(10), Duration::from_millis(5_000));
-        assert_eq!(watch_reconnect_backoff(u32::MAX), Duration::from_millis(5_000));
+        assert_eq!(
+            watch_reconnect_backoff(u32::MAX),
+            Duration::from_millis(5_000)
+        );
     }
 
     #[test]
@@ -2429,7 +2465,10 @@ mod tests {
                 let frame = render_ui_frame(&st, rows, cols);
                 assert_eq!(frame.len(), rows);
                 for line in &frame {
-                    assert!(visible_width(line) <= cols, "overflow at {rows}x{cols}: {line:?}");
+                    assert!(
+                        visible_width(line) <= cols,
+                        "overflow at {rows}x{cols}: {line:?}"
+                    );
                 }
                 let joined = frame.join("\n");
                 assert!(!joined.contains("pwn"));
@@ -2559,7 +2598,9 @@ mod tests {
         let ev1 = rx.recv_timeout(Duration::from_secs(3)).unwrap();
         match ev1 {
             WatchEvent::Snapshot(v) => assert_eq!(v["rev"], 1),
-            WatchEvent::Disconnected { reason, .. } => panic!("unexpected early disconnect: {reason}"),
+            WatchEvent::Disconnected { reason, .. } => {
+                panic!("unexpected early disconnect: {reason}")
+            }
         }
 
         let ev2 = rx.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -2571,7 +2612,9 @@ mod tests {
         let ev3 = rx.recv_timeout(Duration::from_secs(3)).unwrap();
         match ev3 {
             WatchEvent::Snapshot(v) => assert_eq!(v["rev"], 2),
-            WatchEvent::Disconnected { reason, .. } => panic!("expected reconnected snapshot, got disconnect: {reason}"),
+            WatchEvent::Disconnected { reason, .. } => {
+                panic!("expected reconnected snapshot, got disconnect: {reason}")
+            }
         }
 
         stop.store(true, Ordering::Relaxed);

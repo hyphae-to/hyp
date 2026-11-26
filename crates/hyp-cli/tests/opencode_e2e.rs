@@ -135,7 +135,10 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     let cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
     assert_eq!(cfg["$schema"], "https://opencode.ai/config.json");
     assert_eq!(cfg["theme"], "tokyonight");
-    assert_eq!(cfg["mcp"]["user-local"]["command"], json!(["echo", "hello"]));
+    assert_eq!(
+        cfg["mcp"]["user-local"]["command"],
+        json!(["echo", "hello"])
+    );
     assert_eq!(cfg["mcp"]["hyphae"]["type"], "local");
     assert_eq!(cfg["mcp"]["hyphae"]["enabled"], true);
     assert_eq!(
@@ -186,7 +189,10 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     assert!(!cmd_md.contains("--value"));
     assert!(!cmd_md.contains("hp2p1_") && !cmd_md.contains("am2_") && !cmd_md.contains("t3mp1_"));
 
-    assert!(skill_path.exists(), "OpenCode runtime skill should be written");
+    assert!(
+        skill_path.exists(),
+        "OpenCode runtime skill should be written"
+    );
 
     // 3. `hyp doctor` reports OpenCode detected & configured.
     let doc_out = isolated_cmd(&home)
@@ -272,7 +278,11 @@ fn setup_opencode_respects_no_commands_and_no_skills_flags() {
     assert!(home.join(".config/opencode/opencode.json").exists());
     assert!(home.join(".config/opencode/plugins/hyphae.ts").exists());
     assert!(!home.join(".config/opencode/commands/hyphae.md").exists());
-    assert!(!home.join(".config/opencode/skills/hyphae/SKILL.md").exists());
+    assert!(
+        !home
+            .join(".config/opencode/skills/hyphae/SKILL.md")
+            .exists()
+    );
 
     let notes = body["data"]["harnesses"][0]["notes"]
         .as_array()
@@ -344,11 +354,12 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
     let mut mcp_proc = ManagedProcess::spawn("hyp mcp opencode", &mut mcp_cmd);
     let mut mcp_stdin = mcp_proc.take_stdin().expect("mcp stdin");
 
-    let send_mcp = |stdin: &mut std::process::ChildStdin, proc: &ManagedProcess, msg: Value| -> Value {
-        writeln!(stdin, "{msg}").expect("write mcp line");
-        stdin.flush().expect("flush mcp stdin");
-        proc.read_json_line(Duration::from_secs(5))
-    };
+    let send_mcp =
+        |stdin: &mut std::process::ChildStdin, proc: &ManagedProcess, msg: Value| -> Value {
+            writeln!(stdin, "{msg}").expect("write mcp line");
+            stdin.flush().expect("flush mcp stdin");
+            proc.read_json_line(Duration::from_secs(5))
+        };
 
     // MCP initialize handshake.
     let init_resp = send_mcp(
@@ -511,7 +522,10 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
         process.stdout.write(JSON.stringify(out));
         "##,
     );
-    let chan_token = before_chan["args"]["_meshCall"].as_str().unwrap().to_string();
+    let chan_token = before_chan["args"]["_meshCall"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let chan_resp = send_mcp(
         &mut mcp_stdin,
         &mcp_proc,
@@ -546,7 +560,10 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
         process.stdout.write(JSON.stringify(out));
         "#,
     );
-    let rule_token = before_rule["args"]["_meshCall"].as_str().unwrap().to_string();
+    let rule_token = before_rule["args"]["_meshCall"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let rule_resp = send_mcp(
         &mut mcp_stdin,
         &mcp_proc,
@@ -563,7 +580,10 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
             }
         }),
     );
-    assert!(rule_resp["result"]["isError"].as_bool() != Some(true), "rule setup failed: {rule_resp}");
+    assert!(
+        rule_resp["result"]["isError"].as_bool() != Some(true),
+        "rule setup failed: {rule_resp}"
+    );
 
     // Enqueue Interrupt DM #1 for `opencode:ses-live-1` and verify `tool.execute.after` drains it!
     daemon

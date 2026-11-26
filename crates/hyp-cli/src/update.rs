@@ -391,14 +391,31 @@ pub fn read_cached_update_status(
         .to_ascii_lowercase();
     let current_version = env!("CARGO_PKG_VERSION").to_string();
 
-    let available_version = db
-        .and_then(|d| d.local().get_metadata(META_UPDATE_AVAILABLE_VERSION).ok().flatten());
-    let dismissed_version = db
-        .and_then(|d| d.local().get_metadata(META_UPDATE_DISMISSED_VERSION).ok().flatten());
-    let notified_version = db
-        .and_then(|d| d.local().get_metadata(META_UPDATE_NOTIFIED_VERSION).ok().flatten());
+    let available_version = db.and_then(|d| {
+        d.local()
+            .get_metadata(META_UPDATE_AVAILABLE_VERSION)
+            .ok()
+            .flatten()
+    });
+    let dismissed_version = db.and_then(|d| {
+        d.local()
+            .get_metadata(META_UPDATE_DISMISSED_VERSION)
+            .ok()
+            .flatten()
+    });
+    let notified_version = db.and_then(|d| {
+        d.local()
+            .get_metadata(META_UPDATE_NOTIFIED_VERSION)
+            .ok()
+            .flatten()
+    });
     let notified_at = db
-        .and_then(|d| d.local().get_metadata(META_UPDATE_NOTIFIED_AT).ok().flatten())
+        .and_then(|d| {
+            d.local()
+                .get_metadata(META_UPDATE_NOTIFIED_AT)
+                .ok()
+                .flatten()
+        })
         .and_then(|s| s.parse::<i64>().ok());
 
     let should_notify = match (
@@ -441,8 +458,12 @@ pub fn verify_release_manifest(
     current_version: &str,
     min_published_at_ms: Option<i64>,
 ) -> Result<(ReleaseManifestPayload, i64), (&'static str, String)> {
-    let pk = Ed25519PublicKey::from_b64(expected_pubkey_b64.trim())
-        .map_err(|e| ("INVALID_PUBKEY", format!("Invalid release Ed25519 public key: {e}")))?;
+    let pk = Ed25519PublicKey::from_b64(expected_pubkey_b64.trim()).map_err(|e| {
+        (
+            "INVALID_PUBKEY",
+            format!("Invalid release Ed25519 public key: {e}"),
+        )
+    })?;
 
     pk.verify_domain_b64(
         RELEASE_SIGNING_DOMAIN,
@@ -496,13 +517,19 @@ pub fn verify_release_manifest(
     }
 
     if payload.version.trim().is_empty() {
-        return Err(("INVALID_MANIFEST", "Release manifest version is empty".to_string()));
+        return Err((
+            "INVALID_MANIFEST",
+            "Release manifest version is empty".to_string(),
+        ));
     }
 
     let published_ms = parse_rfc3339_millis(&payload.published_at).map_err(|e| {
         (
             "INVALID_MANIFEST",
-            format!("Invalid publishedAt timestamp '{}': {e}", payload.published_at),
+            format!(
+                "Invalid publishedAt timestamp '{}': {e}",
+                payload.published_at
+            ),
         )
     })?;
 
@@ -540,7 +567,10 @@ pub fn verify_release_manifest(
         normalize_sha256_hex(&art.sha256).ok_or_else(|| {
             (
                 "INVALID_MANIFEST",
-                format!("Artifact for '{triple}' has invalid sha256 '{}'", art.sha256),
+                format!(
+                    "Artifact for '{triple}' has invalid sha256 '{}'",
+                    art.sha256
+                ),
             )
         })?;
     }
@@ -603,7 +633,15 @@ pub fn run_update(args: UpdateArgs) -> ExitCode {
             state_dir,
             config,
             json,
-        }) => run_update_check(channel, manifest_url, pubkey, target, state_dir, config, json),
+        }) => run_update_check(
+            channel,
+            manifest_url,
+            pubkey,
+            target,
+            state_dir,
+            config,
+            json,
+        ),
         Some(UpdateAction::Dismiss {
             version,
             state_dir,
@@ -729,7 +767,9 @@ fn run_update_dismiss(version: String, state_dir: Option<PathBuf>, as_json: bool
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
-            summary: Some(format!("Dismissed update notification for version '{trimmed}'")),
+            summary: Some(format!(
+                "Dismissed update notification for version '{trimmed}'"
+            )),
             data: Some(json!({
                 "dismissedVersion": trimmed,
                 "stateDir": dir.display().to_string(),
@@ -792,12 +832,13 @@ fn run_update_check(
     as_json: bool,
 ) -> ExitCode {
     let cmd = "update check";
-    let channel = match resolve_channel(channel_arg, config_arg.as_deref(), state_dir_arg.as_deref())
-    {
-        Ok(c) => c,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "UPDATES_DISABLED", e, None),
-    };
-    let manifest_url = manifest_url_arg.unwrap_or_else(|| channel.default_manifest_url().to_string());
+    let channel =
+        match resolve_channel(channel_arg, config_arg.as_deref(), state_dir_arg.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "UPDATES_DISABLED", e, None),
+        };
+    let manifest_url =
+        manifest_url_arg.unwrap_or_else(|| channel.default_manifest_url().to_string());
     let pubkey = resolve_pubkey(pubkey_arg.as_deref());
     let target_triple = target_arg.unwrap_or_else(|| current_target_triple().to_string());
     let dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
@@ -807,7 +848,16 @@ fn run_update_check(
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "RUNTIME_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "RUNTIME_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
 
     let signed = match rt.block_on(fetch_signed_manifest(&manifest_url)) {
@@ -939,11 +989,14 @@ fn run_update_check(
 fn run_update_apply(args: UpdateArgs) -> ExitCode {
     let cmd = "update";
     let as_json = args.json;
-    let channel =
-        match resolve_channel(args.channel, args.config.as_deref(), args.state_dir.as_deref()) {
-            Ok(c) => c,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "UPDATES_DISABLED", e, None),
-        };
+    let channel = match resolve_channel(
+        args.channel,
+        args.config.as_deref(),
+        args.state_dir.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "UPDATES_DISABLED", e, None),
+    };
     let manifest_url = args
         .manifest_url
         .clone()
@@ -977,7 +1030,16 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         .build()
     {
         Ok(rt) => rt,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "RUNTIME_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "RUNTIME_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
 
     // 1. Fetch & cryptographically verify signed release manifest (FAIL CLOSED!).
@@ -1083,7 +1145,10 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                     "rolloutOrder": rollout_order,
                 })),
                 warnings,
-                next: vec![format!("Re-run without --dry-run to apply {}", manifest.version)],
+                next: vec![format!(
+                    "Re-run without --dry-run to apply {}",
+                    manifest.version
+                )],
                 error: None,
             };
             print_json(&envelope);
@@ -1159,7 +1224,10 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
             } else {
                 eprintln!("FAIL [{}] {}", swap_err.code, swap_err.message);
                 if swap_err.original_preserved {
-                    eprintln!("OK    Original binary preserved intact at {}", target_bin.display());
+                    eprintln!(
+                        "OK    Original binary preserved intact at {}",
+                        target_bin.display()
+                    );
                 }
             }
             return ExitCode::from(EXIT_ERROR);
@@ -1174,9 +1242,10 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         let _ = db
             .local()
             .set_metadata(META_UPDATE_AVAILABLE_VERSION, &manifest.version);
-        let _ = db
-            .local()
-            .set_metadata(META_UPDATE_INSTALLED_PUBLISHED_AT, &published_ms.to_string());
+        let _ = db.local().set_metadata(
+            META_UPDATE_INSTALLED_PUBLISHED_AT,
+            &published_ms.to_string(),
+        );
         let _ = db
             .local()
             .set_metadata(META_UPDATE_CHECKED_AT, &now.to_string());
@@ -1203,9 +1272,11 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     );
     let service_restarted = service_restart.restarted;
 
-    let remote_failed = fleet_plan
-        .iter()
-        .any(|p| p.outcome.as_deref().is_some_and(|o| o.starts_with("FAILED")));
+    let remote_failed = fleet_plan.iter().any(|p| {
+        p.outcome
+            .as_deref()
+            .is_some_and(|o| o.starts_with("FAILED"))
+    });
     let ok = !remote_failed;
 
     if as_json {
@@ -1412,8 +1483,7 @@ fn run_post_upgrade_plugin_sync(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if let Some(plugin_warnings) =
-                        parsed.get("warnings").and_then(Value::as_array)
+                    if let Some(plugin_warnings) = parsed.get("warnings").and_then(Value::as_array)
                     {
                         for w in plugin_warnings {
                             if let Some(s) = w.as_str() {
@@ -1579,11 +1649,18 @@ fn resolve_redirect_url(
         ));
     };
 
-    validate_http_endpoint_origin(&next_url)
-        .map_err(|e| ("UNSAFE_REDIRECT", format!("Refusing unsafe redirect '{next_url}': {e}")))?;
-    let next_uri: http::Uri = next_url
-        .parse()
-        .map_err(|e| ("UNSAFE_REDIRECT", format!("Invalid redirect URL '{next_url}': {e}")))?;
+    validate_http_endpoint_origin(&next_url).map_err(|e| {
+        (
+            "UNSAFE_REDIRECT",
+            format!("Refusing unsafe redirect '{next_url}': {e}"),
+        )
+    })?;
+    let next_uri: http::Uri = next_url.parse().map_err(|e| {
+        (
+            "UNSAFE_REDIRECT",
+            format!("Invalid redirect URL '{next_url}': {e}"),
+        )
+    })?;
     if current_uri.scheme_str() == Some("https") && next_uri.scheme_str() != Some("https") {
         return Err((
             "UNSAFE_REDIRECT",
@@ -1595,13 +1672,16 @@ fn resolve_redirect_url(
 
 async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'static str, String)> {
     let mut current_url = url.trim().to_string();
-    validate_http_endpoint_origin(&current_url)
-        .map_err(|e| ("UNSAFE_URL", format!("Refusing unsafe URL '{current_url}': {e}")))?;
+    validate_http_endpoint_origin(&current_url).map_err(|e| {
+        (
+            "UNSAFE_URL",
+            format!("Refusing unsafe URL '{current_url}': {e}"),
+        )
+    })?;
     let mut current_uri: http::Uri = current_url
         .parse()
         .map_err(|e| ("INVALID_URL", format!("Invalid URL '{current_url}': {e}")))?;
-    let client =
-        build_http_client::<Empty<Bytes>>().map_err(|e| ("HTTP_INIT_ERROR", e))?;
+    let client = build_http_client::<Empty<Bytes>>().map_err(|e| ("HTTP_INIT_ERROR", e))?;
 
     for redirect_count in 0..=MAX_REDIRECTS {
         let req = Request::builder()
@@ -1614,15 +1694,16 @@ async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'stati
             .body(Empty::new())
             .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
 
-        let resp = tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
-            .await
-            .map_err(|_| {
-                (
-                    "HTTP_TIMEOUT",
-                    format!("GET {current_url} timed out after {HTTP_TIMEOUT_SECS}s"),
-                )
-            })?
-            .map_err(|e| ("HTTP_ERROR", format!("GET {current_url} failed: {e}")))?;
+        let resp =
+            tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
+                .await
+                .map_err(|_| {
+                    (
+                        "HTTP_TIMEOUT",
+                        format!("GET {current_url} timed out after {HTTP_TIMEOUT_SECS}s"),
+                    )
+                })?
+                .map_err(|e| ("HTTP_ERROR", format!("GET {current_url} failed: {e}")))?;
 
         let status = resp.status();
         if status.is_redirection() {
@@ -1716,7 +1797,8 @@ fn backup_binary_path(target_bin: &Path) -> PathBuf {
 fn random_suffix_hex() -> Result<String, String> {
     let rng = SystemRandom::new();
     let mut b = [0u8; 8];
-    rng.fill(&mut b).map_err(|_| "OS CSPRNG failure".to_string())?;
+    rng.fill(&mut b)
+        .map_err(|_| "OS CSPRNG failure".to_string())?;
     Ok(hex::encode(b))
 }
 
@@ -1732,7 +1814,10 @@ fn stage_smoke_check_and_swap(
     if let Err(e) = fs::create_dir_all(parent) {
         return Err(SwapFailure {
             code: "IO_ERROR",
-            message: format!("Failed to prepare target directory {}: {e}", parent.display()),
+            message: format!(
+                "Failed to prepare target directory {}: {e}",
+                parent.display()
+            ),
             rolled_back: false,
             original_preserved: true,
         });
@@ -1790,7 +1875,10 @@ fn stage_smoke_check_and_swap(
                 let _ = fs::remove_file(backup);
                 fs::rename(target_bin, backup).map_err(|e| SwapFailure {
                     code: "SWAP_FAILED",
-                    message: format!("Failed to rename current binary to {}: {e}", backup.display()),
+                    message: format!(
+                        "Failed to rename current binary to {}: {e}",
+                        backup.display()
+                    ),
                     rolled_back: false,
                     original_preserved: true,
                 })?;
@@ -1799,7 +1887,10 @@ fn stage_smoke_check_and_swap(
             {
                 fs::copy(target_bin, backup).map_err(|e| SwapFailure {
                     code: "BACKUP_FAILED",
-                    message: format!("Failed to back up current binary to {}: {e}", backup.display()),
+                    message: format!(
+                        "Failed to back up current binary to {}: {e}",
+                        backup.display()
+                    ),
                     rolled_back: false,
                     original_preserved: true,
                 })?;
@@ -1817,7 +1908,10 @@ fn stage_smoke_check_and_swap(
             }
             return Err(SwapFailure {
                 code: "SWAP_FAILED",
-                message: format!("Failed atomic binary swap into {}: {e}", target_bin.display()),
+                message: format!(
+                    "Failed atomic binary swap into {}: {e}",
+                    target_bin.display()
+                ),
                 rolled_back: true,
                 original_preserved: true,
             });
@@ -1892,8 +1986,7 @@ fn extract_binary_into_stage(
             })
             .ok_or_else(|| SwapFailure {
                 code: "EXTRACT_FAILED",
-                message: "Release tar.gz archive did not contain a 'hyp' executable"
-                    .to_string(),
+                message: "Release tar.gz archive did not contain a 'hyp' executable".to_string(),
                 rolled_back: false,
                 original_preserved: true,
             })?;
@@ -1998,7 +2091,9 @@ fn run_binary_smoke_check(bin_path: &Path) -> Result<String, String> {
     if parsed.get("ok") != Some(&Value::Bool(true))
         || parsed.get("command").and_then(Value::as_str) != Some("version")
     {
-        return Err("`version --json` envelope did not report ok=true, command='version'".to_string());
+        return Err(
+            "`version --json` envelope did not report ok=true, command='version'".to_string(),
+        );
     }
     let ver = parsed
         .get("data")
@@ -2118,7 +2213,11 @@ mod tests {
 
         // Tampered signature -> fail closed
         let mut bad_sig = signed.clone();
-        let replacement = if signed.sig.starts_with('A') { 'B' } else { 'A' };
+        let replacement = if signed.sig.starts_with('A') {
+            'B'
+        } else {
+            'A'
+        };
         bad_sig.sig = format!("{replacement}{}", &signed.sig[1..]);
         assert!(
             verify_release_manifest(
@@ -2217,7 +2316,9 @@ mod tests {
             "UNSAFE_REDIRECT"
         );
         assert_eq!(
-            resolve_redirect_url(&gh, "file:///etc/passwd").unwrap_err().0,
+            resolve_redirect_url(&gh, "file:///etc/passwd")
+                .unwrap_err()
+                .0,
             "UNSAFE_REDIRECT"
         );
     }

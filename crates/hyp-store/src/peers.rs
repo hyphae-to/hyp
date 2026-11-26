@@ -377,10 +377,8 @@ impl<'a> PeerStore<'a> {
                 params![human_id, now_ms],
             )?;
             for pid in &revoked_ids {
-                tx.conn().execute(
-                    "DELETE FROM peer_routes WHERE via_peer = ?1",
-                    params![pid],
-                )?;
+                tx.conn()
+                    .execute("DELETE FROM peer_routes WHERE via_peer = ?1", params![pid])?;
                 let _ = delete_peer_bearer_tokens_in_conn(tx.conn(), pid)?;
             }
         }
@@ -580,7 +578,9 @@ impl<'a> PeerStore<'a> {
     /// conflicting content or already-expired `pair_by`).
     pub fn add_grant(&self, input: &GrantInput, now_ms: i64) -> StoreResult<GrantRecord> {
         if input.id.is_empty() {
-            return Err(StoreError::InvalidInput("grant id must be non-empty".to_string()));
+            return Err(StoreError::InvalidInput(
+                "grant id must be non-empty".to_string(),
+            ));
         }
         if !is_node_id(&input.peer_id) {
             return Err(StoreError::InvalidInput(format!(
@@ -648,7 +648,11 @@ impl<'a> PeerStore<'a> {
     pub fn get_grant(&self, id: &str) -> StoreResult<Option<GrantRecord>> {
         self.db
             .conn()
-            .query_row("SELECT * FROM grants WHERE id = ?1", params![id], decode_grant_row)
+            .query_row(
+                "SELECT * FROM grants WHERE id = ?1",
+                params![id],
+                decode_grant_row,
+            )
             .optional()?
             .transpose()
     }
@@ -676,16 +680,15 @@ impl<'a> PeerStore<'a> {
 
     /// Atomically claims a single-use pairing grant inside `BEGIN IMMEDIATE` so two concurrent
     /// pairing attempts racing for the same grant cannot both succeed.
-    pub fn claim_grant(
-        &self,
-        id: &str,
-        entry_json: &str,
-        now_ms: i64,
-    ) -> StoreResult<GrantRecord> {
+    pub fn claim_grant(&self, id: &str, entry_json: &str, now_ms: i64) -> StoreResult<GrantRecord> {
         let tx = self.db.immediate_tx()?;
         let grant: GrantRecord = tx
             .conn()
-            .query_row("SELECT * FROM grants WHERE id = ?1", params![id], decode_grant_row)
+            .query_row(
+                "SELECT * FROM grants WHERE id = ?1",
+                params![id],
+                decode_grant_row,
+            )
             .optional()?
             .transpose()?
             .ok_or_else(|| StoreError::NotFound(format!("grant '{id}' not found")))?;
@@ -933,11 +936,7 @@ impl<'a> PeerStore<'a> {
     /// - For `KeyUse::Signing` and `KeyUse::Encryption`, refuses to silently insert a second
     ///   `Active` key when an `Active` key with a different `kid` already exists; callers
     ///   performing authorized key rotation must use [`PeerStore::rotate_peer_key`].
-    pub fn upsert_peer_key(
-        &self,
-        input: &PeerKeyInput,
-        now_ms: i64,
-    ) -> StoreResult<PeerKeyRecord> {
+    pub fn upsert_peer_key(&self, input: &PeerKeyInput, now_ms: i64) -> StoreResult<PeerKeyRecord> {
         if !is_node_id(&input.peer_id) || input.kid.is_empty() {
             return Err(StoreError::InvalidInput(
                 "invalid peer_id or kid".to_string(),
@@ -1022,11 +1021,7 @@ impl<'a> PeerStore<'a> {
     /// Explicitly rotates a peer's active key for `(peer_id, key_use)`, atomically marking all
     /// prior active keys for that `key_use` with differing `kid` as [`KeyStatus::Retired`] so
     /// no ambiguous duplicate active keys remain.
-    pub fn rotate_peer_key(
-        &self,
-        input: &PeerKeyInput,
-        now_ms: i64,
-    ) -> StoreResult<PeerKeyRecord> {
+    pub fn rotate_peer_key(&self, input: &PeerKeyInput, now_ms: i64) -> StoreResult<PeerKeyRecord> {
         if !is_node_id(&input.peer_id) || input.kid.is_empty() {
             return Err(StoreError::InvalidInput(
                 "invalid peer_id or kid".to_string(),
@@ -1223,7 +1218,10 @@ impl<'a> PeerStore<'a> {
         Ok(saved)
     }
 
-    pub fn latest_checkpoint(&self, authority_id: &str) -> StoreResult<Option<DirectoryCheckpoint>> {
+    pub fn latest_checkpoint(
+        &self,
+        authority_id: &str,
+    ) -> StoreResult<Option<DirectoryCheckpoint>> {
         self.db
             .conn()
             .query_row(

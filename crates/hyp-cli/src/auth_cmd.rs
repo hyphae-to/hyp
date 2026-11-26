@@ -47,9 +47,7 @@ use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_i
 use hyp_proto::cloudevent::{
     CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EXT_LOCAL_EVENT_SIG, TYPE_HUMAN_REVOCATION_V1,
 };
-use hyp_proto::scopes::{
-    ScopePreset, expand_delegated_human_scopes, validate_node_prefix_pattern,
-};
+use hyp_proto::scopes::{ScopePreset, expand_delegated_human_scopes, validate_node_prefix_pattern};
 use hyp_store::{
     HumanAuthorityInput, HumanAuthorityRecord, HumanAuthorityRole, HumanAuthorityStatus,
     HumanDelegationPolicyInput, HumanNodeCertInput, KeyUse, NodeDb, now_ms, uuid_v4,
@@ -710,10 +708,7 @@ fn format_auth_sign_confirm_summary(
             sanitize_tty_display(human_id),
             sanitize_tty_display(human_kid)
         ),
-        format!(
-            "  Target Node: {}",
-            sanitize_tty_display(target_node_id)
-        ),
+        format!("  Target Node: {}", sanitize_tty_display(target_node_id)),
     ];
     if let Some(h) = target_handle {
         lines.push(format!("  Handle:      {}", sanitize_tty_display(h)));
@@ -743,7 +738,11 @@ fn format_auth_sign_confirm_summary(
         }
         CliDropKind::Directive => {
             let preview: String = sanitize_tty_display(body).chars().take(120).collect();
-            let suffix = if body.chars().count() > 120 { "..." } else { "" };
+            let suffix = if body.chars().count() > 120 {
+                "..."
+            } else {
+                ""
+            };
             lines.push(format!("  Directive:   {preview}{suffix}"));
         }
     }
@@ -914,7 +913,8 @@ fn broadcast_human_revocation(
                 .enable_all()
                 .build()
             {
-                if let Ok(receipt) = rt.block_on(send_local_ingest_event(&ingest_socket, &wire_json))
+                if let Ok(receipt) =
+                    rt.block_on(send_local_ingest_event(&ingest_socket, &wire_json))
                 {
                     if receipt.get("ok").and_then(Value::as_bool) == Some(true) {
                         let receipt_id = receipt
@@ -1068,10 +1068,7 @@ fn validate_enrolled_node_cert(
     })
 }
 
-fn persist_verified_node_cert(
-    db: &NodeDb,
-    cert: &VerifiedEnrolledNodeCert,
-) -> Result<(), String> {
+fn persist_verified_node_cert(db: &NodeDb, cert: &VerifiedEnrolledNodeCert) -> Result<(), String> {
     let signed_json = to_canonical_json(&cert.signed)
         .map_err(|e| format!("failed to serialize verified nodeCert: {e}"))?;
     db.human()
@@ -1230,12 +1227,8 @@ fn run_auth_init(
         0
     };
     if existing_count > 0 || gate_locked {
-        let mut summary = format_auth_init_confirm_summary(
-            &human_id,
-            trimmed_label,
-            existing_count,
-            gate_locked,
-        );
+        let mut summary =
+            format_auth_init_confirm_summary(&human_id, trimmed_label, existing_count, gate_locked);
         if web {
             summary.push(
                 "  Mode:       --web (will also open loopback Passkey+PRF enrollment callback)"
@@ -1437,14 +1430,7 @@ fn run_auth_init(
         match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
             Ok(b) => b,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "GATE_POLICY_SYNC_FAILED",
-                    e,
-                    None,
-                );
+                return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
             }
         }
     };
@@ -1516,7 +1502,11 @@ fn run_auth_init(
             inserted.human_id, inserted.kid
         );
         println!("      Label:     {}", inserted.label);
-        println!("      Keystore:  {} ({})", secret_name, secrets.backend().as_str());
+        println!(
+            "      Keystore:  {} ({})",
+            secret_name,
+            secrets.backend().as_str()
+        );
         println!("      Node Cert: issued 365d hcert1_ for '{node_id_str}'");
         if let Some(ref w) = web_enrolled {
             println!(
@@ -1649,9 +1639,13 @@ fn run_auth_add(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(ToOwned::to_owned),
-                obj.get("prfSalt").and_then(Value::as_str).map(ToOwned::to_owned),
+                obj.get("prfSalt")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
                 obj.get("authEpoch").and_then(Value::as_u64),
-                obj.get("kid").and_then(Value::as_str).map(ToOwned::to_owned),
+                obj.get("kid")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
             )
         } else {
             (parsed, None, None, None, None, None)
@@ -1697,14 +1691,7 @@ fn run_auth_add(
         Ok(Some((canon, ekid))) => (Some(canon), Some(ekid)),
         Ok(None) => (None, None),
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_ENC_JWK",
-                e,
-                None,
-            );
+            return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_ENC_JWK", e, None);
         }
     };
     let kid = match jwk.thumbprint() {
@@ -1751,7 +1738,10 @@ fn run_auth_add(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
     };
     let min_epoch = db.human().min_auth_epoch().unwrap_or(1);
-    let effective_epoch = auth_epoch_arg.or(bundle_epoch).unwrap_or(min_epoch).max(min_epoch);
+    let effective_epoch = auth_epoch_arg
+        .or(bundle_epoch)
+        .unwrap_or(min_epoch)
+        .max(min_epoch);
     let effective_prf_salt = prf_salt_arg.or(bundle_prf_salt);
     let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
 
@@ -1788,14 +1778,7 @@ fn run_auth_add(
         ) {
             Ok(cert) => Some(cert),
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
-                    "INVALID_NODE_CERT",
-                    e,
-                    None,
-                );
+                return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_NODE_CERT", e, None);
             }
         }
     } else {
@@ -1850,13 +1833,13 @@ fn run_auth_add(
         false
     };
 
-    let gate_resigned = match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets)
-    {
-        Ok(b) => b,
-        Err(e) => {
-            return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
-        }
-    };
+    let gate_resigned =
+        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
+            Ok(b) => b,
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
+            }
+        };
     let digest = db.human().authorities_digest().ok();
     drop(db);
 
@@ -2182,7 +2165,10 @@ fn run_auth_revoke(
             EXIT_ERROR,
             "SIGNER_KEY_UNAVAILABLE",
             "Cannot --broadcast revocation without an active local admin Ed25519 signing key to sign SignedHumanRevocationV1",
-            Some("Pass --issuer-kid <active-admin-kid> or run `hyp auth init` on an admin node.".to_string()),
+            Some(
+                "Pass --issuer-kid <active-admin-kid> or run `hyp auth init` on an admin node."
+                    .to_string(),
+            ),
         );
     }
 
@@ -2238,16 +2224,20 @@ fn run_auth_revoke(
             })
             .to_string()
         };
-        match db.human().revoke_authority_monotonic(
-            &t.human_id,
-            &t.kid,
-            new_min,
-            &rev_json,
-            now,
-        ) {
+        match db
+            .human()
+            .revoke_authority_monotonic(&t.human_id, &t.kid, new_min, &rev_json, now)
+        {
             Ok(m) => effective_min = effective_min.max(m),
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "REVOKE_FAILED", e.to_string(), None);
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "REVOKE_FAILED",
+                    e.to_string(),
+                    None,
+                );
             }
         }
     }
@@ -2258,7 +2248,14 @@ fn run_auth_revoke(
             .human()
             .set_delegation_enabled(&target.human_id, false, now)
         {
-            return emit_error(cmd, as_json, EXIT_ERROR, "REVOKE_FAILED", e.to_string(), None);
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "REVOKE_FAILED",
+                e.to_string(),
+                None,
+            );
         }
         match db
             .peers()
@@ -2272,18 +2269,25 @@ fn run_auth_revoke(
                 revoked_peers = peers;
             }
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "REVOKE_FAILED", e.to_string(), None);
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "REVOKE_FAILED",
+                    e.to_string(),
+                    None,
+                );
             }
         }
     }
 
-    let gate_resigned = match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets)
-    {
-        Ok(b) => b,
-        Err(e) => {
-            return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
-        }
-    };
+    let gate_resigned =
+        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
+            Ok(b) => b,
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
+            }
+        };
     let digest = db.human().authorities_digest().ok();
     drop(db);
 
@@ -2456,24 +2460,23 @@ fn run_auth_certify_node(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "NODE_OPEN_FAILED", e, None),
     };
 
-    let (admin_rec, admin_kp) = match select_local_signing_authority(
-        &node.db(),
-        &secrets,
-        kid_arg.as_deref(),
-        true,
-    ) {
-        Ok(pair) => pair,
-        Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "ADMIN_KEY_UNAVAILABLE",
-                e,
-                Some(format!("Run `hyp auth init --state-dir {}` first.", state_dir.display())),
-            );
-        }
-    };
+    let (admin_rec, admin_kp) =
+        match select_local_signing_authority(&node.db(), &secrets, kid_arg.as_deref(), true) {
+            Ok(pair) => pair,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ADMIN_KEY_UNAVAILABLE",
+                    e,
+                    Some(format!(
+                        "Run `hyp auth init --state-dir {}` first.",
+                        state_dir.display()
+                    )),
+                );
+            }
+        };
 
     let (signed, hcert1) = match node.issue_node_cert(&admin_kp, &admin_rec.kid, ttl_days) {
         Ok(res) => res,
@@ -2583,7 +2586,9 @@ fn run_auth_sign(
                     as_json,
                     EXIT_USAGE,
                     "RESERVED_SECRET_NAME",
-                    format!("Reserved system secret name '{name}' is permanently blocked for human drops"),
+                    format!(
+                        "Reserved system secret name '{name}' is permanently blocked for human drops"
+                    ),
                     None,
                 );
             }
@@ -2679,7 +2684,10 @@ fn run_auth_sign(
             EXIT_ERROR,
             "NOT_INITIALIZED",
             format!("No node.sqlite found at {}", db_path.display()),
-            Some(format!("Run `hyp auth init --state-dir {}` first.", state_dir.display())),
+            Some(format!(
+                "Run `hyp auth init --state-dir {}` first.",
+                state_dir.display()
+            )),
         );
     }
     let db = match NodeDb::open(&db_path) {
@@ -2698,7 +2706,10 @@ fn run_auth_sign(
                     EXIT_ERROR,
                     "SIGNER_KEY_UNAVAILABLE",
                     e,
-                    Some(format!("Run `hyp auth init --state-dir {}` first.", state_dir.display())),
+                    Some(format!(
+                        "Run `hyp auth init --state-dir {}` first.",
+                        state_dir.display()
+                    )),
                 );
             }
         };
@@ -3104,7 +3115,10 @@ fn run_auth_invite(
                     EXIT_USAGE,
                     "INVALID_ENDPOINT",
                     format!("Invalid --endpoint '{ep}': {e}"),
-                    Some("Use https:// (or loopback http://127.0.0.1 for local testing).".to_string()),
+                    Some(
+                        "Use https:// (or loopback http://127.0.0.1 for local testing)."
+                            .to_string(),
+                    ),
                 );
             }
             ep
@@ -3116,7 +3130,9 @@ fn run_auth_invite(
                 EXIT_USAGE,
                 "MISSING_ENDPOINT",
                 "Hub endpoint is required (pass --endpoint https://... or configure listen.publicUrl in node.json)",
-                Some(format!("Example: hyp auth invite {human_id} --hub {hub_node_id} --endpoint https://hub.example.com")),
+                Some(format!(
+                    "Example: hyp auth invite {human_id} --hub {hub_node_id} --endpoint https://hub.example.com"
+                )),
             );
         }
     };
@@ -3262,7 +3278,9 @@ fn run_auth_invite(
         println!("  Shareable Join Link (single-use, open in browser with Touch ID / Passkey):");
         println!("    {join_url}");
         println!();
-        println!("  Headless / CLI usage: save the token to a private 0600 file and run `hyp join --token-file <path> --local-key`.");
+        println!(
+            "  Headless / CLI usage: save the token to a private 0600 file and run `hyp join --token-file <path> --local-key`."
+        );
         print_next_steps(&next);
     }
     ExitCode::from(EXIT_OK)
@@ -3295,7 +3313,10 @@ fn run_auth_admit(
         );
     }
     let trimmed_label = label.trim();
-    if trimmed_label.is_empty() || trimmed_label.len() > 128 || trimmed_label.chars().any(char::is_control) {
+    if trimmed_label.is_empty()
+        || trimmed_label.len() > 128
+        || trimmed_label.chars().any(char::is_control)
+    {
         return emit_error(
             cmd,
             as_json,
@@ -3531,7 +3552,9 @@ fn run_auth_admit(
             }
             match to_canonical_json(ej) {
                 Ok(s) => Some(s),
-                Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+                Err(e) => {
+                    return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None);
+                }
             }
         }
         None => None,
@@ -3746,7 +3769,16 @@ fn run_auth_whoami(
     };
     let hpub1 = match encode_hpub1(&card) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_FAILED", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_FAILED",
+                e.to_string(),
+                None,
+            );
+        }
     };
 
     if as_json {
@@ -4162,8 +4194,8 @@ async fn handle_enroll_callback(
             .or_else(|| obj.get("csrfToken"))
             .and_then(Value::as_str)
     });
-    let csrf_ok = submitted_token
-        .is_some_and(|tok| ct_eq(tok.as_bytes(), state.csrf_token.as_bytes()));
+    let csrf_ok =
+        submitted_token.is_some_and(|tok| ct_eq(tok.as_bytes(), state.csrf_token.as_bytes()));
     if !csrf_ok {
         return json_enroll_response(
             StatusCode::FORBIDDEN,
@@ -4371,16 +4403,9 @@ mod tests {
             revoked_at: None,
             revocation_json: None,
         };
-        let rev_summary = format_auth_revoke_confirm_summary(
-            &target,
-            true,
-            1,
-            2,
-            true,
-            "lost device",
-            true,
-        )
-        .join("\n");
+        let rev_summary =
+            format_auth_revoke_confirm_summary(&target, true, 1, 2, true, "lost device", true)
+                .join("\n");
         assert!(rev_summary.contains("Human ID:   bob"));
         assert!(rev_summary.contains("Key ID:     kid_1234567890abcdef"));
         assert!(rev_summary.contains("Bump Epoch: yes (1 -> 2)"));

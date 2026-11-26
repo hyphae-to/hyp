@@ -244,7 +244,9 @@ impl<'a> LocalStateStore<'a> {
 
     pub fn set_metadata(&self, key: &str, value: &str) -> StoreResult<()> {
         if key.is_empty() {
-            return Err(StoreError::InvalidInput("metadata key must be non-empty".to_string()));
+            return Err(StoreError::InvalidInput(
+                "metadata key must be non-empty".to_string(),
+            ));
         }
         self.db.conn().execute(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)
@@ -292,7 +294,9 @@ impl<'a> LocalStateStore<'a> {
         now_ms: i64,
     ) -> StoreResult<Session> {
         if id.is_empty() {
-            return Err(StoreError::InvalidInput("session id must be non-empty".to_string()));
+            return Err(StoreError::InvalidInput(
+                "session id must be non-empty".to_string(),
+            ));
         }
         let tx = self.db.immediate_tx()?;
         let existing_backend: Option<String> = tx
@@ -446,7 +450,11 @@ impl<'a> LocalStateStore<'a> {
     pub fn get_session(&self, id: &str) -> StoreResult<Option<Session>> {
         self.db
             .conn()
-            .query_row("SELECT * FROM sessions WHERE id = ?1", params![id], decode_session_row)
+            .query_row(
+                "SELECT * FROM sessions WHERE id = ?1",
+                params![id],
+                decode_session_row,
+            )
             .optional()?
             .transpose()
     }
@@ -556,10 +564,14 @@ impl<'a> LocalStateStore<'a> {
             )?;
             tx.conn()
                 .execute("DELETE FROM muted_sources WHERE scope = ?1", params![id])?;
-            tx.conn()
-                .execute("DELETE FROM bridge_links WHERE session_id = ?1", params![id])?;
-            tx.conn()
-                .execute("DELETE FROM plugin_targets WHERE session_id = ?1", params![id])?;
+            tx.conn().execute(
+                "DELETE FROM bridge_links WHERE session_id = ?1",
+                params![id],
+            )?;
+            tx.conn().execute(
+                "DELETE FROM plugin_targets WHERE session_id = ?1",
+                params![id],
+            )?;
             tx.conn().execute(
                 "UPDATE wakeups SET state = 'cancelled', updated_at = ?1
                  WHERE owner_session_id = ?2 AND state IN ('active', 'paused')",
@@ -1216,7 +1228,11 @@ impl<'a> LocalStateStore<'a> {
 
     /// Peeks up to `limit` **pending** (gate-allowed) mailbox items for `session_id`,
     /// including schema v3 coalescing, TTL, and missed-tick metadata.
-    pub fn peek_inbox_ex(&self, session_id: &str, limit: usize) -> StoreResult<Vec<MailboxEntryEx>> {
+    pub fn peek_inbox_ex(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<MailboxEntryEx>> {
         let mut stmt = self.db.conn().prepare(
             "SELECT * FROM mailbox
              WHERE session_id = ?1 AND gate_state = 'pending'

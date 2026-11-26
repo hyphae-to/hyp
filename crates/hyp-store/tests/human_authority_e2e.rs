@@ -209,8 +209,8 @@ fn sixteen_thread_concurrent_consume_claim_nonce_race_allows_exactly_one() {
             let cid = claim_id.clone();
             let barrier = Arc::clone(&barrier);
             joins.push(thread::spawn(move || {
-                let db = NodeDb::open(&path)
-                    .unwrap_or_else(|e| panic!("thread {tid} failed open: {e}"));
+                let db =
+                    NodeDb::open(&path).unwrap_or_else(|e| panic!("thread {tid} failed open: {e}"));
                 barrier.wait();
                 db.human()
                     .consume_claim_nonce(
@@ -287,7 +287,12 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
     ));
 
     // Active lookups & listing
-    assert!(human.get_active_authority_by_kid("kid_phone_1").unwrap().is_some());
+    assert!(
+        human
+            .get_active_authority_by_kid("kid_phone_1")
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(human.list_authorities(false).unwrap().len(), 3);
 
     // Revoke phone_1 and advance min_auth_epoch -> 4
@@ -297,11 +302,17 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
         .unwrap();
     assert_eq!(new_min, 4);
     assert_eq!(human.min_auth_epoch().unwrap(), 4);
-    assert_eq!(human.get_active_authority_by_kid("kid_phone_1").unwrap(), None);
+    assert_eq!(
+        human.get_active_authority_by_kid("kid_phone_1").unwrap(),
+        None
+    );
     assert_eq!(human.list_authorities(false).unwrap().len(), 2);
     assert_eq!(human.list_authorities(true).unwrap().len(), 3);
 
-    let revoked_rec = human.get_authority("bogdan", "kid_phone_1").unwrap().unwrap();
+    let revoked_rec = human
+        .get_authority("bogdan", "kid_phone_1")
+        .unwrap()
+        .unwrap();
     assert_eq!(revoked_rec.status, HumanAuthorityStatus::Revoked);
     assert_eq!(revoked_rec.revoked_at, Some(T0 + 100));
     assert_eq!(revoked_rec.revocation_json.as_deref(), Some(rev1_json));
@@ -322,7 +333,10 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
         .unwrap();
     assert_eq!(stayed_min, 4, "min_auth_epoch must NEVER roll back below 4");
     assert_eq!(human.min_auth_epoch().unwrap(), 4);
-    assert_eq!(human.get_active_authority_by_kid("kid_phone_2").unwrap(), None);
+    assert_eq!(
+        human.get_active_authority_by_kid("kid_phone_2").unwrap(),
+        None
+    );
 
     // Unknown key revocation fails with NotFound
     assert!(matches!(
@@ -353,7 +367,10 @@ fn authorities_digest_is_order_independent_and_detects_every_mutation() {
 
     let d_both_a = db_a.human().authorities_digest().unwrap();
     let d_both_b = db_b.human().authorities_digest().unwrap();
-    assert_eq!(d_both_a, d_both_b, "digest must be deterministic regardless of insertion order");
+    assert_eq!(
+        d_both_a, d_both_b,
+        "digest must be deterministic regardless of insertion order"
+    );
     assert_ne!(d_both_a, d_empty);
 
     // Every security-relevant field mutation MUST alter authorities_digest()!
@@ -472,12 +489,24 @@ fn nonce_ttl_pruning_wired_into_scheduler_deadline_and_tick() {
     // Consume two nonces with staggered TTLs
     assert!(
         db.human()
-            .consume_claim_nonce("nonce-1", "kid_1", HumanClaimKind::Directive, T0 + 60_000, T0)
+            .consume_claim_nonce(
+                "nonce-1",
+                "kid_1",
+                HumanClaimKind::Directive,
+                T0 + 60_000,
+                T0
+            )
             .unwrap()
     );
     assert!(
         db.human()
-            .consume_claim_nonce("nonce-2", "kid_1", HumanClaimKind::Secret, T0 + 120_000, T0 + 1)
+            .consume_claim_nonce(
+                "nonce-2",
+                "kid_1",
+                HumanClaimKind::Secret,
+                T0 + 120_000,
+                T0 + 1
+            )
             .unwrap()
     );
 
@@ -490,7 +519,13 @@ fn nonce_ttl_pruning_wired_into_scheduler_deadline_and_tick() {
     assert_eq!(rep_before.human_nonces_pruned, 0);
     assert!(
         !db.human()
-            .consume_claim_nonce("nonce-1", "kid_1", HumanClaimKind::Directive, T0 + 60_000, T0 + 59_999)
+            .consume_claim_nonce(
+                "nonce-1",
+                "kid_1",
+                HumanClaimKind::Directive,
+                T0 + 60_000,
+                T0 + 59_999
+            )
             .unwrap()
     );
 
@@ -528,7 +563,10 @@ fn node_certs_anti_rollback_and_mailbox_human_auth_json_attachment() {
             expires_at: T0 + 86_400_000,
         })
         .unwrap();
-    assert_eq!(db.human().get_latest_node_cert("prod@eu-1").unwrap(), Some(c1));
+    assert_eq!(
+        db.human().get_latest_node_cert("prod@eu-1").unwrap(),
+        Some(c1)
+    );
 
     let c2 = db
         .human()
@@ -541,7 +579,10 @@ fn node_certs_anti_rollback_and_mailbox_human_auth_json_attachment() {
             expires_at: T0 + 172_800_000,
         })
         .unwrap();
-    assert_eq!(db.human().get_latest_node_cert("prod@eu-1").unwrap(), Some(c2));
+    assert_eq!(
+        db.human().get_latest_node_cert("prod@eu-1").unwrap(),
+        Some(c2)
+    );
 
     // Epoch rollback on same (node_id, human_kid) fails closed!
     assert!(matches!(
@@ -580,14 +621,26 @@ fn node_certs_anti_rollback_and_mailbox_human_auth_json_attachment() {
     };
 
     assert_eq!(db.human().get_mailbox_human_auth(&receipt).unwrap(), None);
-    let auth_meta = r#"{"claimId":"c1","humanId":"bogdan","humanKid":"kid_phone_1","verified":true}"#;
-    assert!(db.human().set_mailbox_human_auth(&receipt, auth_meta).unwrap());
+    let auth_meta =
+        r#"{"claimId":"c1","humanId":"bogdan","humanKid":"kid_phone_1","verified":true}"#;
+    assert!(
+        db.human()
+            .set_mailbox_human_auth(&receipt, auth_meta)
+            .unwrap()
+    );
     assert_eq!(
-        db.human().get_mailbox_human_auth(&receipt).unwrap().as_deref(),
+        db.human()
+            .get_mailbox_human_auth(&receipt)
+            .unwrap()
+            .as_deref(),
         Some(auth_meta)
     );
     // Missing receipt returns false
-    assert!(!db.human().set_mailbox_human_auth("rcpt-does-not-exist", auth_meta).unwrap());
+    assert!(
+        !db.human()
+            .set_mailbox_human_auth("rcpt-does-not-exist", auth_meta)
+            .unwrap()
+    );
     // Existing mailbox peek still returns intact record
     let inbox = db.local().peek_inbox("sess-ops", 10).unwrap();
     assert_eq!(inbox.len(), 1);
@@ -602,7 +655,10 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
 
     // Empty store -> None
     assert_eq!(human.get_preferred_human_enc_jwk(None).unwrap(), None);
-    assert_eq!(human.get_preferred_human_enc_jwk(Some("bogdan")).unwrap(), None);
+    assert_eq!(
+        human.get_preferred_human_enc_jwk(Some("bogdan")).unwrap(),
+        None
+    );
 
     // Enroll authority without enc_jwk_json -> preferred lookup still None
     let a1 = sample_authority("bogdan", "kid_no_enc", HumanAuthorityRole::Admin, 1);
@@ -620,7 +676,11 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
         Some(sample_enc_jwk("alice_x25519_1").as_str())
     );
     assert_eq!(
-        human.get_preferred_human_enc_jwk(None).unwrap().unwrap().kid,
+        human
+            .get_preferred_human_enc_jwk(None)
+            .unwrap()
+            .unwrap()
+            .kid,
         "kid_alice_enc"
     );
     assert_eq!(
@@ -652,7 +712,11 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
         "kid_no_enc"
     );
     assert_eq!(
-        human.get_preferred_human_enc_jwk(None).unwrap().unwrap().kid,
+        human
+            .get_preferred_human_enc_jwk(None)
+            .unwrap()
+            .unwrap()
+            .kid,
         "kid_alice_enc"
     );
 
@@ -661,7 +725,11 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
     a3.enc_jwk_json = Some(sample_enc_jwk("bogdan_x25519_new"));
     human.upsert_authority(&a3, T0 + 50).unwrap();
     assert_eq!(
-        human.get_preferred_human_enc_jwk(None).unwrap().unwrap().kid,
+        human
+            .get_preferred_human_enc_jwk(None)
+            .unwrap()
+            .unwrap()
+            .kid,
         "kid_bogdan_new"
     );
     assert_eq!(
@@ -674,7 +742,12 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
     );
 
     // Even newer bogdan authority WITHOUT enc_jwk_json is ignored by preferred_enc_jwk lookup
-    let a4 = sample_authority("bogdan", "kid_bogdan_no_enc2", HumanAuthorityRole::Signer, 3);
+    let a4 = sample_authority(
+        "bogdan",
+        "kid_bogdan_no_enc2",
+        HumanAuthorityRole::Signer,
+        3,
+    );
     human.upsert_authority(&a4, T0 + 100).unwrap();
     assert_eq!(
         human
@@ -692,7 +765,11 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
         .unwrap();
     assert!(
         !human
-            .update_authority_enc_jwk("kid_bogdan_new", &sample_enc_jwk("revoked_attempt"), T0 + 160)
+            .update_authority_enc_jwk(
+                "kid_bogdan_new",
+                &sample_enc_jwk("revoked_attempt"),
+                T0 + 160
+            )
             .unwrap()
     );
     assert!(
@@ -714,7 +791,11 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
         "kid_no_enc"
     );
     assert_eq!(
-        human.get_preferred_human_enc_jwk(None).unwrap().unwrap().kid,
+        human
+            .get_preferred_human_enc_jwk(None)
+            .unwrap()
+            .unwrap()
+            .kid,
         "kid_alice_enc"
     );
 }
@@ -771,8 +852,9 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
         assert_eq!(backups.len(), 1);
         let bak_name = backups[0].file_name().unwrap().to_str().unwrap();
         assert!(
-            bak_name.starts_with(&format!("node.sqlite.v{from_ver}-to-v{CURRENT_SCHEMA_VERSION}-"))
-                && bak_name.ends_with(".bak"),
+            bak_name.starts_with(&format!(
+                "node.sqlite.v{from_ver}-to-v{CURRENT_SCHEMA_VERSION}-"
+            )) && bak_name.ends_with(".bak"),
             "unexpected backup name: {bak_name}"
         );
         let bak_conn =
@@ -786,10 +868,14 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
         let mb = db.local().peek_inbox("sess-1", 10).unwrap();
         assert_eq!(mb.len(), 1);
         assert_eq!(mb[0].receipt, "rcpt-legacy");
-        assert_eq!(db.human().get_mailbox_human_auth("rcpt-legacy").unwrap(), None);
+        assert_eq!(
+            db.human().get_mailbox_human_auth("rcpt-legacy").unwrap(),
+            None
+        );
 
         // Post-migration v5 operations work immediately (including enc_jwk_json!)
-        let mut post_auth = sample_authority("bogdan", "kid_post_mig", HumanAuthorityRole::Admin, 1);
+        let mut post_auth =
+            sample_authority("bogdan", "kid_post_mig", HumanAuthorityRole::Admin, 1);
         post_auth.enc_jwk_json = Some(sample_enc_jwk("post_mig_x25519"));
         let stored = db.human().upsert_authority(&post_auth, T0 + 100).unwrap();
         assert_eq!(
@@ -820,7 +906,11 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
     assert!(
         db_v4
             .human()
-            .update_authority_enc_jwk("kid_v4_legacy", &sample_enc_jwk("upgraded_v4_x25519"), T0 + 200)
+            .update_authority_enc_jwk(
+                "kid_v4_legacy",
+                &sample_enc_jwk("upgraded_v4_x25519"),
+                T0 + 200
+            )
             .unwrap()
     );
     let upgraded_v4 = db_v4
@@ -837,7 +927,12 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
     assert!(db_v3.wakeups().get_wakeup("wk-v3").unwrap().is_some());
     // Verify v2 peer_route survived v2->v7 untouched
     assert_eq!(
-        db_v2.peers().get_peer_route("bob@lap").unwrap().unwrap().via_peer,
+        db_v2
+            .peers()
+            .get_peer_route("bob@lap")
+            .unwrap()
+            .unwrap()
+            .via_peer,
         "acme-hub"
     );
 }
@@ -989,7 +1084,9 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
         },
     ] {
         assert!(
-            db.human().upsert_delegation_policy(&bad_policy, T0 + 30).is_err(),
+            db.human()
+                .upsert_delegation_policy(&bad_policy, T0 + 30)
+                .is_err(),
             "forbidden delegation policy {bad_policy:?} MUST fail closed"
         );
     }
@@ -1000,7 +1097,11 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
             &HumanDelegationPolicyInput {
                 human_id: "philip".to_string(),
                 node_prefix: "philip@*".to_string(),
-                scopes: vec!["dm:send".to_string(), "dm:receive".to_string(), "kv:read=*".to_string()],
+                scopes: vec![
+                    "dm:send".to_string(),
+                    "dm:receive".to_string(),
+                    "kv:read=*".to_string(),
+                ],
                 max_devices: 2,
                 delegation_enabled: true,
             },
@@ -1107,11 +1208,19 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
         0
     );
     assert_eq!(
-        db.peers().get_peer("philip@macbook").unwrap().unwrap().status,
+        db.peers()
+            .get_peer("philip@macbook")
+            .unwrap()
+            .unwrap()
+            .status,
         PeerStatus::Revoked
     );
     assert_eq!(
-        db.peers().get_peer("philip@devbox").unwrap().unwrap().status,
+        db.peers()
+            .get_peer("philip@devbox")
+            .unwrap()
+            .unwrap()
+            .status,
         PeerStatus::Revoked
     );
     assert_eq!(
@@ -1126,13 +1235,26 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
 
     // Unrelated peer `alice@macbook` & her bearer token MUST remain untouched!
     assert_eq!(
-        db.peers().get_peer("alice@macbook").unwrap().unwrap().status,
+        db.peers()
+            .get_peer("alice@macbook")
+            .unwrap()
+            .unwrap()
+            .status,
         PeerStatus::Active
     );
-    assert!(db.local().get_metadata("auth_token:hash_alice").unwrap().is_some());
+    assert!(
+        db.local()
+            .get_metadata("auth_token:hash_alice")
+            .unwrap()
+            .is_some()
+    );
 
     // Disabling delegation policy updates cleanly.
-    assert!(db.human().set_delegation_enabled("philip", false, T0 + 101).unwrap());
+    assert!(
+        db.human()
+            .set_delegation_enabled("philip", false, T0 + 101)
+            .unwrap()
+    );
     assert!(
         !db.human()
             .get_delegation_policy("philip")

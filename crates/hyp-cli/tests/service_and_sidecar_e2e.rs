@@ -34,7 +34,10 @@ fn node_start_if_not_running_exits_zero_immediately_when_daemon_alive() {
     ]);
     let mut daemon_proc = ManagedProcess::spawn("hyp node start (primary)", &mut start_cmd);
     let startup_env = daemon_proc.read_json_line(Duration::from_secs(10));
-    assert_eq!(startup_env["ok"], true, "primary daemon startup: {startup_env}");
+    assert_eq!(
+        startup_env["ok"], true,
+        "primary daemon startup: {startup_env}"
+    );
     let original_pid = startup_env["data"]["pid"]
         .as_u64()
         .expect("primary daemon pid");
@@ -148,7 +151,9 @@ fn node_start_if_not_running_exits_zero_immediately_when_daemon_alive() {
         .expect("valid numeric node.pid");
     assert_eq!(pid_file_val, original_pid);
     assert!(
-        daemon_proc.wait_timeout(Duration::from_millis(50)).is_none(),
+        daemon_proc
+            .wait_timeout(Duration::from_millis(50))
+            .is_none(),
         "primary daemon process must still be alive"
     );
 
@@ -168,8 +173,8 @@ fn node_start_if_not_running_starts_cleanly_when_offline_or_stale_socket() {
     let sock_path = state_dir.join(DEFAULT_SOCKET_FILENAME);
     #[cfg(unix)]
     {
-        let stale_listener = std::os::unix::net::UnixListener::bind(&sock_path)
-            .expect("bind stale unix socket");
+        let stale_listener =
+            std::os::unix::net::UnixListener::bind(&sock_path).expect("bind stale unix socket");
         drop(stale_listener);
         assert!(sock_path.exists(), "stale socket file should exist on disk");
     }
@@ -279,7 +284,10 @@ fn setup_antigravity_writes_if_not_running_sidecar_and_is_idempotent() {
     let raw_1 = fs::read_to_string(&sidecar_path).expect("read sidecar.json");
     let sidecar: Value = serde_json::from_str(&raw_1).expect("valid sidecar.json");
     assert_eq!(sidecar["command"], fake_bin);
-    assert_eq!(sidecar["args"], json!(["node", "start", "--if-not-running"]));
+    assert_eq!(
+        sidecar["args"],
+        json!(["node", "start", "--if-not-running"])
+    );
     assert_eq!(sidecar["restart_policy"], "on-failure");
 
     // 3. Re-running setup must be strictly idempotent (byte-for-byte identical).

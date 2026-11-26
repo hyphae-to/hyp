@@ -264,7 +264,10 @@ async fn read_ws_client_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
     stream.read_exact(&mut hdr).await.ok()?;
     let opcode = hdr[0] & 0x0f;
     let masked = (hdr[1] & 0x80) != 0;
-    assert!(masked, "client WS frames MUST always be masked per RFC 6455");
+    assert!(
+        masked,
+        "client WS frames MUST always be masked per RFC 6455"
+    );
     let len_code = hdr[1] & 0x7f;
     let len: usize = match len_code {
         0..=125 => len_code as usize,
@@ -396,8 +399,13 @@ async fn handle_mock_conn(
             return Ok(());
         }
         if auth != Some(expected_auth.as_str()) {
-            write_http_json(&mut stream, 401, "Unauthorized", &json!({ "error": "unauthorized" }))
-                .await;
+            write_http_json(
+                &mut stream,
+                401,
+                "Unauthorized",
+                &json!({ "error": "unauthorized" }),
+            )
+            .await;
             return Ok(());
         }
         write_http_json(
@@ -568,7 +576,13 @@ async fn handle_mock_conn(
         return Ok(());
     }
 
-    write_http_json(&mut stream, 404, "Not Found", &json!({ "error": "not_found" })).await;
+    write_http_json(
+        &mut stream,
+        404,
+        "Not Found",
+        &json!({ "error": "not_found" }),
+    )
+    .await;
     Ok(())
 }
 
@@ -577,7 +591,8 @@ async fn handle_mock_conn(
 // ============================================================================
 
 #[tokio::test]
-async fn sqlite_resolves_v2_and_v1_schemas_ignores_deleted_archived_and_fails_closed_on_ambiguous() {
+async fn sqlite_resolves_v2_and_v1_schemas_ignores_deleted_archived_and_fails_closed_on_ambiguous()
+{
     let tmp = TempDir::new().unwrap();
     let base_dir = tmp.path();
 
@@ -689,30 +704,66 @@ async fn sqlite_resolves_v2_and_v1_schemas_ignores_deleted_archived_and_fails_cl
 
     // In-flight call verification (v2 turn_items + v1 projection_thread_activities).
     assert_eq!(
-        resolve_t3_caller_by_call_id("call_live_123", "hyp_send", base_dir, Duration::from_millis(100)).await,
+        resolve_t3_caller_by_call_id(
+            "call_live_123",
+            "hyp_send",
+            base_dir,
+            Duration::from_millis(100)
+        )
+        .await,
         Ok("t3-v2-live".to_string())
     );
     assert_eq!(
-        resolve_t3_caller_by_call_id("call_v1_act", "hyp_inbox", base_dir, Duration::from_millis(100)).await,
+        resolve_t3_caller_by_call_id(
+            "call_v1_act",
+            "hyp_inbox",
+            base_dir,
+            Duration::from_millis(100)
+        )
+        .await,
         Ok("t3-v1-live".to_string())
     );
     // Completed turn item and mismatched tool name MUST fail closed.
     assert!(matches!(
-        resolve_t3_caller_by_call_id("call_done_456", "hyp_send", base_dir, Duration::from_millis(80)).await,
+        resolve_t3_caller_by_call_id(
+            "call_done_456",
+            "hyp_send",
+            base_dir,
+            Duration::from_millis(80)
+        )
+        .await,
         Err(T3LookupError::CallerNotFound(_))
     ));
     assert!(matches!(
-        resolve_t3_caller_by_call_id("call_live_123", "hyp_inbox", base_dir, Duration::from_millis(80)).await,
+        resolve_t3_caller_by_call_id(
+            "call_live_123",
+            "hyp_inbox",
+            base_dir,
+            Duration::from_millis(80)
+        )
+        .await,
         Err(T3LookupError::CallerNotFound(_))
     ));
     // Ambiguous in-flight call across 2 active threads -> fail closed CallerAmbiguous.
     assert!(matches!(
-        resolve_t3_caller_by_call_id("call_ambig_789", "hyp_mesh", base_dir, Duration::from_millis(80)).await,
+        resolve_t3_caller_by_call_id(
+            "call_ambig_789",
+            "hyp_mesh",
+            base_dir,
+            Duration::from_millis(80)
+        )
+        .await,
         Err(T3LookupError::CallerAmbiguous(_))
     ));
     // Unknown tool -> CallerUnverifiable.
     assert!(matches!(
-        resolve_t3_caller_by_call_id("call_live_123", "not_a_mesh_tool", base_dir, Duration::from_millis(80)).await,
+        resolve_t3_caller_by_call_id(
+            "call_live_123",
+            "not_a_mesh_tool",
+            base_dir,
+            Duration::from_millis(80)
+        )
+        .await,
         Err(T3LookupError::CallerUnverifiable(_))
     ));
 }
@@ -772,7 +823,12 @@ fn url_validation_enforces_strict_https_or_loopback_http_origin() {
 async fn probe_t3_server_reports_authenticated_unauthenticated_and_unreachable() {
     let server = MockT3Server::start(MockT3Config::standard("t3-probe-secret-xyz")).await;
 
-    let authed = probe_t3_server(&server.url, Some("t3-probe-secret-xyz"), Duration::from_secs(2)).await;
+    let authed = probe_t3_server(
+        &server.url,
+        Some("t3-probe-secret-xyz"),
+        Duration::from_secs(2),
+    )
+    .await;
     assert_eq!(
         authed,
         T3ProbeResult {
@@ -803,7 +859,12 @@ async fn probe_t3_server_reports_authenticated_unauthenticated_and_unreachable()
     );
 
     // Non-loopback HTTP is rejected before making any network request.
-    let insecure = probe_t3_server("http://10.0.0.1:3773", Some("t3-probe-secret-xyz"), Duration::from_secs(1)).await;
+    let insecure = probe_t3_server(
+        "http://10.0.0.1:3773",
+        Some("t3-probe-secret-xyz"),
+        Duration::from_secs(1),
+    )
+    .await;
     assert!(!insecure.ok);
     assert!(insecure.error.is_some());
 
@@ -811,7 +872,12 @@ async fn probe_t3_server_reports_authenticated_unauthenticated_and_unreachable()
     server.shutdown().await;
 
     // Stopped server -> probe reports ok: false with error.
-    let dead = probe_t3_server(&dead_url, Some("t3-probe-secret-xyz"), Duration::from_secs(1)).await;
+    let dead = probe_t3_server(
+        &dead_url,
+        Some("t3-probe-secret-xyz"),
+        Duration::from_secs(1),
+    )
+    .await;
     assert!(!dead.ok);
     assert!(dead.error.is_some());
 }
@@ -924,7 +990,9 @@ async fn push_transport_secret_store_queue_interrupt_and_fallback_secret_e2e() {
         token_override: None,
     });
     assert_eq!(
-        fallback_t.deliver("via fallback secret", PushMode::Queue).await,
+        fallback_t
+            .deliver("via fallback secret", PushMode::Queue)
+            .await,
         PushOutcome::Delivered
     );
 
@@ -1012,7 +1080,9 @@ async fn error_mapping_covers_auth_failed_missing_secret_unreachable_and_effect_
     let mut t500 = T3Target::new("thr-idle", &srv_500.url);
     t500.token_override = Some("good-t3-token".into());
     assert_eq!(
-        T3Transport::new(t500).deliver("hello", PushMode::Queue).await,
+        T3Transport::new(t500)
+            .deliver("hello", PushMode::Queue)
+            .await,
         PushOutcome::hold("t3_server_unreachable")
     );
     srv_500.shutdown().await;

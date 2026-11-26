@@ -30,9 +30,9 @@ use std::collections::BTreeSet;
 use std::f64::consts::PI;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(unix)]
 use std::io::{BufReader, Read};
-use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
@@ -337,9 +337,11 @@ impl ManualGuideHarness {
         claude_config_dir: Option<&Path>,
     ) -> PathBuf {
         match self {
-            Self::ClaudeDesktop => {
-                LaunchableHarness::Claude.primary_skill_path_for(home, explicit_home, claude_config_dir)
-            }
+            Self::ClaudeDesktop => LaunchableHarness::Claude.primary_skill_path_for(
+                home,
+                explicit_home,
+                claude_config_dir,
+            ),
             Self::CodexDesktop => LaunchableHarness::Codex.primary_skill_path(home),
             Self::OpenCodeDesktop => LaunchableHarness::Opencode.primary_skill_path(home),
             Self::CursorIde => LaunchableHarness::Cursor.primary_skill_path(home),
@@ -371,9 +373,11 @@ impl ManualGuideHarness {
         claude_config_dir: Option<&Path>,
     ) -> Vec<PathBuf> {
         match self {
-            Self::ClaudeDesktop => {
-                LaunchableHarness::Claude.extra_skill_paths_for(home, explicit_home, claude_config_dir)
-            }
+            Self::ClaudeDesktop => LaunchableHarness::Claude.extra_skill_paths_for(
+                home,
+                explicit_home,
+                claude_config_dir,
+            ),
             Self::CodexDesktop => LaunchableHarness::Codex.extra_skill_paths(home),
             Self::OpenCodeDesktop => vec![
                 home.join(".agents")
@@ -787,10 +791,7 @@ pub fn apply_desktop_mcp_config(
                     "args": ["mcp", "--backend", "claude", "--ephemeral"]
                 }),
             );
-            doc.insert(
-                "mcpServers".to_string(),
-                serde_json::Value::Object(servers),
-            );
+            doc.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
 
             let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(doc))
                 .map_err(|e| format!("failed to serialize {}: {e}", config_path.display()))?;
@@ -963,11 +964,7 @@ pub fn detect_desktop_apps_in_with_env(
         || apps_dir.is_some_and(|a| a.join("OpenCode.app").exists())
         || appdata_dir.is_some_and(|a| a.join("OpenCode").exists())
         || local_appdata_dir.is_some_and(|a| a.join("OpenCode").exists())
-        || home
-            .join("AppData")
-            .join("Local")
-            .join("OpenCode")
-            .exists()
+        || home.join("AppData").join("Local").join("OpenCode").exists()
         || sanitize_http_url(opencode_server_url).is_some();
 
     let cursor_ide = home.join(".cursor").exists()
@@ -1546,10 +1543,7 @@ impl Drop for RawTtyGuard {
 /// within a `2 × 4` character cell:
 /// - `(0,0)->0x01`, `(0,1)->0x02`, `(0,2)->0x04`, `(0,3)->0x40`
 /// - `(1,0)->0x08`, `(1,1)->0x10`, `(1,2)->0x20`, `(1,3)->0x80`
-const BRAILLE_BITS: [[u8; 4]; 2] = [
-    [0x01, 0x02, 0x04, 0x40],
-    [0x08, 0x10, 0x20, 0x80],
-];
+const BRAILLE_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
 
 // Master 16-sub-pixel-tall (4 exact Braille rows) botanical-serif `HYPHAE` bitmaps.
 // Vertical pillars land on even 2-px Braille cell boundaries for razor-sharp terminal rendering.
@@ -2074,8 +2068,13 @@ fn resolve_braille_cell_rgb(cell: BrailleCell) -> Option<(u8, u8, u8)> {
         return Some(lerp_rgb(RGB_TENDRIL_TWILIGHT, lit, intensity));
     }
     if cell.spore_energy > 0.30 && cell.spore_energy >= cell.tendril_energy * 0.70 {
-        let boost = (cell.pulse_energy * 0.85 + (cell.spore_energy - 0.75).max(0.0)).clamp(0.0, 1.0);
-        let base = lerp_rgb(RGB_TENDRIL_SAGE, RGB_SPORE_AMBER, (cell.spore_energy * 1.15).clamp(0.0, 1.0));
+        let boost =
+            (cell.pulse_energy * 0.85 + (cell.spore_energy - 0.75).max(0.0)).clamp(0.0, 1.0);
+        let base = lerp_rgb(
+            RGB_TENDRIL_SAGE,
+            RGB_SPORE_AMBER,
+            (cell.spore_energy * 1.15).clamp(0.0, 1.0),
+        );
         return Some(lerp_rgb(base, RGB_SPORE_GLOW, boost));
     }
     if cell.pulse_energy > 0.22 {
@@ -2083,14 +2082,22 @@ fn resolve_braille_cell_rgb(cell: BrailleCell) -> Option<(u8, u8, u8)> {
         if p < 0.58 {
             return Some(lerp_rgb(RGB_TENDRIL_SAGE, RGB_WORD_CHARTREUSE, p / 0.58));
         }
-        return Some(lerp_rgb(RGB_WORD_CHARTREUSE, RGB_SPORE_GLOW, (p - 0.58) / 0.42));
+        return Some(lerp_rgb(
+            RGB_WORD_CHARTREUSE,
+            RGB_SPORE_GLOW,
+            (p - 0.58) / 0.42,
+        ));
     }
     if cell.tendril_energy > 0.0 {
         let t = cell.tendril_energy.clamp(0.0, 1.0);
         if t < 0.48 {
             return Some(lerp_rgb(RGB_TENDRIL_TWILIGHT, RGB_TENDRIL_DEEP, t / 0.48));
         }
-        return Some(lerp_rgb(RGB_TENDRIL_DEEP, RGB_TENDRIL_SAGE, (t - 0.48) / 0.52));
+        return Some(lerp_rgb(
+            RGB_TENDRIL_DEEP,
+            RGB_TENDRIL_SAGE,
+            (t - 0.48) / 0.52,
+        ));
     }
     None
 }
@@ -2167,9 +2174,8 @@ pub fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     let gray_idx = ((avg - 8 + 5) / 10).clamp(0, 23);
     let gray_lvl = 8 + 10 * gray_idx;
     let gray_code = (232 + gray_idx) as u8;
-    let gray_dist = (r as i32 - gray_lvl).pow(2)
-        + (g as i32 - gray_lvl).pow(2)
-        + (b as i32 - gray_lvl).pow(2);
+    let gray_dist =
+        (r as i32 - gray_lvl).pow(2) + (g as i32 - gray_lvl).pow(2) + (b as i32 - gray_lvl).pow(2);
 
     if gray_dist < cube_dist {
         gray_code
@@ -2188,14 +2194,8 @@ fn cubic_bezier(
     let inv = 1.0 - t;
     let inv2 = inv * inv;
     let t2 = t * t;
-    let x = inv2 * inv * p0.0
-        + 3.0 * inv2 * t * p1.0
-        + 3.0 * inv * t2 * p2.0
-        + t2 * t * p3.0;
-    let y = inv2 * inv * p0.1
-        + 3.0 * inv2 * t * p1.1
-        + 3.0 * inv * t2 * p2.1
-        + t2 * t * p3.1;
+    let x = inv2 * inv * p0.0 + 3.0 * inv2 * t * p1.0 + 3.0 * inv * t2 * p2.0 + t2 * t * p3.0;
+    let y = inv2 * inv * p0.1 + 3.0 * inv2 * t * p1.1 + 3.0 * inv * t2 * p2.1 + t2 * t * p3.1;
     (x, y)
 }
 
@@ -2254,11 +2254,7 @@ fn wordmark_shimmer_value(u_x: f64, u_y: f64, phase: f64) -> f64 {
     (0.72 * wave1 + 0.28 * wave2).clamp(0.0, 1.0)
 }
 
-fn draw_braille_wordmark(
-    canvas: &mut BrailleCanvas,
-    p: f64,
-    phase: f64,
-) -> WordmarkBox {
+fn draw_braille_wordmark(canvas: &mut BrailleCanvas, p: f64, phase: f64) -> WordmarkBox {
     let px_w = canvas.px_w;
     let px_h = canvas.px_h;
     let use_compact_12 = canvas.height <= 8;
@@ -2291,19 +2287,15 @@ fn draw_braille_wordmark(
 
     let scaled_len = |v: usize| -> usize { (v * scale_num) / scale_den };
     let gap = scaled_len(base_gap).max(2);
-    let total_w: usize = glyphs
-        .iter()
-        .map(|g| scaled_len(g[0].len()))
-        .sum::<usize>()
-        + gap * (glyphs.len() - 1);
+    let total_w: usize =
+        glyphs.iter().map(|g| scaled_len(g[0].len())).sum::<usize>() + gap * (glyphs.len() - 1);
     let total_h = scaled_len(base_h);
 
     // Snap origin to even X and multiple-of-4 Y for crisp Braille cell pillar alignment.
     let raw_x0 = px_w.saturating_sub(total_w) / 2;
     let origin_x = (raw_x0 & !1) as isize;
     let raw_y0 = px_h.saturating_sub(total_h) / 2;
-    let origin_y = ((raw_y0 + 2) & !3)
-        .min(px_h.saturating_sub(total_h)) as isize;
+    let origin_y = ((raw_y0 + 2) & !3).min(px_h.saturating_sub(total_h)) as isize;
 
     let cx = origin_x as f64 + (total_w as f64) * 0.5;
     let cy = origin_y as f64 + (total_h as f64) * 0.5;
@@ -2344,8 +2336,11 @@ fn draw_braille_wordmark(
 
                         canvas.mark_wordmark_pixel(px, py, halo_r);
 
-                        let u_x = ((px - origin_x) as f64 / (total_w as f64).max(1.0)).clamp(0.0, 1.0);
-                        let u_y = ((py - origin_y) as f64 / (gh_base as f64 * scale_num as f64 / scale_den as f64).max(1.0)).clamp(0.0, 1.0);
+                        let u_x =
+                            ((px - origin_x) as f64 / (total_w as f64).max(1.0)).clamp(0.0, 1.0);
+                        let u_y = ((py - origin_y) as f64
+                            / (gh_base as f64 * scale_num as f64 / scale_den as f64).max(1.0))
+                        .clamp(0.0, 1.0);
                         let base_shimmer = wordmark_shimmer_value(u_x, u_y, phase);
                         // Brief warm-gold ignition rim as letters crystallize during intro growth.
                         let ignite_rim = if p < 0.99 {
@@ -2370,11 +2365,7 @@ fn draw_braille_wordmark(
     }
 }
 
-fn draw_narrow_wordmark(
-    canvas: &mut BrailleCanvas,
-    p: f64,
-    phase: f64,
-) -> WordmarkBox {
+fn draw_narrow_wordmark(canvas: &mut BrailleCanvas, p: f64, phase: f64) -> WordmarkBox {
     let width = canvas.width;
     let height = canvas.height;
     let cy_row = height / 2;
@@ -2481,24 +2472,23 @@ fn build_botanical_topology(
     let mut strands = Vec::with_capacity(32);
     let mut hubs = Vec::with_capacity(24);
 
-    let mut add_strand_with_hubs =
-        |s: MyceliumStrand, hub_specs: &[(f64, f64)]| {
-            for &(u, radius) in hub_specs {
-                let (hx, hy) = cubic_bezier(s.p0, s.p1, s.p2, s.p3, u);
-                let appear_p = lerp_f64(s.start_p, s.end_p, u);
-                hubs.push(SporeHub {
-                    x: hx,
-                    y: hy,
-                    radius,
-                    appear_p,
-                    pulse_speed: s.pulse_speed,
-                    pulse_offset: s.pulse_offset,
-                    pulse_u: u,
-                    respect_halo: s.respect_halo,
-                });
-            }
-            strands.push(s);
-        };
+    let mut add_strand_with_hubs = |s: MyceliumStrand, hub_specs: &[(f64, f64)]| {
+        for &(u, radius) in hub_specs {
+            let (hx, hy) = cubic_bezier(s.p0, s.p1, s.p2, s.p3, u);
+            let appear_p = lerp_f64(s.start_p, s.end_p, u);
+            hubs.push(SporeHub {
+                x: hx,
+                y: hy,
+                radius,
+                appear_p,
+                pulse_speed: s.pulse_speed,
+                pulse_offset: s.pulse_offset,
+                pulse_u: u,
+                respect_halo: s.respect_halo,
+            });
+        }
+        strands.push(s);
+    };
 
     // 1. Left Botanical Flank Flourishes (airy asymmetric fronds radiating outside H's halo)
     let l_up = (wm.x0 - flank_pad, wm.y0 + wm_h * 0.14);
@@ -3064,14 +3054,7 @@ pub fn render_mycelium_frame_with_phase(
     let seed_vis = 1.0 - smoothstep(0.20, 0.44, p);
     if seed_vis > 0.02 {
         let seed_r = lerp_f64(1.65, 2.35, smoothstep(0.0, 0.16, p));
-        canvas.plot_spore_hub(
-            cx,
-            cy,
-            seed_r,
-            0.98 * seed_vis,
-            0.88 * seed_vis,
-            false,
-        );
+        canvas.plot_spore_hub(cx, cy, seed_r, 0.98 * seed_vis, 0.88 * seed_vis, false);
         let sprout_growth = smoothstep(0.0, 0.34, p);
         if sprout_growth > 0.01 {
             let sprout_targets = [
@@ -3086,8 +3069,14 @@ pub fn render_mycelium_frame_with_phase(
                 let sign = if idx % 2 == 0 { 1.0 } else { -1.0 };
                 let dx = tx - cx;
                 let dy = ty - cy;
-                let c1 = (cx + dx * 0.35 - dy * 0.18 * sign, cy + dy * 0.35 + dx * 0.12 * sign);
-                let c2 = (cx + dx * 0.72 + dy * 0.14 * sign, cy + dy * 0.72 - dx * 0.10 * sign);
+                let c1 = (
+                    cx + dx * 0.35 - dy * 0.18 * sign,
+                    cy + dy * 0.35 + dx * 0.12 * sign,
+                );
+                let c2 = (
+                    cx + dx * 0.72 + dy * 0.14 * sign,
+                    cy + dy * 0.72 - dx * 0.10 * sign,
+                );
                 canvas.plot_cubic_bezier(
                     (cx, cy),
                     c1,
@@ -3427,7 +3416,8 @@ pub fn play_mycelium_animation(no_anim: bool) {
 
     #[cfg(unix)]
     if let Ok(mut raw) = RawTtyGuard::enter(true) {
-        let _ = play_fullscreen_intro_on_alt_screen(&mut raw, term_rows, term_cols, color_mode, 220);
+        let _ =
+            play_fullscreen_intro_on_alt_screen(&mut raw, term_rows, term_cols, color_mode, 220);
         raw.restore();
         alt.leave();
         return;
@@ -3482,7 +3472,8 @@ pub fn run_preview_animation(no_anim: bool) -> ExitCode {
 
     #[cfg(unix)]
     if let Ok(mut raw) = RawTtyGuard::enter(true) {
-        let _ = play_fullscreen_intro_on_alt_screen(&mut raw, term_rows, term_cols, color_mode, 450);
+        let _ =
+            play_fullscreen_intro_on_alt_screen(&mut raw, term_rows, term_cols, color_mode, 450);
         raw.restore();
         alt.leave();
         return ExitCode::from(EXIT_OK);
@@ -3944,9 +3935,7 @@ pub fn build_main_menu_items_with_env(
         ),
         (ManualGuideHarness::T3, "desktop app", "open in T3 Code"),
     ] {
-        if let Some(diag) =
-            find_diag(guide_harness.id()).filter(|d| d.detected || d.configured)
-        {
+        if let Some(diag) = find_diag(guide_harness.id()).filter(|d| d.detected || d.configured) {
             let subtitle = if diag.configured {
                 format!("{default_sub} · configured")
             } else {
@@ -4043,8 +4032,7 @@ fn detect_candidates_in_with_claude(
     existing_node_id: Option<&str>,
     in_herdr_env: Option<&str>,
 ) -> Vec<MainMenuItem> {
-    let diagnostics =
-        detect_harness_statuses(home, explicit_home, claude_config_dir, config_path);
+    let diagnostics = detect_harness_statuses(home, explicit_home, claude_config_dir, config_path);
     let launchables: Vec<(LaunchableHarness, PathBuf)> = LaunchableHarness::ALL
         .iter()
         .filter_map(|&h| find_executable_in_path_env(h.binary_name(), path_var).map(|p| (h, p)))
@@ -4590,7 +4578,10 @@ fn resolve_wizard_cli_bin(explicit_bin: Option<&Path>) -> String {
         .unwrap_or_else(|_| "hyp".to_string())
 }
 
-fn resolve_t3_url_from_home(home: &Path, existing_node: Option<&ExistingNodeInfo>) -> Option<String> {
+fn resolve_t3_url_from_home(
+    home: &Path,
+    existing_node: Option<&ExistingNodeInfo>,
+) -> Option<String> {
     let config_path = existing_node
         .map(|node| node.config_path.clone())
         .unwrap_or_else(|| home.join(".config").join("hyphae").join("node.json"));
@@ -4907,7 +4898,14 @@ fn install_and_handoff_cli(
     ) {
         Ok(v) => v,
         Err(e) => {
-            return emit_error("onboard", as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
+            return emit_error(
+                "onboard",
+                as_json,
+                EXIT_ERROR,
+                "SKILL_INSTALL_FAILED",
+                e,
+                None,
+            );
         }
     };
 
@@ -4922,10 +4920,7 @@ fn install_and_handoff_cli(
         );
     }
 
-    let prompt = build_onboarding_prompt(
-        &primary_skill,
-        existing_node.map(|n| n.node_id.as_str()),
-    );
+    let prompt = build_onboarding_prompt(&primary_skill, existing_node.map(|n| n.node_id.as_str()));
     spawn_interactive_harness(chosen, &exe_path, &prompt, as_json)
 }
 
@@ -4954,7 +4949,14 @@ fn install_and_handoff_herdr(
     ) {
         Ok(v) => v,
         Err(e) => {
-            return emit_error("onboard", as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
+            return emit_error(
+                "onboard",
+                as_json,
+                EXIT_ERROR,
+                "SKILL_INSTALL_FAILED",
+                e,
+                None,
+            );
         }
     };
 
@@ -4971,7 +4973,14 @@ fn install_and_handoff_herdr(
             .join("hyphae-setup")
             .join("SKILL.md");
         if let Err(e) = write_atomic_file(&fallback, HYPHAE_SETUP_SKILL_MD.as_bytes(), false) {
-            return emit_error("onboard", as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
+            return emit_error(
+                "onboard",
+                as_json,
+                EXIT_ERROR,
+                "SKILL_INSTALL_FAILED",
+                e,
+                None,
+            );
         }
         installed.push(InstalledSkillEntry {
             harness: "agents".to_string(),
@@ -4992,10 +5001,7 @@ fn install_and_handoff_herdr(
         );
     }
 
-    let prompt = build_onboarding_prompt(
-        &primary_skill,
-        existing_node.map(|n| n.node_id.as_str()),
-    );
+    let prompt = build_onboarding_prompt(&primary_skill, existing_node.map(|n| n.node_id.as_str()));
     spawn_herdr_template(hc_bin, &template.name, &prompt, as_json)
 }
 
@@ -5073,7 +5079,10 @@ fn print_manual_guide_plain(
             println!("OK    Updated MCP config at {}", cfg_path.display());
         }
         DesktopMcpStatus::AlreadyConfigured(cfg_path) => {
-            println!("OK    MCP config already configured at {}", cfg_path.display());
+            println!(
+                "OK    MCP config already configured at {}",
+                cfg_path.display()
+            );
         }
         DesktopMcpStatus::Skipped | DesktopMcpStatus::NotApplicable => {
             if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
@@ -5117,11 +5126,18 @@ fn install_and_emit_manual_guide(
 ) -> ExitCode {
     let (primary_skill, installed) =
         match install_manual_guide_skills(harness, home, explicit_home, claude_config_dir) {
-        Ok(res) => res,
-        Err(e) => {
-            return emit_error("onboard", as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
-        }
-    };
+            Ok(res) => res,
+            Err(e) => {
+                return emit_error(
+                    "onboard",
+                    as_json,
+                    EXIT_ERROR,
+                    "SKILL_INSTALL_FAILED",
+                    e,
+                    None,
+                );
+            }
+        };
 
     let prompt = build_manual_guide_prompt(harness, existing_node.map(|n| n.node_id.as_str()));
     let deeplink =
@@ -5460,7 +5476,11 @@ fn format_menu_row(
     let effective_tag_w = if show_tag { tag_col_w } else { 0 };
     let label_max = if show_tag {
         label_col_w
-            .min(inner_w.saturating_sub(prefix_len + effective_tag_w + 4).max(8))
+            .min(
+                inner_w
+                    .saturating_sub(prefix_len + effective_tag_w + 4)
+                    .max(8),
+            )
             .max(1)
     } else {
         let sub_reserve = if subtitle.is_empty() {
@@ -5918,13 +5938,7 @@ fn render_herdr_screen(
     anim_tick: usize,
 ) {
     let lines = render_herdr_templates(
-        templates,
-        selected,
-        allow_back,
-        term_rows,
-        term_cols,
-        color_mode,
-        anim_tick,
+        templates, selected, allow_back, term_rows, term_cols, color_mode, anim_tick,
     );
     flush_screen_lines(&lines, term_rows);
 }
@@ -6141,7 +6155,10 @@ pub fn render_manual_guide(
 
     let mut lines = Vec::new();
 
-    let title = format!("{} · Skill Installed & Handoff Guide", harness.display_name());
+    let title = format!(
+        "{} · Skill Installed & Handoff Guide",
+        harness.display_name()
+    );
     lines.push(format!(
         "{left_pad}{}",
         paint_styled_text(
@@ -6689,9 +6706,8 @@ impl SetupToggleState {
                             .to_string(),
                     );
                     if sel.install_skills {
-                        preview.push(
-                            "  + skill: ~/.config/herdr/skills/hyphae/SKILL.md".to_string(),
-                        );
+                        preview
+                            .push("  + skill: ~/.config/herdr/skills/hyphae/SKILL.md".to_string());
                     }
                     if sel.install_herdr_mod {
                         preview.push(
@@ -7016,7 +7032,10 @@ pub fn render_openclaw_config_screen(
     ));
     let sub = format!(
         "Plugin: {}",
-        display_compact_path(&home.join(".openclaw").join("extensions").join("hyphae"), home)
+        display_compact_path(
+            &home.join(".openclaw").join("extensions").join("hyphae"),
+            home
+        )
     );
     lines.push(format!(
         "{left_pad}{}",
@@ -7038,12 +7057,8 @@ pub fn render_openclaw_config_screen(
 
     lines.push(format!("{left_pad}{border_fg}╭{horiz}╮{reset}"));
     let delivery_summary = match state.delivery {
-        OpenClawDeliveryMode::Gateway => {
-            "Delivery: Native plugin wake / /hooks/wake + hyp_inbox"
-        }
-        OpenClawDeliveryMode::Inbox => {
-            "Delivery: Turn-start / hyp_inbox only (no live wakeups)"
-        }
+        OpenClawDeliveryMode::Gateway => "Delivery: Native plugin wake / /hooks/wake + hyp_inbox",
+        OpenClawDeliveryMode::Inbox => "Delivery: Turn-start / hyp_inbox only (no live wakeups)",
     };
     for wrapped in wrap_words(delivery_summary, inner_card_w) {
         lines.push(card_row(&wrapped, RGB_PULSE_IVORY, true));
@@ -7170,10 +7185,7 @@ fn run_plain_tty_openclaw_config(
     loop {
         println!();
         println!("OpenClaw · Delivery Mode & Prompt Injection");
-        println!(
-            "  [1] Delivery mode: {}",
-            state.delivery.display_label()
-        );
+        println!("  [1] Delivery mode: {}", state.delivery.display_label());
         println!(
             "  [2] Prompt injection (before_prompt_build): [{}] {}",
             if state.prompt_injection { "x" } else { " " },
@@ -7282,7 +7294,11 @@ fn format_toggle_row(
     let effective_badge_w = if show_badge { badge_col_w } else { 0 };
     let label_budget = if show_badge {
         label_col_w
-            .min(inner_w.saturating_sub(lead_w + effective_badge_w + 1).max(1))
+            .min(
+                inner_w
+                    .saturating_sub(lead_w + effective_badge_w + 1)
+                    .max(1),
+            )
             .max(1)
     } else {
         inner_w.saturating_sub(lead_w).max(1)
@@ -7865,14 +7881,7 @@ pub fn run_setup_toggle_interactive(
 
                     let has_live_banner = term_rows >= 33 && !state.show_dry_run_preview;
                     render_setup_toggle_fullscreen(
-                        &state,
-                        home,
-                        false,
-                        false,
-                        term_rows,
-                        term_cols,
-                        color_mode,
-                        anim_tick,
+                        &state, home, false, false, term_rows, term_cols, color_mode, anim_tick,
                     );
                     let key = if live_anim && has_live_banner {
                         match raw.read_key_timeout() {
@@ -8086,14 +8095,7 @@ fn run_fullscreen_tui_loop(
             }
             WizardScreen::LocalSetupConfig { state, .. } => {
                 render_setup_toggle_fullscreen(
-                    state,
-                    home,
-                    true,
-                    true,
-                    term_rows,
-                    term_cols,
-                    color_mode,
-                    anim_tick,
+                    state, home, true, true, term_rows, term_cols, color_mode, anim_tick,
                 );
                 term_rows >= 33 && !state.show_dry_run_preview
             }
@@ -8881,18 +8883,18 @@ fn run_plain_tty_manual_guide(
 ) -> Option<WizardOutcome> {
     let (primary_skill, installed) =
         match install_manual_guide_skills(harness, home, explicit_home, claude_config_dir) {
-        Ok(res) => res,
-        Err(e) => {
-            return Some(WizardOutcome::Finished(emit_error(
-                "onboard",
-                false,
-                EXIT_ERROR,
-                "SKILL_INSTALL_FAILED",
-                e,
-                None,
-            )));
-        }
-    };
+            Ok(res) => res,
+            Err(e) => {
+                return Some(WizardOutcome::Finished(emit_error(
+                    "onboard",
+                    false,
+                    EXIT_ERROR,
+                    "SKILL_INSTALL_FAILED",
+                    e,
+                    None,
+                )));
+            }
+        };
 
     let mcp_status = if harness == ManualGuideHarness::Openclaw {
         let mut oc_state = OpenClawConfigState::from_home(home);
@@ -8983,7 +8985,11 @@ fn run_numbered_fallback_wizard(
     let version = env!("CARGO_PKG_VERSION");
     println!();
     if let Some(existing) = existing_node {
-        let legacy_tag = if existing.is_legacy_v1 { " · legacy v1" } else { "" };
+        let legacy_tag = if existing.is_legacy_v1 {
+            " · legacy v1"
+        } else {
+            ""
+        };
         println!(
             "hyphae v{version} · interactive setup (existing node: {}{legacy_tag})",
             existing.node_id
@@ -9352,7 +9358,10 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                 EXIT_ERROR,
                 "HERDR_CLI_NOT_FOUND",
                 "Could not find 'hc' on PATH for Herdr launch templates",
-                Some("Install Herdr (`hc`) or run `hyp onboard --yes` for local CLI setup.".to_string()),
+                Some(
+                    "Install Herdr (`hc`) or run `hyp onboard --yes` for local CLI setup."
+                        .to_string(),
+                ),
             ));
         };
 
@@ -9631,10 +9640,12 @@ mod tests {
             let mut final_lit = 0usize;
 
             for frame_idx in [0, total / 3, (total * 2) / 3, total - 1] {
-                let tc = render_mycelium_frame(frame_idx, total, width, height, ColorMode::TrueColor);
+                let tc =
+                    render_mycelium_frame(frame_idx, total, width, height, ColorMode::TrueColor);
                 let ansi256 =
                     render_mycelium_frame(frame_idx, total, width, height, ColorMode::Ansi256);
-                let plain = render_mycelium_frame(frame_idx, total, width, height, ColorMode::Plain);
+                let plain =
+                    render_mycelium_frame(frame_idx, total, width, height, ColorMode::Plain);
 
                 assert!(!tc.is_empty(), "{width}x{height} frame {frame_idx} empty");
                 assert!(
@@ -9671,7 +9682,10 @@ mod tests {
                 }
 
                 let lit = count_lit_dots(&plain);
-                assert!(lit > 0, "{width}x{height} frame {frame_idx} should have lit cells");
+                assert!(
+                    lit > 0,
+                    "{width}x{height} frame {frame_idx} should have lit cells"
+                );
                 if frame_idx == 0 {
                     early_lit = lit;
                 }
@@ -9791,9 +9805,15 @@ mod tests {
         assert_eq!(parse_stty_size("24 80 99"), None);
         assert_eq!(parse_stty_size(""), None);
 
-        assert_eq!(detect_terminal_size_from_env(Some("38"), Some("106")), (38, 106));
+        assert_eq!(
+            detect_terminal_size_from_env(Some("38"), Some("106")),
+            (38, 106)
+        );
         assert_eq!(detect_terminal_size_from_env(None, None), (24, 80));
-        assert_eq!(detect_terminal_size_from_env(Some("0"), Some("bad")), (24, 80));
+        assert_eq!(
+            detect_terminal_size_from_env(Some("0"), Some("bad")),
+            (24, 80)
+        );
 
         assert_eq!(compute_fullscreen_canvas_size(24, 80), (74, 18));
         assert_eq!(compute_fullscreen_canvas_size(38, 106), (100, 32));
@@ -9898,7 +9918,10 @@ mod tests {
         // Herdr desktop app tab-promotion builder (`herdr-app do terminal.keep ...`).
         let app_path = Path::new("/usr/local/bin/herdr-app");
         let keep_cmd = build_herdr_app_keep_command(app_path, "t4h");
-        assert_eq!(keep_cmd.get_program(), OsStr::new("/usr/local/bin/herdr-app"));
+        assert_eq!(
+            keep_cmd.get_program(),
+            OsStr::new("/usr/local/bin/herdr-app")
+        );
         let keep_args: Vec<&OsStr> = keep_cmd.get_args().collect();
         assert_eq!(
             keep_args,
@@ -9932,7 +9955,9 @@ mod tests {
         );
         // Leading non-JSON log line followed by multi-line pretty JSON.
         assert_eq!(
-            parse_herdr_run_address_json("[hc] warning: slow start\n{\n  \"address\": \"t7b\"\n}\n"),
+            parse_herdr_run_address_json(
+                "[hc] warning: slow start\n{\n  \"address\": \"t7b\"\n}\n"
+            ),
             Some("t7b".to_string())
         );
 
@@ -9943,7 +9968,10 @@ mod tests {
         assert_eq!(parse_herdr_run_address_json(r#"{"address":""}"#), None);
         assert_eq!(parse_herdr_run_address_json(r#"{"address":"   "}"#), None);
         assert_eq!(parse_herdr_run_address_json(r#"{"address":"-bad"}"#), None);
-        assert_eq!(parse_herdr_run_address_json(r#"{"address":"--exec"}"#), None);
+        assert_eq!(
+            parse_herdr_run_address_json(r#"{"address":"--exec"}"#),
+            None
+        );
         assert_eq!(
             parse_herdr_run_address_json(r#"{"address":"t4h --bad"}"#),
             None
@@ -10107,7 +10135,11 @@ mod tests {
         assert_eq!(inside[2].tag, "in terminal");
         assert_eq!(inside[3].label, "Codex");
         assert_eq!(inside[3].tag, "in terminal");
-        assert!(inside.iter().all(|i| !matches!(i.action, MainMenuAction::HerdrTemplates { .. })));
+        assert!(
+            inside
+                .iter()
+                .all(|i| !matches!(i.action, MainMenuAction::HerdrTemplates { .. }))
+        );
 
         // Outside Herdr (`None`): templates stay cleanly grouped under single `"Herdr"` entry.
         let outside = build_main_menu_items_with_env(
@@ -10291,7 +10323,10 @@ mod tests {
             9,
             ColorMode::TrueColor,
         );
-        assert_ne!(f0, f6, "advancing phase ticks must animate bioluminescent pulses");
+        assert_ne!(
+            f0, f6,
+            "advancing phase ticks must animate bioluminescent pulses"
+        );
     }
 
     #[test]
@@ -10476,13 +10511,25 @@ mod tests {
 
         // 1. Claude Desktop
         assert_eq!(
-            build_manual_guide_deeplink(ManualGuideHarness::ClaudeDesktop, prompt, Some(cwd), None, None),
+            build_manual_guide_deeplink(
+                ManualGuideHarness::ClaudeDesktop,
+                prompt,
+                Some(cwd),
+                None,
+                None
+            ),
             Some(format!("claude://claude.ai/new?q={encoded}"))
         );
 
         // 2. Codex Desktop
         assert_eq!(
-            build_manual_guide_deeplink(ManualGuideHarness::CodexDesktop, prompt, Some(cwd), None, None),
+            build_manual_guide_deeplink(
+                ManualGuideHarness::CodexDesktop,
+                prompt,
+                Some(cwd),
+                None,
+                None
+            ),
             Some(format!("codex://threads/new?prompt={encoded}"))
         );
 
@@ -10539,7 +10586,13 @@ mod tests {
 
         // 5. Cursor IDE
         assert_eq!(
-            build_manual_guide_deeplink(ManualGuideHarness::CursorIde, prompt, Some(cwd), None, None),
+            build_manual_guide_deeplink(
+                ManualGuideHarness::CursorIde,
+                prompt,
+                Some(cwd),
+                None,
+                None
+            ),
             Some("cursor://file/Users/alice/my%20project%3Fv%3D1%26ok%3D2".to_string())
         );
         assert_eq!(
@@ -10549,7 +10602,13 @@ mod tests {
 
         // 6. OpenClaw -> None (clipboard copy only)
         assert_eq!(
-            build_manual_guide_deeplink(ManualGuideHarness::Openclaw, prompt, Some(cwd), None, None),
+            build_manual_guide_deeplink(
+                ManualGuideHarness::Openclaw,
+                prompt,
+                Some(cwd),
+                None,
+                None
+            ),
             None
         );
 
@@ -10579,12 +10638,19 @@ mod tests {
         let menu = detect_candidates_in(&home, None, Some(OsStr::new("")), Some(&apps), None, None);
         assert!(menu.iter().any(|m| {
             m.label == "OpenCode Desktop"
-                && matches!(m.action, MainMenuAction::ManualGuide(ManualGuideHarness::OpenCodeDesktop))
+                && matches!(
+                    m.action,
+                    MainMenuAction::ManualGuide(ManualGuideHarness::OpenCodeDesktop)
+                )
         }));
 
         // Confirm & ManualGuide renderers fit cleanly inside 24 rows and display key guidance.
-        let plan = inspect_desktop_mcp_plan(ManualGuideHarness::ClaudeDesktop, &home, "/usr/local/bin/hyp")
-            .unwrap();
+        let plan = inspect_desktop_mcp_plan(
+            ManualGuideHarness::ClaudeDesktop,
+            &home,
+            "/usr/local/bin/hyp",
+        )
+        .unwrap();
         let confirm_lines = render_desktop_mcp_confirm(
             ManualGuideHarness::ClaudeDesktop,
             &home,
@@ -10799,7 +10865,8 @@ mod tests {
     #[test]
     fn setup_toggle_defaults_respect_detected_harnesses_and_herdr_app_dir() {
         // 1. Detected claude + codex, NO herdr-app -> herdr mod unchecked.
-        let s1 = SetupToggleState::from_detection(&[HarnessKind::Claude, HarnessKind::Codex], false);
+        let s1 =
+            SetupToggleState::from_detection(&[HarnessKind::Claude, HarnessKind::Codex], false);
         assert!(s1.is_harness_selected(HarnessKind::Claude));
         assert!(s1.is_harness_selected(HarnessKind::Codex));
         assert!(!s1.is_harness_selected(HarnessKind::Herdr));
@@ -10936,7 +11003,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         let mut state = SetupToggleState::from_detection(
-            &[HarnessKind::Claude, HarnessKind::Antigravity, HarnessKind::Herdr],
+            &[
+                HarnessKind::Claude,
+                HarnessKind::Antigravity,
+                HarnessKind::Herdr,
+            ],
             true,
         );
         state.cursor = 1; // Claude Code
@@ -10983,11 +11054,8 @@ mod tests {
                 assert_eq!(plain.len(), ansi256.len());
                 assert_eq!(plain.len(), tc.len());
 
-                for (idx, ((p, a), t)) in plain
-                    .iter()
-                    .zip(ansi256.iter())
-                    .zip(tc.iter())
-                    .enumerate()
+                for (idx, ((p, a), t)) in
+                    plain.iter().zip(ansi256.iter()).zip(tc.iter()).enumerate()
                 {
                     let sp = strip_ansi(p);
                     let sa = strip_ansi(a);
@@ -11249,11 +11317,8 @@ mod tests {
                 assert!(plain.len() <= rows);
                 assert_eq!(plain.len(), ansi256.len());
                 assert_eq!(plain.len(), tc.len());
-                for (idx, ((p, a), t)) in plain
-                    .iter()
-                    .zip(ansi256.iter())
-                    .zip(tc.iter())
-                    .enumerate()
+                for (idx, ((p, a), t)) in
+                    plain.iter().zip(ansi256.iter()).zip(tc.iter()).enumerate()
                 {
                     let sp = strip_ansi(p);
                     let sa = strip_ansi(a);
@@ -11284,6 +11349,9 @@ mod tests {
         let preview = toggle.build_dry_run_preview(home, false).join("\n");
         assert!(preview.contains("extensions/hyphae"), "preview={preview}");
         assert!(preview.contains("delivery=gateway"), "preview={preview}");
-        assert!(preview.contains("prompt-injection=off"), "preview={preview}");
+        assert!(
+            preview.contains("prompt-injection=off"),
+            "preview={preview}"
+        );
     }
 }

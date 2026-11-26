@@ -30,11 +30,11 @@ use hyp_harness::daemon::{GateReloader, InboundItem, LocalDaemon, LocalDaemonCon
 use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_async};
 use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::engine::{LocalIngestServer, NodeConfig, UnifiedNode, send_local_ingest_event};
+use hyp_node::gates::SecurityGatePipeline;
 use hyp_node::gates::policy::{
     FilterAdapterConfig, FilterPluginConfig, SecurityGateConfig, Stage1DenyAction, Stage2Matchers,
     TrustTier as GateTrustTier, sign_gate_policy,
 };
-use hyp_node::gates::SecurityGatePipeline;
 use hyp_proto::address::NodeId;
 use hyp_store::{GateAuditQuery, GateDecision as StoreGateDecision, MailboxKind, NodeDb, now_ms};
 use serde_json::{Value, json};
@@ -185,10 +185,15 @@ async fn gate_reload_swaps_live_pipeline_without_restart_and_blocks_new_rule() {
     ));
 
     // Initial signed policy: no regex denylist, 0 filters.
-    let initial_cfg = sign_and_write_gate_config(&config_path, &secrets, SecurityGateConfig::default());
+    let initial_cfg =
+        sign_and_write_gate_config(&config_path, &secrets, SecurityGateConfig::default());
     let initial_pipeline = Arc::new(
-        SecurityGatePipeline::new(initial_cfg, Arc::clone(&gate_db), Some(Arc::clone(&secrets)))
-            .unwrap(),
+        SecurityGatePipeline::new(
+            initial_cfg,
+            Arc::clone(&gate_db),
+            Some(Arc::clone(&secrets)),
+        )
+        .unwrap(),
     );
 
     let daemon = LocalDaemon::start(
@@ -234,7 +239,10 @@ async fn gate_reload_swaps_live_pipeline_without_restart_and_blocks_new_rule() {
         })
         .await
         .unwrap();
-    assert!(res1.is_some(), "expected message to be allowed before reload");
+    assert!(
+        res1.is_some(),
+        "expected message to be allowed before reload"
+    );
     let deliveries = transport.wait_for_count(1, Duration::from_secs(2)).await;
     assert!(deliveries[0].0.contains("FORBIDDEN_SECRET_RULE"));
 
@@ -277,10 +285,7 @@ async fn gate_reload_swaps_live_pipeline_without_restart_and_blocks_new_rule() {
     assert_eq!(r["enabled"], true);
     assert_eq!(r["filterCount"], 1);
     assert_eq!(r["requireSignedPolicy"], true);
-    assert!(
-        daemon.ui_rev() > rev_before,
-        "gate.reload must bump ui_rev"
-    );
+    assert!(daemon.ui_rev() > rev_before, "gate.reload must bump ui_rev");
 
     // 3. Immediately after reload (NO restart): `FORBIDDEN_SECRET_RULE` is BLOCKED!
     let res2 = daemon
@@ -470,7 +475,10 @@ async fn gate_reload_fail_closed_preserves_active_pipeline_on_tamper_downgrade_o
     )
     .unwrap();
     let resp_b = rpc(daemon.socket_path(), &json!({ "type": "gate.reload" })).await;
-    assert!(!resp_b.ok, "tampered rule without re-signing must fail closed");
+    assert!(
+        !resp_b.ok,
+        "tampered rule without re-signing must fail closed"
+    );
     assert!(
         resp_b
             .error
@@ -644,7 +652,9 @@ async fn inbox_wake_immediately_delivers_approved_item_and_clears_quarantine_bad
     // Attached PushTransport MUST have received the approved message immediately (NO restart!).
     let deliveries = transport.wait_for_count(1, Duration::from_secs(2)).await;
     assert!(
-        deliveries[0].0.contains("SUSPICIOUS_HOLD please review PR #42"),
+        deliveries[0]
+            .0
+            .contains("SUSPICIOUS_HOLD please review PR #42"),
         "expected approved body in delivery, got: {}",
         deliveries[0].0
     );
@@ -729,7 +739,8 @@ async fn cross_os_tcp_loopback_parity_for_gate_reload_and_inbox_wake() {
         NodeDb::open(state_dir.join("node.sqlite")).unwrap(),
     ));
 
-    let init_cfg = sign_and_write_gate_config(&config_path, &secrets, SecurityGateConfig::default());
+    let init_cfg =
+        sign_and_write_gate_config(&config_path, &secrets, SecurityGateConfig::default());
     let init_pipe = Arc::new(
         SecurityGatePipeline::new(init_cfg, Arc::clone(&gate_db), Some(Arc::clone(&secrets)))
             .unwrap(),

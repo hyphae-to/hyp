@@ -179,7 +179,12 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
             "tailscale",
             "alice-tailnet",
             "hyphae.example.ts.net",
-            &["node.json", "tailscale-serve.sh", "hyphae-node.service", "README.md"],
+            &[
+                "node.json",
+                "tailscale-serve.sh",
+                "hyphae-node.service",
+                "README.md",
+            ],
         ),
         (
             "vps",
@@ -203,7 +208,12 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
             "cloudflare",
             "homelab-cf",
             "cf.acme.example",
-            &["node.json", "cloudflared.yml", "hyphae-node.service", "README.md"],
+            &[
+                "node.json",
+                "cloudflared.yml",
+                "hyphae-node.service",
+                "README.md",
+            ],
         ),
         (
             "fly",
@@ -261,7 +271,11 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
 
         for rel in expected_files {
             let p = out_dir.join(rel);
-            assert!(p.exists(), "missing expected file {} for {provider}", p.display());
+            assert!(
+                p.exists(),
+                "missing expected file {} for {provider}",
+                p.display()
+            );
             let content = fs::read_to_string(&p).unwrap();
             assert!(!content.trim().is_empty());
         }
@@ -269,7 +283,10 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
         // Provider-specific hardening invariants
         if expected_files.contains(&"Caddyfile") {
             let caddy = fs::read_to_string(out_dir.join("Caddyfile")).unwrap();
-            assert!(caddy.contains("flush_interval -1"), "Caddyfile must disable SSE buffering");
+            assert!(
+                caddy.contains("flush_interval -1"),
+                "Caddyfile must disable SSE buffering"
+            );
             assert!(caddy.contains(domain));
         }
         if expected_files.contains(&"hyphae-node.service") {
@@ -285,18 +302,25 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
             let dockerfile = fs::read_to_string(out_dir.join("Dockerfile"))
                 .unwrap()
                 .replace("\r\n", "\n");
-            assert!(dockerfile.contains(&format!("ARG HYP_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
+            assert!(
+                dockerfile.contains(&format!("ARG HYP_VERSION=v{}", env!("CARGO_PKG_VERSION")))
+            );
             assert!(dockerfile.contains("ARG TARGETARCH"));
             assert!(dockerfile.contains("x86_64-unknown-linux-musl"));
             assert!(dockerfile.contains("aarch64-unknown-linux-gnu"));
-            assert!(dockerfile.contains("https://github.com/hyphae-to/hyp/releases/download/${HYP_VERSION}"));
+            assert!(
+                dockerfile
+                    .contains("https://github.com/hyphae-to/hyp/releases/download/${HYP_VERSION}")
+            );
             assert!(dockerfile.contains("SHA256SUMS.txt"));
             assert!(dockerfile.contains("sha256sum -c --ignore-missing"));
             if provider == "fly" {
                 assert!(dockerfile.contains("/usr/local/bin/hyphae-entrypoint.sh"));
                 assert!(dockerfile.contains("chown -R 10001:10001"));
                 assert!(dockerfile.contains("setpriv --reuid=10001 --regid=10001 --init-groups"));
-                assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/hyphae-entrypoint.sh\"]"));
+                assert!(
+                    dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/hyphae-entrypoint.sh\"]")
+                );
                 assert!(!dockerfile.contains("USER 10001:10001"));
             } else {
                 assert!(dockerfile.contains("USER 10001:10001"));
@@ -314,18 +338,27 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
             let useradd_pos = readme
                 .find("sudo useradd -r -s /usr/sbin/nologin hyphae || true")
                 .unwrap_or_else(|| panic!("{provider} README missing useradd step:\n{readme}"));
-            let bin_pos = readme
-                .find("/usr/local/bin/hyp")
-                .unwrap_or_else(|| panic!("{provider} README missing /usr/local/bin/hyp install:\n{readme}"));
+            let bin_pos = readme.find("/usr/local/bin/hyp").unwrap_or_else(|| {
+                panic!("{provider} README missing /usr/local/bin/hyp install:\n{readme}")
+            });
             let dirs_pos = readme
                 .find("sudo mkdir -p /var/lib/hyphae /etc/hyphae && sudo chown -R hyphae:hyphae /var/lib/hyphae /etc/hyphae && sudo chmod 0700 /var/lib/hyphae")
                 .unwrap_or_else(|| panic!("{provider} README missing /var/lib/hyphae setup:\n{readme}"));
-            let systemctl_pos = readme
-                .find("systemctl enable --now")
-                .unwrap_or_else(|| panic!("{provider} README missing systemctl enable --now:\n{readme}"));
-            assert!(useradd_pos < systemctl_pos, "{provider} useradd must precede systemctl");
-            assert!(bin_pos < systemctl_pos, "{provider} /usr/local/bin/hyp must precede systemctl");
-            assert!(dirs_pos < systemctl_pos, "{provider} mkdir/chown must precede systemctl");
+            let systemctl_pos = readme.find("systemctl enable --now").unwrap_or_else(|| {
+                panic!("{provider} README missing systemctl enable --now:\n{readme}")
+            });
+            assert!(
+                useradd_pos < systemctl_pos,
+                "{provider} useradd must precede systemctl"
+            );
+            assert!(
+                bin_pos < systemctl_pos,
+                "{provider} /usr/local/bin/hyp must precede systemctl"
+            );
+            assert!(
+                dirs_pos < systemctl_pos,
+                "{provider} mkdir/chown must precede systemctl"
+            );
 
             let next_steps: Vec<&str> = env["next"]
                 .as_array()
@@ -333,9 +366,17 @@ fn deploy_init_all_six_providers_overwrite_guard_and_config_check() {
                 .iter()
                 .filter_map(Value::as_str)
                 .collect();
-            assert!(next_steps.iter().any(|s| s.contains("useradd -r -s /usr/sbin/nologin hyphae")));
+            assert!(
+                next_steps
+                    .iter()
+                    .any(|s| s.contains("useradd -r -s /usr/sbin/nologin hyphae"))
+            );
             assert!(next_steps.iter().any(|s| s.contains("/usr/local/bin/hyp")));
-            assert!(next_steps.iter().any(|s| s.contains("chmod 0700 /var/lib/hyphae")));
+            assert!(
+                next_steps
+                    .iter()
+                    .any(|s| s.contains("chmod 0700 /var/lib/hyphae"))
+            );
         }
         if expected_files.contains(&"fly.toml") {
             let fly = fs::read_to_string(out_dir.join("fly.toml")).unwrap();
@@ -479,14 +520,24 @@ fn deploy_check_config_rejects_plaintext_secrets_and_unproxied_wildcard_bind() {
     )
     .unwrap();
     let out = scrubbed_cmd()
-        .args(["deploy", "check", "--config", leaky_cfg.to_str().unwrap(), "--json"])
+        .args([
+            "deploy",
+            "check",
+            "--config",
+            leaky_cfg.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     let env: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(env["ok"], false);
     let checks = env["data"]["checks"].as_array().unwrap();
-    assert!(checks.iter().any(|c| c["name"] == "config.secrets" && c["status"] == "fail"));
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "config.secrets" && c["status"] == "fail")
+    );
 
     // 2. Unproxied 0.0.0.0:8790 bind without behindReverseProxy -> FAIL (exit 1)
     let open_bind_cfg = tmp.path().join("open_bind.json");
@@ -503,42 +554,53 @@ fn deploy_check_config_rejects_plaintext_secrets_and_unproxied_wildcard_bind() {
     )
     .unwrap();
     let out2 = scrubbed_cmd()
-        .args(["deploy", "check", "--config", open_bind_cfg.to_str().unwrap(), "--json"])
+        .args([
+            "deploy",
+            "check",
+            "--config",
+            open_bind_cfg.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(out2.status.code(), Some(1));
     let env2: Value = serde_json::from_slice(&out2.stdout).unwrap();
     assert_eq!(env2["ok"], false);
-    assert!(env2["data"]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["name"] == "config.bind" && c["status"] == "fail"));
+    assert!(
+        env2["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "config.bind" && c["status"] == "fail")
+    );
 
     // 3. Remote plaintext http:// URL -> FAIL immediately without network call
     let bad_url = scrubbed_cmd()
-        .args(["deploy", "check", "--url", "http://mesh.example.com", "--json"])
+        .args([
+            "deploy",
+            "check",
+            "--url",
+            "http://mesh.example.com",
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(bad_url.status.code(), Some(1));
     let bad_env: Value = serde_json::from_slice(&bad_url.stdout).unwrap();
     assert_eq!(bad_env["ok"], false);
-    assert!(bad_env["data"]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["name"] == "probe.origin" && c["status"] == "fail"));
+    assert!(
+        bad_env["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "probe.origin" && c["status"] == "fail")
+    );
 }
 
 #[test]
 fn deploy_check_url_probes_hardened_and_rejects_leaky_or_tampered_manifests() {
     // 1. Passing hardened signed manifest (empty advertised arrays, no escalation)
-    let good_body = build_signed_manifest(
-        "acme-team",
-        AdvertisedResources::default(),
-        None,
-        false,
-    );
+    let good_body = build_signed_manifest("acme-team", AdvertisedResources::default(), None, false);
     let (good_url, good_srv) = spawn_one_shot_http_server("200 OK", good_body);
     let good_out = scrubbed_cmd()
         .args(["deploy", "check", "--url", &good_url, "--json"])
@@ -557,8 +619,16 @@ fn deploy_check_url_probes_hardened_and_rejects_leaky_or_tampered_manifests() {
     assert_eq!(good_env["data"]["manifest"]["advertisedEmpty"], true);
     assert_eq!(good_env["data"]["manifest"]["signatureVerified"], true);
     let checks = good_env["data"]["checks"].as_array().unwrap();
-    assert!(checks.iter().any(|c| c["name"] == "manifest.anti_recon" && c["status"] == "ok"));
-    assert!(checks.iter().any(|c| c["name"] == "manifest.signature" && c["status"] == "ok"));
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "manifest.anti_recon" && c["status"] == "ok")
+    );
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["name"] == "manifest.signature" && c["status"] == "ok")
+    );
 
     // 2. Failing leaky unauthenticated manifest (advertised topics/channels leaked!)
     let leaky_body = build_signed_manifest(
@@ -589,19 +659,17 @@ fn deploy_check_url_probes_hardened_and_rejects_leaky_or_tampered_manifests() {
     let leaky_env: Value = serde_json::from_slice(&leaky_out.stdout).unwrap();
     assert_eq!(leaky_env["ok"], false);
     assert_eq!(leaky_env["data"]["manifest"]["advertisedEmpty"], false);
-    assert!(leaky_env["data"]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["name"] == "manifest.anti_recon" && c["status"] == "fail"));
+    assert!(
+        leaky_env["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "manifest.anti_recon" && c["status"] == "fail")
+    );
 
     // 3. Failing tampered Ed25519 signature on manifest
-    let tampered_body = build_signed_manifest(
-        "tampered-hub",
-        AdvertisedResources::default(),
-        None,
-        true,
-    );
+    let tampered_body =
+        build_signed_manifest("tampered-hub", AdvertisedResources::default(), None, true);
     let (tampered_url, tampered_srv) = spawn_one_shot_http_server("200 OK", tampered_body);
     let tampered_out = scrubbed_cmd()
         .args(["deploy", "check", "--url", &tampered_url, "--json"])
@@ -611,11 +679,13 @@ fn deploy_check_url_probes_hardened_and_rejects_leaky_or_tampered_manifests() {
     assert_eq!(tampered_out.status.code(), Some(1));
     let tampered_env: Value = serde_json::from_slice(&tampered_out.stdout).unwrap();
     assert_eq!(tampered_env["ok"], false);
-    assert!(tampered_env["data"]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["name"] == "manifest.signature" && c["status"] == "fail"));
+    assert!(
+        tampered_env["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "manifest.signature" && c["status"] == "fail")
+    );
 }
 
 #[test]
@@ -643,7 +713,10 @@ fn pair_guide_json_covers_all_topologies_and_presets() {
         .iter()
         .map(|p| p["name"].as_str().unwrap())
         .collect();
-    assert_eq!(presets, vec!["guest-ro", "guest", "observer", "member", "full"]);
+    assert_eq!(
+        presets,
+        vec!["guest-ro", "guest", "observer", "member", "full"]
+    );
 
     // Filtered mode
     let p2p_only = scrubbed_cmd()
@@ -701,11 +774,13 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     let offer_id = inv_env["data"]["offerId"].as_str().unwrap();
     assert!(token.starts_with("hp2p1_"));
     // Next commands MUST be stdin-safe (<<<) and never leak token into argv
-    assert!(inv_env["next"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s.as_str().unwrap().contains("<<<")));
+    assert!(
+        inv_env["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("<<<"))
+    );
 
     // Second invite in same state_dir preserves persistent node keypair `kid`, rotates `offerId`
     let inv2 = scrubbed_cmd()
@@ -825,7 +900,10 @@ fn pair_invite_p2p_and_team_roundtrip_via_stdin_and_token_file_and_fail_closed_m
     assert_eq!(am2_insp_env["ok"], true);
     assert_eq!(am2_insp_env["data"]["format"], "am2");
     assert_eq!(am2_insp_env["data"]["nodeId"], "acme-team");
-    assert_eq!(am2_insp_env["data"]["endpoint"], "https://mesh.acme.internal");
+    assert_eq!(
+        am2_insp_env["data"]["endpoint"],
+        "https://mesh.acme.internal"
+    );
     assert_eq!(am2_insp_env["data"]["kid"], am2_kid);
     assert_eq!(am2_insp_env["data"]["expiryStatus"], "OK");
     assert_eq!(am2_insp_env["data"]["escalationNote"]["untrusted"], true);
@@ -995,22 +1073,27 @@ fn plain_tty_output_and_additional_config_fail_closed_checks() {
     )
     .unwrap();
     let relay_out = scrubbed_cmd()
-        .args(["deploy", "check", "--config", open_relay.to_str().unwrap(), "--json"])
+        .args([
+            "deploy",
+            "check",
+            "--config",
+            open_relay.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(relay_out.status.code(), Some(1));
     let relay_env: Value = serde_json::from_slice(&relay_out.stdout).unwrap();
-    assert!(relay_env["data"]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["name"] == "config.forwarding" && c["status"] == "fail"));
+    assert!(
+        relay_env["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "config.forwarding" && c["status"] == "fail")
+    );
 
     // 2. Plain text output of `pair guide`, `deploy check`, `pair invite`, `pair inspect`
-    let guide_plain = scrubbed_cmd()
-        .args(["pair", "guide"])
-        .output()
-        .unwrap();
+    let guide_plain = scrubbed_cmd().args(["pair", "guide"]).output().unwrap();
     assert_eq!(guide_plain.status.code(), Some(0));
     let guide_txt = String::from_utf8_lossy(&guide_plain.stdout);
     assert!(guide_txt.contains("hp2p1_"));
@@ -1018,10 +1101,7 @@ fn plain_tty_output_and_additional_config_fail_closed_checks() {
     assert!(guide_txt.contains("public.hyphae.to"));
     assert!(guide_txt.contains("guest-ro"));
 
-    let check_plain = scrubbed_cmd()
-        .args(["deploy", "check"])
-        .output()
-        .unwrap();
+    let check_plain = scrubbed_cmd().args(["deploy", "check"]).output().unwrap();
     assert_eq!(check_plain.status.code(), Some(0));
     let check_txt = String::from_utf8_lossy(&check_plain.stdout);
     assert!(check_txt.contains("Hyphae Deployment Check"));
@@ -1036,11 +1116,13 @@ fn plain_tty_output_and_additional_config_fail_closed_checks() {
     srv.join().unwrap();
     assert_eq!(nf_out.status.code(), Some(1));
     let nf_env: Value = serde_json::from_slice(&nf_out.stdout).unwrap();
-    assert!(nf_env["data"]["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["name"] == "probe.http" && c["status"] == "fail"));
+    assert!(
+        nf_env["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "probe.http" && c["status"] == "fail")
+    );
 }
 
 #[test]
@@ -1135,7 +1217,10 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
     assert_eq!(accept_env["data"]["format"], "hp2p1");
     assert_eq!(accept_env["data"]["nodeId"], "bob@laptop");
     assert_eq!(accept_env["data"]["peerId"], "alice@macbook");
-    assert_eq!(accept_env["data"]["endpoint"], "https://alice.tailnet.ts.net");
+    assert_eq!(
+        accept_env["data"]["endpoint"],
+        "https://alice.tailnet.ts.net"
+    );
     assert_eq!(accept_env["data"]["kid"], alice_kid);
     assert_eq!(accept_env["data"]["encryptionKid"], alice_enc_kid);
     assert_eq!(
@@ -1166,8 +1251,15 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
     // Verify persistence in node.sqlite (`PeerStore`)
     {
         let db = NodeDb::open(accepter_state.path().join("node.sqlite")).unwrap();
-        let peer = db.peers().get_peer("alice@macbook").unwrap().expect("alice peer persisted");
-        assert_eq!(peer.endpoint.as_deref(), Some("https://alice.tailnet.ts.net"));
+        let peer = db
+            .peers()
+            .get_peer("alice@macbook")
+            .unwrap()
+            .expect("alice peer persisted");
+        assert_eq!(
+            peer.endpoint.as_deref(),
+            Some("https://alice.tailnet.ts.net")
+        );
         assert_eq!(peer.profile, PeerProfile::P2p);
         assert_eq!(peer.trust_tier, TrustTier::Peer);
         assert_eq!(peer.status, PeerStatus::Active);
@@ -1265,7 +1357,11 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
 
     {
         let db = NodeDb::open(accepter_state.path().join("node.sqlite")).unwrap();
-        let hub = db.peers().get_peer("acme-team").unwrap().expect("acme-team peer persisted");
+        let hub = db
+            .peers()
+            .get_peer("acme-team")
+            .unwrap()
+            .expect("acme-team peer persisted");
         assert_eq!(hub.endpoint.as_deref(), Some("https://mesh.acme.internal"));
         assert_eq!(hub.profile, PeerProfile::Router);
         assert_eq!(hub.trust_tier, TrustTier::Org);
@@ -1279,7 +1375,11 @@ fn pair_accept_p2p_and_team_persists_peers_keys_grants_and_rejects_tampered_or_e
         assert_eq!(admin_keys.len(), 1);
         assert_eq!(admin_keys[0].kid, admin_kid);
 
-        let stored_grant = db.peers().get_grant(grant_id).unwrap().expect("Admin-CA grant persisted");
+        let stored_grant = db
+            .peers()
+            .get_grant(grant_id)
+            .unwrap()
+            .expect("Admin-CA grant persisted");
         assert_eq!(stored_grant.peer_id, "acme-team");
         assert_eq!(stored_grant.trust_tier, TrustTier::Org);
     }
@@ -1506,12 +1606,8 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
     }
 
     // 3. Fail-closed: tampered manifest signature MUST exit 1 and NOT persist peer!
-    let tampered_body = build_signed_manifest(
-        "tampered.local",
-        AdvertisedResources::default(),
-        None,
-        true,
-    );
+    let tampered_body =
+        build_signed_manifest("tampered.local", AdvertisedResources::default(), None, true);
     let (tampered_url, srv) = spawn_one_shot_http_server("200 OK", tampered_body);
     let bad_state = tempfile::tempdir().unwrap();
     let bad_join = scrubbed_cmd()
@@ -1581,7 +1677,10 @@ fn pair_join_verifies_live_rust_node_manifest_rejects_tampered_and_supports_offl
         .unwrap()
         .expect("offline peer persisted");
     assert_eq!(off_peer.trust_tier, TrustTier::Guest);
-    assert_eq!(off_peer.endpoint.as_deref(), Some("https://public.hyphae.to"));
+    assert_eq!(
+        off_peer.endpoint.as_deref(),
+        Some("https://public.hyphae.to")
+    );
     assert!(
         off_env["next"]
             .as_array()
@@ -1657,7 +1756,10 @@ fn pair_live_p2p_handshake_single_use_replay_and_onboard_join() {
     let inv_env: Value = serde_json::from_slice(&inv_out.stdout).unwrap();
     let hp2p1_token = inv_env["data"]["token"].as_str().unwrap().to_string();
     let alice_kid = inv_env["data"]["kid"].as_str().unwrap().to_string();
-    let alice_enc_kid = inv_env["data"]["encryptionKid"].as_str().unwrap().to_string();
+    let alice_enc_kid = inv_env["data"]["encryptionKid"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(hp2p1_token.starts_with("hp2p1_"));
 
     let token_file = bob_dir.path().join("p2p.token");
@@ -1853,7 +1955,11 @@ fn pair_live_p2p_handshake_single_use_replay_and_onboard_join() {
     assert_eq!(onboard_json["data"]["stagedJoin"]["status"], "active");
     let db_c = NodeDb::open(charlie_dir.path().join("node.sqlite")).unwrap();
     assert_eq!(
-        db_c.peers().get_peer("alice@macbook").unwrap().unwrap().status,
+        db_c.peers()
+            .get_peer("alice@macbook")
+            .unwrap()
+            .unwrap()
+            .status,
         PeerStatus::Active
     );
 
@@ -2229,7 +2335,10 @@ fn node_cmd_admin_key_and_live_am2_pair_accept() {
     let mut b64_proc = ManagedProcess::spawn("acme-b64-hub (43-char adminKey)", &mut b64_cmd);
     let b64_startup = b64_proc.read_json_line(Duration::from_secs(10));
     assert_eq!(b64_startup["ok"], true, "b64 hub startup: {b64_startup}");
-    let b64_endpoint = b64_startup["data"]["endpoint"].as_str().unwrap().to_string();
+    let b64_endpoint = b64_startup["data"]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let b64_inv = isolated_cmd(hub_b64_dir.path())
         .args([
@@ -2345,8 +2454,8 @@ fn pair_accept_hot_reloads_running_daemon_without_restart_and_degrades_offline()
         .output()
         .unwrap();
     assert_eq!(pre_inv.status.code(), Some(0));
-    let admin_jwk = serde_json::from_slice::<Value>(&pre_inv.stdout).unwrap()["data"]["adminJwk"]
-        .clone();
+    let admin_jwk =
+        serde_json::from_slice::<Value>(&pre_inv.stdout).unwrap()["data"]["adminJwk"].clone();
 
     let hub_cfg_path = hub_dir.path().join("node.json");
     fs::write(
@@ -2401,7 +2510,10 @@ fn pair_accept_hot_reloads_running_daemon_without_restart_and_degrades_offline()
     let bob_startup = bob_proc.read_json_line(Duration::from_secs(10));
     assert_eq!(bob_startup["ok"], true, "bob startup: {bob_startup}");
     assert_eq!(
-        bob_startup["data"]["connectedPeers"].as_array().unwrap().len(),
+        bob_startup["data"]["connectedPeers"]
+            .as_array()
+            .unwrap()
+            .len(),
         0
     );
     let bob_sock = bob_dir.path().join(DEFAULT_SOCKET_FILENAME);
@@ -2548,7 +2660,8 @@ fn pair_accept_hot_reloads_running_daemon_without_restart_and_degrades_offline()
     );
     let am2_stdout = String::from_utf8_lossy(&am2_accept.stdout);
     assert!(
-        am2_stdout.contains("Live daemon reloaded — peer connected immediately (no restart needed)."),
+        am2_stdout
+            .contains("Live daemon reloaded — peer connected immediately (no restart needed)."),
         "TTY output must announce live daemon reload: {am2_stdout}"
     );
     assert!(

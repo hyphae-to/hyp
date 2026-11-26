@@ -328,9 +328,7 @@ impl PushTransport for HerdrTransport {
         mode: PushMode,
     ) -> TransportFuture<'a, PushOutcome> {
         let nudge = super::format_push_wake_nudge(message_count, handle, mode);
-        Box::pin(async move {
-            self.deliver_with_runner(&ProcessRunner, &nudge, mode).await
-        })
+        Box::pin(async move { self.deliver_with_runner(&ProcessRunner, &nudge, mode).await })
     }
 }
 
@@ -536,9 +534,7 @@ pub fn parse_herdr_get_output(stdout: &str) -> Option<HerdrTerminalInfo> {
 }
 
 fn is_valid_agent_state(state: &str) -> bool {
-    !state.is_empty()
-        && state.len() <= MAX_AGENT_STATE_LEN
-        && !state.chars().any(char::is_control)
+    !state.is_empty() && state.len() <= MAX_AGENT_STATE_LEN && !state.chars().any(char::is_control)
 }
 
 /// Returns `true` iff `hc interrupt --json` output is a JSON object with `"outcome": "stopped"`.
@@ -764,7 +760,13 @@ mod tests {
         .to_string()
     }
 
-    fn flat_get_json(address: &str, created_ms: i64, pid: u64, agent: &str, status: &str) -> String {
+    fn flat_get_json(
+        address: &str,
+        created_ms: i64,
+        pid: u64,
+        agent: &str,
+        status: &str,
+    ) -> String {
         serde_json::json!({
             "address": address,
             "created_ms": created_ms,
@@ -866,7 +868,9 @@ mod tests {
     #[test]
     fn parses_interrupt_outcome_strictly() {
         assert!(parse_herdr_interrupt_stopped(r#"{"outcome":"stopped"}"#));
-        assert!(parse_herdr_interrupt_stopped("  {\"outcome\":\"stopped\"}\n"));
+        assert!(parse_herdr_interrupt_stopped(
+            "  {\"outcome\":\"stopped\"}\n"
+        ));
         assert!(!parse_herdr_interrupt_stopped(r#"{"outcome":"timeout"}"#));
         assert!(!parse_herdr_interrupt_stopped(r#"{"outcome":"running"}"#));
         assert!(!parse_herdr_interrupt_stopped(r#"{}"#));
@@ -889,9 +893,14 @@ mod tests {
         assert!(json.contains("\"createdMs\":1700000000000"));
         assert_eq!(serde_json::from_str::<HerdrTarget>(&json).unwrap(), pinned);
 
-        let matching =
-            parse_herdr_get_output(&nested_get_json("t3", 1_700_000_000_000, 4242, "codex", "idle"))
-                .unwrap();
+        let matching = parse_herdr_get_output(&nested_get_json(
+            "t3",
+            1_700_000_000_000,
+            4242,
+            "codex",
+            "idle",
+        ))
+        .unwrap();
         assert!(pinned.matches_live_terminal(&matching));
         assert!(unpinned.matches_live_terminal(
             &parse_herdr_get_output(&flat_get_json("t4", 1, 2, "claude-code", "idle")).unwrap()
@@ -970,8 +979,16 @@ mod tests {
             }
         );
 
-        assert!(probe_with_runner(&runner, "hc", "t5", DEFAULT_GET_TIMEOUT).await.is_none());
-        assert!(probe_with_runner(&runner, "hc", "t6", DEFAULT_GET_TIMEOUT).await.is_none());
+        assert!(
+            probe_with_runner(&runner, "hc", "t5", DEFAULT_GET_TIMEOUT)
+                .await
+                .is_none()
+        );
+        assert!(
+            probe_with_runner(&runner, "hc", "t6", DEFAULT_GET_TIMEOUT)
+                .await
+                .is_none()
+        );
     }
 
     /// Reference specification oracle for McKeeman differential verification of the
@@ -1069,16 +1086,10 @@ mod tests {
                             });
 
                             let runner = MockRunner::with_responses(responses);
-                            let actual = transport
-                                .deliver_with_runner(&runner, "hello", mode)
-                                .await;
-                            let expected = oracle_deliver(
-                                Some(Ok(initial)),
-                                mode,
-                                int_ok,
-                                recheck,
-                                send_code,
-                            );
+                            let actual =
+                                transport.deliver_with_runner(&runner, "hello", mode).await;
+                            let expected =
+                                oracle_deliver(Some(Ok(initial)), mode, int_ok, recheck, send_code);
                             assert_eq!(
                                 actual, expected,
                                 "divergence for initial={initial} mode={mode:?} int_ok={int_ok} recheck={recheck:?} send_code={send_code:?}"
@@ -1086,8 +1097,9 @@ mod tests {
 
                             // Verify exact send guard arguments whenever `send` was invoked.
                             let calls = runner.calls();
-                            if let Some((_bin, send_args)) =
-                                calls.iter().find(|(_, a)| a.first().map(String::as_str) == Some("send"))
+                            if let Some((_bin, send_args)) = calls
+                                .iter()
+                                .find(|(_, a)| a.first().map(String::as_str) == Some("send"))
                             {
                                 let expected_state = if initial == "working" {
                                     recheck.unwrap()
@@ -1169,7 +1181,11 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_herdr_template_enforces_allowlist_and_prompt_validation() {
-        let allowlist = vec!["ci-triage".to_string(), "--evil".to_string(), "bad;cmd".to_string()];
+        let allowlist = vec![
+            "ci-triage".to_string(),
+            "--evil".to_string(),
+            "bad;cmd".to_string(),
+        ];
 
         // Disallowed or syntactically invalid templates fail closed with ZERO subprocess calls!
         for bad_tpl in ["unlisted", "--evil", "bad;cmd", "", "ci triage"] {
@@ -1247,7 +1263,8 @@ mod tests {
         );
 
         // Non-zero exit or timeout -> Reject("herdr_spawn_failed")
-        let fail_runner = MockRunner::with_responses(vec![exit_code(1, "err"), CommandOutcome::TimedOut]);
+        let fail_runner =
+            MockRunner::with_responses(vec![exit_code(1, "err"), CommandOutcome::TimedOut]);
         assert_eq!(
             spawn_herdr_template_with_runner(
                 &fail_runner,

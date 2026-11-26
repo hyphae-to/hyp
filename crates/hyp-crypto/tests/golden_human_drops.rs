@@ -1,24 +1,24 @@
 //! Golden vectors, differential reference-oracle verification, and mutated-valid-input
 //! fail-closed tests for `hyp_crypto::human` (Verified Human Drops MVP).
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hyp_crypto::e2ee::pad_bucket;
 use hyp_crypto::human::{
-    decode_hcert1, decode_hdrop1, derive_prf_ed25519_keypair, derive_prf_x25519_keypair,
-    encode_hcert1, encode_hdrop1, human_draft_hpke_aad, human_draft_hpke_info,
-    human_drop_hpke_aad, human_drop_hpke_info, human_prf_input, is_reserved_secret_name,
-    open_human_draft, open_human_drop, seal_human_draft, seal_human_drop, sign_human_claim,
-    sign_human_revocation, sign_local_ingest_event, sign_node_cert, validate_draft_text,
-    verify_human_revocation, verify_local_ingest_event, verify_node_cert, EncryptedHumanDraftV1,
+    CLOCK_SKEW_MS, EncryptedHumanDraftV1, HCERT1_PREFIX, HDROP1_PREFIX, HUMAN_CLAIM_DOMAIN,
+    HUMAN_DRAFT_SUITE, HUMAN_DROP_SUITE_V1, HUMAN_PRF_HKDF_SALT, HUMAN_PRF_X25519_SALT,
     HumanAudience, HumanClaimV1, HumanDraftPayloadV1, HumanDropEnvelopeV1, HumanDropKind,
-    HumanRevocationPayloadV1, NodeCertPayloadV1, SecretDropSpec, SignedHumanClaimV1,
-    CLOCK_SKEW_MS, HCERT1_PREFIX, HDROP1_PREFIX, HUMAN_CLAIM_DOMAIN, HUMAN_DRAFT_SUITE,
-    HUMAN_DROP_SUITE_V1, HUMAN_PRF_HKDF_SALT, HUMAN_PRF_X25519_SALT, LOCAL_EVENT_SIG_DOMAIN,
-    MAX_CLAIM_TTL_MS, MAX_HUMAN_DRAFT_CHARS, MAX_HUMAN_DRAFT_CONTEXT_CHARS,
+    HumanRevocationPayloadV1, LOCAL_EVENT_SIG_DOMAIN, MAX_CLAIM_TTL_MS, MAX_HUMAN_DRAFT_CHARS,
+    MAX_HUMAN_DRAFT_CONTEXT_CHARS, NodeCertPayloadV1, SecretDropSpec, SignedHumanClaimV1,
+    decode_hcert1, decode_hdrop1, derive_prf_ed25519_keypair, derive_prf_x25519_keypair,
+    encode_hcert1, encode_hdrop1, human_draft_hpke_aad, human_draft_hpke_info, human_drop_hpke_aad,
+    human_drop_hpke_info, human_prf_input, is_reserved_secret_name, open_human_draft,
+    open_human_drop, seal_human_draft, seal_human_drop, sign_human_claim, sign_human_revocation,
+    sign_local_ingest_event, sign_node_cert, validate_draft_text, verify_human_revocation,
+    verify_local_ingest_event, verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, parse_rfc3339_millis};
-use hyp_crypto::{hpke, CryptoError, Ed25519KeyPair, X25519KeyPair};
+use hyp_crypto::{CryptoError, Ed25519KeyPair, X25519KeyPair, hpke};
 use ring::hmac;
 
 const T0: i64 = 1_795_554_000_000; // 2026-11-24T21:00:00.000Z
@@ -121,7 +121,10 @@ fn manual_hpke_seal(
     }
 }
 
-fn manual_sign_claim_unchecked(claim: &HumanClaimV1, signer: &Ed25519KeyPair) -> SignedHumanClaimV1 {
+fn manual_sign_claim_unchecked(
+    claim: &HumanClaimV1,
+    signer: &Ed25519KeyPair,
+) -> SignedHumanClaimV1 {
     let payload = to_canonical_json(claim).unwrap();
     let mut msg = Vec::with_capacity(HUMAN_CLAIM_DOMAIN.len() + payload.len());
     msg.extend_from_slice(HUMAN_CLAIM_DOMAIN);
@@ -252,11 +255,17 @@ fn roundtrip_directive_and_secret_hdrop1_hides_all_metadata() {
     let decoded_env = decode_hdrop1(&armored).unwrap();
     assert_eq!(decoded_env, env);
 
-    let opened = open_human_drop(&decoded_env, &node_enc, "prod@eu-1", T0 + 1_000, |hid, kid| {
-        assert_eq!(hid, "bogdan");
-        assert_eq!(kid, human.kid());
-        Some((human.public_key(), 1))
-    })
+    let opened = open_human_drop(
+        &decoded_env,
+        &node_enc,
+        "prod@eu-1",
+        T0 + 1_000,
+        |hid, kid| {
+            assert_eq!(hid, "bogdan");
+            assert_eq!(kid, human.kid());
+            Some((human.public_key(), 1))
+        },
+    )
     .unwrap();
     assert_eq!(opened, directive);
 
@@ -269,11 +278,10 @@ fn roundtrip_directive_and_secret_hdrop1_hides_all_metadata() {
 
     let sec_armored = encode_hdrop1(&sec_env).unwrap();
     let sec_decoded = decode_hdrop1(&sec_armored).unwrap();
-    let opened_sec =
-        open_human_drop(&sec_decoded, &node_enc, "prod@eu-1", T0 + 5_000, |_, _| {
-            Some((human.public_key(), 1))
-        })
-        .unwrap();
+    let opened_sec = open_human_drop(&sec_decoded, &node_enc, "prod@eu-1", T0 + 5_000, |_, _| {
+        Some((human.public_key(), 1))
+    })
+    .unwrap();
     assert_eq!(opened_sec, secret);
 }
 
@@ -449,9 +457,13 @@ fn mutated_drop_envelopes_and_claims_all_fail_closed() {
     let env_bad_payload =
         manual_hpke_seal(&bad_inner_payload, &node_enc.public_key(), &claim.drop_id);
     assert!(matches!(
-        open_human_drop(&env_bad_payload, &node_enc, "prod@eu-1", T0 + 1_000, |_, _| {
-            Some((human.public_key(), 1))
-        }),
+        open_human_drop(
+            &env_bad_payload,
+            &node_enc,
+            "prod@eu-1",
+            T0 + 1_000,
+            |_, _| { Some((human.public_key(), 1)) }
+        ),
         Err(CryptoError::InvalidSignature(_))
     ));
 
@@ -477,9 +489,13 @@ fn mutated_drop_envelopes_and_claims_all_fail_closed() {
     let signed_wrong_kid = manual_sign_claim_unchecked(&wrong_aud_kid, &human);
     let env_wrong_kid = manual_hpke_seal(&signed_wrong_kid, &node_enc.public_key(), &claim.drop_id);
     assert!(matches!(
-        open_human_drop(&env_wrong_kid, &node_enc, "prod@eu-1", T0 + 1_000, |_, _| {
-            Some((human.public_key(), 1))
-        }),
+        open_human_drop(
+            &env_wrong_kid,
+            &node_enc,
+            "prod@eu-1",
+            T0 + 1_000,
+            |_, _| { Some((human.public_key(), 1)) }
+        ),
         Err(CryptoError::InvalidEnvelope(_))
     ));
 
@@ -487,19 +503,28 @@ fn mutated_drop_envelopes_and_claims_all_fail_closed() {
     let mut bad_outer_drop = valid_env.clone();
     bad_outer_drop.drop_id = "drop_different_99".to_string();
     assert!(
-        open_human_drop(&bad_outer_drop, &node_enc, "prod@eu-1", T0 + 1_000, |_, _| {
-            Some((human.public_key(), 1))
-        })
+        open_human_drop(
+            &bad_outer_drop,
+            &node_enc,
+            "prod@eu-1",
+            T0 + 1_000,
+            |_, _| { Some((human.public_key(), 1)) }
+        )
         .is_err()
     );
 
     // 9. Inner `claim.drop_id` != outer `envelope.drop_id` (manually HPKE-sealed with outer id!)
     let signed_claim = sign_human_claim(&claim, &human).unwrap();
-    let env_mismatch_drop = manual_hpke_seal(&signed_claim, &node_enc.public_key(), "different_outer");
+    let env_mismatch_drop =
+        manual_hpke_seal(&signed_claim, &node_enc.public_key(), "different_outer");
     assert!(matches!(
-        open_human_drop(&env_mismatch_drop, &node_enc, "prod@eu-1", T0 + 1_000, |_, _| {
-            Some((human.public_key(), 1))
-        }),
+        open_human_drop(
+            &env_mismatch_drop,
+            &node_enc,
+            "prod@eu-1",
+            T0 + 1_000,
+            |_, _| { Some((human.public_key(), 1)) }
+        ),
         Err(CryptoError::InvalidEnvelope(_))
     ));
 
@@ -530,7 +555,8 @@ fn mutated_drop_envelopes_and_claims_all_fail_closed() {
     over_ttl.expires_at = format_rfc3339_millis(T0 + MAX_CLAIM_TTL_MS + 1);
     assert!(seal_human_drop(&over_ttl, &human, &node_enc.public_key()).is_err());
     let signed_over_ttl = manual_sign_claim_unchecked(&over_ttl, &human);
-    let env_over_ttl = manual_hpke_seal(&signed_over_ttl, &node_enc.public_key(), &over_ttl.drop_id);
+    let env_over_ttl =
+        manual_hpke_seal(&signed_over_ttl, &node_enc.public_key(), &over_ttl.drop_id);
     assert!(matches!(
         open_human_drop(&env_over_ttl, &node_enc, "prod@eu-1", T0 + 1_000, |_, _| {
             Some((human.public_key(), 1))
@@ -632,7 +658,12 @@ fn reserved_secret_names_fail_closed_case_insensitively_on_seal_and_open() {
     }
 
     // Legitimate application secret names are allowed
-    for allowed in ["stripe-prod-key", "openai_api_key", "db.password-2", "my-node-sign-token"] {
+    for allowed in [
+        "stripe-prod-key",
+        "openai_api_key",
+        "db.password-2",
+        "my-node-sign-token",
+    ] {
         assert!(
             !is_reserved_secret_name(allowed),
             "'{allowed}' must NOT be flagged as reserved"
@@ -845,7 +876,8 @@ fn encrypted_human_draft_roundtrip_and_mutated_inputs_fail_closed() {
         context: None,
         created_at: format_rfc3339_millis(T0),
     };
-    let padded_bad_node = pad_bucket(to_canonical_json(&malicious_node).unwrap().as_bytes()).unwrap();
+    let padded_bad_node =
+        pad_bucket(to_canonical_json(&malicious_node).unwrap().as_bytes()).unwrap();
     let (enc_m, ct_m) = hpke::seal_base(
         &human_enc.public_key(),
         &human_draft_hpke_info("prod@eu-1", &human_enc.kid()),
@@ -972,13 +1004,11 @@ fn local_ingest_event_signature_roundtrip_and_tamper_rejection() {
 
     // 1-bit flip in signature fails closed
     let parts: Vec<&str> = sig_attr.split(':').collect();
-    let tampered_sig = format!(
-        "ed25519:{}:{}",
-        parts[1],
-        flip_b64_bit(parts[2], 0, 0x01)
-    );
+    let tampered_sig = format!("ed25519:{}:{}", parts[1], flip_b64_bit(parts[2], 0, 0x01));
     assert!(matches!(
-        verify_local_ingest_event(&tampered_sig, canonical_event, |_| Some(signer.public_key())),
+        verify_local_ingest_event(&tampered_sig, canonical_event, |_| Some(
+            signer.public_key()
+        )),
         Err(CryptoError::InvalidSignature(_))
     ));
 
@@ -1031,7 +1061,9 @@ fn local_ingest_event_signature_roundtrip_and_tamper_rejection() {
     ] {
         assert!(
             matches!(
-                verify_local_ingest_event(malformed, canonical_event, |_| Some(signer.public_key())),
+                verify_local_ingest_event(malformed, canonical_event, |_| Some(
+                    signer.public_key()
+                )),
                 Err(CryptoError::InvalidSignature(_))
             ),
             "malformed hyphaesig '{malformed}' must fail closed"

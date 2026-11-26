@@ -534,7 +534,10 @@ fn setup_openclaw_installs_plugin_persists_delivery_and_prompt_injection_and_rej
         .output()
         .unwrap();
     assert_eq!(conflict.status.code(), Some(2));
-    assert_eq!(parse_json_stdout(&conflict)["error"]["code"], "CONFLICTING_FLAGS");
+    assert_eq!(
+        parse_json_stdout(&conflict)["error"]["code"],
+        "CONFLICTING_FLAGS"
+    );
 
     // 2. Default install -> conservative prompt injection OFF, delivery=gateway, plugin files installed.
     let fake_bin = "/opt/hyphae/bin/hyp";
@@ -561,12 +564,16 @@ fn setup_openclaw_installs_plugin_persists_delivery_and_prompt_injection_and_rej
         String::from_utf8_lossy(&out_default.stderr)
     );
     let payload_default = parse_json_stdout(&out_default);
-    let notes_str = serde_json::to_string(&payload_default["data"]["harnesses"][0]["notes"]).unwrap();
+    let notes_str =
+        serde_json::to_string(&payload_default["data"]["harnesses"][0]["notes"]).unwrap();
     assert!(
         notes_str.contains("Even with prompt injection OFF") && notes_str.contains("hyp_inbox"),
         "expected reassurance note: {notes_str}"
     );
-    assert!(home.join(".openclaw/extensions/hyphae/openclaw.plugin.json").is_file());
+    assert!(
+        home.join(".openclaw/extensions/hyphae/openclaw.plugin.json")
+            .is_file()
+    );
     assert!(home.join(".openclaw/extensions/hyphae/index.js").is_file());
 
     let oc_cfg: Value =

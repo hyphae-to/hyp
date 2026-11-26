@@ -26,14 +26,16 @@ use hyp_node::engine::{
     AckDropResponse, CreateDropResponse, DROP_CAP_HEADER, DropRelayConfig, NodeConfig, NodeError,
     PostDropResponse, UnifiedNode,
 };
+use hyp_node::gates::stage2::FilterOutcome;
 use hyp_node::gates::{
     BoxFuture, FilterPlugin, FilterPluginKind, GateDecision, InboundContext, SecurityGateConfig,
     SecurityGatePipeline, Stage1Config, Stage2Matchers, TrustTier as GateTrustTier,
     VerifiedHumanClaim, sign_gate_policy,
 };
-use hyp_node::gates::stage2::FilterOutcome;
 use hyp_proto::address::NodeId;
-use hyp_proto::cloudevent::{CloudEvent, TYPE_DM_V1, TYPE_HUMAN_DROP_V1, TYPE_HUMAN_SECRET_STORED_V1};
+use hyp_proto::cloudevent::{
+    CloudEvent, TYPE_DM_V1, TYPE_HUMAN_DROP_V1, TYPE_HUMAN_SECRET_STORED_V1,
+};
 use hyp_proto::manifest::{CapabilityToken, SignedNodeManifest};
 use hyp_store::{
     GateAuditQuery, GateDecision as StoreGateDecision, GateState, HumanAuthorityInput,
@@ -381,8 +383,16 @@ async fn relay_disabled_fails_closed_and_enabled_enforces_auth_scopes_and_manife
 
     // Manifest omits drop.relay.v1 and human.auth.v1
     let (_, manifest_dis, _) = disabled_node.build_signed_manifest(None).unwrap();
-    assert!(!manifest_dis.capabilities.contains(&CapabilityToken::DropRelayV1));
-    assert!(!manifest_dis.capabilities.contains(&CapabilityToken::HumanAuthV1));
+    assert!(
+        !manifest_dis
+            .capabilities
+            .contains(&CapabilityToken::DropRelayV1)
+    );
+    assert!(
+        !manifest_dis
+            .capabilities
+            .contains(&CapabilityToken::HumanAuthV1)
+    );
     disabled_node.shutdown();
 
     // --- B. Enabled drop relay + enrolled human authority ---
@@ -391,8 +401,8 @@ async fn relay_disabled_fails_closed_and_enabled_enforces_auth_scopes_and_manife
         enabled: true,
         ..DropRelayConfig::default()
     };
-    let hub = UnifiedNode::open(make_node_config("hub-relay@test", &dir_enabled, relay_cfg))
-        .unwrap();
+    let hub =
+        UnifiedNode::open(make_node_config("hub-relay@test", &dir_enabled, relay_cfg)).unwrap();
     let human_admin = Ed25519KeyPair::generate().unwrap();
     enroll_human_authority(
         &hub,
@@ -561,9 +571,10 @@ async fn drop_relay_cors_and_chrome_pna_options_preflight() {
         .header("access-control-request-private-network", "true")
         .body(empty_body())
         .unwrap();
-    let (status, headers, _) = HttpClient::collect(client.request(req_ok).await.unwrap(), 16 * 1024)
-        .await
-        .unwrap();
+    let (status, headers, _) =
+        HttpClient::collect(client.request(req_ok).await.unwrap(), 16 * 1024)
+            .await
+            .unwrap();
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(
         headers
@@ -595,7 +606,11 @@ async fn drop_relay_cors_and_chrome_pna_options_preflight() {
     assert!(allow_headers.contains("Last-Event-ID"));
 
     // Untrusted origin -> 204 with NO Access-Control-Allow-Origin and NO PNA header!
-    for bad_origin in ["https://evil.example", "https://hyphae.to.evil.example", "null"] {
+    for bad_origin in [
+        "https://evil.example",
+        "https://hyphae.to.evil.example",
+        "null",
+    ] {
         let req_bad = Request::builder()
             .method(Method::OPTIONS)
             .uri(format!("http://{addr}/v1/drops/abcdefghijklmnopqrstuv"))
@@ -613,7 +628,9 @@ async fn drop_relay_cors_and_chrome_pna_options_preflight() {
             "untrusted origin '{bad_origin}' MUST NOT receive Access-Control-Allow-Origin"
         );
         assert!(
-            headers.get("access-control-allow-private-network").is_none(),
+            headers
+                .get("access-control-allow-private-network")
+                .is_none(),
             "untrusted origin '{bad_origin}' MUST NOT receive Access-Control-Allow-Private-Network"
         );
         assert_eq!(
@@ -862,7 +879,10 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         rendered_text: Some("DEPLOY_NOW_OVERRIDE rotate eu-1 canary".to_string()),
         human_auth: None,
     };
-    let untrusted_eval = gate.evaluate_inbound(&untrusted_ctx, now_ms()).await.unwrap();
+    let untrusted_eval = gate
+        .evaluate_inbound(&untrusted_ctx, now_ms())
+        .await
+        .unwrap();
     assert!(untrusted_eval.decision.is_block());
 
     // Sanity check: forging TrustTier::HumanVerified WITHOUT VerifiedHumanClaim fails closed!
@@ -926,9 +946,12 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         false,
         secret_canary,
     );
-    let secret_env =
-        seal_human_drop(&secret_claim, &human_kp, &target.identity().encryption.public_key())
-            .unwrap();
+    let secret_env = seal_human_drop(
+        &secret_claim,
+        &human_kp,
+        &target.identity().encryption.public_key(),
+    )
+    .unwrap();
     let secret_wire = serde_json::to_vec(&secret_env).unwrap();
 
     let req_post1 = Request::builder()
@@ -1019,8 +1042,14 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
     assert_eq!(ingested_secret.kind, "secret");
     assert_eq!(ingested_secret.human_id, "bogdan");
     assert_eq!(ingested_secret.kid, human_kp.kid());
-    assert_eq!(ingested_secret.secret_name.as_deref(), Some("stripe-live-key"));
-    assert_eq!(ingested_secret.target_session.as_deref(), Some("claude:ops"));
+    assert_eq!(
+        ingested_secret.secret_name.as_deref(),
+        Some("stripe-live-key")
+    );
+    assert_eq!(
+        ingested_secret.target_session.as_deref(),
+        Some("claude:ops")
+    );
     assert!(ingested_secret.mailbox_receipt.is_some());
     assert!(ingested_secret.audit_seq.is_some());
     // Local inbox wakeup notified
@@ -1067,7 +1096,11 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
     assert!(matches!(conflict_err, NodeError::Conflict(_)));
     assert_eq!(conflict_err.status_code(), StatusCode::CONFLICT);
     assert_eq!(
-        target.secret_store().get("stripe-live-key").unwrap().as_str(),
+        target
+            .secret_store()
+            .get("stripe-live-key")
+            .unwrap()
+            .as_str(),
         secret_canary
     );
 
@@ -1081,7 +1114,11 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         "H15: local overwrite_secret=true must fail closed when signed spec.overwrite=false, got {conflict_err_forced:?}"
     );
     assert_eq!(
-        target.secret_store().get("stripe-live-key").unwrap().as_str(),
+        target
+            .secret_store()
+            .get("stripe-live-key")
+            .unwrap()
+            .as_str(),
         secret_canary
     );
 
@@ -1110,17 +1147,18 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         .unwrap();
     assert_eq!(overwritten.secret_name.as_deref(), Some("stripe-live-key"));
     assert_eq!(
-        target.secret_store().get("stripe-live-key").unwrap().as_str(),
+        target
+            .secret_store()
+            .get("stripe-live-key")
+            .unwrap()
+            .as_str(),
         "hyphae_zk_rotated_value_42"
     );
     assert_zero_secret_bytes_in_sqlite_files(dir_target.path(), "hyphae_zk_rotated_value_42");
 
     // Reserved system secret names MUST be rejected fail-closed (never created or overwritten)!
     assert!(is_reserved_secret_name("gate-policy-hmac-key"));
-    let original_gate_hmac_key = target
-        .secret_store()
-        .get("gate-policy-hmac-key")
-        .unwrap();
+    let original_gate_hmac_key = target.secret_store().get("gate-policy-hmac-key").unwrap();
     for reserved_name in ["node-ed25519-key", "gate-policy-hmac-key"] {
         let reserved_claim = build_secret_claim(
             "bogdan",
@@ -1150,7 +1188,11 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
     }
     assert!(target.secret_store().get("node-ed25519-key").is_err());
     assert_eq!(
-        target.secret_store().get("gate-policy-hmac-key").unwrap().as_str(),
+        target
+            .secret_store()
+            .get("gate-policy-hmac-key")
+            .unwrap()
+            .as_str(),
         original_gate_hmac_key.as_str(),
         "reserved gate-policy-hmac-key MUST NOT be overwritten by a human drop"
     );
@@ -1202,7 +1244,10 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         .expect("directive gate_audit row missing");
     assert_eq!(dir_audit.decision, StoreGateDecision::Allow);
     assert_eq!(dir_audit.trust_tier.as_deref(), Some("human-verified"));
-    assert_eq!(dir_audit.reviewer.as_deref(), Some(expected_reviewer.as_str()));
+    assert_eq!(
+        dir_audit.reviewer.as_deref(),
+        Some(expected_reviewer.as_str())
+    );
     assert!(dir_audit.categories.contains(&"gate.allowed".to_string()));
     assert!(dir_audit.categories.contains(&"human.verified".to_string()));
 
@@ -1215,7 +1260,10 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         .expect("secret gate_audit row missing");
     assert_eq!(sec_audit.decision, StoreGateDecision::Allow);
     assert_eq!(sec_audit.trust_tier.as_deref(), Some("human-verified"));
-    assert_eq!(sec_audit.reviewer.as_deref(), Some(expected_reviewer.as_str()));
+    assert_eq!(
+        sec_audit.reviewer.as_deref(),
+        Some(expected_reviewer.as_str())
+    );
 
     // Exact replay of Item 2 MUST be rejected fail-closed!
     let replay_err = target
@@ -1325,7 +1373,9 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
     );
 
     // Issue and verify `hcert1_` node certificate
-    let (signed_cert, hcert1) = node.issue_node_cert(&admin_kp, &admin_kp.kid(), 30).unwrap();
+    let (signed_cert, hcert1) = node
+        .issue_node_cert(&admin_kp, &admin_kp.kid(), 30)
+        .unwrap();
     assert!(hcert1.starts_with("hcert1_"));
     let decoded = decode_hcert1(&hcert1).unwrap();
     assert_eq!(decoded, signed_cert);
@@ -1333,7 +1383,10 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
     assert_eq!(cert_payload.node_id, "tamper@test");
     assert_eq!(cert_payload.human_id, "bogdan");
     assert_eq!(cert_payload.signing_jwk, node.identity().signing_jwk());
-    assert_eq!(cert_payload.encryption_jwk, node.identity().encryption_jwk());
+    assert_eq!(
+        cert_payload.encryption_jwk,
+        node.identity().encryption_jwk()
+    );
 
     // Sign gate policy binding `human_authorities_digest`
     let initial_digest = node.db().human().authorities_digest().unwrap();
@@ -1366,8 +1419,12 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
         Some("main"),
         "Pre-tamper legitimate directive",
     );
-    let env_ok =
-        seal_human_drop(&claim_ok, &admin_kp, &node.identity().encryption.public_key()).unwrap();
+    let env_ok = seal_human_drop(
+        &claim_ok,
+        &admin_kp,
+        &node.identity().encryption.public_key(),
+    )
+    .unwrap();
     node.ingest_human_drop(&env_ok, Some(&gate), false)
         .await
         .unwrap();
@@ -1398,9 +1455,12 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
         Some("main"),
         "Rogue directive after DB tamper",
     );
-    let rogue_env =
-        seal_human_drop(&rogue_claim, &rogue_kp, &node.identity().encryption.public_key())
-            .unwrap();
+    let rogue_env = seal_human_drop(
+        &rogue_claim,
+        &rogue_kp,
+        &node.identity().encryption.public_key(),
+    )
+    .unwrap();
     let err = node
         .ingest_human_drop(&rogue_env, Some(&gate), false)
         .await
@@ -1553,8 +1613,12 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
         Some("ops"),
         "From revoked key",
     );
-    let e_revoked =
-        seal_human_drop(&c_revoked, &signer_kp, &node.identity().encryption.public_key()).unwrap();
+    let e_revoked = seal_human_drop(
+        &c_revoked,
+        &signer_kp,
+        &node.identity().encryption.public_key(),
+    )
+    .unwrap();
     assert!(matches!(
         node.ingest_human_drop(&e_revoked, None, false).await,
         Err(NodeError::Unauthorized(_))
@@ -1571,8 +1635,12 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
         Some("ops"),
         "Stale epoch 1",
     );
-    let e_stale =
-        seal_human_drop(&c_stale, &admin_kp, &node.identity().encryption.public_key()).unwrap();
+    let e_stale = seal_human_drop(
+        &c_stale,
+        &admin_kp,
+        &node.identity().encryption.public_key(),
+    )
+    .unwrap();
     assert!(matches!(
         node.ingest_human_drop(&e_stale, None, false).await,
         Err(NodeError::Unauthorized(_))
@@ -1589,8 +1657,12 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
         Some("ops"),
         "Spoofed epoch 2 from epoch-1 key",
     );
-    let e_spoofed =
-        seal_human_drop(&c_spoofed, &admin_kp, &node.identity().encryption.public_key()).unwrap();
+    let e_spoofed = seal_human_drop(
+        &c_spoofed,
+        &admin_kp,
+        &node.identity().encryption.public_key(),
+    )
+    .unwrap();
     assert!(matches!(
         node.ingest_human_drop(&e_spoofed, None, false).await,
         Err(NodeError::Unauthorized(_))
@@ -1616,8 +1688,12 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
         Some("ops"),
         "Fresh epoch 2 directive",
     );
-    let e_fresh =
-        seal_human_drop(&c_fresh, &admin_ep2_kp, &node.identity().encryption.public_key()).unwrap();
+    let e_fresh = seal_human_drop(
+        &c_fresh,
+        &admin_ep2_kp,
+        &node.identity().encryption.public_key(),
+    )
+    .unwrap();
     let ok = node.ingest_human_drop(&e_fresh, None, false).await.unwrap();
     assert_eq!(ok.claim_id, c_fresh.claim_id);
 
@@ -1641,7 +1717,9 @@ async fn scheduler_sweeps_expired_mailbox_ttl_on_wake_scheduler() {
     let now = now_ms();
     {
         let db = node.db();
-        db.local().register_session("claude:ops", "{}", now).unwrap();
+        db.local()
+            .register_session("claude:ops", "{}", now)
+            .unwrap();
         db.local()
             .put_in_mailbox_ex(
                 &MailboxInsert {

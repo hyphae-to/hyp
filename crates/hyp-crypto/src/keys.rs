@@ -4,10 +4,10 @@
 
 use std::fmt;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{self, KeyPair as _};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -275,7 +275,9 @@ fn parse_rfc8410_pkcs8(
         }
     };
 
-    if after_ver.len() < expected_alg_id.len() || &after_ver[..expected_alg_id.len()] != expected_alg_id {
+    if after_ver.len() < expected_alg_id.len()
+        || &after_ver[..expected_alg_id.len()] != expected_alg_id
+    {
         return Err(CryptoError::InvalidKey(format!(
             "PKCS#8 algorithm OID mismatch (expected {alg_name})"
         )));
@@ -400,11 +402,10 @@ impl Ed25519KeyPair {
         let seed = Zeroizing::new(seed);
         let inner = signature::Ed25519KeyPair::from_seed_unchecked(&*seed)
             .map_err(|_| CryptoError::InvalidKey("invalid Ed25519 seed".into()))?;
-        let public_key: [u8; 32] = inner
-            .public_key()
-            .as_ref()
-            .try_into()
-            .map_err(|_| CryptoError::InvalidKey("unexpected Ed25519 public key length".into()))?;
+        let public_key: [u8; 32] =
+            inner.public_key().as_ref().try_into().map_err(|_| {
+                CryptoError::InvalidKey("unexpected Ed25519 public key length".into())
+            })?;
         Ok(Self {
             seed,
             public_key,
@@ -512,7 +513,11 @@ impl Ed25519KeyPair {
     }
 
     /// Canonicalizes `value` with RFC 8785 JCS and signs under `"hyphae/v2/<kind>\n"`.
-    pub fn sign_jcs<T: Serialize>(&self, kind: &str, value: &T) -> Result<SignedPayload, CryptoError> {
+    pub fn sign_jcs<T: Serialize>(
+        &self,
+        kind: &str,
+        value: &T,
+    ) -> Result<SignedPayload, CryptoError> {
         let payload = to_canonical_json(value)?;
         let sig = self.sign_domain_b64(kind, payload.as_bytes());
         Ok(SignedPayload { payload, sig })
@@ -892,10 +897,11 @@ mod tests {
         kp.public_key()
             .verify_domain_b64("manifest", b"{\"v\":1}", &sig)
             .unwrap();
-        assert!(kp
-            .public_key()
-            .verify_domain_b64("grant", b"{\"v\":1}", &sig)
-            .is_err());
+        assert!(
+            kp.public_key()
+                .verify_domain_b64("grant", b"{\"v\":1}", &sig)
+                .is_err()
+        );
     }
 
     #[test]
@@ -925,7 +931,11 @@ mod tests {
         let kp = Ed25519KeyPair::generate().unwrap();
         let mut forged = kp.sign_domain("test", b"hello");
         forged[..32].copy_from_slice(&SMALL_ORDER_ED25519_Y_LE[0]);
-        assert!(kp.public_key().verify_domain("test", b"hello", &forged).is_err());
+        assert!(
+            kp.public_key()
+                .verify_domain("test", b"hello", &forged)
+                .is_err()
+        );
     }
 
     #[test]

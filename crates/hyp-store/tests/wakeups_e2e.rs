@@ -80,7 +80,12 @@ fn cron_insert(
     }
 }
 
-fn wakeup_mailbox_insert(session_id: &str, wakeup_id: &str, item_id: &str, text: &str) -> MailboxInsert {
+fn wakeup_mailbox_insert(
+    session_id: &str,
+    wakeup_id: &str,
+    item_id: &str,
+    text: &str,
+) -> MailboxInsert {
     MailboxInsert {
         session_id: session_id.to_string(),
         origin_node: "local".to_string(),
@@ -108,7 +113,8 @@ fn wakeup_validation_ownership_quotas_and_autopause() {
     let mut bad_empty_label = timer_insert(None, Some("sess-a"), "sess-a", BASE_T0 + 5_000);
     bad_empty_label.label = "   ".to_string();
     assert!(matches!(
-        db.wakeups().create_wakeup(&bad_empty_label, &limits, BASE_T0),
+        db.wakeups()
+            .create_wakeup(&bad_empty_label, &limits, BASE_T0),
         Err(StoreError::InvalidInput(_))
     ));
 
@@ -128,16 +134,27 @@ fn wakeup_validation_ownership_quotas_and_autopause() {
 
     // Timer in the past or zero delay -> rejected.
     assert!(matches!(
-        db.wakeups()
-            .create_wakeup(&timer_insert(None, Some("sess-a"), "sess-a", BASE_T0), &limits, BASE_T0),
+        db.wakeups().create_wakeup(
+            &timer_insert(None, Some("sess-a"), "sess-a", BASE_T0),
+            &limits,
+            BASE_T0
+        ),
         Err(StoreError::InvalidInput(_))
     ));
 
     // Agent-owned cron without max_iterations -> rejected fail-closed!
-    let agent_unbounded_cron =
-        cron_insert(None, Some("sess-a"), "sess-a", "*/5 * * * *", CronTimezone::Utc, true, None);
+    let agent_unbounded_cron = cron_insert(
+        None,
+        Some("sess-a"),
+        "sess-a",
+        "*/5 * * * *",
+        CronTimezone::Utc,
+        true,
+        None,
+    );
     assert!(matches!(
-        db.wakeups().create_wakeup(&agent_unbounded_cron, &limits, BASE_T0),
+        db.wakeups()
+            .create_wakeup(&agent_unbounded_cron, &limits, BASE_T0),
         Err(StoreError::InvalidInput(_))
     ));
 
@@ -220,15 +237,18 @@ fn wakeup_validation_ownership_quotas_and_autopause() {
         )
         .unwrap();
     assert!(matches!(
-        db.wakeups().cancel_wakeup(&human_cron.id, Some("sess-a"), BASE_T0 + 1),
+        db.wakeups()
+            .cancel_wakeup(&human_cron.id, Some("sess-a"), BASE_T0 + 1),
         Err(StoreError::Unauthorized(_))
     ));
     assert!(matches!(
-        db.wakeups().cancel_wakeup(&agent_a.id, Some("sess-b"), BASE_T0 + 1),
+        db.wakeups()
+            .cancel_wakeup(&agent_a.id, Some("sess-b"), BASE_T0 + 1),
         Err(StoreError::Unauthorized(_))
     ));
     assert!(matches!(
-        db.wakeups().pause_wakeup(&agent_a.id, Some("sess-b"), BASE_T0 + 1),
+        db.wakeups()
+            .pause_wakeup(&agent_a.id, Some("sess-b"), BASE_T0 + 1),
         Err(StoreError::Unauthorized(_))
     ));
 
@@ -282,7 +302,12 @@ fn wakeup_validation_ownership_quotas_and_autopause() {
     // Session-leave cleanup cancels all owned wakeups (active + paused) while preserving human wakeups.
     db.wakeups()
         .create_wakeup(
-            &timer_insert(Some("agent-a-timer"), Some("sess-a"), "sess-a", BASE_T0 + 3 * HOUR_MS),
+            &timer_insert(
+                Some("agent-a-timer"),
+                Some("sess-a"),
+                "sess-a",
+                BASE_T0 + 3 * HOUR_MS,
+            ),
             &limits,
             BASE_T0,
         )
@@ -296,7 +321,11 @@ fn wakeup_validation_ownership_quotas_and_autopause() {
         .unwrap();
     assert_eq!(cancelled_count, 2);
     assert_eq!(
-        db.wakeups().get_wakeup(&human_cron.id).unwrap().unwrap().state,
+        db.wakeups()
+            .get_wakeup(&human_cron.id)
+            .unwrap()
+            .unwrap()
+            .state,
         WakeupState::Active
     );
 
@@ -363,7 +392,12 @@ fn wakeup_validation_ownership_quotas_and_autopause() {
     // 129th active wakeup (even human-owned!) hits global quota!
     assert!(matches!(
         db.wakeups().create_wakeup(
-            &timer_insert(Some("quota-global-overflow"), None, "sess-x", BASE_T0 + 500_000),
+            &timer_insert(
+                Some("quota-global-overflow"),
+                None,
+                "sess-x",
+                BASE_T0 + 500_000
+            ),
             &limits,
             BASE_T0,
         ),
@@ -371,7 +405,9 @@ fn wakeup_validation_ownership_quotas_and_autopause() {
     ));
 
     // Session pruning also cancels owned wakeups of pruned stale sessions.
-    db.local().register_session("quota-s1", "{}", BASE_T0).unwrap();
+    db.local()
+        .register_session("quota-s1", "{}", BASE_T0)
+        .unwrap();
     let prune = db
         .local()
         .prune_sessions(BASE_T0 + 1_000, &HashSet::new())
@@ -443,7 +479,12 @@ fn laptop_sleep_five_hour_jump_produces_single_catchup_and_exact_missed_count() 
     let timer = db
         .wakeups()
         .create_wakeup(
-            &timer_insert(Some("oneshot"), Some("sess-1"), "sess-1", BASE_T0 + 2 * HOUR_MS),
+            &timer_insert(
+                Some("oneshot"),
+                Some("sess-1"),
+                "sess-1",
+                BASE_T0 + 2 * HOUR_MS,
+            ),
             &limits,
             t_start,
         )
@@ -453,7 +494,11 @@ fn laptop_sleep_five_hour_jump_produces_single_catchup_and_exact_missed_count() 
     // Laptop sleeps 5 hours and wakes at 05:30:00Z!
     let t_wake = t_start + 5 * HOUR_MS; // 05:30:00Z
     let rep = db.tick(t_wake).unwrap();
-    assert_eq!(rep.wakeups_fired.len(), 3, "each due wakeup fires at most ONCE");
+    assert_eq!(
+        rep.wakeups_fired.len(),
+        3,
+        "each due wakeup fires at most ONCE"
+    );
 
     let by_id: BTreeMap<String, _> = rep
         .wakeups_fired
@@ -479,7 +524,12 @@ fn laptop_sleep_five_hour_jump_produces_single_catchup_and_exact_missed_count() 
         "next_fire_at ({}) must be strictly > wake time ({t_wake})",
         f5.wakeup.next_fire_at
     );
-    let expected_next_5 = apply_cron_jitter(BASE_T0 + 5 * HOUR_MS + 35 * MIN_MS, 5 * MIN_MS, "five-min-jitter", false);
+    let expected_next_5 = apply_cron_jitter(
+        BASE_T0 + 5 * HOUR_MS + 35 * MIN_MS,
+        5 * MIN_MS,
+        "five-min-jitter",
+        false,
+    );
     assert_eq!(f5.wakeup.next_fire_at, expected_next_5);
 
     // One-shot timer: completed with missed_count = 0.
@@ -620,7 +670,10 @@ fn mailbox_coalescing_missed_count_ttl_and_zero_polling_deadlines() {
     assert_eq!(ex2.entry.text, "second tick");
     assert_eq!(ex2.entry.received_at, BASE_T0 + 10_000);
     assert_eq!(ex2.expires_at, Some(BASE_T0 + 120_000));
-    assert!(!ex2.entry.notified, "coalesced update must reset notified = false");
+    assert!(
+        !ex2.entry.notified,
+        "coalesced update must reset notified = false"
+    );
     assert_eq!(ex2.missed_count, 1);
 
     // Exact duplicate retry of `tick-2` returns Duplicate without bumping missed_count!
@@ -635,7 +688,11 @@ fn mailbox_coalescing_missed_count_ttl_and_zero_polling_deadlines() {
         MailboxPutResult::Duplicate
     );
     assert_eq!(
-        db.local().get_mailbox_entry_ex(&r1).unwrap().unwrap().missed_count,
+        db.local()
+            .get_mailbox_entry_ex(&r1)
+            .unwrap()
+            .unwrap()
+            .missed_count,
         1
     );
 
@@ -652,7 +709,11 @@ fn mailbox_coalescing_missed_count_ttl_and_zero_polling_deadlines() {
     };
     assert_ne!(rq, r1);
     assert_eq!(
-        db.local().get_mailbox_entry_ex(&r1).unwrap().unwrap().missed_count,
+        db.local()
+            .get_mailbox_entry_ex(&r1)
+            .unwrap()
+            .unwrap()
+            .missed_count,
         1
     );
 
@@ -695,7 +756,10 @@ fn mailbox_coalescing_missed_count_ttl_and_zero_polling_deadlines() {
     assert_eq!(ex_fresh.missed_count, 0);
 
     // Drain delivers it; next put creates another fresh row with missed_count = 0.
-    let drained = db.local().drain_inbox_ex("sess-1", 10, BASE_T0 + 135_000).unwrap();
+    let drained = db
+        .local()
+        .drain_inbox_ex("sess-1", 10, BASE_T0 + 135_000)
+        .unwrap();
     assert_eq!(drained.len(), 2);
     assert_eq!(db.next_deadline_ms(BASE_T0 + 135_000).unwrap(), None);
 
@@ -781,7 +845,11 @@ impl ReferenceOracle {
         }
     }
 
-    fn create_wakeup(&mut self, input: &WakeupInsert, now_ms: i64) -> Result<WakeupRecord, &'static str> {
+    fn create_wakeup(
+        &mut self,
+        input: &WakeupInsert,
+        now_ms: i64,
+    ) -> Result<WakeupRecord, &'static str> {
         let id = input.id.clone().expect("oracle uses explicit ids");
         if self.wakeups.contains_key(&id) {
             return Err("id_conflict");
@@ -798,7 +866,9 @@ impl ReferenceOracle {
             let active_owner = self
                 .wakeups
                 .values()
-                .filter(|w| w.state == WakeupState::Active && w.owner_session_id.as_deref() == Some(owner))
+                .filter(|w| {
+                    w.state == WakeupState::Active && w.owner_session_id.as_deref() == Some(owner)
+                })
                 .count();
             if active_owner >= self.limits.max_active_per_session {
                 return Err("quota");
@@ -820,13 +890,19 @@ impl ReferenceOracle {
                     .map_err(|_| "invalid")?;
                 expr.validate_min_interval(self.limits.min_cron_interval_seconds)
                     .map_err(|_| "invalid")?;
-                let first_base = expr.next_fire_after(now_ms, input.timezone).ok_or("invalid")?;
+                let first_base = expr
+                    .next_fire_after(now_ms, input.timezone)
+                    .ok_or("invalid")?;
                 let interval = expr
                     .next_fire_after(first_base, input.timezone)
                     .map(|n| n - first_base)
                     .unwrap_or(0);
                 let first_fire = apply_cron_jitter(first_base, interval, &id, input.exact_timing);
-                (Some(expr.as_str().to_string()), first_fire, input.max_iterations)
+                (
+                    Some(expr.as_str().to_string()),
+                    first_fire,
+                    input.max_iterations,
+                )
             }
         };
 
@@ -860,7 +936,12 @@ impl ReferenceOracle {
         Ok(rec)
     }
 
-    fn cancel_wakeup(&mut self, id: &str, caller: Option<&str>, now_ms: i64) -> Result<(), &'static str> {
+    fn cancel_wakeup(
+        &mut self,
+        id: &str,
+        caller: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), &'static str> {
         let Some(rec) = self.wakeups.get_mut(id) else {
             return Err("not_found");
         };
@@ -937,8 +1018,10 @@ impl ReferenceOracle {
                         rec.state = WakeupState::Completed;
                         (missed, true)
                     } else {
-                        let interval = expr.next_fire_after(next_base, rec.timezone).unwrap() - next_base;
-                        rec.next_fire_at = apply_cron_jitter(next_base, interval, &rec.id, rec.exact_timing);
+                        let interval =
+                            expr.next_fire_after(next_base, rec.timezone).unwrap() - next_base;
+                        rec.next_fire_at =
+                            apply_cron_jitter(next_base, interval, &rec.id, rec.exact_timing);
                         (missed, false)
                     }
                 }
@@ -1026,7 +1109,11 @@ impl ReferenceOracle {
             }
         }
         self.pending_mailbox = keep;
-        drained.sort_by(|a, b| a.received_at.cmp(&b.received_at).then(a.receipt.cmp(&b.receipt)));
+        drained.sort_by(|a, b| {
+            a.received_at
+                .cmp(&b.received_at)
+                .then(a.receipt.cmp(&b.receipt))
+        });
         drained
     }
 
@@ -1105,7 +1192,15 @@ fn differential_oracle_wakeup_and_mailbox_state_machine_with_crash_reopen() {
                 } else {
                     None
                 };
-                cron_insert(Some(&id), owner, target, expr, CronTimezone::Utc, exact, max_it)
+                cron_insert(
+                    Some(&id),
+                    owner,
+                    target,
+                    expr,
+                    CronTimezone::Utc,
+                    exact,
+                    max_it,
+                )
             };
 
             let o_res = oracle.create_wakeup(&insert, now);
@@ -1150,7 +1245,10 @@ fn differential_oracle_wakeup_and_mailbox_state_machine_with_crash_reopen() {
                 .iter()
                 .map(|f| (f.wakeup.id.clone(), f.missed_count, f.completed))
                 .collect();
-            assert_eq!(s_fired, o_fired, "step {step} at now={now}: fired wakeups mismatch");
+            assert_eq!(
+                s_fired, o_fired,
+                "step {step} at now={now}: fired wakeups mismatch"
+            );
             assert_eq!(
                 s_rep.mailbox_expired, o_expired,
                 "step {step} at now={now}: mailbox_expired mismatch"
@@ -1197,7 +1295,11 @@ fn differential_oracle_wakeup_and_mailbox_state_machine_with_crash_reopen() {
                 oracle.record_delivery(
                     &f.wakeup.id,
                     succeeded,
-                    if succeeded { None } else { Some("delivery_timeout") },
+                    if succeeded {
+                        None
+                    } else {
+                        Some("delivery_timeout")
+                    },
                     limits.max_consecutive_failures,
                     now,
                 );
@@ -1205,7 +1307,11 @@ fn differential_oracle_wakeup_and_mailbox_state_machine_with_crash_reopen() {
                     .record_delivery_result(
                         &f.wakeup.id,
                         succeeded,
-                        if succeeded { None } else { Some("delivery_timeout") },
+                        if succeeded {
+                            None
+                        } else {
+                            Some("delivery_timeout")
+                        },
                         limits.max_consecutive_failures,
                         now,
                     )
@@ -1232,7 +1338,11 @@ fn differential_oracle_wakeup_and_mailbox_state_machine_with_crash_reopen() {
             };
             let s_put = db
                 .local()
-                .put_in_mailbox_ex(&wakeup_mailbox_insert(sess, &wk_key, &item_id, &text), &opts, now)
+                .put_in_mailbox_ex(
+                    &wakeup_mailbox_insert(sess, &wk_key, &item_id, &text),
+                    &opts,
+                    now,
+                )
                 .unwrap();
             let (s_tag, receipt_opt) = match &s_put {
                 MailboxPutResult::Stored { receipt } => ("stored", Some(receipt.as_str())),
@@ -1246,7 +1356,11 @@ fn differential_oracle_wakeup_and_mailbox_state_machine_with_crash_reopen() {
             let sess = sessions[rng.range(sessions.len())];
             let o_drained = oracle.drain_mailbox(sess);
             let s_drained = db.local().drain_inbox_ex(sess, 100, now).unwrap();
-            assert_eq!(s_drained.len(), o_drained.len(), "step {step}: drain count mismatch");
+            assert_eq!(
+                s_drained.len(),
+                o_drained.len(),
+                "step {step}: drain count mismatch"
+            );
             for (sd, od) in s_drained.iter().zip(o_drained.iter()) {
                 assert_eq!(sd.entry.receipt, od.receipt);
                 assert_eq!(sd.entry.item_id, od.item_id);
@@ -1265,7 +1379,10 @@ fn differential_oracle_wakeup_and_mailbox_state_machine_with_crash_reopen() {
             .into_iter()
             .map(|w| (w.id.clone(), w))
             .collect();
-        assert_eq!(s_wakeups, oracle.wakeups, "step {step}: full wakeups table mismatch");
+        assert_eq!(
+            s_wakeups, oracle.wakeups,
+            "step {step}: full wakeups table mismatch"
+        );
 
         let bd = db.next_deadline_breakdown(now).unwrap();
         assert_eq!(
@@ -1287,8 +1404,16 @@ fn differential_oracle_wakeup_and_mailbox_state_machine_with_crash_reopen() {
                 .iter()
                 .filter(|r| r.session_id == sess)
                 .collect();
-            o_inbox.sort_by(|a, b| a.received_at.cmp(&b.received_at).then(a.receipt.cmp(&b.receipt)));
-            assert_eq!(s_inbox.len(), o_inbox.len(), "step {step} {sess}: pending len mismatch");
+            o_inbox.sort_by(|a, b| {
+                a.received_at
+                    .cmp(&b.received_at)
+                    .then(a.receipt.cmp(&b.receipt))
+            });
+            assert_eq!(
+                s_inbox.len(),
+                o_inbox.len(),
+                "step {step} {sess}: pending len mismatch"
+            );
             for (si, oi) in s_inbox.iter().zip(o_inbox.iter()) {
                 assert_eq!(si.entry.receipt, oi.receipt);
                 assert_eq!(si.entry.item_id, oi.item_id);
@@ -1454,8 +1579,14 @@ fn migration_v2_to_v3_and_v1_to_v3_backup_parity_and_zero_data_loss() {
     let migrated_v1 = NodeDb::open(&v1_path).unwrap();
     let fresh_v3 = NodeDb::open(&fresh_path).unwrap();
 
-    assert_eq!(migrated_v2.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    assert_eq!(migrated_v1.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        migrated_v2.schema_version().unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        migrated_v1.schema_version().unwrap(),
+        CURRENT_SCHEMA_VERSION
+    );
     assert_eq!(fresh_v3.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     assert!(migrated_v2.schema_version().unwrap() >= 3);
 
@@ -1525,13 +1656,21 @@ fn migration_v2_to_v3_and_v1_to_v3_backup_parity_and_zero_data_loss() {
             .via_peer,
         "acme-hub"
     );
-    let mb_v2 = migrated_v2.local().get_mailbox_entry_ex("rcpt-v2").unwrap().unwrap();
+    let mb_v2 = migrated_v2
+        .local()
+        .get_mailbox_entry_ex("rcpt-v2")
+        .unwrap()
+        .unwrap();
     assert_eq!(mb_v2.entry.text, "preserved across v2->v3");
     assert_eq!(mb_v2.coalesce_key, None);
     assert_eq!(mb_v2.expires_at, None);
     assert_eq!(mb_v2.missed_count, 0);
 
-    let mb_v1 = migrated_v1.local().get_mailbox_entry_ex("rcpt-v1").unwrap().unwrap();
+    let mb_v1 = migrated_v1
+        .local()
+        .get_mailbox_entry_ex("rcpt-v1")
+        .unwrap()
+        .unwrap();
     assert_eq!(mb_v1.entry.text, "preserved across v1->v3");
     assert_eq!(mb_v1.missed_count, 0);
 

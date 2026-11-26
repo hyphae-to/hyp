@@ -496,10 +496,7 @@ fn run_providers(as_json: bool) -> ExitCode {
     println!("{}", "-".repeat(104));
     for p in &providers {
         let tag = if p.detected { "OK" } else { "-" };
-        println!(
-            "{:<12}  {:<8}  {:<36}  {}",
-            p.id, tag, p.name, p.best_for
-        );
+        println!("{:<12}  {:<8}  {:<36}  {}", p.id, tag, p.name, p.best_for);
     }
     println!();
     for p in &providers {
@@ -534,9 +531,7 @@ fn validate_domain_hostname(domain: &str) -> Result<String, String> {
         .bytes()
         .any(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')))
     {
-        return Err(
-            "domain may only contain ASCII letters, digits, dots, and hyphens".to_string(),
-        );
+        return Err("domain may only contain ASCII letters, digits, dots, and hyphens".to_string());
     }
     if trimmed.starts_with('.')
         || trimmed.ends_with('.')
@@ -560,9 +555,9 @@ fn validate_bind_addr(bind: &str) -> Result<String, String> {
         return Err("bind address contains disallowed characters".to_string());
     }
     // Validate `host:port` (including IPv6 `[::1]:8790`).
-    let (host, port_str) = trimmed
-        .rsplit_once(':')
-        .ok_or_else(|| "bind address must have format <host>:<port> (e.g. 127.0.0.1:8790)".to_string())?;
+    let (host, port_str) = trimmed.rsplit_once(':').ok_or_else(|| {
+        "bind address must have format <host>:<port> (e.g. 127.0.0.1:8790)".to_string()
+    })?;
     if host.is_empty() {
         return Err("bind host cannot be empty".to_string());
     }
@@ -689,7 +684,8 @@ fn run_init(
         }
     };
 
-    let out_dir = out_arg.unwrap_or_else(|| PathBuf::from(format!("hyphae-deploy-{}", provider.as_str())));
+    let out_dir =
+        out_arg.unwrap_or_else(|| PathBuf::from(format!("hyphae-deploy-{}", provider.as_str())));
     let artifacts = build_provider_artifacts(
         provider,
         profile,
@@ -732,7 +728,10 @@ fn run_init(
             as_json,
             EXIT_ERROR,
             "IO_ERROR",
-            format!("Failed to create output directory {}: {e}", out_dir.display()),
+            format!(
+                "Failed to create output directory {}: {e}",
+                out_dir.display()
+            ),
             None,
         );
     }
@@ -752,7 +751,9 @@ fn run_init(
                 );
             }
         }
-        if let Err(e) = write_artifact_file(&full_path, artifact.content.as_bytes(), artifact.executable) {
+        if let Err(e) =
+            write_artifact_file(&full_path, artifact.content.as_bytes(), artifact.executable)
+        {
             return emit_error(
                 cmd,
                 as_json,
@@ -819,10 +820,7 @@ fn run_init(
     println!();
     println!("Generated files:");
     for a in &artifacts {
-        println!(
-            "  • {:<24} {}",
-            a.rel_path, a.description
-        );
+        println!("  • {:<24} {}", a.rel_path, a.description);
     }
     print_warnings(&warnings);
     print_next_steps(&next);
@@ -1607,7 +1605,12 @@ volumes:
     )
 }
 
-fn render_drop_relay_fly_toml(app_name: &str, node_id: &str, port: u16, max_memory_mb: usize) -> String {
+fn render_drop_relay_fly_toml(
+    app_name: &str,
+    node_id: &str,
+    port: u16,
+    max_memory_mb: usize,
+) -> String {
     let vm_memory_mb = max_memory_mb.saturating_add(256).max(512);
     format!(
         r#"# Fly.io configuration for Hyphae v2 Blind Drop Relay ({node_id})
@@ -1730,7 +1733,8 @@ fn build_provider_artifacts(
         drop_max_memory_mb,
     );
     let dummy_out = PathBuf::from(".");
-    let next_for_readme = build_init_next_steps(provider, profile, node_id, domain, bind, &dummy_out);
+    let next_for_readme =
+        build_init_next_steps(provider, profile, node_id, domain, bind, &dummy_out);
     let readme = render_kit_readme(provider, profile, node_id, domain, bind, &next_for_readme);
 
     match provider {
@@ -1962,7 +1966,12 @@ fn build_provider_artifacts(
                 GeneratedArtifact {
                     rel_path: "fly.toml",
                     description: "Fly.io zero-disk Drop Relay config (auto-HTTPS, always-on SSE)",
-                    content: render_drop_relay_fly_toml(&app_name, node_id, port, drop_max_memory_mb),
+                    content: render_drop_relay_fly_toml(
+                        &app_name,
+                        node_id,
+                        port,
+                        drop_max_memory_mb,
+                    ),
                     executable: false,
                 },
                 GeneratedArtifact {
@@ -2269,11 +2278,7 @@ fn validate_config_file(path: &Path, checks: &mut Vec<CliCheck>) -> Option<Value
             if (mode & 0o002) != 0 {
                 checks.push(CliCheck::fail(
                     "config.permissions",
-                    format!(
-                        "{} is world-writable (mode {:04o})",
-                        path.display(),
-                        mode
-                    ),
+                    format!("{} is world-writable (mode {:04o})", path.display(), mode),
                     Some(format!("chmod 0640 {}", path.display())),
                 ));
             } else {
@@ -2402,7 +2407,9 @@ fn validate_config_file(path: &Path, checks: &mut Vec<CliCheck>) -> Option<Value
         } else {
             checks.push(CliCheck::warn(
                 "config.bind",
-                format!("Non-loopback bind '{bind}'; confirm TLS terminates in front of this interface"),
+                format!(
+                    "Non-loopback bind '{bind}'; confirm TLS terminates in front of this interface"
+                ),
                 None,
             ));
         }
@@ -2448,7 +2455,10 @@ fn validate_config_file(path: &Path, checks: &mut Vec<CliCheck>) -> Option<Value
             checks.push(CliCheck::fail(
                 "config.forwarding",
                 format!("Unsafe forwarding.mode '{mode}' (only 'deny' or 'allowlist' permitted)"),
-                Some("Set forwarding.mode to \"deny\" (or \"allowlist\" with explicit rules).".to_string()),
+                Some(
+                    "Set forwarding.mode to \"deny\" (or \"allowlist\" with explicit rules)."
+                        .to_string(),
+                ),
             ));
         }
     }
@@ -2476,10 +2486,14 @@ fn validate_config_file(path: &Path, checks: &mut Vec<CliCheck>) -> Option<Value
                 } else if dr.max_ttl_seconds == 0 || dr.max_ttl_seconds > 900 {
                     checks.push(CliCheck::fail(
                         "config.dropRelay",
-                        format!("dropRelay.maxTtlSeconds ({}) must be in 1..=900", dr.max_ttl_seconds),
+                        format!(
+                            "dropRelay.maxTtlSeconds ({}) must be in 1..=900",
+                            dr.max_ttl_seconds
+                        ),
                         Some("Set dropRelay.maxTtlSeconds <= 900 (15 minutes).".to_string()),
                     ));
-                } else if dr.default_ttl_seconds == 0 || dr.default_ttl_seconds > dr.max_ttl_seconds {
+                } else if dr.default_ttl_seconds == 0 || dr.default_ttl_seconds > dr.max_ttl_seconds
+                {
                     checks.push(CliCheck::fail(
                         "config.dropRelay",
                         format!(
@@ -2542,13 +2556,19 @@ fn validate_config_file(path: &Path, checks: &mut Vec<CliCheck>) -> Option<Value
                     Err(e) => checks.push(CliCheck::fail(
                         "config.dropPortalUrl",
                         format!("Invalid dropPortalUrl '{raw_portal}': {e}"),
-                        Some("Set dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop).".to_string()),
+                        Some(
+                            "Set dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop)."
+                                .to_string(),
+                        ),
                     )),
                 },
                 None => checks.push(CliCheck::fail(
                     "config.dropPortalUrl",
                     "Invalid dropPortalUrl: must be a string",
-                    Some("Set dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop).".to_string()),
+                    Some(
+                        "Set dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop)."
+                            .to_string(),
+                    ),
                 )),
             }
         }
@@ -2644,25 +2664,34 @@ async fn probe_manifest_url(
         }
     };
 
-    let resp = match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), client.request(req)).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            checks.push(CliCheck::fail(
-                "probe.connect",
-                format!("GET {manifest_url} failed: {e}"),
-                Some("Verify the node is running, DNS resolves, and TLS certificates are valid.".to_string()),
-            ));
-            return None;
-        }
-        Err(_) => {
-            checks.push(CliCheck::fail(
-                "probe.connect",
-                format!("GET {manifest_url} timed out after {PROBE_TIMEOUT_SECS}s"),
-                Some("Check firewall rules, reverse proxy upstream address, and node health.".to_string()),
-            ));
-            return None;
-        }
-    };
+    let resp =
+        match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), client.request(req))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                checks.push(CliCheck::fail(
+                    "probe.connect",
+                    format!("GET {manifest_url} failed: {e}"),
+                    Some(
+                        "Verify the node is running, DNS resolves, and TLS certificates are valid."
+                            .to_string(),
+                    ),
+                ));
+                return None;
+            }
+            Err(_) => {
+                checks.push(CliCheck::fail(
+                    "probe.connect",
+                    format!("GET {manifest_url} timed out after {PROBE_TIMEOUT_SECS}s"),
+                    Some(
+                        "Check firewall rules, reverse proxy upstream address, and node health."
+                            .to_string(),
+                    ),
+                ));
+                return None;
+            }
+        };
 
     let status = resp.status().as_u16();
     if status != 200 {
@@ -2729,40 +2758,43 @@ async fn probe_manifest_url(
         }
     };
 
-    let (payload, signed_envelope, signature_verified) =
-        if raw_json.get("payload").and_then(Value::as_str).is_some()
-            && raw_json.get("sig").and_then(Value::as_str).is_some()
-        {
-            let signed: SignedNodeManifest = match serde_json::from_value(raw_json) {
-                Ok(s) => s,
-                Err(e) => {
-                    checks.push(CliCheck::fail(
-                        "manifest.schema",
-                        format!("Invalid SignedNodeManifest envelope: {e}"),
-                        None,
-                    ));
-                    return None;
-                }
-            };
-            let payload: NodeManifestPayload = match serde_json::from_str(&signed.payload) {
-                Ok(p) => p,
-                Err(e) => {
-                    checks.push(CliCheck::fail(
-                        "manifest.schema",
-                        format!("Invalid NodeManifestPayload JSON inside signed envelope: {e}"),
-                        None,
-                    ));
-                    return None;
-                }
-            };
-            // Verify Ed25519 signature over `"hyphae/v2/manifest\n" || payload` against embedded signingJwk.
-            let crypto_jwk = CryptoOkpJwk {
-                kty: payload.identity.signing_jwk.kty.clone(),
-                crv: payload.identity.signing_jwk.crv.as_str().to_string(),
-                x: payload.identity.signing_jwk.x.clone(),
-            };
-            let sig_ok = match crypto_jwk.to_ed25519() {
-                Ok(pk) => match pk.verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig) {
+    let (payload, signed_envelope, signature_verified) = if raw_json
+        .get("payload")
+        .and_then(Value::as_str)
+        .is_some()
+        && raw_json.get("sig").and_then(Value::as_str).is_some()
+    {
+        let signed: SignedNodeManifest = match serde_json::from_value(raw_json) {
+            Ok(s) => s,
+            Err(e) => {
+                checks.push(CliCheck::fail(
+                    "manifest.schema",
+                    format!("Invalid SignedNodeManifest envelope: {e}"),
+                    None,
+                ));
+                return None;
+            }
+        };
+        let payload: NodeManifestPayload = match serde_json::from_str(&signed.payload) {
+            Ok(p) => p,
+            Err(e) => {
+                checks.push(CliCheck::fail(
+                    "manifest.schema",
+                    format!("Invalid NodeManifestPayload JSON inside signed envelope: {e}"),
+                    None,
+                ));
+                return None;
+            }
+        };
+        // Verify Ed25519 signature over `"hyphae/v2/manifest\n" || payload` against embedded signingJwk.
+        let crypto_jwk = CryptoOkpJwk {
+            kty: payload.identity.signing_jwk.kty.clone(),
+            crv: payload.identity.signing_jwk.crv.as_str().to_string(),
+            x: payload.identity.signing_jwk.x.clone(),
+        };
+        let sig_ok = match crypto_jwk.to_ed25519() {
+            Ok(pk) => {
+                match pk.verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig) {
                     Ok(()) => {
                         checks.push(CliCheck::ok(
                             "manifest.signature",
@@ -2778,36 +2810,39 @@ async fn probe_manifest_url(
                         ));
                         false
                     }
-                },
-                Err(e) => {
-                    checks.push(CliCheck::fail(
-                        "manifest.signature",
-                        format!("Invalid signingJwk in manifest: {e}"),
-                        None,
-                    ));
-                    false
                 }
-            };
-            (payload, true, Some(sig_ok))
-        } else {
-            let payload: NodeManifestPayload = match serde_json::from_value(raw_json) {
-                Ok(p) => p,
-                Err(e) => {
-                    checks.push(CliCheck::fail(
-                        "manifest.schema",
-                        format!("Response is not a valid NodeManifestPayload or SignedNodeManifest: {e}"),
-                        None,
-                    ));
-                    return None;
-                }
-            };
-            checks.push(CliCheck::warn(
-                "manifest.signature",
-                "Manifest served as unsigned raw JSON instead of SignedNodeManifest { payload, sig }",
-                Some("Serve signed SignedNodeManifest envelopes on GET /v1/manifest.".to_string()),
-            ));
-            (payload, false, None)
+            }
+            Err(e) => {
+                checks.push(CliCheck::fail(
+                    "manifest.signature",
+                    format!("Invalid signingJwk in manifest: {e}"),
+                    None,
+                ));
+                false
+            }
         };
+        (payload, true, Some(sig_ok))
+    } else {
+        let payload: NodeManifestPayload = match serde_json::from_value(raw_json) {
+            Ok(p) => p,
+            Err(e) => {
+                checks.push(CliCheck::fail(
+                    "manifest.schema",
+                    format!(
+                        "Response is not a valid NodeManifestPayload or SignedNodeManifest: {e}"
+                    ),
+                    None,
+                ));
+                return None;
+            }
+        };
+        checks.push(CliCheck::warn(
+            "manifest.signature",
+            "Manifest served as unsigned raw JSON instead of SignedNodeManifest { payload, sig }",
+            Some("Serve signed SignedNodeManifest envelopes on GET /v1/manifest.".to_string()),
+        ));
+        (payload, false, None)
+    };
 
     // Anti-recon checks on unauthenticated GET /v1/manifest (§3.1)
     let advertised_empty = payload.advertised.is_empty();
@@ -2822,7 +2857,10 @@ async fn probe_manifest_url(
     } else {
         let mut leaks = Vec::new();
         if !audience_public {
-            leaks.push(format!("audience='{}' (expected 'public')", payload.audience));
+            leaks.push(format!(
+                "audience='{}' (expected 'public')",
+                payload.audience
+            ));
         }
         if !payload.advertised.topics.is_empty() {
             leaks.push(format!("{} topic(s)", payload.advertised.topics.len()));
@@ -2831,10 +2869,16 @@ async fn probe_manifest_url(
             leaks.push(format!("{} channel(s)", payload.advertised.channels.len()));
         }
         if !payload.advertised.kv_namespaces.is_empty() {
-            leaks.push(format!("{} kvNamespace(s)", payload.advertised.kv_namespaces.len()));
+            leaks.push(format!(
+                "{} kvNamespace(s)",
+                payload.advertised.kv_namespaces.len()
+            ));
         }
         if !payload.advertised.rpc_commands.is_empty() {
-            leaks.push(format!("{} rpcCommand(s)", payload.advertised.rpc_commands.len()));
+            leaks.push(format!(
+                "{} rpcCommand(s)",
+                payload.advertised.rpc_commands.len()
+            ));
         }
         if escalation_present {
             leaks.push("escalation text".to_string());
@@ -2860,7 +2904,11 @@ async fn probe_manifest_url(
     }
     match payload.identity.signing_jwk.thumbprint_sha256() {
         Ok(expected_kid) if expected_kid == payload.identity.kid => {
-            if let Err(e) = payload.identity.encryption_jwk.validate(Some(hyp_proto::manifest::OkpCurve::X25519)) {
+            if let Err(e) = payload
+                .identity
+                .encryption_jwk
+                .validate(Some(hyp_proto::manifest::OkpCurve::X25519))
+            {
                 checks.push(CliCheck::fail(
                     "manifest.identity",
                     format!("Invalid encryptionJwk: {e}"),
@@ -3166,8 +3214,12 @@ mod tests {
                 DEFAULT_DROP_RELAY_MEMORY_MB,
             );
             for a in &artifacts {
-                write_artifact_file(&out_dir.join(a.rel_path), a.content.as_bytes(), a.executable)
-                    .expect("write artifact");
+                write_artifact_file(
+                    &out_dir.join(a.rel_path),
+                    a.content.as_bytes(),
+                    a.executable,
+                )
+                .expect("write artifact");
             }
 
             let node_path = out_dir.join("node.json");

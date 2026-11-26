@@ -355,13 +355,9 @@ pub fn translate_tool_call(
             })
         }
         "hyp_mesh" => {
-            let action = args
-                .get("action")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    "Expected action: join | leave | peers | channels | status | drop_link"
-                        .to_string()
-                })?;
+            let action = args.get("action").and_then(Value::as_str).ok_or_else(|| {
+                "Expected action: join | leave | peers | channels | status | drop_link".to_string()
+            })?;
             let channel = args
                 .get("channel")
                 .and_then(Value::as_str)
@@ -1190,12 +1186,10 @@ where
                             .and_then(Value::as_object)
                             .cloned()
                             .unwrap_or_default();
-                        let call_token = raw_args
-                            .remove("_meshCall")
-                            .and_then(|v| match v {
-                                Value::String(s) if !s.is_empty() => Some(s),
-                                _ => None,
-                            });
+                        let call_token = raw_args.remove("_meshCall").and_then(|v| match v {
+                            Value::String(s) if !s.is_empty() => Some(s),
+                            _ => None,
+                        });
                         let meta = params.get("_meta").and_then(Value::as_object);
                         let call_id = extract_meta_call_id(meta);
 
@@ -1308,16 +1302,28 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        let kv_names: Vec<&str> = with_kv.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let kv_names: Vec<&str> = with_kv
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
         let all_names: Vec<&str> = with_all
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
 
-        assert_eq!(core_names, vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream"]);
+        assert_eq!(
+            core_names,
+            vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream"]
+        );
         assert_eq!(
             bridge_names,
-            vec!["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream", "hyp_bridge"]
+            vec![
+                "hyp_send",
+                "hyp_inbox",
+                "hyp_mesh",
+                "hyp_stream",
+                "hyp_bridge"
+            ]
         );
         assert_eq!(
             kv_names,
@@ -1342,7 +1348,11 @@ mod tests {
         let send_props = &core[0]["inputSchema"]["properties"];
         assert_eq!(send_props["reaction"]["type"], json!("string"));
         let rxn_desc = send_props["reaction"]["description"].as_str().unwrap();
-        assert!(rxn_desc.contains("Telegram") && rxn_desc.contains("Slack") && rxn_desc.contains("WhatsApp"));
+        assert!(
+            rxn_desc.contains("Telegram")
+                && rxn_desc.contains("Slack")
+                && rxn_desc.contains("WhatsApp")
+        );
         assert_eq!(send_props["remove"]["type"], json!("boolean"));
         assert_eq!(send_props["replyTo"]["type"], json!("string"));
         assert_eq!(send_props["chatId"]["type"], json!("string"));
@@ -1657,15 +1667,13 @@ mod tests {
         .unwrap();
 
         // 3. Expect channel.ack for delivery 7
-        let ack: Value =
-            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(ack["type"], "channel.ack");
         assert_eq!(ack["delivery"], 7);
         assert_eq!(ack["submitted"], true);
 
         // 4. Handle mcp.caps -> hasPlugins: true
-        let caps: Value =
-            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let caps: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(caps["type"], "mcp.caps");
         write_ndjson_line_async(
             &mut w,
@@ -1675,8 +1683,7 @@ mod tests {
         .unwrap();
 
         // 5. Handle tool.call -> assert callId + callToken + translated name
-        let call: Value =
-            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let call: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(call["type"], "tool.call");
         assert_eq!(call["name"], "hyp_session");
         assert_eq!(call["callId"], "toolu_99");
@@ -1936,14 +1943,7 @@ mod tests {
         assert!(default_instr.contains("untrusted"));
 
         // Non-native-scheduling harnesses document `local.schedule` + `hyp emit`/`ingest.sock`.
-        for non_native in [
-            &herdr_env,
-            &t3_env,
-            &chan,
-            &cx_q_instr,
-            &cl,
-            &default_instr,
-        ] {
+        for non_native in [&herdr_env, &t3_env, &chan, &cx_q_instr, &cl, &default_instr] {
             assert!(non_native.contains("local.schedule"));
             assert!(non_native.contains("hyp emit"));
             assert!(non_native.contains("ingest.sock"));

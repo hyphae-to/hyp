@@ -311,8 +311,10 @@ pub const fn sanitize_transport_for_target(
                 requested
             } else if matches!(target, SkillTargetHarness::Antigravity) {
                 TransportHintMode::AntigravityWait
-            } else if matches!(target, SkillTargetHarness::Codex | SkillTargetHarness::CodexDesktop)
-                && matches!(requested, TransportHintMode::ClaudeDualWithPush)
+            } else if matches!(
+                target,
+                SkillTargetHarness::Codex | SkillTargetHarness::CodexDesktop
+            ) && matches!(requested, TransportHintMode::ClaudeDualWithPush)
             {
                 TransportHintMode::CodexDualWithPush
             } else {
@@ -335,7 +337,10 @@ pub const fn sanitize_transport_for_target(
             }
         }
         TransportHintMode::CodexDualWithPush => {
-            if matches!(target, SkillTargetHarness::Codex | SkillTargetHarness::CodexDesktop) {
+            if matches!(
+                target,
+                SkillTargetHarness::Codex | SkillTargetHarness::CodexDesktop
+            ) {
                 TransportHintMode::CodexDualWithPush
             } else if matches!(target, SkillTargetHarness::Claude) {
                 TransportHintMode::ClaudeDualWithPush
@@ -388,9 +393,9 @@ pub const fn resolve_transport_for_harness(
             }
         }
         SkillTargetHarness::Antigravity => TransportHintMode::AntigravityWait,
-        SkillTargetHarness::Cursor
-        | SkillTargetHarness::Opencode
-        | SkillTargetHarness::Gemini => TransportHintMode::BackgroundWait,
+        SkillTargetHarness::Cursor | SkillTargetHarness::Opencode | SkillTargetHarness::Gemini => {
+            TransportHintMode::BackgroundWait
+        }
     }
 }
 
@@ -797,10 +802,7 @@ fn detect_claude_channel_in_file(claude_json: &Path) -> bool {
         .and_then(|s| s.get("hyphae"))
         .and_then(|h| h.get("args"))
         .and_then(Value::as_array)
-        .is_some_and(|args| {
-            args.iter()
-                .any(|a| a.as_str() == Some("--claude-channel"))
-        })
+        .is_some_and(|args| args.iter().any(|a| a.as_str() == Some("--claude-channel")))
 }
 
 fn detect_claude_channel_in_config(home: &Path, claude_profiles: &[ClaudeConfigProfile]) -> bool {
@@ -955,7 +957,8 @@ mod tests {
 
                         // Legacy `hyp_wakeup` / `hyp wakeup` MUST NEVER appear anywhere.
                         assert!(
-                            !normalized.contains("hyp_wakeup") && !normalized.contains("hyp wakeup"),
+                            !normalized.contains("hyp_wakeup")
+                                && !normalized.contains("hyp wakeup"),
                             "removed wakeup command/tool leaked into {profile:?}\n{normalized}"
                         );
 

@@ -103,7 +103,9 @@ mod unix_tests {
     #[tokio::test]
     async fn real_webhook_plugin_hmac_body_cap_and_outbound_post_e2e() {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_webhook_plugin_hmac_body_cap_and_outbound_post_e2e: `node` not on PATH");
+            eprintln!(
+                "SKIP real_webhook_plugin_hmac_body_cap_and_outbound_post_e2e: `node` not on PATH"
+            );
             return;
         };
 
@@ -140,7 +142,11 @@ mod unix_tests {
         let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
         let port = pick_free_loopback_port().await;
         let plugin_script = repo_root().join("plugins/webhook/index.mjs");
-        assert!(plugin_script.exists(), "missing {}", plugin_script.display());
+        assert!(
+            plugin_script.exists(),
+            "missing {}",
+            plugin_script.display()
+        );
 
         let mut cfg = SubprocessConfig::new(
             "webhook-real",
@@ -165,7 +171,11 @@ mod unix_tests {
         supervisor.start(Arc::clone(&host) as _).await.unwrap();
 
         let webhook_url = format!("http://127.0.0.1:{port}/webhook");
-        wait_for_http_ready(&format!("http://127.0.0.1:{port}/ready-probe"), Duration::from_secs(10)).await;
+        wait_for_http_ready(
+            &format!("http://127.0.0.1:{port}/ready-probe"),
+            Duration::from_secs(10),
+        )
+        .await;
 
         let client = HttpClient::new().unwrap();
 
@@ -211,7 +221,9 @@ mod unix_tests {
             .body(full_body(valid_body.clone()))
             .unwrap();
         let resp_replay_hdr = client.request(req_replay_hdr).await.unwrap();
-        let (st_rep, _, body_rep) = HttpClient::collect(resp_replay_hdr, 64 * 1024).await.unwrap();
+        let (st_rep, _, body_rep) = HttpClient::collect(resp_replay_hdr, 64 * 1024)
+            .await
+            .unwrap();
         assert_eq!(st_rep, StatusCode::ACCEPTED);
         let rep_json: Value = serde_json::from_slice(&body_rep).unwrap();
         assert_eq!(rep_json["status"], "duplicate");
@@ -303,7 +315,11 @@ mod unix_tests {
         // (b) 1-bit flipped HMAC signature -> 401!
         let mut bad_sig_bytes = valid_sig.clone().into_bytes();
         let last = bad_sig_bytes.len() - 1;
-        bad_sig_bytes[last] = if bad_sig_bytes[last] == b'0' { b'1' } else { b'0' };
+        bad_sig_bytes[last] = if bad_sig_bytes[last] == b'0' {
+            b'1'
+        } else {
+            b'0'
+        };
         let bad_sig = String::from_utf8(bad_sig_bytes).unwrap();
         let req_bad_sig = Request::builder()
             .method(Method::POST)
@@ -372,7 +388,9 @@ mod unix_tests {
     #[tokio::test]
     async fn real_prometheus_plugin_differential_parity_with_native_rust_adapter() {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_prometheus_plugin_differential_parity_with_native_rust_adapter: `node` not on PATH");
+            eprintln!(
+                "SKIP real_prometheus_plugin_differential_parity_with_native_rust_adapter: `node` not on PATH"
+            );
             return;
         };
 
@@ -398,12 +416,19 @@ mod unix_tests {
         rust_cfg.bearer_token = Some(Zeroizing::new(bearer_token.to_string()));
         rust_cfg.webhook_secret = Some(Zeroizing::new(hmac_secret.to_string()));
         let rust_adapter = PrometheusWebhookAdapter::new(rust_cfg);
-        rust_adapter.start(Arc::clone(&rust_host) as _).await.unwrap();
+        rust_adapter
+            .start(Arc::clone(&rust_host) as _)
+            .await
+            .unwrap();
 
         // Start real `plugins/prometheus/index.mjs` subprocess.
         let port = pick_free_loopback_port().await;
         let plugin_script = repo_root().join("plugins/prometheus/index.mjs");
-        assert!(plugin_script.exists(), "missing {}", plugin_script.display());
+        assert!(
+            plugin_script.exists(),
+            "missing {}",
+            plugin_script.display()
+        );
 
         let mut sub_cfg = SubprocessConfig::new(
             "prom-real",
@@ -413,10 +438,18 @@ mod unix_tests {
             vec!["alerts".to_string()],
         );
         sub_cfg.hello_mode = HelloMode::Auto;
-        sub_cfg.env.insert("PROMETHEUS_HOST".into(), "127.0.0.1".into());
-        sub_cfg.env.insert("PROMETHEUS_PORT".into(), port.to_string());
-        sub_cfg.env.insert("PROMETHEUS_PATH".into(), "/alerts".into());
-        sub_cfg.env.insert("PROMETHEUS_TOPIC".into(), "alerts".into());
+        sub_cfg
+            .env
+            .insert("PROMETHEUS_HOST".into(), "127.0.0.1".into());
+        sub_cfg
+            .env
+            .insert("PROMETHEUS_PORT".into(), port.to_string());
+        sub_cfg
+            .env
+            .insert("PROMETHEUS_PATH".into(), "/alerts".into());
+        sub_cfg
+            .env
+            .insert("PROMETHEUS_TOPIC".into(), "alerts".into());
         sub_cfg.env.insert(
             "PROMETHEUS_BEARER_TOKEN_FILE".into(),
             bearer_file.to_string_lossy().into_owned(),
@@ -427,7 +460,10 @@ mod unix_tests {
         );
 
         let supervisor = SubprocessSupervisor::new(sub_cfg);
-        supervisor.start(Arc::clone(&plugin_host) as _).await.unwrap();
+        supervisor
+            .start(Arc::clone(&plugin_host) as _)
+            .await
+            .unwrap();
 
         wait_for_http_ready(
             &format!("http://127.0.0.1:{port}/health"),
@@ -486,7 +522,8 @@ mod unix_tests {
         }))
         .unwrap();
 
-        let valid_sig = compute_hmac_sha256_header(hmac_secret.as_bytes(), &alertmanager_v4_payload);
+        let valid_sig =
+            compute_hmac_sha256_header(hmac_secret.as_bytes(), &alertmanager_v4_payload);
         let client = HttpClient::new().unwrap();
 
         // 1. Send valid Alertmanager v4 payload to real Node plugin.
@@ -571,7 +608,10 @@ mod unix_tests {
             }
         }
         assert_eq!(plugin_events[0].1.event_type, "io.prometheus.alert.firing");
-        assert_eq!(plugin_events[1].1.event_type, "io.prometheus.alert.resolved");
+        assert_eq!(
+            plugin_events[1].1.event_type,
+            "io.prometheus.alert.resolved"
+        );
 
         // 4. Invalid auth (wrong Bearer AND bad HMAC) -> 401 on BOTH plugin and Rust adapter!
         let req_bad_bearer = Request::builder()
@@ -588,7 +628,10 @@ mod unix_tests {
         );
 
         let mut bad_rust_headers = HeaderMap::new();
-        bad_rust_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer wrong-token"));
+        bad_rust_headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
         bad_rust_headers.insert(
             "x-webhook-signature-256",
             HeaderValue::from_str(&valid_sig).unwrap(),
@@ -629,7 +672,9 @@ mod unix_tests {
     #[tokio::test]
     async fn real_telegram_plugin_polling_allowlist_offset_and_outbound_post_e2e() {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_telegram_plugin_polling_allowlist_offset_and_outbound_post_e2e: `node` not on PATH");
+            eprintln!(
+                "SKIP real_telegram_plugin_polling_allowlist_offset_and_outbound_post_e2e: `node` not on PATH"
+            );
             return;
         };
 
@@ -713,7 +758,11 @@ mod unix_tests {
         let node = open_test_node("tg-node", tmp.path());
         let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
         let plugin_script = repo_root().join("plugins/telegram/index.mjs");
-        assert!(plugin_script.exists(), "missing {}", plugin_script.display());
+        assert!(
+            plugin_script.exists(),
+            "missing {}",
+            plugin_script.display()
+        );
 
         let mut cfg = SubprocessConfig::new(
             "telegram-real",
@@ -728,8 +777,10 @@ mod unix_tests {
             token_file.to_string_lossy().into_owned(),
         );
         cfg.env.insert("TELEGRAM_TARGET".into(), "telegram".into());
-        cfg.env.insert("TELEGRAM_ALLOWED_CHATS".into(), "12345".into());
-        cfg.env.insert("TELEGRAM_API_BASE".into(), mock_tg.base_url());
+        cfg.env
+            .insert("TELEGRAM_ALLOWED_CHATS".into(), "12345".into());
+        cfg.env
+            .insert("TELEGRAM_API_BASE".into(), mock_tg.base_url());
         cfg.env.insert(
             "TELEGRAM_STATE_FILE".into(),
             state_file.to_string_lossy().into_owned(),
@@ -758,7 +809,11 @@ mod unix_tests {
         }
 
         let all_events = host.published_events().await;
-        assert_eq!(all_events.len(), 1, "non-allowlisted chat must be dropped silently");
+        assert_eq!(
+            all_events.len(),
+            1,
+            "non-allowlisted chat must be dropped silently"
+        );
         assert_eq!(all_events[0].0, "telegram");
         assert_eq!(all_events[0].1.id, "101");
         assert_eq!(all_events[0].1.event_type, "com.telegram.message");
@@ -804,7 +859,11 @@ mod unix_tests {
         );
 
         let outbound = sent_messages.lock().await;
-        assert_eq!(outbound.len(), 1, "only allowlisted sendMessage may be called");
+        assert_eq!(
+            outbound.len(),
+            1,
+            "only allowlisted sendMessage may be called"
+        );
         assert_eq!(outbound[0]["chat_id"], json!("12345"));
         assert_eq!(outbound[0]["text"], json!("Reply from Hyphae agent"));
         assert_eq!(outbound[0]["reply_to_message_id"], json!(2));
@@ -908,7 +967,11 @@ mod unix_tests {
         );
 
         let rxn_calls = sent_reactions.lock().await;
-        assert_eq!(rxn_calls.len(), 4, "expected exactly 4 setMessageReaction calls");
+        assert_eq!(
+            rxn_calls.len(),
+            4,
+            "expected exactly 4 setMessageReaction calls"
+        );
         assert_eq!(
             rxn_calls[0],
             json!({
@@ -943,7 +1006,11 @@ mod unix_tests {
         );
 
         let outbound_after = sent_messages.lock().await;
-        assert_eq!(outbound_after.len(), 2, "only text posts may call sendMessage");
+        assert_eq!(
+            outbound_after.len(),
+            2,
+            "only text posts may call sendMessage"
+        );
         assert_eq!(outbound_after[1]["text"], json!("On it!"));
         assert_eq!(outbound_after[1]["reply_to_message_id"], json!(2));
 
@@ -958,13 +1025,19 @@ mod unix_tests {
     #[tokio::test]
     async fn real_slack_plugin_fail_closed_guards_and_outbound_post_e2e() {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_slack_plugin_fail_closed_guards_and_outbound_post_e2e: `node` not on PATH");
+            eprintln!(
+                "SKIP real_slack_plugin_fail_closed_guards_and_outbound_post_e2e: `node` not on PATH"
+            );
             return;
         };
 
         let tmp = TempDir::new().unwrap();
         let plugin_script = repo_root().join("plugins/slack/index.mjs");
-        assert!(plugin_script.exists(), "missing {}", plugin_script.display());
+        assert!(
+            plugin_script.exists(),
+            "missing {}",
+            plugin_script.display()
+        );
 
         let app_token = "xapp-test-1-000";
         let bot_token = "xoxb-test-2-000";
@@ -1075,10 +1148,11 @@ mod unix_tests {
                     return MockResponse::json(StatusCode::OK, &json!({ "ok": true }));
                 }
                 if req.path.ends_with("/reactions.remove") {
-                    reactions
-                        .lock()
-                        .await
-                        .push(("reactions.remove".to_string(), auth_hdr, body_val));
+                    reactions.lock().await.push((
+                        "reactions.remove".to_string(),
+                        auth_hdr,
+                        body_val,
+                    ));
                     return MockResponse::json(StatusCode::OK, &json!({ "ok": true }));
                 }
                 MockResponse::json(
@@ -1109,9 +1183,12 @@ mod unix_tests {
             bot_token_file.to_string_lossy().into_owned(),
         );
         cfg.env.insert("SLACK_TARGET".into(), "slack".into());
-        cfg.env.insert("SLACK_ALLOWED_CHANNELS".into(), "C_ALLOW".into());
-        cfg.env.insert("SLACK_DEFAULT_CHANNEL".into(), "C_ALLOW".into());
-        cfg.env.insert("SLACK_API_BASE".into(), mock_slack.base_url());
+        cfg.env
+            .insert("SLACK_ALLOWED_CHANNELS".into(), "C_ALLOW".into());
+        cfg.env
+            .insert("SLACK_DEFAULT_CHANNEL".into(), "C_ALLOW".into());
+        cfg.env
+            .insert("SLACK_API_BASE".into(), mock_slack.base_url());
 
         let supervisor = SubprocessSupervisor::new(cfg);
         supervisor.start(Arc::clone(&host) as _).await.unwrap();
@@ -1273,7 +1350,11 @@ mod unix_tests {
 
         let tmp = TempDir::new().unwrap();
         let plugin_script = repo_root().join("plugins/whatsapp/index.mjs");
-        assert!(plugin_script.exists(), "missing {}", plugin_script.display());
+        assert!(
+            plugin_script.exists(),
+            "missing {}",
+            plugin_script.display()
+        );
 
         let app_secret = "wa-test-app-secret-2026";
         let access_token = "wa-test-bearer-token-2026";
@@ -1319,8 +1400,10 @@ mod unix_tests {
         cfg.env.insert("WHATSAPP_PORT".into(), port.to_string());
         cfg.env.insert("WHATSAPP_PATH".into(), "/whatsapp".into());
         cfg.env.insert("WHATSAPP_TARGET".into(), "whatsapp".into());
-        cfg.env.insert("WHATSAPP_PHONE_NUMBER_ID".into(), "987654321".into());
-        cfg.env.insert("WHATSAPP_ALLOWED_NUMBERS".into(), "+15551234567".into());
+        cfg.env
+            .insert("WHATSAPP_PHONE_NUMBER_ID".into(), "987654321".into());
+        cfg.env
+            .insert("WHATSAPP_ALLOWED_NUMBERS".into(), "+15551234567".into());
         cfg.env.insert(
             "WHATSAPP_APP_SECRET_FILE".into(),
             app_secret_file.to_string_lossy().into_owned(),
@@ -1329,7 +1412,8 @@ mod unix_tests {
             "WHATSAPP_ACCESS_TOKEN_FILE".into(),
             access_token_file.to_string_lossy().into_owned(),
         );
-        cfg.env.insert("WHATSAPP_API_BASE".into(), mock_wa.base_url());
+        cfg.env
+            .insert("WHATSAPP_API_BASE".into(), mock_wa.base_url());
 
         let supervisor = SubprocessSupervisor::new(cfg);
         supervisor.start(Arc::clone(&host) as _).await.unwrap();
@@ -1486,7 +1570,9 @@ mod unix_tests {
     #[tokio::test]
     async fn real_node_sdk_client_mjs_hello_ack_nack_and_post_rpc_e2e() {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_node_sdk_client_mjs_hello_ack_nack_and_post_rpc_e2e: `node` not on PATH");
+            eprintln!(
+                "SKIP real_node_sdk_client_mjs_hello_ack_nack_and_post_rpc_e2e: `node` not on PATH"
+            );
             return;
         };
 
@@ -1633,7 +1719,9 @@ setInterval(() => {}, 10_000);
     #[tokio::test]
     async fn real_python_sdk_client_py_hello_ack_nack_and_status_e2e() {
         let Some(python_bin) = find_binary("python3") else {
-            eprintln!("SKIP real_python_sdk_client_py_hello_ack_nack_and_status_e2e: `python3` not on PATH");
+            eprintln!(
+                "SKIP real_python_sdk_client_py_hello_ack_nack_and_status_e2e: `python3` not on PATH"
+            );
             return;
         };
 
@@ -1712,10 +1800,8 @@ client._dead.wait(timeout=15)
             vec!["sdk-py".to_string()],
         );
         cfg.hello_mode = HelloMode::Auto;
-        cfg.env.insert(
-            "SDK_PY_DIR".into(),
-            sdk_dir.to_string_lossy().into_owned(),
-        );
+        cfg.env
+            .insert("SDK_PY_DIR".into(), sdk_dir.to_string_lossy().into_owned());
         cfg.env.insert(
             "SDK_REPORT_FILE".into(),
             report_file.to_string_lossy().into_owned(),
@@ -1804,9 +1890,12 @@ client._dead.wait(timeout=15)
     // ========================================================================
 
     #[tokio::test]
-    async fn real_webhook_and_prometheus_plugins_fail_closed_without_auth_and_reject_non_loopback_unsigned() {
+    async fn real_webhook_and_prometheus_plugins_fail_closed_without_auth_and_reject_non_loopback_unsigned()
+     {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_webhook_and_prometheus_plugins_fail_closed_without_auth_and_reject_non_loopback_unsigned: `node` not on PATH");
+            eprintln!(
+                "SKIP real_webhook_and_prometheus_plugins_fail_closed_without_auth_and_reject_non_loopback_unsigned: `node` not on PATH"
+            );
             return;
         };
 
@@ -1965,7 +2054,9 @@ client._dead.wait(timeout=15)
     #[tokio::test]
     async fn real_slack_bridge_fail_closed_unseen_channel_and_no_cross_channel_reaction() {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_slack_bridge_fail_closed_unseen_channel_and_no_cross_channel_reaction: `node` not on PATH");
+            eprintln!(
+                "SKIP real_slack_bridge_fail_closed_unseen_channel_and_no_cross_channel_reaction: `node` not on PATH"
+            );
             return;
         };
 
@@ -2017,8 +2108,10 @@ client._dead.wait(timeout=15)
             bot_file.to_string_lossy().into_owned(),
         );
         cfg.env.insert("SLACK_TARGET".into(), "pm".into());
-        cfg.env.insert("SLACK_ALLOWED_USERS".into(), "U_ALICE".into());
-        cfg.env.insert("SLACK_API_BASE".into(), mock_slack.base_url());
+        cfg.env
+            .insert("SLACK_ALLOWED_USERS".into(), "U_ALICE".into());
+        cfg.env
+            .insert("SLACK_API_BASE".into(), mock_slack.base_url());
 
         let supervisor = SubprocessSupervisor::new(cfg);
         supervisor.start(Arc::clone(&host) as _).await.unwrap();
@@ -2059,7 +2152,9 @@ client._dead.wait(timeout=15)
     #[tokio::test]
     async fn real_telegram_bridge_fail_closed_unseen_chat_and_no_cross_chat_reaction_fallback() {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_telegram_bridge_fail_closed_unseen_chat_and_no_cross_chat_reaction_fallback: `node` not on PATH");
+            eprintln!(
+                "SKIP real_telegram_bridge_fail_closed_unseen_chat_and_no_cross_chat_reaction_fallback: `node` not on PATH"
+            );
             return;
         };
 
@@ -2104,7 +2199,10 @@ client._dead.wait(timeout=15)
                         );
                     }
                     tokio::time::sleep(Duration::from_millis(150)).await;
-                    return MockResponse::json(StatusCode::OK, &json!({ "ok": true, "result": [] }));
+                    return MockResponse::json(
+                        StatusCode::OK,
+                        &json!({ "ok": true, "result": [] }),
+                    );
                 }
                 if req.path.ends_with("/sendMessage") {
                     return MockResponse::json(
@@ -2113,7 +2211,10 @@ client._dead.wait(timeout=15)
                     );
                 }
                 if req.path.ends_with("/setMessageReaction") {
-                    return MockResponse::json(StatusCode::OK, &json!({ "ok": true, "result": true }));
+                    return MockResponse::json(
+                        StatusCode::OK,
+                        &json!({ "ok": true, "result": true }),
+                    );
                 }
                 MockResponse::json(StatusCode::NOT_FOUND, &json!({ "ok": false }))
             }
@@ -2139,7 +2240,8 @@ client._dead.wait(timeout=15)
         );
         cfg.env.insert("TELEGRAM_TARGET".into(), "personal".into());
         cfg.env.insert("TELEGRAM_ALLOWED_USERS".into(), "42".into());
-        cfg.env.insert("TELEGRAM_API_BASE".into(), mock_tg.base_url());
+        cfg.env
+            .insert("TELEGRAM_API_BASE".into(), mock_tg.base_url());
 
         let supervisor = SubprocessSupervisor::new(cfg);
         supervisor.start(Arc::clone(&host) as _).await.unwrap();
@@ -2195,9 +2297,12 @@ client._dead.wait(timeout=15)
     }
 
     #[tokio::test]
-    async fn real_whatsapp_bridge_isolates_per_recipient_reactions_and_requires_explicit_to_when_ambiguous() {
+    async fn real_whatsapp_bridge_isolates_per_recipient_reactions_and_requires_explicit_to_when_ambiguous()
+     {
         let Some(node_bin) = find_binary("node") else {
-            eprintln!("SKIP real_whatsapp_bridge_isolates_per_recipient_reactions_and_requires_explicit_to_when_ambiguous: `node` not on PATH");
+            eprintln!(
+                "SKIP real_whatsapp_bridge_isolates_per_recipient_reactions_and_requires_explicit_to_when_ambiguous: `node` not on PATH"
+            );
             return;
         };
 
@@ -2232,7 +2337,8 @@ client._dead.wait(timeout=15)
         cfg.env.insert("WHATSAPP_PORT".into(), port.to_string());
         cfg.env.insert("WHATSAPP_PATH".into(), "/whatsapp".into());
         cfg.env.insert("WHATSAPP_TARGET".into(), "whatsapp".into());
-        cfg.env.insert("WHATSAPP_PHONE_NUMBER_ID".into(), "987654321".into());
+        cfg.env
+            .insert("WHATSAPP_PHONE_NUMBER_ID".into(), "987654321".into());
         cfg.env.insert(
             "WHATSAPP_ALLOWED_NUMBERS".into(),
             "+15551111111,+15552222222,+15553333333".into(),
@@ -2245,7 +2351,8 @@ client._dead.wait(timeout=15)
             "WHATSAPP_ACCESS_TOKEN_FILE".into(),
             access_token_file.to_string_lossy().into_owned(),
         );
-        cfg.env.insert("WHATSAPP_API_BASE".into(), mock_wa.base_url());
+        cfg.env
+            .insert("WHATSAPP_API_BASE".into(), mock_wa.base_url());
 
         let supervisor = SubprocessSupervisor::new(cfg);
         supervisor.start(Arc::clone(&host) as _).await.unwrap();
@@ -2324,7 +2431,9 @@ client._dead.wait(timeout=15)
     #[tokio::test]
     async fn supervisor_captures_redacted_stderr_log_and_trips_crash_loop_circuit_breaker() {
         let Some(python_bin) = find_binary("python3") else {
-            eprintln!("SKIP supervisor_captures_redacted_stderr_log_and_trips_crash_loop_circuit_breaker: `python3` not on PATH");
+            eprintln!(
+                "SKIP supervisor_captures_redacted_stderr_log_and_trips_crash_loop_circuit_breaker: `python3` not on PATH"
+            );
             return;
         };
 
@@ -2350,7 +2459,8 @@ sys.exit(1)
             vec!["-u".to_string(), "-c".to_string(), script.to_string()],
             vec!["ops".to_string()],
         );
-        cfg.env.insert("MY_BOT_TOKEN".to_string(), secret_val.to_string());
+        cfg.env
+            .insert("MY_BOT_TOKEN".to_string(), secret_val.to_string());
         cfg.redacted_values.push(secret_val.to_string());
         cfg.stderr_log_path = Some(log_path.clone());
         cfg.initial_backoff = Duration::from_millis(15);
@@ -2374,7 +2484,10 @@ sys.exit(1)
 
         // Circuit breaker stopped hot-looping after 3 rapid crashes (2 restarts after initial attempt).
         let restarts_at_trip = supervisor.restart_count();
-        assert_eq!(restarts_at_trip, 2, "expected 2 restarts before 3rd crash trips breaker");
+        assert_eq!(
+            restarts_at_trip, 2,
+            "expected 2 restarts before 3rd crash trips breaker"
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert_eq!(
             supervisor.restart_count(),
@@ -2386,10 +2499,19 @@ sys.exit(1)
         let health = supervisor.health();
         match &health {
             AdapterHealth::Degraded(msg) => {
-                assert!(msg.contains("CrashLoopBackOff"), "expected CrashLoopBackOff in {msg}");
-                assert!(msg.contains("fatal auth failure"), "expected stderr detail in {msg}");
+                assert!(
+                    msg.contains("CrashLoopBackOff"),
+                    "expected CrashLoopBackOff in {msg}"
+                );
+                assert!(
+                    msg.contains("fatal auth failure"),
+                    "expected stderr detail in {msg}"
+                );
                 assert!(msg.contains("[REDACTED]"), "expected [REDACTED] in {msg}");
-                assert!(!msg.contains(secret_val), "raw secret leaked into health: {msg}");
+                assert!(
+                    !msg.contains(secret_val),
+                    "raw secret leaked into health: {msg}"
+                );
             }
             other => panic!("expected Degraded(CrashLoopBackOff), got {other:?}"),
         }
@@ -2398,7 +2520,10 @@ sys.exit(1)
         assert!(!recent.is_empty(), "expected captured stderr lines");
         assert!(recent.iter().any(|l| l.contains("[REDACTED]")));
         for line in &recent {
-            assert!(!line.contains(secret_val), "raw secret leaked in recent_stderr: {line}");
+            assert!(
+                !line.contains(secret_val),
+                "raw secret leaked in recent_stderr: {line}"
+            );
         }
 
         // Bounded per-plugin log file exists with 0600 permissions and redacted content!
@@ -2653,9 +2778,10 @@ setInterval(() => {}, 10_000);
         );
         sdk_cfg.transport_mode = PluginTransportMode::LoopbackTcp;
         sdk_cfg.hello_mode = HelloMode::Auto;
-        sdk_cfg
-            .env
-            .insert("SDK_MJS_PATH".into(), sdk_path.to_string_lossy().into_owned());
+        sdk_cfg.env.insert(
+            "SDK_MJS_PATH".into(),
+            sdk_path.to_string_lossy().into_owned(),
+        );
         sdk_cfg.env.insert(
             "SDK_REPORT_FILE".into(),
             sdk_report_file.to_string_lossy().into_owned(),
@@ -2809,7 +2935,9 @@ rl.on("close", () => process.exit(0));
         let v2_sup = SubprocessSupervisor::new(v2_cfg);
         v2_sup.start(Arc::clone(&v2_host) as _).await.unwrap();
 
-        let v2_events = v2_host.wait_for_event_count(1, Duration::from_secs(10)).await;
+        let v2_events = v2_host
+            .wait_for_event_count(1, Duration::from_secs(10))
+            .await;
         assert_eq!(v2_events[0].0, "ops");
         assert_eq!(v2_events[0].1.id, "v2-tcp-evt-1");
         assert_eq!(v2_sup.detected_protocol(), WireProtocol::JsonRpcV2);
@@ -2851,7 +2979,10 @@ rl.on("close", () => process.exit(0));
         .await;
 
         let wh_node = open_test_node("wh-tcp-node", &tmp.path().join("wh-tcp-node"));
-        wh_node.register_handle("sess-tcp-wh", "agent").await.unwrap();
+        wh_node
+            .register_handle("sess-tcp-wh", "agent")
+            .await
+            .unwrap();
         wh_node
             .subscribe_local_or_remote(SubscribeRequest {
                 id: Some("sub-tcp-wh".to_string()),
@@ -2877,7 +3008,9 @@ rl.on("close", () => process.exit(0));
         wh_cfg.transport_mode = PluginTransportMode::LoopbackTcp;
         wh_cfg.hello_mode = HelloMode::Auto;
         wh_cfg.env.insert("WEBHOOK_HOST".into(), "127.0.0.1".into());
-        wh_cfg.env.insert("WEBHOOK_PORT".into(), wh_port.to_string());
+        wh_cfg
+            .env
+            .insert("WEBHOOK_PORT".into(), wh_port.to_string());
         wh_cfg.env.insert("WEBHOOK_PATH".into(), "/webhook".into());
         wh_cfg.env.insert("WEBHOOK_TARGET".into(), "webhook".into());
         wh_cfg.env.insert(
@@ -2922,7 +3055,9 @@ rl.on("close", () => process.exit(0));
         assert_eq!(ack_json["status"], "stored");
         assert_eq!(ack_json["id"], expected_id);
 
-        let tcp_events = wh_host.wait_for_event_count(1, Duration::from_secs(5)).await;
+        let tcp_events = wh_host
+            .wait_for_event_count(1, Duration::from_secs(5))
+            .await;
         assert_eq!(tcp_events[0].0, "webhook");
         assert_eq!(tcp_events[0].1.id, expected_id);
         assert_eq!(tcp_events[0].1.event_type, "com.acme.tcp.deploy");
@@ -2977,10 +3112,16 @@ rl.on("close", () => process.exit(0));
             );
             fd3_cfg.transport_mode = PluginTransportMode::UnixFd3;
             fd3_cfg.hello_mode = HelloMode::Auto;
-            fd3_cfg.env.insert("WEBHOOK_HOST".into(), "127.0.0.1".into());
-            fd3_cfg.env.insert("WEBHOOK_PORT".into(), fd3_port.to_string());
+            fd3_cfg
+                .env
+                .insert("WEBHOOK_HOST".into(), "127.0.0.1".into());
+            fd3_cfg
+                .env
+                .insert("WEBHOOK_PORT".into(), fd3_port.to_string());
             fd3_cfg.env.insert("WEBHOOK_PATH".into(), "/webhook".into());
-            fd3_cfg.env.insert("WEBHOOK_TARGET".into(), "webhook".into());
+            fd3_cfg
+                .env
+                .insert("WEBHOOK_TARGET".into(), "webhook".into());
             fd3_cfg.env.insert(
                 "WEBHOOK_SECRET_FILE".into(),
                 secret_file.to_string_lossy().into_owned(),
@@ -3001,9 +3142,14 @@ rl.on("close", () => process.exit(0));
                 .header("x-webhook-signature-256", &valid_sig)
                 .body(full_body(valid_body))
                 .unwrap();
-            assert_eq!(client.request(req_fd3).await.unwrap().status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                client.request(req_fd3).await.unwrap().status(),
+                StatusCode::ACCEPTED
+            );
 
-            let fd3_events = fd3_host.wait_for_event_count(1, Duration::from_secs(5)).await;
+            let fd3_events = fd3_host
+                .wait_for_event_count(1, Duration::from_secs(5))
+                .await;
             assert_eq!(tcp_events[0].0, fd3_events[0].0);
             assert_eq!(tcp_events[0].1.id, fd3_events[0].1.id);
             assert_eq!(tcp_events[0].1.event_type, fd3_events[0].1.event_type);
@@ -3149,7 +3295,10 @@ client._dead.wait(timeout=15)
             "sdk-py-tcp-test",
             AdapterKind::Bridge,
             python_bin,
-            vec!["-u".to_string(), helper_script.to_string_lossy().into_owned()],
+            vec![
+                "-u".to_string(),
+                helper_script.to_string_lossy().into_owned(),
+            ],
             vec!["sdk-py-tcp".to_string()],
         );
         cfg.transport_mode = PluginTransportMode::LoopbackTcp;
@@ -3276,7 +3425,8 @@ client._dead.wait(timeout=15)
     }
 
     #[tokio::test]
-    async fn loopback_tcp_fail_closed_auth_wrong_token_missing_auth_oversized_timeout_and_redaction() {
+    async fn loopback_tcp_fail_closed_auth_wrong_token_missing_auth_oversized_timeout_and_redaction()
+     {
         let Some(node_bin) = find_binary("node") else {
             eprintln!(
                 "SKIP loopback_tcp_fail_closed_auth_wrong_token_missing_auth_oversized_timeout_and_redaction: `node` not on PATH"
@@ -3350,7 +3500,10 @@ setInterval(() => {}, 10_000);
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        assert!(!sup_a.is_connected().await, "unauthenticated child must never be connected");
+        assert!(
+            !sup_a.is_connected().await,
+            "unauthenticated child must never be connected"
+        );
         assert!(
             host_a.published_events().await.is_empty(),
             "spoofed event after wrong auth token MUST NEVER reach UnifiedNode"

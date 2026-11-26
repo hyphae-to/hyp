@@ -85,10 +85,11 @@ where
     loop {
         let items = node.peek_local_inbox(session_id, 50).expect("peek inbox");
         if let Some(found) = items.into_iter().find(|e| predicate(e)) {
-            let _ = node
-                .db()
-                .local()
-                .acknowledge_inbox(session_id, &[found.receipt.as_str()], now_ms());
+            let _ = node.db().local().acknowledge_inbox(
+                session_id,
+                &[found.receipt.as_str()],
+                now_ms(),
+            );
             return found;
         }
         let now = tokio::time::Instant::now();
@@ -168,10 +169,22 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
     let member_refs: Vec<&str> = member_scopes.iter().map(String::as_str).collect();
 
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &member_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &member_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_am2, _) = hub
-        .create_admin_invite(&admin_ca, "bob@laptop", &member_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &member_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
 
     let alice_link_info = alice.accept_am2_invite(&alice_am2).await.unwrap();
@@ -188,7 +201,10 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
 
     // Verify RFC 9110 ETag conditional fetch -> `304 Not Modified`!
     let (not_modified, updated) = alice.refresh_peer_manifest("acme-team").await.unwrap();
-    assert!(not_modified, "expected 304 Not Modified on unchanged manifest");
+    assert!(
+        not_modified,
+        "expected 304 Not Modified on unchanged manifest"
+    );
     assert!(updated.is_none());
 
     // Register local agent handles on Alice (`claude`) and Bob (`codex`).
@@ -225,8 +241,13 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
     // ------------------------------------------------------------------------
     // 1B. E2EE `#incidents` (`channel.e2ee.v1`): epoch 1 -> rotate epoch 2 -> ZERO plaintext!
     // ------------------------------------------------------------------------
-    alice.join_channel("acme-team/#incidents", "claude").await.unwrap();
-    bob.join_channel("acme-team/#incidents", "codex").await.unwrap();
+    alice
+        .join_channel("acme-team/#incidents", "claude")
+        .await
+        .unwrap();
+    bob.join_channel("acme-team/#incidents", "codex")
+        .await
+        .unwrap();
 
     let ep1 = alice
         .ensure_channel_epoch("acme-team", "#incidents")
@@ -317,7 +338,10 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
             assert_eq!(prob.status, 403);
             assert_eq!(prob.error, "channel_read_only");
             assert_eq!(prob.title, "Channel is read-only (announcement mode)");
-            assert_eq!(prob.extensions.get("channel"), Some(&json!("#announcements")));
+            assert_eq!(
+                prob.extensions.get("channel"),
+                Some(&json!("#announcements"))
+            );
             let note = prob
                 .extensions
                 .get("escalationNote")
@@ -406,7 +430,9 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
             .await
             .unwrap_err();
         assert!(
-            reject_err.to_string().contains("unauthorized_announcement_writer"),
+            reject_err
+                .to_string()
+                .contains("unauthorized_announcement_writer"),
             "recipient must reject unauthorized announcement writer even if hub is compromised; got {reject_err:?}"
         );
     }
@@ -417,8 +443,13 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
         ChannelPolicy::announcement(["alice@macbook/claude"]),
     )
     .unwrap();
-    alice.join_channel("acme-team/#releases", "claude").await.unwrap();
-    bob.join_channel("acme-team/#releases", "codex").await.unwrap();
+    alice
+        .join_channel("acme-team/#releases", "claude")
+        .await
+        .unwrap();
+    bob.join_channel("acme-team/#releases", "codex")
+        .await
+        .unwrap();
     alice
         .post_channel("acme-team/#releases", "claude", "RELEASE-HANDLE-EXACT-OK")
         .await
@@ -426,7 +457,11 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
     let _ = wait_for_mailbox_item(&bob, "sess-bob", |m| m.text == "RELEASE-HANDLE-EXACT-OK").await;
     // Different handle on the SAME authorized node (`alice@macbook/other`) is still rejected!
     let other_handle_err = alice
-        .post_channel("acme-team/#releases", "other", "unauthorized handle on alice")
+        .post_channel(
+            "acme-team/#releases",
+            "other",
+            "unauthorized handle on alice",
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -437,7 +472,9 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
         .post_channel("acme-team/#releases", "codex", "bob blocked")
         .await
         .unwrap_err();
-    assert!(matches!(rel_err, NodeError::RemoteProblem(ref p) if p.status == 403 && p.error == "channel_read_only"));
+    assert!(
+        matches!(rel_err, NodeError::RemoteProblem(ref p) if p.status == 403 && p.error == "channel_read_only")
+    );
 
     // ------------------------------------------------------------------------
     // 1D. Shared KV (`shared` CAS `If-Match` -> `409 version_conflict`) + `kv.e2ee.v1`
@@ -755,11 +792,13 @@ async fn direct_two_node_p2p_hp2p1_asymmetric_scopes_and_public_manifest_isolati
             .decode(&forged.binding_mac)
             .unwrap();
         mac_bytes[0] ^= 0x01;
-        forged.binding_mac =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac_bytes);
+        forged.binding_mac = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac_bytes);
         let bad_req = Request::builder()
             .method(Method::POST)
-            .uri(format!("http://{alice_addr}/v1/p2p/pair/{}", offer.offer_id))
+            .uri(format!(
+                "http://{alice_addr}/v1/p2p/pair/{}",
+                offer.offer_id
+            ))
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(hyp_node::engine::http_util::full_body(
                 serde_json::to_vec(&forged).unwrap(),
@@ -840,7 +879,9 @@ async fn direct_two_node_p2p_hp2p1_asymmetric_scopes_and_public_manifest_isolati
             assert!(prob.extensions.contains_key("currentScopes"));
             assert_eq!(
                 prob.extensions.get("escalationNote"),
-                Some(&json!("Production writes require on-call approval from Alice."))
+                Some(&json!(
+                    "Production writes require on-call approval from Alice."
+                ))
             );
         }
         other => panic!("expected RemoteProblem 403 not_granted, got {other:?}"),
@@ -963,7 +1004,11 @@ async fn adversarial_routing_loops_manifest_rollback_e2ee_downgrade_and_required
     let neg_v2 = alice
         .verify_and_cache_peer_manifest("hub-a", &manifest_v2, Some(etag_v2), false)
         .unwrap();
-    assert!(neg_v2.shared_capabilities.contains(&CapabilityToken::DmE2eeV1));
+    assert!(
+        neg_v2
+            .shared_capabilities
+            .contains(&CapabilityToken::DmE2eeV1)
+    );
 
     // Rollback attack: sign a valid manifest with older `manifest_version = 1 < 2`!
     let mut rollback_payload = payload_v2.clone();
@@ -987,7 +1032,10 @@ async fn adversarial_routing_loops_manifest_rollback_e2ee_downgrade_and_required
         ),
         "expected ManifestRollbackDetected, got {rb_err:?}"
     );
-    assert_eq!(rb_err.to_problem_details().error, "manifest_rollback_detected");
+    assert_eq!(
+        rb_err.to_problem_details().error,
+        "manifest_rollback_detected"
+    );
 
     // E2EE downgrade attack: sign manifest_version = 3 WITHOUT `dm.e2ee.v1`!
     let mut downgrade_payload = payload_v2.clone();
@@ -1023,7 +1071,8 @@ async fn adversarial_routing_loops_manifest_rollback_e2ee_downgrade_and_required
 
     // 3C. `E2eePolicy::Required` vs legacy non-E2EE peer fails closed!
     let mut strict_dir = TempDir::new().unwrap();
-    let mut strict_cfg = NodeConfig::local(NodeId::new("strict@laptop").unwrap(), strict_dir.path());
+    let mut strict_cfg =
+        NodeConfig::local(NodeId::new("strict@laptop").unwrap(), strict_dir.path());
     strict_cfg.secret_backend = Some(SecretBackend::File);
     strict_cfg.e2ee_policy = E2eePolicy::Required;
     let strict_node = UnifiedNode::open(strict_cfg).unwrap();
@@ -1090,7 +1139,7 @@ async fn adversarial_routing_loops_manifest_rollback_e2ee_downgrade_and_required
 
 #[tokio::test]
 async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and_rotates_on_join_or_revoke()
-{
+ {
     let hub_dir = TempDir::new().unwrap();
     let alice_dir = TempDir::new().unwrap();
     let bob_dir = TempDir::new().unwrap();
@@ -1139,12 +1188,24 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
 
     // Pair Alice, Bob, and a non-KV Guest against the hub.
     let (inv_a, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &member_scopes, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &member_scopes,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&inv_a).await.unwrap();
 
     let (inv_b, _) = hub
-        .create_admin_invite(&admin_ca, "bob@laptop", &member_scopes, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &member_scopes,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     bob.accept_am2_invite(&inv_b).await.unwrap();
 
@@ -1330,7 +1391,12 @@ async fn hub_restart_bumps_manifest_version_and_paired_client_reconnects_cleanly
     alice_cfg.secret_backend = Some(SecretBackend::File);
     let alice1 = UnifiedNode::open(alice_cfg.clone()).unwrap();
 
-    let scopes = ["dm:send=*", "dm:receive", "kv:read=shared/*", "kv:write=shared/*"];
+    let scopes = [
+        "dm:send=*",
+        "dm:receive",
+        "kv:read=shared/*",
+        "kv:write=shared/*",
+    ];
     let (inv, _) = hub1
         .create_admin_invite(&admin_ca, "alice@macbook", &scopes, TrustTier::Org, 300_000)
         .unwrap();

@@ -112,11 +112,7 @@ fn mint_offline_am2_invite(
     (am2, grant_id, signed_grant, parsed)
 }
 
-async fn send_post_json(
-    client: &HttpClient,
-    url: &str,
-    body: &Value,
-) -> (StatusCode, Vec<u8>) {
+async fn send_post_json(client: &HttpClient, url: &str, body: &Value) -> (StatusCode, Vec<u8>) {
     let req = Request::builder()
         .method(Method::POST)
         .uri(url)
@@ -159,7 +155,13 @@ async fn p1_1_p2p_peer_id_takeover_blocked_and_store_key_pin_enforced() {
     let member_scopes = ScopePreset::Member.expand();
     let member_refs: Vec<&str> = member_scopes.iter().map(String::as_str).collect();
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &member_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &member_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&alice_am2).await.unwrap();
 
@@ -216,8 +218,12 @@ async fn p1_1_p2p_peer_id_takeover_blocked_and_store_key_pin_enforced() {
         &make_p2p_grant(),
     )
     .unwrap();
-    let (st_hub, body_hub) =
-        send_post_json(&client, &pair_url, &serde_json::to_value(&hijack_resp).unwrap()).await;
+    let (st_hub, body_hub) = send_post_json(
+        &client,
+        &pair_url,
+        &serde_json::to_value(&hijack_resp).unwrap(),
+    )
+    .await;
     assert_eq!(
         st_hub,
         StatusCode::CONFLICT,
@@ -258,7 +264,9 @@ async fn p1_1_p2p_peer_id_takeover_blocked_and_store_key_pin_enforced() {
         hub_enc_before
     );
     assert_eq!(
-        alice_secrets.get(&peer_auth_secret_name("acme-hub")).unwrap(),
+        alice_secrets
+            .get(&peer_auth_secret_name("acme-hub"))
+            .unwrap(),
         hub_bearer_before
     );
 
@@ -271,8 +279,12 @@ async fn p1_1_p2p_peer_id_takeover_blocked_and_store_key_pin_enforced() {
         &make_p2p_grant(),
     )
     .unwrap();
-    let (st_self, body_self) =
-        send_post_json(&client, &pair_url, &serde_json::to_value(&self_claim).unwrap()).await;
+    let (st_self, body_self) = send_post_json(
+        &client,
+        &pair_url,
+        &serde_json::to_value(&self_claim).unwrap(),
+    )
+    .await;
     assert_eq!(
         st_self,
         StatusCode::CONFLICT,
@@ -294,8 +306,12 @@ async fn p1_1_p2p_peer_id_takeover_blocked_and_store_key_pin_enforced() {
         &make_p2p_grant(),
     )
     .unwrap();
-    let (st_local, body_local) =
-        send_post_json(&client, &pair_url, &serde_json::to_value(&local_claim).unwrap()).await;
+    let (st_local, body_local) = send_post_json(
+        &client,
+        &pair_url,
+        &serde_json::to_value(&local_claim).unwrap(),
+    )
+    .await;
     assert_eq!(
         st_local,
         StatusCode::CONFLICT,
@@ -327,8 +343,12 @@ async fn p1_1_p2p_peer_id_takeover_blocked_and_store_key_pin_enforced() {
         &make_p2p_grant(),
     )
     .unwrap();
-    let (st_bh, _) =
-        send_post_json(&client, &pair_url2, &serde_json::to_value(&bob_hijack).unwrap()).await;
+    let (st_bh, _) = send_post_json(
+        &client,
+        &pair_url2,
+        &serde_json::to_value(&bob_hijack).unwrap(),
+    )
+    .await;
     assert_eq!(st_bh, StatusCode::CONFLICT);
 
     let bob_untargeted_repair = create_p2p_response(
@@ -374,8 +394,12 @@ async fn p1_1_p2p_peer_id_takeover_blocked_and_store_key_pin_enforced() {
         &make_p2p_grant(),
     )
     .unwrap();
-    let (st_wrong_peer, _) =
-        send_post_json(&client, &targeted_url, &serde_json::to_value(&wrong_peer).unwrap()).await;
+    let (st_wrong_peer, _) = send_post_json(
+        &client,
+        &targeted_url,
+        &serde_json::to_value(&wrong_peer).unwrap(),
+    )
+    .await;
     assert_eq!(st_wrong_peer, StatusCode::CONFLICT);
 
     let valid_repair = create_p2p_response(
@@ -386,8 +410,12 @@ async fn p1_1_p2p_peer_id_takeover_blocked_and_store_key_pin_enforced() {
         &make_p2p_grant(),
     )
     .unwrap();
-    let (st_repair, body_repair) =
-        send_post_json(&client, &targeted_url, &serde_json::to_value(&valid_repair).unwrap()).await;
+    let (st_repair, body_repair) = send_post_json(
+        &client,
+        &targeted_url,
+        &serde_json::to_value(&valid_repair).unwrap(),
+    )
+    .await;
     assert_eq!(
         st_repair,
         StatusCode::OK,
@@ -458,7 +486,13 @@ async fn p1_2_put_keys_rejects_self_signed_guest_unpinned_and_allows_authorized_
     let member_scopes = ScopePreset::Member.expand();
     let member_refs: Vec<&str> = member_scopes.iter().map(String::as_str).collect();
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &member_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &member_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&alice_am2).await.unwrap();
 
@@ -490,7 +524,10 @@ async fn p1_2_put_keys_rejects_self_signed_guest_unpinned_and_allows_authorized_
     let evil_put = PutKeyRequest {
         signing_jwk: evil_keys.signing_jwk(),
         encryption_jwk: evil_keys.encryption_jwk(),
-        proof: evil_keys.signing.sign_jcs("key-reg", &evil_payload).unwrap(),
+        proof: evil_keys
+            .signing
+            .sign_jcs("key-reg", &evil_payload)
+            .unwrap(),
     };
     let req_bearer_attack = Request::builder()
         .method(Method::PUT)
@@ -718,7 +755,10 @@ async fn p1_2_put_keys_rejects_self_signed_guest_unpinned_and_allows_authorized_
     // New key `alice_v2` authenticates cleanly; retired `alice_v1` is rejected with 401!
     let alice_auth_v2 = Ed25519AuthBuilder::new("alice@macbook", &alice_v2.signing);
     let ok_v2_req = alice_auth_v2.sign_request(Method::GET, &hub_url, "/v1/channels", None, None);
-    assert_eq!(client.request(ok_v2_req).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        client.request(ok_v2_req).await.unwrap().status(),
+        StatusCode::OK
+    );
     let bad_v1_req = alice_auth_v1.sign_request(Method::GET, &hub_url, "/v1/channels", None, None);
     assert_eq!(
         client.request(bad_v1_req).await.unwrap().status(),
@@ -746,7 +786,10 @@ async fn p1_2_put_keys_rejects_self_signed_guest_unpinned_and_allows_authorized_
         Some(Bytes::from(serde_json::to_vec(&dual_body).unwrap())),
         Some("application/json"),
     );
-    assert_eq!(client.request(req_v3).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        client.request(req_v3).await.unwrap().status(),
+        StatusCode::OK
+    );
     assert_eq!(
         hub.lookup_peer_signing_key("alice@macbook")
             .unwrap()
@@ -778,11 +821,7 @@ async fn p1_2_put_keys_rejects_self_signed_guest_unpinned_and_allows_authorized_
         .body(full_body(admin_rot_bytes.clone()))
         .unwrap();
     assert_eq!(
-        client
-            .request(req_v4_stale_bearer)
-            .await
-            .unwrap()
-            .status(),
+        client.request(req_v4_stale_bearer).await.unwrap().status(),
         StatusCode::UNAUTHORIZED,
         "N1: pre-rotation bearer token must be rejected with 401 after key rotation"
     );
@@ -795,7 +834,10 @@ async fn p1_2_put_keys_rejects_self_signed_guest_unpinned_and_allows_authorized_
         Some(Bytes::from(admin_rot_bytes)),
         Some("application/json"),
     );
-    assert_eq!(client.request(req_v4).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        client.request(req_v4).await.unwrap().status(),
+        StatusCode::OK
+    );
     assert_eq!(
         hub.lookup_peer_signing_key("alice@macbook")
             .unwrap()
@@ -997,7 +1039,13 @@ async fn p1_3_true_offline_admin_ca_pairing_replay_and_tamper_mutations() {
 
     // 6. Backwards compatibility: Hub-DB-backed pairing WITHOUT inline `signedGrant` still works!
     let (_legacy_am2, legacy_rec) = hub
-        .create_admin_invite(&offline_admin_ca, "bob@laptop", &member_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &offline_admin_ca,
+            "bob@laptop",
+            &member_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let legacy_decoded = hyp_crypto::pairing::decode_am2(&_legacy_am2).unwrap();
     let legacy_code = parse_pairing_code_v1(&legacy_decoded.pairing_code).unwrap();
@@ -1070,13 +1118,22 @@ async fn p1_11_anti_recon_blocks_guests_and_underscoped_peers_from_enumerating_d
     let member_scopes = ScopePreset::Member.expand();
     let member_refs: Vec<&str> = member_scopes.iter().map(String::as_str).collect();
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &member_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &member_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let mut alice_cfg = NodeConfig::local(NodeId::new("alice@macbook").unwrap(), alice_dir.path());
     alice_cfg.secret_backend = Some(SecretBackend::File);
     let alice = UnifiedNode::open(alice_cfg).unwrap();
     alice.accept_am2_invite(&alice_am2).await.unwrap();
-    alice.register_handle("sess-a", "claude-secret").await.unwrap();
+    alice
+        .register_handle("sess-a", "claude-secret")
+        .await
+        .unwrap();
 
     // Pair an under-scoped peer `streamonly@box` with ONLY `stream:subscribe=alerts`
     // (lacking dm:send / channel:join / directory:read / *).
@@ -1089,7 +1146,8 @@ async fn p1_11_anti_recon_blocks_guests_and_underscoped_peers_from_enumerating_d
             300_000,
         )
         .unwrap();
-    let mut stream_cfg = NodeConfig::local(NodeId::new("streamonly@box").unwrap(), stream_dir.path());
+    let mut stream_cfg =
+        NodeConfig::local(NodeId::new("streamonly@box").unwrap(), stream_dir.path());
     stream_cfg.secret_backend = Some(SecretBackend::File);
     let stream_peer = UnifiedNode::open(stream_cfg).unwrap();
     stream_peer.accept_am2_invite(&stream_am2).await.unwrap();

@@ -17,9 +17,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 #[cfg(unix)]
 use common::run_hyp_in_pty;
 use common::{ManagedProcess, isolated_cmd, parse_json_stdout};
+use hyp_crypto::human::{NodeCertPayloadV1, encode_hcert1, sign_node_cert};
 #[cfg(unix)]
 use hyp_crypto::human::{derive_prf_ed25519_keypair, derive_prf_x25519_keypair};
-use hyp_crypto::human::{NodeCertPayloadV1, encode_hcert1, sign_node_cert};
 use hyp_crypto::keys::{Ed25519KeyPair, OkpJwk, X25519KeyPair};
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
@@ -49,7 +49,9 @@ fn seal_hdrop1_via_stored_admin(
     drop_id: &str,
     body: &str,
 ) -> String {
-    use hyp_crypto::human::{HumanAudience, HumanClaimV1, SecretDropSpec, encode_hdrop1, seal_human_drop};
+    use hyp_crypto::human::{
+        HumanAudience, HumanClaimV1, SecretDropSpec, encode_hdrop1, seal_human_drop,
+    };
     use sha2::{Digest, Sha256};
 
     let store = SecretStore::new(state_dir, SecretBackend::File);
@@ -343,7 +345,10 @@ fn cli_emit_to_live_node_local_ingest_socket_unsigned_and_signed() {
     let status_json = parse_json_stdout(&status_out);
     assert_eq!(status_json["data"]["localIngest"]["enabled"], true);
     assert_eq!(status_json["data"]["localIngest"]["socketExists"], true);
-    assert_eq!(status_json["data"]["localIngest"]["defaultTopic"], "schedule");
+    assert_eq!(
+        status_json["data"]["localIngest"]["defaultTopic"],
+        "schedule"
+    );
     assert_eq!(status_json["data"]["localIngest"]["routesCount"], 1);
 
     node_proc.shutdown_gracefully();
@@ -464,9 +469,9 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
     let list_json = parse_json_stdout(&list_out);
     let auths = list_json["data"]["authorities"].as_array().unwrap();
     assert!(
-        auths
-            .iter()
-            .any(|a| a["kid"] == passkey_ed.kid() && a["encKey"] == true && a["encKid"] == passkey_x.kid()),
+        auths.iter().any(|a| a["kid"] == passkey_ed.kid()
+            && a["encKey"] == true
+            && a["encKid"] == passkey_x.kid()),
         "expected encKey=true in auth list: {list_json}"
     );
     let st_out = isolated_cmd(home)
@@ -1771,7 +1776,10 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
 
     // Verify `<state_dir>/last_drop.json` was persisted atomically (0600 on Unix)!
     let last_drop_path = state_dir.join("last_drop.json");
-    assert!(last_drop_path.exists(), "last_drop.json must be written on online drop create");
+    assert!(
+        last_drop_path.exists(),
+        "last_drop.json must be written on online drop create"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1910,7 +1918,10 @@ fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
         .expect("run gate propose");
     assert_eq!(prop_out.status.code(), Some(0));
     let proposal_path = state_dir.join("gate.proposed.json");
-    assert!(proposal_path.exists(), "gate.proposed.json must exist after propose");
+    assert!(
+        proposal_path.exists(),
+        "gate.proposed.json must exist after propose"
+    );
 
     // 2. Lock via `hyp gate lock` -> merges `gate.proposed.json` into `node.json`, signs, and removes proposal!
     let lock_out = run_hyp_in_pty(

@@ -396,7 +396,8 @@ impl NodeDb {
             ensure_dir_0700(dir)?;
             (dir.clone(), None)
         } else {
-            let dir = std::env::temp_dir().join(format!("hyp-store-mem-{}", crate::types::uuid_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("hyp-store-mem-{}", crate::types::uuid_v4()));
             ensure_dir_0700(&dir)?;
             (dir.clone(), Some(dir))
         };
@@ -414,19 +415,19 @@ impl NodeDb {
 
     /// Returns the currently applied schema version.
     pub fn schema_version(&self) -> StoreResult<i64> {
-        let version: Option<i64> = self
-            .conn
-            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
-                row.get(0)
-            })?;
+        let version: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                    row.get(0)
+                })?;
         Ok(version.unwrap_or(0))
     }
 
     /// Returns all applied migrations as `(version, applied_at)` pairs ordered ascending.
     pub fn applied_migrations(&self) -> StoreResult<Vec<(i64, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT version, applied_at FROM schema_version ORDER BY version ASC",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version, applied_at FROM schema_version ORDER BY version ASC")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -580,7 +581,9 @@ where
     loop {
         match op() {
             Ok(val) => return Ok(val),
-            Err(StoreError::Sqlite(ref err)) if is_locked_error(err) && Instant::now() < deadline => {
+            Err(StoreError::Sqlite(ref err))
+                if is_locked_error(err) && Instant::now() < deadline =>
+            {
                 thread::sleep(Duration::from_millis(20));
             }
             Err(err) => return Err(err),
@@ -776,7 +779,9 @@ fn collect_foreign_key_violations(conn: &Connection) -> StoreResult<Vec<String>>
             let rowid: Option<i64> = row.get(1)?;
             let parent: String = row.get(2)?;
             let fkid: i64 = row.get(3)?;
-            Ok(format!("table={table} rowid={rowid:?} parent={parent} fkid={fkid}"))
+            Ok(format!(
+                "table={table} rowid={rowid:?} parent={parent} fkid={fkid}"
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -926,8 +931,8 @@ fn list_migration_backups_in_dir(backups_dir: &Path) -> StoreResult<Vec<PathBuf>
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .unwrap_or_default();
         let parsed_ts = parse_backup_timestamp_ms(name);
-        let sort_ts = parsed_ts
-            .unwrap_or_else(|| i64::try_from(mtime_dur.as_millis()).unwrap_or(i64::MAX));
+        let sort_ts =
+            parsed_ts.unwrap_or_else(|| i64::try_from(mtime_dur.as_millis()).unwrap_or(i64::MAX));
         entries.push((
             sort_ts,
             mtime_dur.as_nanos(),

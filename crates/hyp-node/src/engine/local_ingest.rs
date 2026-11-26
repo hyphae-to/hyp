@@ -57,12 +57,12 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
+use crate::engine::config::NodeError;
 pub use crate::engine::config::{
     DEFAULT_LOCAL_INGEST_BURST, DEFAULT_LOCAL_INGEST_MAX_PAYLOAD_BYTES,
     DEFAULT_LOCAL_INGEST_MAX_PER_MINUTE, DEFAULT_LOCAL_INGEST_ROUTE_ID, DEFAULT_LOCAL_INGEST_TOPIC,
     LocalIngestConfig, LocalIngestLimitAction, LocalIngestRoute,
 };
-use crate::engine::config::NodeError;
 use crate::engine::node::UnifiedNode;
 use crate::gates::{
     GateDecision, InboundContext, RateLimitConfig, SecurityGatePipeline, TokenBucket, TrustTier,
@@ -415,11 +415,8 @@ impl LocalIngestState {
         now_ms: i64,
     ) -> Result<LocalIngestOutcome, LocalIngestError> {
         // 1. Normalize into `(topic, CloudEvent)` + optional TTL / coalesce hints.
-        let normalized = normalize_local_ingest_payload(
-            raw_json,
-            &self.config.default_topic,
-            now_ms,
-        )?;
+        let normalized =
+            normalize_local_ingest_payload(raw_json, &self.config.default_topic, now_ms)?;
         let topic = normalized.topic;
         let event = normalized.event;
 
@@ -1144,13 +1141,13 @@ async fn handle_connection<S>(
         };
 
         if let Some(ref expected) = bearer_token {
-            let provided = val
-                .as_object_mut()
-                .and_then(|obj| obj.remove("auth"))
-                .map(|v| match v {
-                    Value::String(s) => s,
-                    _ => String::new(),
-                });
+            let provided =
+                val.as_object_mut()
+                    .and_then(|obj| obj.remove("auth"))
+                    .map(|v| match v {
+                        Value::String(s) => s,
+                        _ => String::new(),
+                    });
 
             if let Some(candidate) = provided {
                 if !constant_time_token_eq(&candidate, expected.as_str()) {
@@ -1555,8 +1552,8 @@ fn normalize_shorthand_to_cloudevent(
         extensions,
     };
 
-    let ce_val = serde_json::to_value(&ce)
-        .map_err(|e| LocalIngestError::InvalidEvent(e.to_string()))?;
+    let ce_val =
+        serde_json::to_value(&ce).map_err(|e| LocalIngestError::InvalidEvent(e.to_string()))?;
     let (validated, _) = check_cloudevent_v2_with_limits(&ce_val, parse_limits)
         .map_err(|e| LocalIngestError::InvalidEvent(e.to_string()))?;
     Ok(validated)
@@ -1607,9 +1604,7 @@ fn extract_optional_ttl_seconds(
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(n)) => {
             let secs = n.as_u64().ok_or_else(|| {
-                LocalIngestError::InvalidEvent(
-                    "ttlSeconds must be a positive integer".to_string(),
-                )
+                LocalIngestError::InvalidEvent("ttlSeconds must be a positive integer".to_string())
             })?;
             if secs == 0 {
                 return Err(LocalIngestError::InvalidEvent(
@@ -1656,10 +1651,7 @@ fn prepare_unix_socket_path(path: &Path) -> Result<(), NodeError> {
             if ft.is_dir() || ft.is_symlink() {
                 return Err(NodeError::Io(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    format!(
-                        "refusing to replace non-socket path at {}",
-                        path.display()
-                    ),
+                    format!("refusing to replace non-socket path at {}", path.display()),
                 )));
             }
             if ft.is_socket() {
@@ -1775,7 +1767,10 @@ fn parse_addr_descriptor_file(
             LocalIngestError::Transport(format!("failed to read {}: {e}", path.display()))
         })?;
     let parsed: LoopbackAddrFile = serde_json::from_str(raw.trim()).map_err(|e| {
-        LocalIngestError::Transport(format!("invalid ingest.addr JSON at {}: {e}", path.display()))
+        LocalIngestError::Transport(format!(
+            "invalid ingest.addr JSON at {}: {e}",
+            path.display()
+        ))
     })?;
     let addr: SocketAddr = parsed.addr.trim().parse().map_err(|e| {
         LocalIngestError::Transport(format!("invalid loopback addr '{}': {e}", parsed.addr))

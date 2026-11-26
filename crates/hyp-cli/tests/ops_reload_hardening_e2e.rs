@@ -11,7 +11,9 @@ use http_body_util::Full;
 use hyp_crypto::CryptoError;
 #[cfg(unix)]
 use hyp_crypto::human::SignedHumanRevocationV1;
-use hyp_crypto::human::{HumanAudience, HumanClaimV1, HumanDropKind, encode_hdrop1, seal_human_drop};
+use hyp_crypto::human::{
+    HumanAudience, HumanClaimV1, HumanDropKind, encode_hdrop1, seal_human_drop,
+};
 use hyp_crypto::keys::Ed25519KeyPair;
 use hyp_crypto::keystore::{
     SecretBackend, SecretStore, classify_linux_secret_service_output, classify_mac_keychain_output,
@@ -144,7 +146,10 @@ fn d10_keystore_backend_errors_and_partial_keys_never_silently_regenerate() {
         );
         fs::set_permissions(&sign_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            store.load_or_create_node_keys("d10-node@box").unwrap().kid(),
+            store
+                .load_or_create_node_keys("d10-node@box")
+                .unwrap()
+                .kid(),
             _orig.kid()
         );
     }
@@ -336,7 +341,10 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
         String::from_utf8_lossy(&emit_after_add.stdout),
         String::from_utf8_lossy(&emit_after_add.stderr)
     );
-    assert_eq!(parse_json_stdout(&emit_after_add)["data"]["decision"], "allow");
+    assert_eq!(
+        parse_json_stdout(&emit_after_add)["data"]["decision"],
+        "allow"
+    );
 
     // 4b. Subscribe a paired peer (`peer-b@box`) to `human.revocations` BEFORE revoking with `--broadcast`!
     {
@@ -417,7 +425,10 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
         "locked daemon must NOT quarantine traffic after live auth revoke reload! stdout={}",
         String::from_utf8_lossy(&emit_after_rev.stdout)
     );
-    assert_eq!(parse_json_stdout(&emit_after_rev)["data"]["decision"], "allow");
+    assert_eq!(
+        parse_json_stdout(&emit_after_rev)["data"]["decision"],
+        "allow"
+    );
 
     // 7. Verify the `to.hyphae.human.revocation.v1` CloudEvent was matched into `peer-b@box`'s
     //    `human.revocations` EventStore batch AND a second peer node can ingest it via `ingest_human_revocation`!
@@ -487,7 +498,12 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
         .expect("paired peer must accept broadcasted SignedHumanRevocationV1");
     {
         let pdb = peer_node.db();
-        assert!(pdb.human().get_active_authority_by_kid(&bob_kid).unwrap().is_none());
+        assert!(
+            pdb.human()
+                .get_active_authority_by_kid(&bob_kid)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(pdb.human().min_auth_epoch().unwrap(), 2);
     }
 
@@ -582,9 +598,7 @@ fn r3_supervisor_invokes_fresh_env_resolver_on_respawn_and_redacts_rotated_secre
     rt.block_on(async {
         let tmp = TempDir::new().unwrap();
         let store = SecretStore::file_only(tmp.path());
-        store
-            .set("rot-bot-token", "ROT_SECRET_V1_INITIAL")
-            .unwrap();
+        store.set("rot-bot-token", "ROT_SECRET_V1_INITIAL").unwrap();
 
         let trace_file = tmp.path().join("env_trace.log");
         let gate_file = tmp.path().join("allow_second_run");
@@ -641,14 +655,15 @@ fn r3_supervisor_invokes_fresh_env_resolver_on_respawn_and_redacts_rotated_secre
                     break;
                 }
             }
-            assert!(Instant::now() < deadline, "timed out waiting for initial spawn");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for initial spawn"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         // Rotate secret in SecretStore and let the respawned child stay alive.
-        store
-            .set("rot-bot-token", "ROT_SECRET_V2_UPDATED")
-            .unwrap();
+        store.set("rot-bot-token", "ROT_SECRET_V2_UPDATED").unwrap();
         fs::write(&gate_file, b"go").unwrap();
 
         // Wait until respawned child observes V2!
@@ -678,8 +693,7 @@ fn r3_supervisor_invokes_fresh_env_resolver_on_respawn_and_redacts_rotated_secre
         );
         for line in &stderr_lines {
             assert!(
-                !line.contains("ROT_SECRET_V1_INITIAL")
-                    && !line.contains("ROT_SECRET_V2_UPDATED"),
+                !line.contains("ROT_SECRET_V1_INITIAL") && !line.contains("ROT_SECRET_V2_UPDATED"),
                 "raw secret leaked into supervisor stderr: {line}"
             );
         }
@@ -730,22 +744,33 @@ fn r3_secret_set_and_delete_warn_when_referenced_in_node_json() {
 
     // 1. Referenced plugin secret -> warns & suggests `hyp service restart --json`.
     let mut set_tg = isolated_cmd(&home)
-        .args(["secret", "set", "tg-bot-token", "--state-dir", state_str, "--json"])
+        .args([
+            "secret",
+            "set",
+            "tg-bot-token",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    set_tg.stdin.take().unwrap().write_all(b"tg-val-123").unwrap();
+    set_tg
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"tg-val-123")
+        .unwrap();
     let set_tg_out = set_tg.wait_with_output().unwrap();
     assert_eq!(set_tg_out.status.code(), Some(0));
     let set_tg_json = parse_json_stdout(&set_tg_out);
     assert!(
-        set_tg_json["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap_or("").contains("plugins[telegram].env.TELEGRAM_BOT_TOKEN")),
+        set_tg_json["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap_or("")
+            .contains("plugins[telegram].env.TELEGRAM_BOT_TOKEN")),
         "expected plugin reference warning: {set_tg_json}"
     );
     assert!(
@@ -759,13 +784,25 @@ fn r3_secret_set_and_delete_warn_when_referenced_in_node_json() {
 
     // 2. Referenced source secret -> warns & suggests restart.
     let mut set_gh = isolated_cmd(&home)
-        .args(["secret", "set", "gh-acme-token", "--state-dir", state_str, "--json"])
+        .args([
+            "secret",
+            "set",
+            "gh-acme-token",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    set_gh.stdin.take().unwrap().write_all(b"gh-val-456").unwrap();
+    set_gh
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"gh-val-456")
+        .unwrap();
     let set_gh_out = set_gh.wait_with_output().unwrap();
     assert_eq!(set_gh_out.status.code(), Some(0));
     let set_gh_json = parse_json_stdout(&set_gh_out);
@@ -787,13 +824,25 @@ fn r3_secret_set_and_delete_warn_when_referenced_in_node_json() {
 
     // 3. Unreferenced secret -> no warning and no restart hint.
     let mut set_unref = isolated_cmd(&home)
-        .args(["secret", "set", "unused-secret", "--state-dir", state_str, "--json"])
+        .args([
+            "secret",
+            "set",
+            "unused-secret",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    set_unref.stdin.take().unwrap().write_all(b"unused-val").unwrap();
+    set_unref
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"unused-val")
+        .unwrap();
     let set_unref_out = set_unref.wait_with_output().unwrap();
     assert_eq!(set_unref_out.status.code(), Some(0));
     let set_unref_json = parse_json_stdout(&set_unref_out);
@@ -817,7 +866,14 @@ fn r3_secret_set_and_delete_warn_when_referenced_in_node_json() {
 
     // 4. Delete referenced secret -> warns & suggests restart.
     let del_out = isolated_cmd(&home)
-        .args(["secret", "delete", "tg-bot-token", "--state-dir", state_str, "--json"])
+        .args([
+            "secret",
+            "delete",
+            "tg-bot-token",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(del_out.status.code(), Some(0));
@@ -854,7 +910,14 @@ fn r4_plugin_remove_cleans_node_json_and_strips_source_location_query_string() {
     // 1. Install telegram & slack from local repo plugins dir.
     for plugin in ["telegram", "slack"] {
         let out = isolated_cmd(&home)
-            .args(["plugin", "install", plugin, "--state-dir", state_str, "--json"])
+            .args([
+                "plugin",
+                "install",
+                plugin,
+                "--state-dir",
+                state_str,
+                "--json",
+            ])
             .output()
             .expect("install plugin");
         assert_eq!(
@@ -933,13 +996,27 @@ fn r4_plugin_remove_cleans_node_json_and_strips_source_location_query_string() {
     //    `plugins[]` entries (`id == telegram` and `args` pointing into `plugins/telegram/`), preserves `slack`,
     //    and emits `hyp service restart --json` in `next`!
     let reinstall = isolated_cmd(&home)
-        .args(["plugin", "install", "telegram", "--state-dir", state_str, "--json"])
+        .args([
+            "plugin",
+            "install",
+            "telegram",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(reinstall.status.code(), Some(0));
 
     let rm_out = isolated_cmd(&home)
-        .args(["plugin", "remove", "telegram", "--state-dir", state_str, "--json"])
+        .args([
+            "plugin",
+            "remove",
+            "telegram",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(rm_out.status.code(), Some(0));
@@ -1134,17 +1211,30 @@ fn r5_doctor_flags_daemon_version_skew_and_update_supports_no_restart() {
 
     // 1. `hyp status --json` surfaces daemonBinaryVersion and daemonPid.
     let status_out = isolated_cmd(&home)
-        .args(["status", "--state-dir", state_dir.to_str().unwrap(), "--json"])
+        .args([
+            "status",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(status_out.status.code(), Some(0));
     let status_json = parse_json_stdout(&status_out);
-    assert_eq!(status_json["data"]["node"]["daemonBinaryVersion"], "0.0.1-stale");
+    assert_eq!(
+        status_json["data"]["node"]["daemonBinaryVersion"],
+        "0.0.1-stale"
+    );
     assert_eq!(status_json["data"]["node"]["daemonPid"], 42424);
 
     // 2. `hyp doctor --json` emits WARN `DAEMON_VERSION_SKEW` with `hyp service restart --json`!
     let doc_out = isolated_cmd(&home)
-        .args(["doctor", "--state-dir", state_dir.to_str().unwrap(), "--json"])
+        .args([
+            "doctor",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(doc_out.status.code(), Some(0));
@@ -1168,7 +1258,12 @@ fn r5_doctor_flags_daemon_version_skew_and_update_supports_no_restart() {
     // 3. Once daemon reports matching version, `DAEMON_VERSION_SKEW` disappears and `daemon.version` is OK!
     *reported_version.lock().unwrap() = env!("CARGO_PKG_VERSION").to_string();
     let doc_ok_out = isolated_cmd(&home)
-        .args(["doctor", "--state-dir", state_dir.to_str().unwrap(), "--json"])
+        .args([
+            "doctor",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
         .output()
         .unwrap();
     assert_eq!(doc_ok_out.status.code(), Some(0));
@@ -1436,12 +1531,8 @@ fn h6_h18_drop_wait_reconnects_with_last_event_id_ignores_junk_and_r6_relay_set_
             issued_at: format_rfc3339_millis(now_s),
             expires_at: format_rfc3339_millis(now_s + 300_000),
         };
-        let valid_env = seal_human_drop(
-            &valid_claim,
-            &admin_kp,
-            &node_keys.encryption.public_key(),
-        )
-        .unwrap();
+        let valid_env =
+            seal_human_drop(&valid_claim, &admin_kp, &node_keys.encryption.public_key()).unwrap();
         encode_hdrop1(&valid_env).unwrap()
     };
 
@@ -1537,10 +1628,7 @@ fn h6_h18_drop_wait_reconnects_with_last_event_id_ignores_junk_and_r6_relay_set_
                                     )
                                 } else {
                                     // Connection #2: valid drop item 3!
-                                    format!(
-                                        "id: 3\nevent: drop\ndata: {}\n\n",
-                                        valid.as_str()
-                                    )
+                                    format!("id: 3\nevent: drop\ndata: {}\n\n", valid.as_str())
                                 };
                                 Ok::<_, Infallible>(
                                     Response::builder()
@@ -1773,9 +1861,9 @@ fn wave4c_status_and_doctor_surface_plugin_health_and_disabled_g17_warnings() {
     let doc_disabled_json = parse_json_stdout(&doc_disabled);
     let disabled_checks = doc_disabled_json["data"]["checks"].as_array().unwrap();
     assert!(
-        disabled_checks.iter().any(|c| {
-            c["name"] == "gate.stage2.disabled_insecure_url" && c["status"] == "warn"
-        }),
+        disabled_checks
+            .iter()
+            .any(|c| { c["name"] == "gate.stage2.disabled_insecure_url" && c["status"] == "warn" }),
         "expected gate.stage2.disabled_insecure_url WARN: {doc_disabled_json}"
     );
     assert!(
@@ -1857,7 +1945,10 @@ fn wave4c_status_and_doctor_surface_plugin_health_and_disabled_g17_warnings() {
     assert_eq!(st_tty_out.status.code(), Some(0));
     let st_tty = String::from_utf8_lossy(&st_tty_out.stdout);
     assert!(st_tty.contains("Runtime Plugins:"), "tty={st_tty}");
-    assert!(st_tty.contains("telegram [crash_loop_backoff]"), "tty={st_tty}");
+    assert!(
+        st_tty.contains("telegram [crash_loop_backoff]"),
+        "tty={st_tty}"
+    );
     assert!(st_tty.contains("restarts=7"), "tty={st_tty}");
     assert!(st_tty.contains("slack [degraded]"), "tty={st_tty}");
     assert!(st_tty.contains("discord [error]"), "tty={st_tty}");
@@ -1879,19 +1970,27 @@ fn wave4c_status_and_doctor_surface_plugin_health_and_disabled_g17_warnings() {
     let doc_json = parse_json_stdout(&doc_out);
     let checks = doc_json["data"]["checks"].as_array().unwrap();
     assert!(
-        checks.iter().any(|c| c["name"] == "plugin:runtime:telegram" && c["status"] == "fail"),
+        checks
+            .iter()
+            .any(|c| c["name"] == "plugin:runtime:telegram" && c["status"] == "fail"),
         "checks={checks:?}"
     );
     assert!(
-        checks.iter().any(|c| c["name"] == "plugin:runtime:discord" && c["status"] == "fail"),
+        checks
+            .iter()
+            .any(|c| c["name"] == "plugin:runtime:discord" && c["status"] == "fail"),
         "checks={checks:?}"
     );
     assert!(
-        checks.iter().any(|c| c["name"] == "plugin:runtime:slack" && c["status"] == "warn"),
+        checks
+            .iter()
+            .any(|c| c["name"] == "plugin:runtime:slack" && c["status"] == "warn"),
         "checks={checks:?}"
     );
     assert!(
-        checks.iter().any(|c| c["name"] == "plugin:runtime:github" && c["status"] == "ok"),
+        checks
+            .iter()
+            .any(|c| c["name"] == "plugin:runtime:github" && c["status"] == "ok"),
         "checks={checks:?}"
     );
 }

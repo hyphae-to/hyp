@@ -88,11 +88,12 @@ async fn missing_hc_binary_holds_and_probe_returns_none() {
             .is_none()
     );
 
-    let transport = HerdrTransport::new(HerdrTarget::new("t3").with_bin(missing_str)).with_timeouts(
-        Duration::from_millis(500),
-        Duration::from_millis(500),
-        Duration::from_millis(500),
-    );
+    let transport = HerdrTransport::new(HerdrTarget::new("t3").with_bin(missing_str))
+        .with_timeouts(
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
     let outcome = transport.deliver("hello", PushMode::Queue).await;
     assert_eq!(outcome, PushOutcome::hold("herdr_binary_missing"));
 }
@@ -297,10 +298,9 @@ esac
                     .unwrap();
                 let mut args = Vec::with_capacity(argc);
                 for i in 0..argc {
-                    let arg = fs::read_to_string(
-                        self.calls_dir.join(format!("call_{n}_arg_{i}.txt")),
-                    )
-                    .unwrap();
+                    let arg =
+                        fs::read_to_string(self.calls_dir.join(format!("call_{n}_arg_{i}.txt")))
+                            .unwrap();
                     args.push(arg);
                 }
                 all.push(args);
@@ -353,7 +353,10 @@ esac
         let hc = FakeHc::new();
 
         // 1. Nested v0.1 shape
-        hc.set_get_default(0, &nested_json("t3", 1_710_000_000_000, 4242, "codex", "idle"));
+        hc.set_get_default(
+            0,
+            &nested_json("t3", 1_710_000_000_000, 4242, "codex", "idle"),
+        );
         let target = probe_herdr_terminal(&hc.bin(), "t3")
             .await
             .expect("probe must capture nested live terminal");
@@ -371,7 +374,10 @@ esac
 
         // 2. Flat `hc ls --json` shape (`status: "idle"` + `agent: "claude-code"`)
         hc.reset_calls();
-        hc.set_get_default(0, &flat_json("t8", 1_720_000_000_000, 9001, "claude-code", "idle"));
+        hc.set_get_default(
+            0,
+            &flat_json("t8", 1_720_000_000_000, 9001, "claude-code", "idle"),
+        );
         let flat_target = probe_herdr_terminal(&hc.bin(), "t8")
             .await
             .expect("probe must capture flat live terminal");
@@ -530,7 +536,10 @@ esac
         hc.set_get_default(0, &nested_json("t3", 100, 4242, "codex", "working"));
         hc.set_interrupt(0, r#"{"outcome":"timeout"}"#);
         let outcome = transport.deliver("urgent", PushMode::Interrupt).await;
-        assert_eq!(outcome, PushOutcome::reject("herdr_interrupt_outcome_unknown"));
+        assert_eq!(
+            outcome,
+            PushOutcome::reject("herdr_interrupt_outcome_unknown")
+        );
         assert_eq!(
             hc.recorded_calls(),
             vec![
@@ -543,7 +552,10 @@ esac
         hc.reset_calls();
         hc.set_interrupt(1, r#"{"outcome":"stopped"}"#);
         let outcome = transport.deliver("urgent", PushMode::Interrupt).await;
-        assert_eq!(outcome, PushOutcome::reject("herdr_interrupt_outcome_unknown"));
+        assert_eq!(
+            outcome,
+            PushOutcome::reject("herdr_interrupt_outcome_unknown")
+        );
         assert_eq!(hc.recorded_calls().len(), 2);
 
         // 3. Interrupt stopped, but post-interrupt `get` still shows `working` -> hold_interrupted("herdr_agent_not_ready")
@@ -552,7 +564,10 @@ esac
         hc.set_get_seq(1, 0, &nested_json("t3", 100, 4242, "codex", "working"));
         hc.set_get_seq(2, 0, &nested_json("t3", 100, 4242, "codex", "working"));
         let outcome = transport.deliver("urgent", PushMode::Interrupt).await;
-        assert_eq!(outcome, PushOutcome::hold_interrupted("herdr_agent_not_ready"));
+        assert_eq!(
+            outcome,
+            PushOutcome::hold_interrupted("herdr_agent_not_ready")
+        );
         assert_eq!(
             hc.recorded_calls(),
             vec![
@@ -820,7 +835,11 @@ esac
     async fn e2e_malformed_and_oversized_get_output_fail_closed() {
         let hc = FakeHc::new();
         let transport = HerdrTransport::new(HerdrTarget::new("t3").with_bin(hc.bin()))
-            .with_timeouts(Duration::from_secs(2), Duration::from_secs(2), Duration::from_secs(2));
+            .with_timeouts(
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            );
 
         hc.set_get_default(0, "{truncated json");
         assert_eq!(
@@ -845,7 +864,11 @@ esac
         hc.set_send(0, r#"{"outcome":"sent"}"#);
 
         let transport = HerdrTransport::new(HerdrTarget::new("t3").with_bin(hc.bin()))
-            .with_timeouts(Duration::from_secs(2), Duration::from_secs(2), Duration::from_secs(2));
+            .with_timeouts(
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            );
         assert!(transport.is_nudge_only());
 
         // Queue nudge with valid handle

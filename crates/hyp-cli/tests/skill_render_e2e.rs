@@ -366,7 +366,9 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
         assert!(txt.contains("`hyp_bridge`"), "{rel}:\n{txt}");
         assert!(txt.contains("`hyp_kv`"), "{rel}:\n{txt}");
         assert!(
-            !txt.contains("hyp_wakeup") && !txt.contains("local.schedule") && !txt.contains("hyp emit"),
+            !txt.contains("hyp_wakeup")
+                && !txt.contains("local.schedule")
+                && !txt.contains("hyp emit"),
             "{profile} must suppress local schedule clutter:\n{txt}"
         );
     }
@@ -405,9 +407,9 @@ fn setup_preserves_unmanaged_skill_unless_force_skills_is_passed() {
     assert_eq!(read_lf(&claude_skill), custom_skill);
     let notes = json1["data"]["harnesses"][0]["notes"].as_array().unwrap();
     assert!(
-        notes
-            .iter()
-            .any(|n| n.as_str().is_some_and(|s| s.contains("Preserved unmanaged skill"))),
+        notes.iter().any(|n| n
+            .as_str()
+            .is_some_and(|s| s.contains("Preserved unmanaged skill"))),
         "expected unmanaged preservation note: {json1}"
     );
 

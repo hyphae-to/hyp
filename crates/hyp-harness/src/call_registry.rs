@@ -413,9 +413,9 @@ pub fn is_valid_session_id(s: &str) -> bool {
     if !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
         return false;
     }
-    bytes[1..].iter().all(|&b| {
-        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')
-    })
+    bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 fn generate_call_token() -> String {

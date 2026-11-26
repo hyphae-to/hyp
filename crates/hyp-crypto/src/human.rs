@@ -12,7 +12,7 @@
 //!   `authEpoch >= min_auth_epoch`, strict Ed25519 signature checks (rejecting small-order /
 //!   non-canonical points), and the reserved system-secret name denylist.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -22,7 +22,7 @@ use crate::error::CryptoError;
 use crate::hpke::{self, hkdf_sha256};
 use crate::jcs::to_canonical_json;
 use crate::keys::{
-    decode_raw_key_32, Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519KeyPair, X25519PublicKey,
+    Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519KeyPair, X25519PublicKey, decode_raw_key_32,
 };
 use crate::keystore::validate_secret_name;
 use crate::pairing::{is_valid_node_id, validate_endpoint_origin};
@@ -305,8 +305,9 @@ pub struct EncryptedHumanDraftV1 {
 /// Builds the exact RFC 9180 HPKE `info` bytes for `human.drop.v1`:
 /// `"hyphae/v2/human-drop\n1\n" || recipientEncKid || "\n" || dropId`.
 pub fn human_drop_hpke_info(recipient_enc_kid: &str, drop_id: &str) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(HUMAN_DROP_HPKE_INFO_PREFIX.len() + recipient_enc_kid.len() + 1 + drop_id.len());
+    let mut out = Vec::with_capacity(
+        HUMAN_DROP_HPKE_INFO_PREFIX.len() + recipient_enc_kid.len() + 1 + drop_id.len(),
+    );
     out.extend_from_slice(HUMAN_DROP_HPKE_INFO_PREFIX.as_bytes());
     out.extend_from_slice(recipient_enc_kid.as_bytes());
     out.push(b'\n');
@@ -317,8 +318,9 @@ pub fn human_drop_hpke_info(recipient_enc_kid: &str, drop_id: &str) -> Vec<u8> {
 /// Builds the exact RFC 9180 HPKE `aad` bytes for `human.drop.v1`:
 /// `"hyphae/v2/human-drop-aad\nhuman.drop.v1\n" || recipientEncKid || "\n" || dropId`.
 pub fn human_drop_hpke_aad(recipient_enc_kid: &str, drop_id: &str) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(HUMAN_DROP_HPKE_AAD_PREFIX.len() + recipient_enc_kid.len() + 1 + drop_id.len());
+    let mut out = Vec::with_capacity(
+        HUMAN_DROP_HPKE_AAD_PREFIX.len() + recipient_enc_kid.len() + 1 + drop_id.len(),
+    );
     out.extend_from_slice(HUMAN_DROP_HPKE_AAD_PREFIX.as_bytes());
     out.extend_from_slice(recipient_enc_kid.as_bytes());
     out.push(b'\n');
@@ -568,7 +570,9 @@ fn validate_claim_fields(claim: &HumanClaimV1) -> Result<(i64, i64), CryptoError
     Ok((issued_ms, expires_ms))
 }
 
-fn validate_envelope_structure(envelope: &HumanDropEnvelopeV1) -> Result<([u8; 32], Vec<u8>), CryptoError> {
+fn validate_envelope_structure(
+    envelope: &HumanDropEnvelopeV1,
+) -> Result<([u8; 32], Vec<u8>), CryptoError> {
     if envelope.v != 1 || envelope.suite != HUMAN_DROP_SUITE_V1 {
         return Err(CryptoError::InvalidEnvelope(format!(
             "unsupported human drop envelope v={} suite={}",
@@ -676,7 +680,8 @@ where
     let padded = hpke::open_base(&enc_bytes, recipient_enc_kp, &info, &aad, &ct_bytes)?;
     let signed_bytes = unpad_bucket(&padded)?;
 
-    let signed: Zeroizing<SignedHumanClaimV1> = Zeroizing::new(serde_json::from_slice(&signed_bytes)?);
+    let signed: Zeroizing<SignedHumanClaimV1> =
+        Zeroizing::new(serde_json::from_slice(&signed_bytes)?);
     let claim: HumanClaimV1 = serde_json::from_str(&signed.payload)?;
 
     // Look up active authority and verify Ed25519 signature BEFORE accepting claim semantics.
@@ -1178,7 +1183,11 @@ pub fn sign_local_ingest_event(signer: &Ed25519KeyPair, canonical_event_json: &s
     format!(
         "ed25519:{}:{}",
         signer.kid(),
-        sign_with_domain(signer, LOCAL_EVENT_SIG_DOMAIN, canonical_event_json.as_bytes())
+        sign_with_domain(
+            signer,
+            LOCAL_EVENT_SIG_DOMAIN,
+            canonical_event_json.as_bytes()
+        )
     )
 }
 
@@ -1209,9 +1218,7 @@ pub fn verify_local_ingest_event(
     }
 
     let pk = lookup_pk(kid).ok_or_else(|| {
-        CryptoError::InvalidSignature(format!(
-            "unknown or revoked local event signer kid '{kid}'"
-        ))
+        CryptoError::InvalidSignature(format!("unknown or revoked local event signer kid '{kid}'"))
     })?;
     if pk.kid() != kid {
         return Err(CryptoError::InvalidSignature(
@@ -1335,8 +1342,9 @@ fn validate_human_invite_fields(invite: &HumanInviteV1) -> Result<(i64, i64), Cr
             invite.human_id
         )));
     }
-    validate_node_prefix_pattern(&invite.node_prefix, false)
-        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid HumanInviteV1 nodePrefix: {e}")))?;
+    validate_node_prefix_pattern(&invite.node_prefix, false).map_err(|e| {
+        CryptoError::InvalidEnvelope(format!("invalid HumanInviteV1 nodePrefix: {e}"))
+    })?;
     validate_delegated_human_scopes(&invite.scopes)
         .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid HumanInviteV1 scopes: {e}")))?;
     if invite.max_devices == 0 || invite.max_devices > MAX_DELEGATED_DEVICES_LIMIT {
@@ -1464,7 +1472,9 @@ pub fn decode_hjoin1(armored: &str) -> Result<SignedHumanInviteV1, CryptoError> 
     Ok(signed)
 }
 
-fn validate_human_pub_card(card: &HumanPubCardV1) -> Result<(Ed25519PublicKey, Option<X25519PublicKey>), CryptoError> {
+fn validate_human_pub_card(
+    card: &HumanPubCardV1,
+) -> Result<(Ed25519PublicKey, Option<X25519PublicKey>), CryptoError> {
     if card.v != 1 {
         return Err(CryptoError::InvalidEnvelope(format!(
             "unsupported HumanPubCardV1 version {} (expected 1)",

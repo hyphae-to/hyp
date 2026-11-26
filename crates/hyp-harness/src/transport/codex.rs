@@ -200,9 +200,7 @@ impl CodexQueueTransport {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {
                         return PushOutcome::hold(REASON_BINARY_MISSING);
                     }
-                    Err(err)
-                        if err.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 5 =>
-                    {
+                    Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 5 => {
                         attempts += 1;
                         tokio::time::sleep(Duration::from_millis(10 * u64::from(attempts))).await;
                     }
@@ -574,8 +572,7 @@ fn filename_matches_codex_rollout(filename: &str, tid_lower: &str) -> bool {
         let start = search_from + rel;
         let end = start + tid_lower.len();
         let left_ok = start == 0 || matches!(stem.as_bytes()[start - 1], b'-' | b'_' | b'.');
-        let right_ok =
-            end == stem.len() || matches!(stem.as_bytes()[end], b'-' | b'_' | b'.');
+        let right_ok = end == stem.len() || matches!(stem.as_bytes()[end], b'-' | b'_' | b'.');
         if left_ok && right_ok {
             return true;
         }

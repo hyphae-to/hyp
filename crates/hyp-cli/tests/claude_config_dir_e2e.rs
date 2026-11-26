@@ -75,7 +75,11 @@ fn claude_gateway_symlinked_profile_cli_override_env_and_hermetic_isolation() {
     //   claude-gateway/commands/     is separate (NOT symlinked)
     let gw_settings_link = gateway.join("settings.json");
     let gw_skills_link = gateway.join("skills");
-    symlink(home.join(".claude").join("settings.json"), &gw_settings_link).unwrap();
+    symlink(
+        home.join(".claude").join("settings.json"),
+        &gw_settings_link,
+    )
+    .unwrap();
     symlink(home.join(".claude").join("skills"), &gw_skills_link).unwrap();
 
     let fake_bin = "/opt/hyphae/bin/hyp";
@@ -166,14 +170,9 @@ fn claude_gateway_symlinked_profile_cli_override_env_and_hermetic_isolation() {
             .join("register.tsx")
             .is_file()
     );
-    let runtime_skill = fs::read_to_string(
-        gateway
-            .join("skills")
-            .join("hyphae")
-            .join("SKILL.md"),
-    )
-    .unwrap()
-    .replace("\r\n", "\n");
+    let runtime_skill = fs::read_to_string(gateway.join("skills").join("hyphae").join("SKILL.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
     assert!(runtime_skill.starts_with("---\nname: hyphae\n"));
 
     // 5. `hyp doctor --claude-config-dir <gateway>` sees claude configured + statusLine chained OK.
@@ -276,7 +275,12 @@ fn claude_gateway_symlinked_profile_cli_override_env_and_hermetic_isolation() {
 
     // Both distinct commands dirs populated; symlinks still intact!
     assert!(gateway.join("commands").join("hyphae.md").is_file());
-    assert!(home.join(".claude").join("commands").join("hyphae.md").is_file());
+    assert!(
+        home.join(".claude")
+            .join("commands")
+            .join("hyphae.md")
+            .is_file()
+    );
     assert!(
         fs::symlink_metadata(&gw_settings_link)
             .unwrap()
@@ -593,10 +597,9 @@ fn independent_claude_config_dir_statusline_chain_onboard_and_doctor_all_os() {
         &fs::read_to_string(home.join(".claude").join("settings.json")).unwrap(),
     )
     .unwrap();
-    let restored_work: Value = serde_json::from_str(
-        &fs::read_to_string(work_profile.join("settings.json")).unwrap(),
-    )
-    .unwrap();
+    let restored_work: Value =
+        serde_json::from_str(&fs::read_to_string(work_profile.join("settings.json")).unwrap())
+            .unwrap();
     assert_eq!(restored_home["statusLine"], home_bar);
     assert_eq!(restored_work["statusLine"], work_bar);
     assert!(!canonical_chain.exists());
@@ -827,7 +830,10 @@ fn herdr_symlinked_custom_header_pill_js_and_patch_layout_symlink_safety_e2e() {
     assert_eq!(out_custom.status.code(), Some(0));
     let json_custom = parse_json_stdout(&out_custom);
     assert_eq!(json_custom["ok"], true);
-    assert_eq!(json_custom["data"]["herdrMod"]["layoutAction"], "skipped_symlink");
+    assert_eq!(
+        json_custom["data"]["herdrMod"]["layoutAction"],
+        "skipped_symlink"
+    );
     assert_eq!(
         fs::read_to_string(&external_custom).unwrap(),
         original_custom,
@@ -860,9 +866,9 @@ fn herdr_symlinked_custom_header_pill_js_and_patch_layout_symlink_safety_e2e() {
         "expected custom-header symlink warning: {warnings:?}"
     );
     assert!(
-        notes
-            .iter()
-            .any(|n| n.contains("pill.js") && n.contains("mods/folder-pane/") && n.contains("hyphae-panel")),
+        notes.iter().any(|n| n.contains("pill.js")
+            && n.contains("mods/folder-pane/")
+            && n.contains("hyphae-panel")),
         "expected pill.js + hyphae-panel composition note: {notes:?}"
     );
     for msg in warnings.iter().chain(notes.iter()).chain(next.iter()) {

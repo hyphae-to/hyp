@@ -229,11 +229,7 @@ pub(crate) fn resolve_claude_profiles_with_env(
     }]
 }
 
-fn claude_chain_file_path(
-    home: &Path,
-    profile: &ClaudeConfigProfile,
-    state_dir: &Path,
-) -> PathBuf {
+fn claude_chain_file_path(home: &Path, profile: &ClaudeConfigProfile, state_dir: &Path) -> PathBuf {
     let default_settings = home.join(".claude").join("settings.json");
     let profile_settings = profile.settings_file();
     if profile.is_default_home
@@ -249,8 +245,7 @@ fn claude_chain_file_path(
 
 const MAX_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 
-const CLAUDE_CMD_HYPHAE: &str =
-    include_str!("../../../plugins/claude-code/commands/hyphae.md");
+const CLAUDE_CMD_HYPHAE: &str = include_str!("../../../plugins/claude-code/commands/hyphae.md");
 const CLAUDE_CMD_HYPHAE_SUBS: &str =
     include_str!("../../../plugins/claude-code/commands/hyphae-subs.md");
 const CLAUDE_CMD_HYPHAE_FOCUS: &str =
@@ -515,7 +510,10 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
             EXIT_USAGE,
             "CONFLICTING_FLAGS",
             "`--no-skills` and `--refresh-skills` are mutually exclusive",
-            Some("Pass either `--no-skills` to skip skills or `--refresh-skills` to update them.".to_string()),
+            Some(
+                "Pass either `--no-skills` to skip skills or `--refresh-skills` to update them."
+                    .to_string(),
+            ),
         );
     }
     if args.plugins_dir.is_some() && args.plugins_archive.is_some() {
@@ -562,7 +560,10 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
                 EXIT_USAGE,
                 "CONFLICTING_FLAGS",
                 "`--interactive` cannot be combined with `--restore-statusline` or `--refresh-skills`",
-                Some("Run `hyp setup --interactive` to pick harnesses and components interactively.".to_string()),
+                Some(
+                    "Run `hyp setup --interactive` to pick harnesses and components interactively."
+                        .to_string(),
+                ),
             );
         }
         if !io::stdout().is_terminal() {
@@ -619,10 +620,8 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         }
     };
 
-    let mut wants_herdr_mod = args.install_mod
-        || args.patch_layout
-        || args.clone_layout.is_some()
-        || args.force_layout;
+    let mut wants_herdr_mod =
+        args.install_mod || args.patch_layout || args.clone_layout.is_some() || args.force_layout;
 
     let mut openclaw_delivery_override = args.openclaw_delivery;
     let mut openclaw_prompt_injection_override: Option<bool> = if args.openclaw_prompt_injection {
@@ -729,13 +728,7 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
 
     for kind in targets {
         let step_res = if args.restore_statusline {
-            restore_harness_statusline_only(
-                kind,
-                &home,
-                &claude_profiles,
-                &state_dir,
-                args.dry_run,
-            )
+            restore_harness_statusline_only(kind, &home, &claude_profiles, &state_dir, args.dry_run)
         } else if args.refresh_skills {
             refresh_harness_skill_only(kind, &home, &claude_profiles, &skill_ctx, args.dry_run)
         } else {
@@ -819,10 +812,7 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
     } else if results.is_empty() {
         vec!["hyp setup --harness all".to_string()]
     } else {
-        vec![
-            "hyp doctor".to_string(),
-            "hyp node start".to_string(),
-        ]
+        vec!["hyp doctor".to_string(), "hyp node start".to_string()]
     };
     for step in extra_next {
         if !next.contains(&step) {
@@ -1089,7 +1079,8 @@ fn run_onboard_deterministic(
         "stateDir".to_string(),
         Value::String(state_dir.display().to_string()),
     );
-    if matches!(profile, NodeProfile::Router | NodeProfile::P2p) && !cfg_map.contains_key("listen") {
+    if matches!(profile, NodeProfile::Router | NodeProfile::P2p) && !cfg_map.contains_key("listen")
+    {
         cfg_map.insert(
             "listen".to_string(),
             json!({
@@ -1111,31 +1102,32 @@ fn run_onboard_deterministic(
     };
 
     if let Some(ref staged) = staged_join {
-        let handshake_res: Option<Result<OnboardJoinResult, LiveHandshakeError>> = match staged.format {
-            "hp2p1" => Some(live_pair_hp2p1_for_onboard(
-                &staged.raw_token,
-                &state_dir,
-                &node_id,
-                &keys,
-                &db,
-                &secrets,
-            )),
-            "am2" => Some(live_pair_am2_for_onboard(
-                &staged.raw_token,
-                &node_id,
-                &keys,
-                &db,
-                &secrets,
-            )),
-            "url" => Some(live_join_url_for_onboard(
-                &staged.raw_token,
-                &node_id,
-                &keys,
-                &db,
-                &mut warnings,
-            )),
-            _ => None,
-        };
+        let handshake_res: Option<Result<OnboardJoinResult, LiveHandshakeError>> =
+            match staged.format {
+                "hp2p1" => Some(live_pair_hp2p1_for_onboard(
+                    &staged.raw_token,
+                    &state_dir,
+                    &node_id,
+                    &keys,
+                    &db,
+                    &secrets,
+                )),
+                "am2" => Some(live_pair_am2_for_onboard(
+                    &staged.raw_token,
+                    &node_id,
+                    &keys,
+                    &db,
+                    &secrets,
+                )),
+                "url" => Some(live_join_url_for_onboard(
+                    &staged.raw_token,
+                    &node_id,
+                    &keys,
+                    &db,
+                    &mut warnings,
+                )),
+                _ => None,
+            };
 
         match handshake_res {
             Some(Ok(outcome)) => {
@@ -1396,10 +1388,7 @@ fn run_onboard_deterministic(
         if using_default_paths {
             next.push("hyp setup --harness all".to_string());
         } else {
-            next.push(format!(
-                "hyp setup --harness all --home {}",
-                home.display()
-            ));
+            next.push(format!("hyp setup --harness all --home {}", home.display()));
         }
     }
     for step in extra_next {
@@ -1571,7 +1560,10 @@ fn is_generic_localhost(raw: &str) -> bool {
 }
 
 fn run_trimmed_stdout(program: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(program).args(args).output().ok()?;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1698,7 +1690,14 @@ fn read_and_stage_join_token(
             .lock()
             .take(MAX_JOIN_TOKEN_BYTES + 1)
             .read_to_string(&mut buf)
-            .map_err(|e| (EXIT_ERROR, "STDIN_ERROR", format!("Failed reading join token from stdin: {e}"), None))?;
+            .map_err(|e| {
+                (
+                    EXIT_ERROR,
+                    "STDIN_ERROR",
+                    format!("Failed reading join token from stdin: {e}"),
+                    None,
+                )
+            })?;
         buf
     } else {
         // Security invariant: refuse raw pairing tokens passed directly in CLI argv!
@@ -1860,7 +1859,8 @@ fn read_and_stage_join_token(
                 None,
             )
         })?;
-        warnings.push("Staged legacy v1 t3mp1_ code; prefer v2 am2_ or hp2p1_ bundles.".to_string());
+        warnings
+            .push("Staged legacy v1 t3mp1_ code; prefer v2 am2_ or hp2p1_ bundles.".to_string());
         Ok(StagedJoin {
             format: "t3mp1",
             peer_node_id: None,
@@ -2070,8 +2070,7 @@ pub fn detect_harness_statuses(
                     }
                 }
 
-                let configured =
-                    !claude_profiles.is_empty() && unconfigured_profile.is_none();
+                let configured = !claude_profiles.is_empty() && unconfigured_profile.is_none();
                 let (detail, fix) = if configured {
                     (
                         format!("Configured ({})", configured_locations.join(", ")),
@@ -2710,10 +2709,7 @@ fn configure_statusline_in_doc(
     match existing {
         None => {
             let cmd = statusline_command(bin, target.as_str(), opts.socket, None);
-            settings_doc.insert(
-                "statusLine".to_string(),
-                target.build_statusline_value(cmd),
-            );
+            settings_doc.insert("statusLine".to_string(), target.build_statusline_value(cmd));
             notes.push(format!(
                 "Configured Hyphae live statusLine for {}.",
                 target.as_str()
@@ -2729,16 +2725,9 @@ fn configure_statusline_in_doc(
                 None if default_chain_path.exists() => Some(default_chain_path.to_path_buf()),
                 None => None,
             };
-            let cmd = statusline_command(
-                bin,
-                target.as_str(),
-                opts.socket,
-                chain_to_keep.as_deref(),
-            );
-            settings_doc.insert(
-                "statusLine".to_string(),
-                target.build_statusline_value(cmd),
-            );
+            let cmd =
+                statusline_command(bin, target.as_str(), opts.socket, chain_to_keep.as_deref());
+            settings_doc.insert("statusLine".to_string(), target.build_statusline_value(cmd));
             if let Some(ref cp) = chain_to_keep {
                 notes.push(format!(
                     "Updated Hyphae statusLine idempotently (preserved existing --chain-file {}).",
@@ -2754,16 +2743,9 @@ fn configure_statusline_in_doc(
         Some(custom_val) => {
             maybe_write_json(default_chain_path, &custom_val, true, opts.dry_run)?;
             files.push(default_chain_path.display().to_string());
-            let cmd = statusline_command(
-                bin,
-                target.as_str(),
-                opts.socket,
-                Some(default_chain_path),
-            );
-            settings_doc.insert(
-                "statusLine".to_string(),
-                target.build_statusline_value(cmd),
-            );
+            let cmd =
+                statusline_command(bin, target.as_str(), opts.socket, Some(default_chain_path));
+            settings_doc.insert("statusLine".to_string(), target.build_statusline_value(cmd));
             notes.push(format!(
                 "Preserved existing {} statusLine in {} (0600) and chained via --chain-file.",
                 target.as_str(),
@@ -3149,7 +3131,10 @@ fn setup_antigravity(
         dry_run,
     )?;
 
-    let sidecar_json = plugin_dir.join("sidecars").join("daemon").join("sidecar.json");
+    let sidecar_json = plugin_dir
+        .join("sidecars")
+        .join("daemon")
+        .join("sidecar.json");
     maybe_write_json(
         &sidecar_json,
         &json!({
@@ -3262,10 +3247,7 @@ fn setup_claude(
             let preserve_claude_channel = hyphae_entry
                 .get("args")
                 .and_then(Value::as_array)
-                .is_some_and(|args| {
-                    args.iter()
-                        .any(|a| a.as_str() == Some("--claude-channel"))
-                });
+                .is_some_and(|args| args.iter().any(|a| a.as_str() == Some("--claude-channel")));
             let claude_mcp_args = if preserve_claude_channel {
                 mcp_args(socket, &["--claude-channel"])
             } else {
@@ -3472,7 +3454,10 @@ fn setup_codex(
 
     let args_vec: Vec<String> = mcp_args(socket, &["--backend", "codex"])
         .into_iter()
-        .filter_map(|v| v.as_str().map(|s| serde_json::to_string(s).unwrap_or_default()))
+        .filter_map(|v| {
+            v.as_str()
+                .map(|s| serde_json::to_string(s).unwrap_or_default())
+        })
         .collect();
     let toml_block = format!(
         "[mcp_servers.hyphae]\ncommand = {}\nargs = [{}]\nenv_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]",
@@ -3708,8 +3693,7 @@ fn setup_opencode(
     skill_ctx: &SetupSkillContext,
 ) -> Result<HarnessSetupOutcome, String> {
     const OPENCODE_PLUGIN_TS: &str = include_str!("../../../plugins/opencode/hyphae.ts");
-    const OPENCODE_CMD_HYPHAE: &str =
-        include_str!("../../../plugins/opencode/commands/hyphae.md");
+    const OPENCODE_CMD_HYPHAE: &str = include_str!("../../../plugins/opencode/commands/hyphae.md");
 
     let socket = opts.socket;
     let dry_run = opts.dry_run;
@@ -3955,10 +3939,7 @@ pub fn read_openclaw_hyphae_preferences(home: &Path) -> (OpenClawDeliveryMode, b
             entry
                 .and_then(|e| e.get("hooks"))
                 .and_then(Value::as_object)
-                .and_then(|h| {
-                    h.get("allowPromptModification")
-                        .and_then(Value::as_bool)
-                })
+                .and_then(|h| h.get("allowPromptModification").and_then(Value::as_bool))
         })
         .unwrap_or(false);
     (delivery, prompt_injection)
@@ -4401,7 +4382,10 @@ mod tests {
         let state_dir = tmp.path().join("state");
         let default_chain = claude_chain_file_path(&home, &both[1], &state_dir);
         let gateway_chain = claude_chain_file_path(&home, &both[0], &state_dir);
-        assert_eq!(default_chain, state_dir.join("claude-statusline-chain.json"));
+        assert_eq!(
+            default_chain,
+            state_dir.join("claude-statusline-chain.json")
+        );
         assert_ne!(gateway_chain, default_chain);
         assert!(
             gateway_chain

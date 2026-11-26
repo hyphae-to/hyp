@@ -157,16 +157,20 @@ pub fn pack_delivery_batch(
         }
 
         let raw_block = format_inline_block(item);
-        let (mut candidate, mut was_truncated) =
-            if estimate_tokens(&raw_block) > max_single_tokens {
-                (truncate_item_preview(&raw_block, &item.id, max_single_tokens), true)
-            } else {
-                (raw_block, false)
-            };
+        let (mut candidate, mut was_truncated) = if estimate_tokens(&raw_block) > max_single_tokens
+        {
+            (
+                truncate_item_preview(&raw_block, &item.id, max_single_tokens),
+                true,
+            )
+        } else {
+            (raw_block, false)
+        };
 
         let remaining_after = &items[idx + 1..];
         let footer_after = build_footer(remaining_after, muted_count, false);
-        let candidate_total = compose_rendered_tokens(&inline_blocks, Some(&candidate), footer_after.as_deref());
+        let candidate_total =
+            compose_rendered_tokens(&inline_blocks, Some(&candidate), footer_after.as_deref());
 
         if candidate_total > max_budget {
             if inline_blocks.is_empty() {
@@ -330,7 +334,11 @@ fn compose_rendered_tokens(
     total_chars.div_ceil(4)
 }
 
-fn build_footer(spilled: &[&PackableItem], muted_count: usize, notify_only: bool) -> Option<String> {
+fn build_footer(
+    spilled: &[&PackableItem],
+    muted_count: usize,
+    notify_only: bool,
+) -> Option<String> {
     let muted_suffix = if muted_count > 0 {
         format!(" · {muted_count} muted")
     } else {
@@ -449,8 +457,20 @@ mod tests {
     fn notify_only_emits_slim_digest_with_piggybacked_muted() {
         let policy = SessionDeliveryPolicy::focus_mode();
         let items = vec![
-            mk("n1", DeliveryUrgency::Notify, "bob@laptop/codex", "PR ready", 10),
-            mk("n2", DeliveryUrgency::Notify, "bob@laptop/codex", "Tests green", 20),
+            mk(
+                "n1",
+                DeliveryUrgency::Notify,
+                "bob@laptop/codex",
+                "PR ready",
+                10,
+            ),
+            mk(
+                "n2",
+                DeliveryUrgency::Notify,
+                "bob@laptop/codex",
+                "Tests green",
+                20,
+            ),
         ];
         let batch = pack_delivery_batch(&items, 7, &policy).expect("digest must emit");
         assert!(batch.notify_only);
@@ -474,7 +494,11 @@ mod tests {
         let batch = pack_delivery_batch(&[item], 0, &policy).unwrap();
         assert_eq!(batch.truncated_ids, vec!["big-1"]);
         assert!(batch.inline_ids.is_empty());
-        assert!(batch.rendered.contains("full body in hyp_inbox(ids:[\"big-1\"])"));
+        assert!(
+            batch
+                .rendered
+                .contains("full body in hyp_inbox(ids:[\"big-1\"])")
+        );
         assert!(batch.estimated_tokens <= policy.max_batch_tokens);
     }
 
@@ -521,7 +545,11 @@ mod tests {
         }
         assert!(batch.rendered.contains("> ---"));
         assert!(batch.rendered.contains("> [hyphae · dm:admin@node]"));
-        assert!(batch.rendered.contains(">   [HYPHAE interrupt · root@host]"));
+        assert!(
+            batch
+                .rendered
+                .contains(">   [HYPHAE interrupt · root@host]")
+        );
 
         // Explicit `is_system_notice: true` still emits bare daemon notices cleanly.
         let mut sys = mk(

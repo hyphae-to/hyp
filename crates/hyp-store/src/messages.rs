@@ -300,10 +300,14 @@ impl<'a> MessageStore<'a> {
         now_ms: i64,
     ) -> StoreResult<HandleRecord> {
         if !is_node_id(node_id) {
-            return Err(StoreError::InvalidInput(format!("invalid node_id '{node_id}'")));
+            return Err(StoreError::InvalidInput(format!(
+                "invalid node_id '{node_id}'"
+            )));
         }
         if !is_handle(handle) {
-            return Err(StoreError::InvalidInput(format!("invalid handle '{handle}'")));
+            return Err(StoreError::InvalidInput(format!(
+                "invalid handle '{handle}'"
+            )));
         }
         let sanitized_desc = sanitize_handle_description(description);
         let tx = self.db.immediate_tx()?;
@@ -347,12 +351,7 @@ impl<'a> MessageStore<'a> {
     }
 
     /// Updates `last_heartbeat_at` for an enrolled handle. Returns `false` if not enrolled.
-    pub fn heartbeat_handle(
-        &self,
-        node_id: &str,
-        handle: &str,
-        now_ms: i64,
-    ) -> StoreResult<bool> {
+    pub fn heartbeat_handle(&self, node_id: &str, handle: &str, now_ms: i64) -> StoreResult<bool> {
         let changed = self.db.conn().execute(
             "UPDATE handles SET last_heartbeat_at = ?1 WHERE node_id = ?2 AND handle = ?3",
             params![now_ms, node_id, handle],
@@ -391,7 +390,9 @@ impl<'a> MessageStore<'a> {
         now_ms: i64,
     ) -> StoreResult<Vec<HandleRecord>> {
         if !is_node_id(node_id) {
-            return Err(StoreError::InvalidInput(format!("invalid node_id '{node_id}'")));
+            return Err(StoreError::InvalidInput(format!(
+                "invalid node_id '{node_id}'"
+            )));
         }
         let mut next: BTreeMap<String, Option<String>> = BTreeMap::new();
         for &(h, desc) in handles {
@@ -608,7 +609,11 @@ impl<'a> MessageStore<'a> {
     pub fn get_message(&self, id: &str) -> StoreResult<Option<MessageRecord>> {
         self.db
             .conn()
-            .query_row("SELECT * FROM messages WHERE id = ?1", params![id], decode_message_row)
+            .query_row(
+                "SELECT * FROM messages WHERE id = ?1",
+                params![id],
+                decode_message_row,
+            )
             .optional()?
             .transpose()
     }
@@ -754,7 +759,9 @@ impl<'a> ChannelStore<'a> {
         now_ms: i64,
     ) -> StoreResult<ChannelMembership> {
         if !is_node_id(host_node) {
-            return Err(StoreError::InvalidInput(format!("invalid host_node '{host_node}'")));
+            return Err(StoreError::InvalidInput(format!(
+                "invalid host_node '{host_node}'"
+            )));
         }
         if !is_channel_name(channel) {
             return Err(StoreError::InvalidInput(format!(
@@ -764,7 +771,9 @@ impl<'a> ChannelStore<'a> {
         let address = format_address(node_id, handle);
         let tx = self.db.immediate_tx()?;
         if !is_enrolled_conn(tx.conn(), &address)? {
-            return Err(StoreError::NotFound(format!("handle '{address}' is not enrolled")));
+            return Err(StoreError::NotFound(format!(
+                "handle '{address}' is not enrolled"
+            )));
         }
         tx.conn().execute(
             "INSERT OR REPLACE INTO channel_members (host_node, channel, address, joined_at)
@@ -790,10 +799,14 @@ impl<'a> ChannelStore<'a> {
         handle: &str,
     ) -> StoreResult<bool> {
         if !is_node_id(host_node) {
-            return Err(StoreError::InvalidInput(format!("invalid host_node '{host_node}'")));
+            return Err(StoreError::InvalidInput(format!(
+                "invalid host_node '{host_node}'"
+            )));
         }
         if !is_channel_name(channel) {
-            return Err(StoreError::InvalidInput(format!("invalid channel name '{channel}'")));
+            return Err(StoreError::InvalidInput(format!(
+                "invalid channel name '{channel}'"
+            )));
         }
         let address = format_address(node_id, handle);
         let changed = self.db.conn().execute(
@@ -832,8 +845,10 @@ impl<'a> ChannelStore<'a> {
                 "SELECT host_node, channel, address FROM channel_members
                  WHERE host_node = ?1 ORDER BY host_node ASC, channel ASC, address ASC",
             )?;
-            stmt.query_map(params![host], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<Result<Vec<_>, _>>()?
+            stmt.query_map(params![host], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
         } else {
             let mut stmt = self.db.conn().prepare(
                 "SELECT host_node, channel, address FROM channel_members
@@ -862,11 +877,7 @@ impl<'a> ChannelStore<'a> {
     /// Fans out a `#channel` post to every enrolled member (except the sender) **WITHOUT mutating
     /// `input.text`**, storing the channel name in the structured `messages.channel` column to
     /// preserve E2EE ciphertext authentication.
-    pub fn post(
-        &self,
-        input: &PostChannelInput,
-        now_ms: i64,
-    ) -> StoreResult<PostChannelResult> {
+    pub fn post(&self, input: &PostChannelInput, now_ms: i64) -> StoreResult<PostChannelResult> {
         if !is_node_id(&input.host_node) {
             return Err(StoreError::InvalidInput(format!(
                 "invalid host_node '{}'",
@@ -880,7 +891,9 @@ impl<'a> ChannelStore<'a> {
             )));
         }
         if input.id.is_empty() {
-            return Err(StoreError::InvalidInput("post id must be non-empty".to_string()));
+            return Err(StoreError::InvalidInput(
+                "post id must be non-empty".to_string(),
+            ));
         }
         let sender_addr = format_address(&input.from_node, &input.from_handle);
         let tx = self.db.immediate_tx()?;
@@ -939,11 +952,7 @@ impl<'a> ChannelStore<'a> {
     ///
     /// Enforces monotonic epoch progression: storing an older epoch fails closed with
     /// [`StoreError::EpochConflict`], while identical replay of an existing epoch is idempotent.
-    pub fn put_epoch(
-        &self,
-        input: &ChannelEpochInput,
-        now_ms: i64,
-    ) -> StoreResult<ChannelEpoch> {
+    pub fn put_epoch(&self, input: &ChannelEpochInput, now_ms: i64) -> StoreResult<ChannelEpoch> {
         if !is_node_id(&input.host_node) {
             return Err(StoreError::InvalidInput(format!(
                 "invalid host_node '{}'",
@@ -963,7 +972,9 @@ impl<'a> ChannelStore<'a> {
             )));
         }
         if input.epoch == 0 {
-            return Err(StoreError::InvalidInput("channel epoch must be >= 1".to_string()));
+            return Err(StoreError::InvalidInput(
+                "channel epoch must be >= 1".to_string(),
+            ));
         }
         let mut sorted_members = input.members.clone();
         sorted_members.sort();
@@ -991,7 +1002,10 @@ impl<'a> ChannelStore<'a> {
             }
             return Err(StoreError::EpochConflict {
                 scope: format!("{}/{}", input.host_node, input.channel),
-                message: format!("epoch {} already exists with different content", input.epoch),
+                message: format!(
+                    "epoch {} already exists with different content",
+                    input.epoch
+                ),
             });
         }
 
@@ -1165,7 +1179,9 @@ fn enqueue_in_tx(
     now_ms: i64,
 ) -> StoreResult<EnqueueResult> {
     if msg.id.is_empty() {
-        return Err(StoreError::InvalidInput("message id must be non-empty".to_string()));
+        return Err(StoreError::InvalidInput(
+            "message id must be non-empty".to_string(),
+        ));
     }
     if let Some(ch) = &msg.channel {
         if !is_channel_name(ch) {

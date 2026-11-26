@@ -22,15 +22,17 @@ use hyp_harness::hooks::{HookEvent, HookTransportHints};
 use hyp_harness::mcp::McpOptions;
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_async};
-use hyp_harness::transport::t3::{DEFAULT_T3_TOKEN_SECRET, T3Target, T3Transport, t3_state_db_path};
+use hyp_harness::transport::t3::{
+    DEFAULT_T3_TOKEN_SECRET, T3Target, T3Transport, t3_state_db_path,
+};
 use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::delivery::{DeliveryError, InboxQuery, InboxStateFilter, query_inbox};
 use hyp_node::engine::{LocalIngestServer, NodeConfig, UnifiedNode, send_local_ingest_event};
+use hyp_node::gates::SecurityGatePipeline;
 use hyp_node::gates::policy::{
     GateDecision, InboundContext, SecurityGateConfig, Stage1DenyAction, TrustTier as GateTrustTier,
     sign_gate_policy,
 };
-use hyp_node::gates::SecurityGatePipeline;
 use hyp_proto::address::NodeId;
 use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent, TYPE_SCHEDULED_MESSAGE_V1};
 use hyp_store::{
@@ -64,7 +66,11 @@ struct ScriptedTransport {
 }
 
 impl ScriptedTransport {
-    fn new(kind: &'static str, scripted: Vec<PushOutcome>, default_outcome: PushOutcome) -> Arc<Self> {
+    fn new(
+        kind: &'static str,
+        scripted: Vec<PushOutcome>,
+        default_outcome: PushOutcome,
+    ) -> Arc<Self> {
         Arc::new(Self {
             kind,
             outcomes: Mutex::new(scripted.into()),
@@ -187,9 +193,9 @@ async fn spawn_mock_t3_auth_server(
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 let auth_ok = match expected {
-                    Some(tok) => req_str
-                        .lines()
-                        .any(|line| line.eq_ignore_ascii_case(&format!("authorization: Bearer {tok}"))),
+                    Some(tok) => req_str.lines().any(|line| {
+                        line.eq_ignore_ascii_case(&format!("authorization: Bearer {tok}"))
+                    }),
                     None => false,
                 };
                 let body = format!("{{\"authenticated\":{auth_ok}}}");
@@ -298,7 +304,9 @@ async fn x3_unauthenticated_t3_never_attaches_and_t3_auth_missing_detaches_clean
 
     // Part B: With valid bearer token in SecretStore, authenticated T3 server DOES attach!
     let store = SecretStore::new(&state_dir, SecretBackend::File);
-    store.set(DEFAULT_T3_TOKEN_SECRET, "real-t3-secret").unwrap();
+    store
+        .set(DEFAULT_T3_TOKEN_SECRET, "real-t3-secret")
+        .unwrap();
     seed_t3_state_db(&t3_base, "sess-t3-authed", "thr-t3-authed");
 
     let pre2 = run_hook_with_hints(
@@ -495,7 +503,9 @@ async fn u4_mute_ttl_persists_across_reopen_and_daemon_restart_and_expires() {
     // 1. Store-level persistence across close & reopen + deterministic expiry check
     {
         let db = NodeDb::open(&db_path).unwrap();
-        db.local().register_session("claude:s-u4", "{}", t0).unwrap();
+        db.local()
+            .register_session("claude:s-u4", "{}", t0)
+            .unwrap();
         let rule = db
             .local()
             .add_mute_with_expiry("claude:s-u4", "noisy@peer/*", "human", t0, Some(exp))
@@ -510,7 +520,10 @@ async fn u4_mute_ttl_persists_across_reopen_and_daemon_restart_and_expires() {
     }
     {
         let db = NodeDb::open(&db_path).unwrap();
-        let before = db.local().list_mutes_at(Some("claude:s-u4"), t0 + 29_999).unwrap();
+        let before = db
+            .local()
+            .list_mutes_at(Some("claude:s-u4"), t0 + 29_999)
+            .unwrap();
         assert_eq!(before.len(), 1);
         assert_eq!(before[0].expires_at, Some(exp));
 
@@ -529,7 +542,10 @@ async fn u4_mute_ttl_persists_across_reopen_and_daemon_restart_and_expires() {
         );
         // Sweep deletes expired row cleanly and returns its (scope, pattern).
         let swept = db.local().sweep_expired_mutes(exp).unwrap();
-        assert_eq!(swept, vec![("claude:s-u4".to_string(), "noisy@peer/*".to_string())]);
+        assert_eq!(
+            swept,
+            vec![("claude:s-u4".to_string(), "noisy@peer/*".to_string())]
+        );
         assert!(db.local().sweep_expired_mutes(exp).unwrap().is_empty());
     }
 
@@ -703,7 +719,12 @@ async fn u6_g16_prune_sessions_removes_stale_idle_and_preserves_quarantined_and_
     // `stale-clean` MUST be pruned on startup; `stale-pending`, `stale-quarantined`, and `fresh-idle` MUST survive!
     {
         let db = node.db();
-        assert!(db.local().get_session("claude:stale-clean").unwrap().is_none());
+        assert!(
+            db.local()
+                .get_session("claude:stale-clean")
+                .unwrap()
+                .is_none()
+        );
         assert!(
             db.local()
                 .get_session("claude:stale-pending")
@@ -726,7 +747,12 @@ async fn u6_g16_prune_sessions_removes_stale_idle_and_preserves_quarantined_and_
                 .len(),
             1
         );
-        assert!(db.local().get_session("claude:fresh-idle").unwrap().is_some());
+        assert!(
+            db.local()
+                .get_session("claude:fresh-idle")
+                .unwrap()
+                .is_some()
+        );
     }
 
     // 3. Also verify periodic prune protects a stale session with a live attached transport,
@@ -905,9 +931,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
                         // First stream connection: send `id: 1` ready event then drop TCP connection!
                         let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
                         let _ = stream.write_all(hdr.as_bytes()).await;
-                        let _ = stream
-                            .write_all(b"id: 1\nevent: ready\ndata: {}\n\n")
-                            .await;
+                        let _ = stream.write_all(b"id: 1\nevent: ready\ndata: {}\n\n").await;
                         let _ = stream.flush().await;
                         // Abrupt EOF!
                     } else {
@@ -974,10 +998,18 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         .await;
     assert!(!drop_err, "drop_link failed: {drop_txt}");
     // Mark setup turn idle via Stop so idle PushTransport delivers immediately.
-    let _ = run_hook(&sock, HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "h6-sess" })).await;
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Claude,
+        HookEvent::Stop,
+        json!({ "session_id": "h6-sess" }),
+    )
+    .await;
 
     // Wait for reconnect + ingest + live delivery to `claude:h6-sess`!
-    let delivered = transport.wait_for_delivered(1, Duration::from_secs(5)).await;
+    let delivered = transport
+        .wait_for_delivered(1, Duration::from_secs(5))
+        .await;
     assert!(
         delivered[0].contains("H6_RECONNECTED_DIRECTIVE_PAYLOAD_77"),
         "expected reconnected human directive delivery, got: {:?}",
@@ -1007,7 +1039,10 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         Some("1"),
         "H6: reconnect MUST send Last-Event-ID from prior event: {ids:?}"
     );
-    assert!(ack_count.load(Ordering::SeqCst) >= 1, "must ack burned drop");
+    assert!(
+        ack_count.load(Ordering::SeqCst) >= 1,
+        "must ack burned drop"
+    );
 
     // Part B: Unrecoverable relay error (HTTP 410 Gone) delivers a safe metadata-only notice!
     let gone_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1041,7 +1076,8 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
                     );
                     let _ = stream.write_all(resp.as_bytes()).await;
                 } else {
-                    let resp = "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let resp =
+                        "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = stream.write_all(resp.as_bytes()).await;
                 }
             });
@@ -1061,9 +1097,17 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         )
         .await;
     assert!(!gone_err);
-    let _ = run_hook(&sock, HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "h6-sess" })).await;
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Claude,
+        HookEvent::Stop,
+        json!({ "session_id": "h6-sess" }),
+    )
+    .await;
 
-    let delivered_after_gone = transport.wait_for_delivered(2, Duration::from_secs(5)).await;
+    let delivered_after_gone = transport
+        .wait_for_delivered(2, Duration::from_secs(5))
+        .await;
     assert!(
         delivered_after_gone[1].contains("drop-gone-410")
             && delivered_after_gone[1].contains("410"),
@@ -1157,11 +1201,20 @@ async fn h9_human_verified_metadata_exposed_in_hyp_inbox_and_packed_headers() {
     assert!(!inbox_err, "hyp_inbox failed: {inbox_txt}");
     let inbox_val: Value = serde_json::from_str(&inbox_txt).unwrap();
     let items = inbox_val["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2, "expected 1 verified + 1 peer DM: {inbox_val}");
+    assert_eq!(
+        items.len(),
+        2,
+        "expected 1 verified + 1 peer DM: {inbox_val}"
+    );
 
     let verified_item = items
         .iter()
-        .find(|i| i["text"].as_str().unwrap_or("").contains("APPROVE_PROD_RELEASE_H9"))
+        .find(|i| {
+            i["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("APPROVE_PROD_RELEASE_H9")
+        })
         .expect("verified human item present");
     assert_eq!(verified_item["humanVerified"], true);
     assert_eq!(verified_item["verifiedHumanId"], "alice-admin");
@@ -1169,7 +1222,12 @@ async fn h9_human_verified_metadata_exposed_in_hyp_inbox_and_packed_headers() {
 
     let peer_item = items
         .iter()
-        .find(|i| i["text"].as_str().unwrap_or("").contains("UNTRUSTED_PEER_DM_H9"))
+        .find(|i| {
+            i["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("UNTRUSTED_PEER_DM_H9")
+        })
         .expect("peer item present");
     assert!(
         peer_item.get("humanVerified").is_none() || peer_item["humanVerified"] == false,
@@ -1224,7 +1282,8 @@ async fn g8_approving_quarantined_local_ingest_fans_out_to_subscribed_sessions()
         .inbound_regex_denylist
         .push("HOLD_FOR_APPROVAL".into());
     gate_cfg.stage1.regex_deny_action = Stage1DenyAction::Quarantine;
-    let pipeline = Arc::new(SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap());
+    let pipeline =
+        Arc::new(SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap());
 
     let daemon = LocalDaemon::start(
         Arc::clone(&node),
@@ -1312,7 +1371,9 @@ async fn g8_approving_quarantined_local_ingest_fans_out_to_subscribed_sessions()
     );
 
     // 3. Subscribed session's live transport MUST receive the approved local-ingest event without re-quarantine!
-    let delivered = transport.wait_for_delivered(1, Duration::from_secs(3)).await;
+    let delivered = transport
+        .wait_for_delivered(1, Duration::from_secs(3))
+        .await;
     assert!(
         delivered[0].contains("HOLD_FOR_APPROVAL nightly backup summary #42"),
         "subscribed session must receive approved local-ingest payload: {:?}",
@@ -1350,7 +1411,8 @@ async fn g10_reconcile_quarantine_surfaces_coalesced_metadata_only_notice() {
         .inbound_regex_denylist
         .push("SECRET_EXFIL_BODY_G10".into());
     gate_cfg.stage1.regex_deny_action = Stage1DenyAction::Quarantine;
-    let pipeline = Arc::new(SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap());
+    let pipeline =
+        Arc::new(SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap());
 
     let daemon = LocalDaemon::start(
         Arc::clone(&node),
@@ -1531,7 +1593,11 @@ async fn g12_query_inbox_and_mcp_never_leak_quarantined_rejected_or_blocked_item
     };
 
     let r_valid = put("g12-ok", "VISIBLE_ALLOWED_BODY", GateState::Pending);
-    let r_quar = put("g12-q", "HIDDEN_QUARANTINED_BODY_999", GateState::Quarantined);
+    let r_quar = put(
+        "g12-q",
+        "HIDDEN_QUARANTINED_BODY_999",
+        GateState::Quarantined,
+    );
     let r_rej = put("g12-r", "HIDDEN_REJECTED_BODY_888", GateState::Rejected);
 
     // Direct `query_inbox({ state: All, ids: [r_quar, r_rej, r_valid] })` returns ONLY `r_valid`!
@@ -1935,7 +2001,10 @@ async fn u2_session_leave_channel_returns_error_when_not_a_member() {
         }),
     )
     .await;
-    assert!(leave_ok.ok, "first leave_channel should succeed: {leave_ok:?}");
+    assert!(
+        leave_ok.ok,
+        "first leave_channel should succeed: {leave_ok:?}"
+    );
 
     let leave_twice = rpc(
         &sock,
@@ -2081,9 +2150,17 @@ async fn h18_drop_watcher_ignores_junk_envelope_and_delivers_subsequent_valid_dr
         .await;
     assert!(!drop_err);
     // Mark setup turn idle via Stop so idle PushTransport delivers immediately.
-    let _ = run_hook(&sock, HarnessKind::Claude, HookEvent::Stop, json!({ "session_id": "h18-sess" })).await;
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Claude,
+        HookEvent::Stop,
+        json!({ "session_id": "h18-sess" }),
+    )
+    .await;
 
-    let delivered = transport.wait_for_delivered(1, Duration::from_secs(5)).await;
+    let delivered = transport
+        .wait_for_delivered(1, Duration::from_secs(5))
+        .await;
     assert!(
         delivered[0].contains("REAL_HUMAN_DROP_AFTER_JUNK_H18"),
         "H18: drop watcher must survive junk envelope and deliver valid drop: {delivered:?}"
@@ -2116,7 +2193,8 @@ async fn g8_approval_never_blanket_approves_unrelated_batches_and_sweeps_on_star
         .inbound_regex_denylist
         .push("BLOCK_UNRELATED_G8".into());
     gate_cfg.stage1.regex_deny_action = Stage1DenyAction::Quarantine;
-    let pipeline = Arc::new(SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap());
+    let pipeline =
+        Arc::new(SecurityGatePipeline::new(gate_cfg, Arc::clone(&gate_db), None).unwrap());
 
     let daemon = LocalDaemon::start(
         Arc::clone(&node),
@@ -2197,7 +2275,9 @@ async fn g8_approval_never_blanket_approves_unrelated_batches_and_sweeps_on_star
     let wake = rpc(&sock, &json!({ "type": "inbox.wake", "receipt": q_rcpt })).await;
     assert!(wake.ok);
 
-    let delivered = transport.wait_for_delivered(1, Duration::from_secs(3)).await;
+    let delivered = transport
+        .wait_for_delivered(1, Duration::from_secs(3))
+        .await;
     let combined = delivered.join("\n");
     assert!(
         combined.contains("explicitly human approved"),

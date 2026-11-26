@@ -241,7 +241,10 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     assert_eq!(dry_json["ok"], true);
     assert_eq!(dry_json["data"]["dryRun"], true);
     assert_eq!(dry_json["data"]["configuredCount"], 9);
-    assert!(!home.join(".openclaw").exists(), "dry-run must not write files");
+    assert!(
+        !home.join(".openclaw").exists(),
+        "dry-run must not write files"
+    );
 
     // 3. Run real `setup --harness all`
     let setup1 = isolated_cmd(&home)
@@ -337,8 +340,10 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     );
 
     let agy_sidecar: Value = serde_json::from_str(
-        &fs::read_to_string(home.join(".gemini/config/plugins/hyphae/sidecars/daemon/sidecar.json"))
-            .unwrap(),
+        &fs::read_to_string(
+            home.join(".gemini/config/plugins/hyphae/sidecars/daemon/sidecar.json"),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(agy_sidecar["restart_policy"], "on-failure");
@@ -364,7 +369,8 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     for (path, first_content) in &snapshots {
         let second_content = fs::read_to_string(path).unwrap();
         assert_eq!(
-            first_content, &second_content,
+            first_content,
+            &second_content,
             "setup must be strictly idempotent for {}",
             path.display()
         );
@@ -487,8 +493,7 @@ fn secret_stdin_and_web_out_of_band_capture() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let client: Client<_, Full<Bytes>> =
-            Client::builder(TokioExecutor::new()).build_http();
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
 
         // GET HTML form and extract hidden CSRF nonce
         let get_req = Request::builder()
@@ -675,7 +680,13 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
     // Re-lock via `gate lock` (confirmed via interactive POSIX PTY) -> doctor returns OK again
     let lock_out = run_hyp_in_pty(
         &home,
-        &["gate", "lock", "--state-dir", state_dir.to_str().unwrap(), "--json"],
+        &[
+            "gate",
+            "lock",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ],
         None,
         Some("y\n"),
     );
@@ -1166,10 +1177,20 @@ fn status_and_doctor_version_skew_table() {
     assert_eq!(find_peer("team-v22")["kv"], "kv.e2ee.v1");
     assert_eq!(find_peer("team-v20")["status"], "warn");
     assert_eq!(find_peer("team-v20")["kv"], "missing");
-    assert!(find_peer("team-v20")["upgradeHint"].as_str().unwrap().contains("team-v20"));
+    assert!(
+        find_peer("team-v20")["upgradeHint"]
+            .as_str()
+            .unwrap()
+            .contains("team-v20")
+    );
     assert_eq!(find_peer("legacy-v11")["status"], "fail");
     assert_eq!(find_peer("legacy-v11")["e2ee"], "missing");
-    assert!(find_peer("legacy-v11")["notes"].as_str().unwrap().contains("dm.e2ee.v1"));
+    assert!(
+        find_peer("legacy-v11")["notes"]
+            .as_str()
+            .unwrap()
+            .contains("dm.e2ee.v1")
+    );
 
     // Check `doctor --json` exits 1 due to the FAIL peer skew!
     let doctor_out = isolated_cmd(&home)
@@ -1319,7 +1340,12 @@ fn status_and_doctor_classify_inbound_local_v2_peers_and_fail_closed_without_enc
     assert_eq!(gn["version"], "v2-client");
     assert_eq!(gn["e2ee"], "dm+chan");
     assert_eq!(gn["kv"], "kv.e2ee.v1");
-    assert!(gn["notes"].as_str().unwrap().contains("inbound v2 local client"));
+    assert!(
+        gn["notes"]
+            .as_str()
+            .unwrap()
+            .contains("inbound v2 local client")
+    );
 
     let guest = find_peer("guest@reader").expect("inbound local v2 guest present");
     assert_eq!(guest["status"], "ok");
@@ -1342,7 +1368,12 @@ fn status_and_doctor_classify_inbound_local_v2_peers_and_fail_closed_without_enc
         ])
         .output()
         .unwrap();
-    assert_eq!(doc_ok.status.code(), Some(0), "doctor should pass for healthy inbound local v2 peers: {}", String::from_utf8_lossy(&doc_ok.stdout));
+    assert_eq!(
+        doc_ok.status.code(),
+        Some(0),
+        "doctor should pass for healthy inbound local v2 peers: {}",
+        String::from_utf8_lossy(&doc_ok.stdout)
+    );
 
     // 4. Nearby mutated invalid cases MUST fail closed under `requireE2ee = true`:
     //    (a) inbound local peer WITHOUT a pinned X25519 encryption key
@@ -1473,8 +1504,12 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
         } else {
             ("hyp", b"#!/bin/sh\necho broken >&2\nexit 42\n")
         };
-        pack_tar_gz_bytes(&[(entry_name, script_bytes)], &mut buf, TarPackOptions::default())
-            .unwrap();
+        pack_tar_gz_bytes(
+            &[(entry_name, script_bytes)],
+            &mut buf,
+            TarPackOptions::default(),
+        )
+        .unwrap();
         buf
     };
     let broken_sha = hex::encode(Sha256::digest(&broken_archive));
@@ -1497,7 +1532,9 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     let eligible_hits = Arc::new(AtomicUsize::new(0));
     let public_hits = Arc::new(AtomicUsize::new(0));
     let remote_updated_before_local = Arc::new(AtomicBool::new(false));
-    let target_bin = tmp.path().join(if cfg!(windows) { "hyp.exe" } else { "hyp" });
+    let target_bin = tmp
+        .path()
+        .join(if cfg!(windows) { "hyp.exe" } else { "hyp" });
     let sentinel_original = b"original-sentinel-binary-bytes-v0";
     fs::write(&target_bin, sentinel_original).unwrap();
 
@@ -1528,7 +1565,11 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
             });
             let signed = release_kp.sign_jcs("release", &payload_val).unwrap();
             let sig = if tamper_sig {
-                let first = if signed.sig.starts_with('A') { 'B' } else { 'A' };
+                let first = if signed.sig.starts_with('A') {
+                    'B'
+                } else {
+                    'A'
+                };
                 format!("{first}{}", &signed.sig[1..])
             } else {
                 signed.sig
@@ -2054,8 +2095,14 @@ fn node_start_legacy_v1_and_http_manifest_probe() {
     assert_eq!(startup_env["ok"], true);
 
     let status_file = state_dir.join("node.status.json");
-    assert!(status_file.exists(), "node.status.json must be written on start");
-    assert!(state_dir.join("node.pid").exists(), "node.pid must be written on start");
+    assert!(
+        status_file.exists(),
+        "node.status.json must be written on start"
+    );
+    assert!(
+        state_dir.join("node.pid").exists(),
+        "node.pid must be written on start"
+    );
 
     let status_doc: Value =
         serde_json::from_str(&fs::read_to_string(&status_file).unwrap()).unwrap();

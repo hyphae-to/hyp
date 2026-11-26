@@ -222,12 +222,13 @@ pub async fn run_wait_to_writer_with_token<W: Write>(
         return Err(WaitError::MissingSession);
     }
 
-    let (read_half, mut write_half) = connect_daemon_async(&options.socket_path)
-        .await
-        .map_err(|source| WaitError::Connect {
-            path: options.socket_path.display().to_string(),
-            source,
-        })?;
+    let (read_half, mut write_half) =
+        connect_daemon_async(&options.socket_path)
+            .await
+            .map_err(|source| WaitError::Connect {
+                path: options.socket_path.display().to_string(),
+                source,
+            })?;
     let mut reader = BufReader::new(read_half);
 
     let mut sub = Map::new();

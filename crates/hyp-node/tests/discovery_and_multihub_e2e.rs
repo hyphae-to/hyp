@@ -69,10 +69,11 @@ where
     loop {
         let items = node.peek_local_inbox(session_id, 50).expect("peek inbox");
         if let Some(found) = items.into_iter().find(|e| predicate(e)) {
-            let _ = node
-                .db()
-                .local()
-                .acknowledge_inbox(session_id, &[found.receipt.as_str()], now_ms());
+            let _ = node.db().local().acknowledge_inbox(
+                session_id,
+                &[found.receipt.as_str()],
+                now_ms(),
+            );
             return found;
         }
         let now = tokio::time::Instant::now();
@@ -90,7 +91,12 @@ where
 async fn spawn_hub(
     node_id: &str,
     dir: &Path,
-) -> (Arc<UnifiedNode>, Ed25519KeyPair, String, tokio::task::JoinHandle<()>) {
+) -> (
+    Arc<UnifiedNode>,
+    Ed25519KeyPair,
+    String,
+    tokio::task::JoinHandle<()>,
+) {
     let admin_ca = Ed25519KeyPair::generate().unwrap();
     let admin_proto_jwk = OkpJwk::new(OkpCurve::Ed25519, &admin_ca.public_key_bytes());
     let mut cfg = NodeConfig::router(NodeId::new(node_id).unwrap(), dir);
@@ -198,7 +204,10 @@ async fn handle_description_wire_roundtrip_sanitization_and_v020_compat() {
         .register_handle_with_description("sess-alice-long", "longdesc", Some(&overlong_utf8))
         .await
         .unwrap();
-    assert_eq!(long_rec.description.as_deref(), Some(expected_truncated.as_str()));
+    assert_eq!(
+        long_rec.description.as_deref(),
+        Some(expected_truncated.as_str())
+    );
 
     bob.register_handle_with_description(
         "sess-bob",
@@ -302,7 +311,10 @@ async fn handle_description_wire_roundtrip_sanitization_and_v020_compat() {
         .iter()
         .find(|h| h.address == "alice@macbook/longdesc")
         .unwrap();
-    assert_eq!(long.description.as_deref(), Some(expected_truncated.as_str()));
+    assert_eq!(
+        long.description.as_deref(),
+        Some(expected_truncated.as_str())
+    );
 
     // Backward-compatible `register_handle` clears description to `None` while preserving sibling handles.
     alice
@@ -319,7 +331,10 @@ async fn handle_description_wire_roundtrip_sanitization_and_v020_compat() {
         .iter()
         .find(|h| h.address == "alice@macbook/longdesc")
         .unwrap();
-    assert_eq!(long.description.as_deref(), Some(expected_truncated.as_str()));
+    assert_eq!(
+        long.description.as_deref(),
+        Some(expected_truncated.as_str())
+    );
 
     // Set description again and force a full `connect_peer` reconnect: descriptions MUST survive!
     alice
@@ -336,12 +351,18 @@ async fn handle_description_wire_roundtrip_sanitization_and_v020_compat() {
         .iter()
         .find(|h| h.address == "alice@macbook/reviewer")
         .unwrap();
-    assert_eq!(rev.description.as_deref(), Some("Persists across reconnect"));
+    assert_eq!(
+        rev.description.as_deref(),
+        Some("Persists across reconnect")
+    );
     let long = discovered_after_reconnect
         .iter()
         .find(|h| h.address == "alice@macbook/longdesc")
         .unwrap();
-    assert_eq!(long.description.as_deref(), Some(expected_truncated.as_str()));
+    assert_eq!(
+        long.description.as_deref(),
+        Some(expected_truncated.as_str())
+    );
 
     alice.shutdown();
     bob.shutdown();
@@ -461,7 +482,8 @@ async fn multi_hub_automatic_dm_and_file_transfer_routing_without_hub_prefix() {
         .unwrap();
     assert!(dm_carol_res.encrypted);
     assert_eq!(dm_carol_res.routed_via, "hub-alpha");
-    let carol_got = wait_for_mailbox_item(&carol, "sess-carol", |m| m.text == dm_carol_secret).await;
+    let carol_got =
+        wait_for_mailbox_item(&carol, "sess-carol", |m| m.text == dm_carol_secret).await;
     assert_eq!(carol_got.kind, MailboxKind::Message);
     assert_eq!(carol_got.source, "alice@macbook/alice");
     assert_zero_plaintext_in_sqlite(hub_alpha_dir.path(), dm_carol_secret);
@@ -767,8 +789,7 @@ async fn connect_peer_and_pair_seed_routes_immediately() {
 
     let (hub_alpha, alpha_ca, _alpha_url, _alpha_srv) =
         spawn_hub("hub-alpha", hub_alpha_dir.path()).await;
-    let (hub_beta, beta_ca, beta_url, _beta_srv) =
-        spawn_hub("hub-beta", hub_beta_dir.path()).await;
+    let (hub_beta, beta_ca, beta_url, _beta_srv) = spawn_hub("hub-beta", hub_beta_dir.path()).await;
 
     // Carol and Bob join their hubs BEFORE Alice ever connects.
     let carol = open_local("carol@workstation", carol_dir.path());
@@ -811,7 +832,11 @@ async fn connect_peer_and_pair_seed_routes_immediately() {
     );
 
     // Clear `peer_routes` manually and reconnect via `connect_peer` -> re-seeds immediately!
-    alice.db().peers().delete_peer_routes_via("hub-beta").unwrap();
+    alice
+        .db()
+        .peers()
+        .delete_peer_routes_via("hub-beta")
+        .unwrap();
     assert!(
         alice
             .db()

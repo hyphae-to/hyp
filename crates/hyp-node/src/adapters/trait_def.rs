@@ -119,11 +119,8 @@ pub trait NodeAdapterHost: Send + Sync {
     ) -> BoxFuture<'a, Result<PublishOutcome, AdapterError>>;
 
     /// Reports a change in an adapter's health status.
-    fn update_status<'a>(
-        &'a self,
-        adapter_id: &'a str,
-        health: AdapterHealth,
-    ) -> BoxFuture<'a, ()>;
+    fn update_status<'a>(&'a self, adapter_id: &'a str, health: AdapterHealth)
+    -> BoxFuture<'a, ()>;
 
     /// Reports that one or more events for `target` could not be delivered.
     fn report_delivery_failed<'a>(

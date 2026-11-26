@@ -18,9 +18,7 @@ use crate::ui::{
 use crate::update::read_cached_update_status;
 use clap::Args;
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
-use hyp_node::engine::{
-    DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile,
-};
+use hyp_node::engine::{DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile};
 use hyp_node::gates::policy::{FilterAdapterConfig, LlmProvider, SecurityGateConfig};
 use hyp_node::gates::stage2::validate_classifier_endpoint_url;
 use hyp_proto::manifest::{
@@ -244,7 +242,10 @@ fn run_status_or_doctor(
                 if cfg.is_legacy_v1 {
                     checks.push(CliCheck::warn(
                         "config",
-                        format!("Loaded legacy v1 connector config at {}", cfg.path.display()),
+                        format!(
+                            "Loaded legacy v1 connector config at {}",
+                            cfg.path.display()
+                        ),
                         Some("Run `hyp onboard` to write native v2 node.json.".to_string()),
                     ));
                 } else {
@@ -287,10 +288,8 @@ fn run_status_or_doctor(
                     "store.sqlite",
                     format!("node.sqlite schema v{schema}{backup_note}"),
                 ));
-                let backup_files: Vec<String> = backups
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect();
+                let backup_files: Vec<String> =
+                    backups.iter().map(|p| p.display().to_string()).collect();
                 let report = StorageStatusReport {
                     path: db_path.display().to_string(),
                     exists: true,
@@ -437,13 +436,11 @@ fn run_status_or_doctor(
     let status_doc: Option<Value> = fs::read_to_string(&status_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-    let mut socket_path: Option<String> = status_doc
-        .as_ref()
-        .and_then(|v| {
-            v.get("socketPath")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        });
+    let mut socket_path: Option<String> = status_doc.as_ref().and_then(|v| {
+        v.get("socketPath")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    });
     if let Some(ref sock) = socket_path {
         if std::path::Path::new(sock).exists() {
             checks.push(CliCheck::ok(
@@ -576,7 +573,10 @@ fn run_status_or_doctor(
         match row.status {
             CheckStatus::Ok => checks.push(CliCheck::ok(
                 check_name,
-                format!("{} ({}, e2ee={}, kv={})", row.version, row.proto, row.e2ee, row.kv),
+                format!(
+                    "{} ({}, e2ee={}, kv={})",
+                    row.version, row.proto, row.e2ee, row.kv
+                ),
             )),
             CheckStatus::Warn => checks.push(CliCheck::warn(
                 check_name,
@@ -593,11 +593,8 @@ fn run_status_or_doctor(
     }
 
     // 2. Security Gate Policy & Quarantine status
-    let gate_status = inspect_gate_status(
-        loaded_cfg.as_ref().map(|c| &c.raw),
-        &secrets,
-        db.as_ref(),
-    );
+    let gate_status =
+        inspect_gate_status(loaded_cfg.as_ref().map(|c| &c.raw), &secrets, db.as_ref());
     match gate_status.gate_policy_sig.as_str() {
         "OK" => checks.push(CliCheck::ok("gate.policy_sig", gate_status.detail.clone())),
         "FAIL" => checks.push(CliCheck::fail(
@@ -633,7 +630,10 @@ fn run_status_or_doctor(
                 "{} quarantined item(s) awaiting human CLI review",
                 gate_status.quarantined_count
             ),
-            Some(format!("hyp gate review --state-dir {}", state_dir.display())),
+            Some(format!(
+                "hyp gate review --state-dir {}",
+                state_dir.display()
+            )),
         ));
     }
 
@@ -649,15 +649,13 @@ fn run_status_or_doctor(
         .and_then(|c| c.raw.get("localIngest"))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
-    let recorded_ingest_socket: Option<PathBuf> = status_doc
-        .as_ref()
-        .and_then(|v| {
-            v.get("localIngestSocket")
-                .and_then(serde_json::Value::as_str)
-                .map(PathBuf::from)
-        });
-    let ingest_socket_path = recorded_ingest_socket
-        .unwrap_or_else(|| local_ingest_cfg.resolved_socket_path(&state_dir));
+    let recorded_ingest_socket: Option<PathBuf> = status_doc.as_ref().and_then(|v| {
+        v.get("localIngestSocket")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+    });
+    let ingest_socket_path =
+        recorded_ingest_socket.unwrap_or_else(|| local_ingest_cfg.resolved_socket_path(&state_dir));
     let ingest_socket_exists = ingest_socket_path.exists();
     let ingest_routes_count = local_ingest_cfg.effective_routes().len();
     if local_ingest_cfg.enabled {
@@ -771,7 +769,9 @@ fn run_status_or_doctor(
 
     // 5. Update channel & cached available update notice
     let update_status = read_cached_update_status(
-        loaded_cfg.as_ref().and_then(|c| c.update_channel.as_deref()),
+        loaded_cfg
+            .as_ref()
+            .and_then(|c| c.update_channel.as_deref()),
         db.as_ref(),
         now_ms(),
     );
@@ -805,7 +805,10 @@ fn run_status_or_doctor(
     for h in &harnesses {
         if h.detected || h.configured {
             if h.configured {
-                checks.push(CliCheck::ok(format!("harness:{}", h.harness), h.detail.clone()));
+                checks.push(CliCheck::ok(
+                    format!("harness:{}", h.harness),
+                    h.detail.clone(),
+                ));
             } else {
                 checks.push(CliCheck::warn(
                     format!("harness:{}", h.harness),
@@ -819,9 +822,7 @@ fn run_status_or_doctor(
     // 5. StatusLine diagnostics for Claude Code & Antigravity CLI (non-failing info/warning checks)
     let status_lines: Vec<StatusLineDiagnostic> = resolved_home
         .as_deref()
-        .map(|h| {
-            detect_statusline_statuses(h, explicit_home, claude_config_dir_arg.as_deref())
-        })
+        .map(|h| detect_statusline_statuses(h, explicit_home, claude_config_dir_arg.as_deref()))
         .unwrap_or_default();
     for sl in &status_lines {
         if sl.configured {
@@ -1055,7 +1056,11 @@ fn run_status_or_doctor(
         );
         println!(
             "  Ingest:   {} (topic=local.{}, routes={}, socket={}{})",
-            if local_ingest_cfg.enabled { "enabled" } else { "disabled" },
+            if local_ingest_cfg.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             local_ingest_cfg.default_topic,
             ingest_routes_count,
             ingest_socket_path.display(),
@@ -1067,7 +1072,11 @@ fn run_status_or_doctor(
             has_enc_jwk_count,
             min_auth_epoch,
             if has_node_cert { "yes" } else { "no" },
-            if drop_relay_cfg.enabled { "enabled" } else { "disabled" },
+            if drop_relay_cfg.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             drop_relay_url
                 .as_deref()
                 .map(|u| format!(", url={u}"))
@@ -1190,7 +1199,10 @@ pub fn evaluate_peer_skew(
     local_require_e2ee: bool,
     has_pinned_enc_key: bool,
 ) -> PeerSkewRow {
-    let parsed_manifest = peer.manifest_json.as_deref().and_then(parse_cached_manifest);
+    let parsed_manifest = peer
+        .manifest_json
+        .as_deref()
+        .and_then(parse_cached_manifest);
 
     // Determine if this peer is a read-only public guest hub (e.g. public.hyphae.to) where DMs/KV are unused.
     let is_guest_ro = peer.trust_tier == TrustTier::Guest
@@ -1408,7 +1420,10 @@ pub fn evaluate_peer_skew(
             notes: "Legacy v1 peer (plaintext DMs; will ratchet to E2EE on upgrade)".to_string(),
             admitted_by_human_id: peer.admitted_by_human_id.clone(),
             admitted_auth_epoch: peer.admitted_auth_epoch,
-            upgrade_hint: Some(format!("Upgrade '{}' to hyp >= 2.2.0 for E2EE, pushdown, and Shared KV.", peer.peer_id)),
+            upgrade_hint: Some(format!(
+                "Upgrade '{}' to hyp >= 2.2.0 for E2EE, pushdown, and Shared KV.",
+                peer.peer_id
+            )),
             missing_capabilities: missing_optional,
         };
     }
@@ -1585,16 +1600,7 @@ fn redact_plugin_error(raw: &str) -> String {
 fn looks_sensitive_token(tok: &str) -> bool {
     let trimmed = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | '('));
     let prefixes = [
-        "sk-",
-        "ghp_",
-        "gho_",
-        "xoxb-",
-        "xoxp-",
-        "AIza",
-        "AKIA",
-        "am2_",
-        "hp2p1_",
-        "t3mp1_",
+        "sk-", "ghp_", "gho_", "xoxb-", "xoxp-", "AIza", "AKIA", "am2_", "hp2p1_", "t3mp1_",
         "hdrop1_",
     ];
     if prefixes.iter().any(|p| trimmed.starts_with(p)) {
@@ -1603,10 +1609,7 @@ fn looks_sensitive_token(tok: &str) -> bool {
     // Telegram bot tokens: `<digits>:<secret>`
     if let Some((left, right)) = trimmed.split_once(':') {
         let digits = left.strip_prefix("bot").unwrap_or(left);
-        if digits.len() >= 6
-            && digits.bytes().all(|b| b.is_ascii_digit())
-            && right.len() >= 16
-        {
+        if digits.len() >= 6 && digits.bytes().all(|b| b.is_ascii_digit()) && right.len() >= 16 {
             return true;
         }
     }
@@ -1838,7 +1841,10 @@ pub(crate) fn parse_https_port_from_url(raw: &str) -> Option<u16> {
         if tail.is_empty() {
             Some(443)
         } else {
-            tail.strip_prefix(':')?.parse::<u16>().ok().filter(|&p| p > 0)
+            tail.strip_prefix(':')?
+                .parse::<u16>()
+                .ok()
+                .filter(|&p| p > 0)
         }
     } else if let Some((_host, port_str)) = authority.split_once(':') {
         port_str.parse::<u16>().ok().filter(|&p| p > 0)
@@ -1848,8 +1854,8 @@ pub(crate) fn parse_https_port_from_url(raw: &str) -> Option<u16> {
 }
 
 fn parse_tailscale_status_json(bytes: &[u8]) -> Result<ParsedTailscaleStatus, String> {
-    let parsed: Value = serde_json::from_slice(bytes)
-        .map_err(|e| format!("invalid tailscale status JSON: {e}"))?;
+    let parsed: Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid tailscale status JSON: {e}"))?;
     let Some(root) = parsed.as_object() else {
         return Err("tailscale status JSON is not an object".to_string());
     };
@@ -1925,7 +1931,10 @@ fn normalize_proxy_loopback_port(raw: &str) -> Option<(bool, String, u16)> {
         let p = p_str.parse::<u16>().ok()?;
         (h.to_ascii_lowercase(), p)
     };
-    let is_loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::");
+    let is_loopback = matches!(
+        host.as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::"
+    );
     Some((is_loopback, host, port))
 }
 
@@ -2290,13 +2299,14 @@ pub(crate) fn probe_tailscale_operational(
             }
             let err_text = String::from_utf8_lossy(&stderr).trim().to_string();
             let err_lower = err_text.to_ascii_lowercase();
-            let inferred_state = if err_lower.contains("stopped") || err_lower.contains("not running") {
-                "stopped"
-            } else if err_lower.contains("logged out") || err_lower.contains("needs login") {
-                "needs_login"
-            } else {
-                "error"
-            };
+            let inferred_state =
+                if err_lower.contains("stopped") || err_lower.contains("not running") {
+                    "stopped"
+                } else if err_lower.contains("logged out") || err_lower.contains("needs login") {
+                    "needs_login"
+                } else {
+                    "error"
+                };
             TailscaleOperationalStatus {
                 installed: true,
                 state: inferred_state.to_string(),
@@ -2338,7 +2348,9 @@ fn probe_tailscale_serve_from_env_or_bin(
 ) -> Option<TailscaleServeStatus> {
     if let Ok(raw_env) = std::env::var(ENV_TAILSCALE_SERVE_STATUS_JSON) {
         let trimmed = raw_env.trim();
-        if trimmed.eq_ignore_ascii_case("permission_denied") || trimmed.eq_ignore_ascii_case("error") {
+        if trimmed.eq_ignore_ascii_case("permission_denied")
+            || trimmed.eq_ignore_ascii_case("error")
+        {
             return Some(TailscaleServeStatus {
                 checked: false,
                 exposed: None,
@@ -2360,13 +2372,14 @@ fn probe_tailscale_serve_from_env_or_bin(
     }
 
     let bin_path = bin?;
-    match run_bounded_probe_command(bin_path, &["serve", "status", "--json"], TAILSCALE_PROBE_TIMEOUT)
-    {
-        Ok((true, stdout, _stderr)) if !stdout.is_empty() => Some(parse_tailscale_serve_status_json(
-            &stdout,
-            expected_port,
-            expected_bind,
-        )),
+    match run_bounded_probe_command(
+        bin_path,
+        &["serve", "status", "--json"],
+        TAILSCALE_PROBE_TIMEOUT,
+    ) {
+        Ok((true, stdout, _stderr)) if !stdout.is_empty() => Some(
+            parse_tailscale_serve_status_json(&stdout, expected_port, expected_bind),
+        ),
         Ok((_ok, _stdout, stderr)) => {
             let err_snippet = sanitize_tty_display(String::from_utf8_lossy(&stderr).trim());
             Some(TailscaleServeStatus {
@@ -2389,7 +2402,9 @@ fn probe_tailscale_serve_from_env_or_bin(
             expected_https_port: Some(expected_port),
             expected_target: Some(format!("http://{expected_bind}")),
             matched_target: None,
-            detail: Some(format!("Could not inspect `tailscale serve status --json`: {err}")),
+            detail: Some(format!(
+                "Could not inspect `tailscale serve status --json`: {err}"
+            )),
             fix_command: None,
         }),
     }
@@ -2426,17 +2441,17 @@ pub(crate) fn build_tailscale_checks(
                     Some(true) => {
                         out.push(CliCheck::ok(
                             "tailscale.serve",
-                            serve
-                                .detail
-                                .clone()
-                                .unwrap_or_else(|| "Tailscale Serve HTTPS route matches listen.bind".to_string()),
+                            serve.detail.clone().unwrap_or_else(|| {
+                                "Tailscale Serve HTTPS route matches listen.bind".to_string()
+                            }),
                         ));
                     }
                     Some(false) => {
                         out.push(CliCheck::warn(
                             "tailscale.serve",
                             serve.detail.clone().unwrap_or_else(|| {
-                                "Configured *.ts.net URL is not exposed via Tailscale Serve".to_string()
+                                "Configured *.ts.net URL is not exposed via Tailscale Serve"
+                                    .to_string()
                             }),
                             serve.fix_command.clone(),
                         ));
@@ -2501,7 +2516,10 @@ mod tests {
         }"#;
         let parsed = parse_tailscale_status_json(running).unwrap();
         assert_eq!(parsed.state, "running");
-        assert_eq!(parsed.dns_name.as_deref(), Some("alice-mbp.tail9f3a.ts.net"));
+        assert_eq!(
+            parsed.dns_name.as_deref(),
+            Some("alice-mbp.tail9f3a.ts.net")
+        );
         assert_eq!(parsed.tailnet_ips[0], "100.64.0.12");
         assert_eq!(parsed.online, Some(true));
 
@@ -2513,7 +2531,10 @@ mod tests {
                 "Online": false
             }
         }"#;
-        assert_eq!(parse_tailscale_status_json(stopped).unwrap().state, "stopped");
+        assert_eq!(
+            parse_tailscale_status_json(stopped).unwrap().state,
+            "stopped"
+        );
 
         let needs_login = br#"{ "BackendState": "NeedsLogin", "Self": { "Online": false } }"#;
         assert_eq!(
@@ -2623,7 +2644,9 @@ mod tests {
     #[test]
     fn is_ts_net_endpoint_and_port_parsing() {
         assert!(is_ts_net_endpoint("https://alice.tail9f3a.ts.net"));
-        assert!(is_ts_net_endpoint("https://alice.tail9f3a.ts.net:8443/v1/manifest"));
+        assert!(is_ts_net_endpoint(
+            "https://alice.tail9f3a.ts.net:8443/v1/manifest"
+        ));
         assert!(!is_ts_net_endpoint("https://ts.net"));
         assert!(!is_ts_net_endpoint("https://public.hyphae.to"));
         assert!(!is_ts_net_endpoint("ssh://ops@alice.tail9f3a.ts.net"));

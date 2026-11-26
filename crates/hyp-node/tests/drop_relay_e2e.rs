@@ -8,8 +8,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::{HeaderMap, StatusCode};
 use hyp_node::engine::drop_relay::{
-    CREATE_RATE_WINDOW_MS, CreateDropRequest, DROP_CAP_PREFIX, DROP_ID_LEN, DropCapRole,
-    DropRelay, DropRelayConfig, DropRelayError, DropSubscriberAuth, HARD_MAX_TTL_SECONDS,
+    CREATE_RATE_WINDOW_MS, CreateDropRequest, DROP_CAP_PREFIX, DROP_ID_LEN, DropCapRole, DropRelay,
+    DropRelayConfig, DropRelayError, DropSubscriberAuth, HARD_MAX_TTL_SECONDS,
     KEY_ROTATION_INTERVAL_MS,
 };
 
@@ -58,7 +58,10 @@ fn config_defaults_and_camel_case_serde_roundtrip() {
     assert_eq!(json["maxSseStreams"], 4_096);
     assert_eq!(json["maxSseStreamsPerDrop"], 2);
     assert_eq!(json["maxSseStreamsPerIp"], 16);
-    assert_eq!(json["allowedOrigins"], serde_json::json!(["https://hyphae.to"]));
+    assert_eq!(
+        json["allowedOrigins"],
+        serde_json::json!(["https://hyphae.to"])
+    );
     assert_eq!(json["allowPrivateNetwork"], true);
 
     let roundtrip: DropRelayConfig =
@@ -71,7 +74,10 @@ fn config_defaults_and_camel_case_serde_roundtrip() {
     assert!(partial.enabled);
     assert_eq!(partial.max_memory_mb, 64);
     assert_eq!(partial.default_ttl_seconds, 600);
-    assert_eq!(partial.allowed_origins, vec!["https://hyphae.to".to_string()]);
+    assert_eq!(
+        partial.allowed_origins,
+        vec!["https://hyphae.to".to_string()]
+    );
 }
 
 #[test]
@@ -80,7 +86,12 @@ fn disabled_relay_fails_closed_with_404() {
     assert!(!relay.is_enabled());
 
     let err = relay
-        .create_drop("ops@prod", "203.0.113.1", CreateDropRequest::default(), BASE_TS_MS)
+        .create_drop(
+            "ops@prod",
+            "203.0.113.1",
+            CreateDropRequest::default(),
+            BASE_TS_MS,
+        )
         .unwrap_err();
     assert_eq!(err, DropRelayError::Disabled);
     assert_eq!(err.status_code(), StatusCode::NOT_FOUND);
@@ -123,7 +134,12 @@ fn disabled_relay_fails_closed_with_404() {
 async fn happy_path_live_sse_and_burn_wipes_ram() {
     let relay = DropRelay::new(enabled_config());
     let created = relay
-        .create_drop("prod@eu-1", "198.51.100.10", CreateDropRequest::default(), BASE_TS_MS)
+        .create_drop(
+            "prod@eu-1",
+            "198.51.100.10",
+            CreateDropRequest::default(),
+            BASE_TS_MS,
+        )
         .expect("create_drop");
 
     assert_eq!(created.drop_id.len(), DROP_ID_LEN);
@@ -168,7 +184,10 @@ async fn happy_path_live_sse_and_burn_wipes_ram() {
         .expect("live SSE item arrived in time")
         .expect("live SSE item present");
 
-    let posted = poster_task.await.expect("poster task join").expect("post_drop");
+    let posted = poster_task
+        .await
+        .expect("poster task join")
+        .expect("post_drop");
     assert_eq!(posted.seq, 1);
     assert_eq!(posted.expires_at_ms, created.expires_at_ms);
 
@@ -214,15 +233,30 @@ async fn happy_path_live_sse_and_burn_wipes_ram() {
 async fn late_subscriber_catch_up_last_event_id_and_burn_reconnect() {
     let relay = DropRelay::new(enabled_config());
     let created = relay
-        .create_drop("prod@eu-1", "198.51.100.20", CreateDropRequest::default(), BASE_TS_MS)
+        .create_drop(
+            "prod@eu-1",
+            "198.51.100.20",
+            CreateDropRequest::default(),
+            BASE_TS_MS,
+        )
         .expect("create_drop");
 
     // Post #1 and #2 BEFORE any subscriber connects.
     let p1 = relay
-        .post_drop(&created.drop_id, &created.post_cap, b"sealed-item-1".to_vec(), BASE_TS_MS + 10)
+        .post_drop(
+            &created.drop_id,
+            &created.post_cap,
+            b"sealed-item-1".to_vec(),
+            BASE_TS_MS + 10,
+        )
         .expect("post #1");
     let p2 = relay
-        .post_drop(&created.drop_id, &created.post_cap, b"sealed-item-2".to_vec(), BASE_TS_MS + 20)
+        .post_drop(
+            &created.drop_id,
+            &created.post_cap,
+            b"sealed-item-2".to_vec(),
+            BASE_TS_MS + 20,
+        )
         .expect("post #2");
     assert_eq!(p1.seq, 1);
     assert_eq!(p2.seq, 2);
@@ -268,7 +302,12 @@ async fn late_subscriber_catch_up_last_event_id_and_burn_reconnect() {
 
         // Post live #3 while connected.
         let p3 = relay
-            .post_drop(&created.drop_id, &created.post_cap, b"sealed-item-3".to_vec(), BASE_TS_MS + 50)
+            .post_drop(
+                &created.drop_id,
+                &created.post_cap,
+                b"sealed-item-3".to_vec(),
+                BASE_TS_MS + 50,
+            )
             .expect("post #3");
         assert_eq!(p3.seq, 3);
 
@@ -292,7 +331,10 @@ async fn late_subscriber_catch_up_last_event_id_and_burn_reconnect() {
         .expect("ack burn <=2");
     assert_eq!(ack2.burned_items, 2);
     assert_eq!(ack2.remaining_items, 1);
-    assert_eq!(relay.health(BASE_TS_MS + 60).buffered_bytes, b"sealed-item-3".len());
+    assert_eq!(
+        relay.health(BASE_TS_MS + 60).buffered_bytes,
+        b"sealed-item-3".len()
+    );
 
     // Burn seq = 3 -> wipes remaining RAM completely.
     let ack3 = relay
@@ -349,7 +391,12 @@ async fn burn_after_read_closes_slot_and_terminates_live_stream() {
         .expect("creator subscribe");
 
     relay
-        .post_drop(&created.drop_id, &created.post_cap, b"one-shot-secret".to_vec(), BASE_TS_MS + 20)
+        .post_drop(
+            &created.drop_id,
+            &created.post_cap,
+            b"one-shot-secret".to_vec(),
+            BASE_TS_MS + 20,
+        )
         .expect("post one-shot");
 
     let item = sub.recv().await.expect("receive one-shot");
@@ -372,7 +419,12 @@ async fn burn_after_read_closes_slot_and_terminates_live_stream() {
 
     // Subsequent post/subscribe sees NotFound and active_drops == 0.
     assert_eq!(
-        relay.post_drop(&created.drop_id, &created.post_cap, b"late".to_vec(), BASE_TS_MS + 40),
+        relay.post_drop(
+            &created.drop_id,
+            &created.post_cap,
+            b"late".to_vec(),
+            BASE_TS_MS + 40
+        ),
         Err(DropRelayError::NotFound)
     );
     assert_eq!(relay.health(BASE_TS_MS + 40).active_drops, 0);
@@ -430,7 +482,12 @@ fn fail_closed_capability_tampering_role_confusion_swap_expiry_and_size_bounds()
             mutated[byte_idx] ^= 1 << bit;
             let tampered_cap = format!("{DROP_CAP_PREFIX}{}", URL_SAFE_NO_PAD.encode(&mutated));
             let err = relay
-                .post_drop(&drop_a.drop_id, &tampered_cap, b"ct".to_vec(), BASE_TS_MS + 1)
+                .post_drop(
+                    &drop_a.drop_id,
+                    &tampered_cap,
+                    b"ct".to_vec(),
+                    BASE_TS_MS + 1,
+                )
                 .unwrap_err();
             assert_eq!(
                 err.status_code(),
@@ -443,7 +500,12 @@ fn fail_closed_capability_tampering_role_confusion_swap_expiry_and_size_bounds()
     // 3. Role confusion: subCap on post_drop, postCap on subscribe_drop and ack_drop.
     assert_eq!(
         relay
-            .post_drop(&drop_a.drop_id, &drop_a.sub_cap, b"ct".to_vec(), BASE_TS_MS + 1)
+            .post_drop(
+                &drop_a.drop_id,
+                &drop_a.sub_cap,
+                b"ct".to_vec(),
+                BASE_TS_MS + 1
+            )
             .unwrap_err()
             .status_code(),
         StatusCode::UNAUTHORIZED
@@ -478,7 +540,12 @@ fn fail_closed_capability_tampering_role_confusion_swap_expiry_and_size_bounds()
     // 4. Cross-drop capability swap & wrong creator node fail closed.
     assert_eq!(
         relay
-            .post_drop(&drop_b.drop_id, &drop_a.post_cap, b"ct".to_vec(), BASE_TS_MS + 1)
+            .post_drop(
+                &drop_b.drop_id,
+                &drop_a.post_cap,
+                b"ct".to_vec(),
+                BASE_TS_MS + 1
+            )
             .unwrap_err()
             .status_code(),
         StatusCode::UNAUTHORIZED
@@ -526,7 +593,12 @@ fn fail_closed_capability_tampering_role_confusion_swap_expiry_and_size_bounds()
     // 5. Payload size boundaries: empty rejected (400), > 64 KiB rejected (413), exact 64 KiB ok!
     assert_eq!(
         relay
-            .post_drop(&drop_a.drop_id, &drop_a.post_cap, Vec::new(), BASE_TS_MS + 2)
+            .post_drop(
+                &drop_a.drop_id,
+                &drop_a.post_cap,
+                Vec::new(),
+                BASE_TS_MS + 2
+            )
             .unwrap_err()
             .status_code(),
         StatusCode::BAD_REQUEST
@@ -551,20 +623,35 @@ fn fail_closed_capability_tampering_role_confusion_swap_expiry_and_size_bounds()
     assert_eq!(p1.seq, 1);
 
     let p2 = relay
-        .post_drop(&drop_a.drop_id, &drop_a.post_cap, b"second".to_vec(), BASE_TS_MS + 4)
+        .post_drop(
+            &drop_a.drop_id,
+            &drop_a.post_cap,
+            b"second".to_vec(),
+            BASE_TS_MS + 4,
+        )
         .expect("item #2 succeeds");
     assert_eq!(p2.seq, 2);
 
     // 6. Per-drop max_items cap (2) enforced with 409 DropFull.
     let full_err = relay
-        .post_drop(&drop_a.drop_id, &drop_a.post_cap, b"third".to_vec(), BASE_TS_MS + 5)
+        .post_drop(
+            &drop_a.drop_id,
+            &drop_a.post_cap,
+            b"third".to_vec(),
+            BASE_TS_MS + 5,
+        )
         .unwrap_err();
     assert_eq!(full_err, DropRelayError::DropFull { max_items: 2 });
     assert_eq!(full_err.status_code(), StatusCode::CONFLICT);
 
     // 7. Expired capability / slot fails closed at exact boundary now_ms == expires_at_ms.
     let exp_err = relay
-        .post_drop(&drop_b.drop_id, &drop_b.post_cap, b"late".to_vec(), drop_b.expires_at_ms)
+        .post_drop(
+            &drop_b.drop_id,
+            &drop_b.post_cap,
+            b"late".to_vec(),
+            drop_b.expires_at_ms,
+        )
         .unwrap_err();
     assert_eq!(exp_err, DropRelayError::Expired);
     assert_eq!(exp_err.status_code(), StatusCode::GONE);
@@ -608,10 +695,20 @@ fn hourly_hmac_key_rotation_preserves_inflight_15m_drops() {
 
     // A brand-new drop in the new hour mints under the new current key.
     let fresh = relay
-        .create_drop("ops@eu-1", "198.51.100.40", CreateDropRequest::default(), t_after_rotation)
+        .create_drop(
+            "ops@eu-1",
+            "198.51.100.40",
+            CreateDropRequest::default(),
+            t_after_rotation,
+        )
         .expect("create after rotation");
     relay
-        .post_drop(&fresh.drop_id, &fresh.post_cap, b"new-key".to_vec(), t_after_rotation + 1)
+        .post_drop(
+            &fresh.drop_id,
+            &fresh.post_cap,
+            b"new-key".to_vec(),
+            t_after_rotation + 1,
+        )
         .expect("new key post works");
 
     // The pre-rotation drop MUST still verify cleanly via the previous key!
@@ -634,7 +731,10 @@ fn hourly_hmac_key_rotation_preserves_inflight_15m_drops() {
             t_after_rotation + 3,
         )
         .expect("pre-rotation subCap still valid across hour boundary");
-    assert_eq!(sub.try_recv().expect("catch-up item").payload_bytes(), b"cross-boundary-payload");
+    assert_eq!(
+        sub.try_recv().expect("catch-up item").payload_bytes(),
+        b"cross-boundary-payload"
+    );
 
     relay
         .ack_drop(
@@ -649,7 +749,12 @@ fn hourly_hmac_key_rotation_preserves_inflight_15m_drops() {
     // Advance 2+ hours: old key is retired & zeroized; old token fails closed.
     let t_two_hours_later = hour_boundary + 2 * KEY_ROTATION_INTERVAL_MS + 1_000;
     let err = relay
-        .verify_capability(&created.drop_id, &created.post_cap, DropCapRole::Post, t_two_hours_later)
+        .verify_capability(
+            &created.drop_id,
+            &created.post_cap,
+            DropCapRole::Post,
+            t_two_hours_later,
+        )
         .unwrap_err();
     assert_eq!(err.status_code(), StatusCode::UNAUTHORIZED);
 }
@@ -666,7 +771,12 @@ fn ttl_clamping_and_local_drops_only_enforcement() {
 
     // Different creator node rejected with 403.
     let err = relay
-        .create_drop("bob@tailnet", "100.64.0.2", CreateDropRequest::default(), BASE_TS_MS)
+        .create_drop(
+            "bob@tailnet",
+            "100.64.0.2",
+            CreateDropRequest::default(),
+            BASE_TS_MS,
+        )
         .unwrap_err();
     assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
 
@@ -735,7 +845,12 @@ fn anti_dos_per_node_active_cap_hourly_limits_and_per_ip_limits() {
             .expect("within active cap");
     }
     let active_err = relay
-        .create_drop("guest@node-1", "198.51.100.50", CreateDropRequest::default(), BASE_TS_MS + 500)
+        .create_drop(
+            "guest@node-1",
+            "198.51.100.50",
+            CreateDropRequest::default(),
+            BASE_TS_MS + 500,
+        )
         .unwrap_err();
     assert_eq!(active_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
     assert!(active_err.retry_after_secs().unwrap_or(0) >= 1);
@@ -775,7 +890,12 @@ fn anti_dos_per_node_active_cap_hourly_limits_and_per_ip_limits() {
             .expect("within 10/hr node quota");
     }
     let node_rate_err = relay_node_rate
-        .create_drop("noisy@node", "198.51.100.61", CreateDropRequest::default(), BASE_TS_MS + 15_000)
+        .create_drop(
+            "noisy@node",
+            "198.51.100.61",
+            CreateDropRequest::default(),
+            BASE_TS_MS + 15_000,
+        )
         .unwrap_err();
     assert_eq!(node_rate_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
     assert!(node_rate_err.retry_after_secs().unwrap_or(0) >= 1);
@@ -801,18 +921,33 @@ fn anti_dos_per_node_active_cap_hourly_limits_and_per_ip_limits() {
     for i in 0..20 {
         let node = format!("node-{}@fleet", i / 5);
         relay_ip_rate
-            .create_drop(&node, "198.51.100.77", CreateDropRequest::default(), BASE_TS_MS + i * 100)
+            .create_drop(
+                &node,
+                "198.51.100.77",
+                CreateDropRequest::default(),
+                BASE_TS_MS + i * 100,
+            )
             .expect("within 20/hr IP quota");
     }
     let ip_rate_err = relay_ip_rate
-        .create_drop("fresh-node@fleet", "198.51.100.77", CreateDropRequest::default(), BASE_TS_MS + 5_000)
+        .create_drop(
+            "fresh-node@fleet",
+            "198.51.100.77",
+            CreateDropRequest::default(),
+            BASE_TS_MS + 5_000,
+        )
         .unwrap_err();
     assert_eq!(ip_rate_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
     assert!(ip_rate_err.retry_after_secs().unwrap_or(0) >= 1);
 
     // Different IP is completely unaffected.
     relay_ip_rate
-        .create_drop("fresh-node@fleet", "198.51.100.78", CreateDropRequest::default(), BASE_TS_MS + 5_000)
+        .create_drop(
+            "fresh-node@fleet",
+            "198.51.100.78",
+            CreateDropRequest::default(),
+            BASE_TS_MS + 5_000,
+        )
         .expect("other IP unaffected");
 }
 
@@ -845,7 +980,12 @@ async fn global_memory_and_slot_caps_return_503_without_evicting_honest_drops() 
     let mut honest_payload = vec![0xAAu8; 65_536];
     honest_payload[0..11].copy_from_slice(b"HONEST-DROP");
     relay
-        .post_drop(&honest.drop_id, &honest.post_cap, honest_payload.clone(), BASE_TS_MS + 10)
+        .post_drop(
+            &honest.drop_id,
+            &honest.post_cap,
+            honest_payload.clone(),
+            BASE_TS_MS + 10,
+        )
         .expect("honest post");
 
     // Noisy neighbor fills the remaining 15 * 64 KiB = 960 KiB with shorter 30s drops.
@@ -874,7 +1014,12 @@ async fn global_memory_and_slot_caps_return_503_without_evicting_honest_drops() 
 
     // 17th payload MUST fail closed with 503 CapacityExceeded + Retry-After, WITHOUT evicting honest drop!
     let cap_err = relay
-        .post_drop(&noisy.drop_id, &noisy.post_cap, vec![0xCCu8; 1024], BASE_TS_MS + 200)
+        .post_drop(
+            &noisy.drop_id,
+            &noisy.post_cap,
+            vec![0xCCu8; 1024],
+            BASE_TS_MS + 200,
+        )
         .unwrap_err();
     assert_eq!(cap_err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(cap_err.retry_after_secs().unwrap_or(0) >= 1);
@@ -895,10 +1040,20 @@ async fn global_memory_and_slot_caps_return_503_without_evicting_honest_drops() 
 
     // Once noisy drop expires (t + 35s), sweep reclaims its 960 KiB and new posts succeed!
     let honest2 = relay
-        .create_drop("honest@prod", "198.51.100.1", CreateDropRequest::default(), BASE_TS_MS + 35_000)
+        .create_drop(
+            "honest@prod",
+            "198.51.100.1",
+            CreateDropRequest::default(),
+            BASE_TS_MS + 35_000,
+        )
         .expect("create after noisy expiry");
     relay
-        .post_drop(&honest2.drop_id, &honest2.post_cap, vec![0xDDu8; 32_768], BASE_TS_MS + 35_010)
+        .post_drop(
+            &honest2.drop_id,
+            &honest2.post_cap,
+            vec![0xDDu8; 32_768],
+            BASE_TS_MS + 35_010,
+        )
         .expect("post succeeds after expired RAM swept");
 
     let health = relay.health(BASE_TS_MS + 35_020);
@@ -913,19 +1068,39 @@ async fn global_memory_and_slot_caps_return_503_without_evicting_honest_drops() 
         ..Default::default()
     });
     let s1 = slot_cap_relay
-        .create_drop("n1@a", "198.51.100.1", CreateDropRequest::default(), BASE_TS_MS)
+        .create_drop(
+            "n1@a",
+            "198.51.100.1",
+            CreateDropRequest::default(),
+            BASE_TS_MS,
+        )
         .expect("slot 1");
     slot_cap_relay
-        .create_drop("n2@a", "198.51.100.2", CreateDropRequest::default(), BASE_TS_MS + 1)
+        .create_drop(
+            "n2@a",
+            "198.51.100.2",
+            CreateDropRequest::default(),
+            BASE_TS_MS + 1,
+        )
         .expect("slot 2");
     let s3_err = slot_cap_relay
-        .create_drop("n3@a", "198.51.100.3", CreateDropRequest::default(), BASE_TS_MS + 2)
+        .create_drop(
+            "n3@a",
+            "198.51.100.3",
+            CreateDropRequest::default(),
+            BASE_TS_MS + 2,
+        )
         .unwrap_err();
     assert_eq!(s3_err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(s3_err.retry_after_secs().unwrap_or(0) >= 1);
     // Slot 1 must still exist!
     slot_cap_relay
-        .post_drop(&s1.drop_id, &s1.post_cap, b"still-here".to_vec(), BASE_TS_MS + 3)
+        .post_drop(
+            &s1.drop_id,
+            &s1.post_cap,
+            b"still-here".to_vec(),
+            BASE_TS_MS + 3,
+        )
         .expect("slot 1 not evicted");
 }
 
@@ -940,40 +1115,86 @@ fn sse_stream_caps_enforced_and_raii_drop_releases_slots() {
     });
 
     let d1 = relay
-        .create_drop("n1@a", "198.51.100.1", CreateDropRequest::default(), BASE_TS_MS)
+        .create_drop(
+            "n1@a",
+            "198.51.100.1",
+            CreateDropRequest::default(),
+            BASE_TS_MS,
+        )
         .expect("d1");
     let d2 = relay
-        .create_drop("n2@a", "198.51.100.2", CreateDropRequest::default(), BASE_TS_MS)
+        .create_drop(
+            "n2@a",
+            "198.51.100.2",
+            CreateDropRequest::default(),
+            BASE_TS_MS,
+        )
         .expect("d2");
 
     // 2 streams on d1 from ip A succeed; 3rd on d1 fails with 429 (per-drop cap = 2).
     let s1 = relay
-        .subscribe_drop(&d1.drop_id, DropSubscriberAuth::SubCap(&d1.sub_cap), "198.51.100.90", None, BASE_TS_MS + 1)
+        .subscribe_drop(
+            &d1.drop_id,
+            DropSubscriberAuth::SubCap(&d1.sub_cap),
+            "198.51.100.90",
+            None,
+            BASE_TS_MS + 1,
+        )
         .expect("stream 1");
     let s2 = relay
-        .subscribe_drop(&d1.drop_id, DropSubscriberAuth::SubCap(&d1.sub_cap), "198.51.100.90", None, BASE_TS_MS + 2)
+        .subscribe_drop(
+            &d1.drop_id,
+            DropSubscriberAuth::SubCap(&d1.sub_cap),
+            "198.51.100.90",
+            None,
+            BASE_TS_MS + 2,
+        )
         .expect("stream 2");
     assert_eq!(relay.health(BASE_TS_MS + 3).active_sse_streams, 2);
 
     let per_drop_err = relay
-        .subscribe_drop(&d1.drop_id, DropSubscriberAuth::SubCap(&d1.sub_cap), "198.51.100.91", None, BASE_TS_MS + 3)
+        .subscribe_drop(
+            &d1.drop_id,
+            DropSubscriberAuth::SubCap(&d1.sub_cap),
+            "198.51.100.91",
+            None,
+            BASE_TS_MS + 3,
+        )
         .unwrap_err();
     assert_eq!(per_drop_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
 
     // Same IP 198.51.100.90 trying d2 hits per-IP cap = 2 (429).
     let per_ip_err = relay
-        .subscribe_drop(&d2.drop_id, DropSubscriberAuth::SubCap(&d2.sub_cap), "198.51.100.90", None, BASE_TS_MS + 4)
+        .subscribe_drop(
+            &d2.drop_id,
+            DropSubscriberAuth::SubCap(&d2.sub_cap),
+            "198.51.100.90",
+            None,
+            BASE_TS_MS + 4,
+        )
         .unwrap_err();
     assert_eq!(per_ip_err.status_code(), StatusCode::TOO_MANY_REQUESTS);
 
     // Different IP on d2 takes the 3rd global stream slot; 4th hits global cap = 3 (503).
     let s3 = relay
-        .subscribe_drop(&d2.drop_id, DropSubscriberAuth::SubCap(&d2.sub_cap), "198.51.100.92", None, BASE_TS_MS + 5)
+        .subscribe_drop(
+            &d2.drop_id,
+            DropSubscriberAuth::SubCap(&d2.sub_cap),
+            "198.51.100.92",
+            None,
+            BASE_TS_MS + 5,
+        )
         .expect("stream 3");
     assert_eq!(relay.health(BASE_TS_MS + 6).active_sse_streams, 3);
 
     let global_err = relay
-        .subscribe_drop(&d2.drop_id, DropSubscriberAuth::SubCap(&d2.sub_cap), "198.51.100.93", None, BASE_TS_MS + 6)
+        .subscribe_drop(
+            &d2.drop_id,
+            DropSubscriberAuth::SubCap(&d2.sub_cap),
+            "198.51.100.93",
+            None,
+            BASE_TS_MS + 6,
+        )
         .unwrap_err();
     assert_eq!(global_err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
 
@@ -982,7 +1203,13 @@ fn sse_stream_caps_enforced_and_raii_drop_releases_slots() {
     assert_eq!(relay.health(BASE_TS_MS + 7).active_sse_streams, 2);
 
     let s4 = relay
-        .subscribe_drop(&d1.drop_id, DropSubscriberAuth::SubCap(&d1.sub_cap), "198.51.100.90", None, BASE_TS_MS + 8)
+        .subscribe_drop(
+            &d1.drop_id,
+            DropSubscriberAuth::SubCap(&d1.sub_cap),
+            "198.51.100.90",
+            None,
+            BASE_TS_MS + 8,
+        )
         .expect("re-acquired after RAII drop");
     assert_eq!(relay.health(BASE_TS_MS + 9).active_sse_streams, 3);
 
@@ -1006,7 +1233,10 @@ fn cors_allowlist_and_pna_headers_fail_closed() {
         ..Default::default()
     });
 
-    assert_eq!(relay.cors_origin_for(Some("https://hyphae.to")), Some("https://hyphae.to"));
+    assert_eq!(
+        relay.cors_origin_for(Some("https://hyphae.to")),
+        Some("https://hyphae.to")
+    );
     assert_eq!(
         relay.cors_origin_for(Some("https://drop.example.com")),
         Some("https://drop.example.com")
@@ -1025,7 +1255,11 @@ fn cors_allowlist_and_pna_headers_fail_closed() {
         Some("https://hyphae.to.evil.example"),
         Some("https://hyphae.to\r\nX-Injected: 1"),
     ] {
-        assert_eq!(relay.cors_origin_for(bad), None, "origin {bad:?} must be rejected");
+        assert_eq!(
+            relay.cors_origin_for(bad),
+            None,
+            "origin {bad:?} must be rejected"
+        );
     }
 
     // Response header helper emits ACAO + PNA only for allowed origin.
@@ -1036,7 +1270,9 @@ fn cors_allowlist_and_pna_headers_fail_closed() {
         "https://hyphae.to"
     );
     assert_eq!(
-        allowed_headers.get("access-control-allow-private-network").unwrap(),
+        allowed_headers
+            .get("access-control-allow-private-network")
+            .unwrap(),
         "true"
     );
     assert_eq!(allowed_headers.get("vary").unwrap(), "Origin");
@@ -1044,7 +1280,11 @@ fn cors_allowlist_and_pna_headers_fail_closed() {
     let mut blocked_headers = HeaderMap::new();
     assert!(!relay.apply_cors_headers(Some("https://evil.example"), &mut blocked_headers));
     assert!(blocked_headers.get("access-control-allow-origin").is_none());
-    assert!(blocked_headers.get("access-control-allow-private-network").is_none());
+    assert!(
+        blocked_headers
+            .get("access-control-allow-private-network")
+            .is_none()
+    );
     assert_eq!(blocked_headers.get("vary").unwrap(), "Origin");
 
     // When allow_private_network is false, PNA header is omitted.
@@ -1060,7 +1300,11 @@ fn cors_allowlist_and_pna_headers_fail_closed() {
         no_pna_headers.get("access-control-allow-origin").unwrap(),
         "https://hyphae.to"
     );
-    assert!(no_pna_headers.get("access-control-allow-private-network").is_none());
+    assert!(
+        no_pna_headers
+            .get("access-control-allow-private-network")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1073,7 +1317,12 @@ async fn concurrent_post_and_subscribe_zero_gap_zero_duplication() {
     });
 
     let created = relay
-        .create_drop("prod@eu-1", "198.51.100.99", CreateDropRequest::default(), BASE_TS_MS)
+        .create_drop(
+            "prod@eu-1",
+            "198.51.100.99",
+            CreateDropRequest::default(),
+            BASE_TS_MS,
+        )
         .expect("create");
 
     let relay_post = relay.clone();
@@ -1385,9 +1634,18 @@ fn differential_model_vs_drop_relay_stateful_sequence() {
             .sum();
         let health = relay.health(now_ms);
         assert_eq!(health.active_drops, model.len(), "step {step} active_drops");
-        assert_eq!(health.buffered_bytes, expected_bytes, "step {step} buffered_bytes");
-        assert_eq!(health.active_sse_streams, 0, "step {step} active_sse_streams");
-        assert_eq!(health.drops_created_total, created_total, "step {step} created_total");
+        assert_eq!(
+            health.buffered_bytes, expected_bytes,
+            "step {step} buffered_bytes"
+        );
+        assert_eq!(
+            health.active_sse_streams, 0,
+            "step {step} active_sse_streams"
+        );
+        assert_eq!(
+            health.drops_created_total, created_total,
+            "step {step} created_total"
+        );
         assert_eq!(
             health.drops_delivered_total, delivered_total,
             "step {step} delivered_total"

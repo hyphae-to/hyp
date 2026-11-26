@@ -268,9 +268,8 @@ fn cut_chars(text: &str, max_chars: usize) -> String {
 
 fn is_valid_subject(subject: &str) -> bool {
     static SUBJECT_RE: OnceLock<Regex> = OnceLock::new();
-    let re = SUBJECT_RE.get_or_init(|| {
-        Regex::new(r"^[A-Za-z0-9._/-]{1,128}$").expect("valid subject regex")
-    });
+    let re = SUBJECT_RE
+        .get_or_init(|| Regex::new(r"^[A-Za-z0-9._/-]{1,128}$").expect("valid subject regex"));
     re.is_match(subject)
 }
 
@@ -316,9 +315,7 @@ fn extract_mentions(text: &str) -> Vec<String> {
         // Boundary check before `agent:` matching `(?<![A-Za-z0-9_:/.-])`
         if full.start() > 0 {
             let prev = bytes[full.start() - 1];
-            if prev.is_ascii_alphanumeric()
-                || matches!(prev, b'_' | b':' | b'/' | b'.' | b'-')
-            {
+            if prev.is_ascii_alphanumeric() || matches!(prev, b'_' | b':' | b'/' | b'.' | b'-') {
                 continue;
             }
         }
@@ -572,8 +569,8 @@ pub fn normalize_github_webhook(
         }
         "workflow_run" => {
             let run = obj_get(Some(payload), "workflow_run");
-            data.title =
-                get_str(run, "name").or_else(|| get_str(obj_get(Some(payload), "workflow"), "name"));
+            data.title = get_str(run, "name")
+                .or_else(|| get_str(obj_get(Some(payload), "workflow"), "name"));
             data.url = get_str(run, "html_url");
             data.conclusion = get_str(run, "conclusion");
             data.branch = get_str(run, "head_branch");
@@ -641,11 +638,9 @@ pub fn normalize_github_webhook(
         }
         "push" => {
             let git_ref = get_str(Some(payload), "ref").unwrap_or_default();
-            data.branch = git_ref
-                .strip_prefix("refs/heads/")
-                .map(ToString::to_string);
-            data.head_sha = get_str(Some(payload), "after")
-                .or_else(|| get_str(Some(payload), "head"));
+            data.branch = git_ref.strip_prefix("refs/heads/").map(ToString::to_string);
+            data.head_sha =
+                get_str(Some(payload), "after").or_else(|| get_str(Some(payload), "head"));
             data.url = get_str(Some(payload), "compare");
             if git_ref.starts_with("refs/heads/") {
                 Some(git_ref)
@@ -844,8 +839,8 @@ impl GitHubWebhookAdapter {
 
         let ce_val = serde_json::to_value(&ce)
             .map_err(|e| AdapterError::Internal(format!("CloudEvent serialization failed: {e}")))?;
-        let (validated, _) = check_cloudevent_v2(&ce_val)
-            .map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
+        let (validated, _) =
+            check_cloudevent_v2(&ce_val).map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
 
         let host = self
             .host
@@ -1015,16 +1010,31 @@ fn fit_prometheus_data(data: Value) -> Value {
         return data;
     };
     let mut compact = Map::new();
-    for key in ["status", "alertname", "severity", "service", "instance", "startsAt", "endsAt", "receiver"] {
+    for key in [
+        "status",
+        "alertname",
+        "severity",
+        "service",
+        "instance",
+        "startsAt",
+        "endsAt",
+        "receiver",
+    ] {
         if let Some(v) = obj.get(key) {
             compact.insert(key.to_string(), v.clone());
         }
     }
     if let Some(summary) = obj.get("summary").and_then(Value::as_str) {
-        compact.insert("summary".to_string(), Value::String(cut_chars(summary, 512)));
+        compact.insert(
+            "summary".to_string(),
+            Value::String(cut_chars(summary, 512)),
+        );
     }
     if let Some(desc) = obj.get("description").and_then(Value::as_str) {
-        compact.insert("description".to_string(), Value::String(cut_chars(desc, 1024)));
+        compact.insert(
+            "description".to_string(),
+            Value::String(cut_chars(desc, 1024)),
+        );
     }
     compact.insert("truncated".to_string(), Value::Bool(true));
     Value::Object(compact)
@@ -1217,8 +1227,8 @@ pub fn normalize_prometheus_webhook(
 
         let ce_val = serde_json::to_value(&ce)
             .map_err(|e| AdapterError::Internal(format!("CloudEvent serialization failed: {e}")))?;
-        let (validated, _) = check_cloudevent_v2(&ce_val)
-            .map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
+        let (validated, _) =
+            check_cloudevent_v2(&ce_val).map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
         out.push(validated);
     }
 
@@ -1522,8 +1532,8 @@ pub fn normalize_generic_webhook(
 
     let ce_val = serde_json::to_value(&ce)
         .map_err(|e| AdapterError::Internal(format!("CloudEvent serialization failed: {e}")))?;
-    let (validated, _) = check_cloudevent_v2(&ce_val)
-        .map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
+    let (validated, _) =
+        check_cloudevent_v2(&ce_val).map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
     Ok(validated)
 }
 
@@ -1736,14 +1746,22 @@ mod tests {
                 "assignees": []
             }
         });
-        let ev = match normalize_github_webhook("pull_request", "big-1", &payload, "2026-11-24T00:00:00Z") {
+        let ev = match normalize_github_webhook(
+            "pull_request",
+            "big-1",
+            &payload,
+            "2026-11-24T00:00:00Z",
+        ) {
             GitHubNormalizeOutcome::Publish(ev) => *ev,
             GitHubNormalizeOutcome::Ignore(r) => panic!("unexpected ignore: {r}"),
         };
         let data_json = serde_json::to_string(ev.data.as_ref().unwrap()).unwrap();
         assert!(data_json.len() <= MAX_DATA_BYTES);
         assert_eq!(ev.data.as_ref().unwrap()["signed_by"], "ci-bot");
-        assert_eq!(ev.data.as_ref().unwrap()["mentions"], json!(["agent:reviewer"]));
+        assert_eq!(
+            ev.data.as_ref().unwrap()["mentions"],
+            json!(["agent:reviewer"])
+        );
         let val = serde_json::to_value(&ev).unwrap();
         assert!(check_cloudevent_v2(&val).is_ok());
     }
@@ -1751,11 +1769,27 @@ mod tests {
     #[test]
     fn basic_auth_and_timestamp_replay_guards() {
         let valid_basic = format!("Basic {}", BASE64_STANDARD.encode("prom:s3cr3t"));
-        assert!(verify_basic_auth_header(Some(&valid_basic), "prom", "s3cr3t"));
-        assert!(!verify_basic_auth_header(Some(&valid_basic), "prom", "wrong"));
-        assert!(!verify_basic_auth_header(Some(&valid_basic), "other", "s3cr3t"));
+        assert!(verify_basic_auth_header(
+            Some(&valid_basic),
+            "prom",
+            "s3cr3t"
+        ));
+        assert!(!verify_basic_auth_header(
+            Some(&valid_basic),
+            "prom",
+            "wrong"
+        ));
+        assert!(!verify_basic_auth_header(
+            Some(&valid_basic),
+            "other",
+            "s3cr3t"
+        ));
         assert!(!verify_basic_auth_header(None, "prom", "s3cr3t"));
-        assert!(!verify_basic_auth_header(Some("Bearer tok"), "prom", "s3cr3t"));
+        assert!(!verify_basic_auth_header(
+            Some("Bearer tok"),
+            "prom",
+            "s3cr3t"
+        ));
 
         let now_sec = (now_unix_ms() / 1_000).to_string();
         let parsed = parse_webhook_timestamp_ms(&now_sec).unwrap();
@@ -1767,10 +1801,12 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-webhook-timestamp", now_sec.parse().unwrap());
         let body = br#"{"event":"deploy","env":"prod"}"#;
-        let ev1 = normalize_generic_webhook(&h, body, "ci/hook", "ci.deploy", "2026-11-25T12:00:00Z")
-            .unwrap();
-        let ev2 = normalize_generic_webhook(&h, body, "ci/hook", "ci.deploy", "2026-11-25T12:00:00Z")
-            .unwrap();
+        let ev1 =
+            normalize_generic_webhook(&h, body, "ci/hook", "ci.deploy", "2026-11-25T12:00:00Z")
+                .unwrap();
+        let ev2 =
+            normalize_generic_webhook(&h, body, "ci/hook", "ci.deploy", "2026-11-25T12:00:00Z")
+                .unwrap();
         assert_eq!(ev1.id, ev2.id);
         assert!(ev1.id.starts_with("wh-"));
     }

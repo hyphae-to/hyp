@@ -274,9 +274,7 @@ impl UnifiedNode {
                     let io = TokioIo::new(LingeringTcpStream::new(stream));
                     let service = service_fn(move |req: Request<Incoming>| {
                         let n = Arc::clone(&conn_node);
-                        async move {
-                            Ok::<_, Infallible>(handle_http_request(n, peer_addr, req).await)
-                        }
+                        async move { Ok::<_, Infallible>(handle_http_request(n, peer_addr, req).await) }
                     });
                     let builder = AutoServerBuilder::new(TokioExecutor::new());
                     let conn = builder.serve_connection(io, service);
@@ -708,8 +706,11 @@ async fn route_request(
                     .collect();
                 let handles = {
                     let db = node.db();
-                    db.messages()
-                        .set_handles_with_descriptions(&caller.peer_id, &pairs, now_ms())?
+                    db.messages().set_handles_with_descriptions(
+                        &caller.peer_id,
+                        &pairs,
+                        now_ms(),
+                    )?
                 };
                 Ok(json_response(StatusCode::OK, &HandlesResponse { handles }))
             }
@@ -736,7 +737,10 @@ async fn route_request(
     if method == Method::GET && path == "/v1/channels" {
         let filter_ch = query.get("channel").map(String::as_str);
         let channels = node.list_channels_for_caller(&caller, filter_ch)?;
-        return Ok(json_response(StatusCode::OK, &ChannelsResponse { channels }));
+        return Ok(json_response(
+            StatusCode::OK,
+            &ChannelsResponse { channels },
+        ));
     }
 
     if method == Method::POST && path == "/v1/channels/join" {
@@ -871,9 +875,7 @@ async fn route_request(
                         .kv()
                         .get_epoch(node.node_id().as_str(), &ns, ep_num)?
                 } else {
-                    node.db()
-                        .kv()
-                        .latest_epoch(node.node_id().as_str(), &ns)?
+                    node.db().kv().latest_epoch(node.node_id().as_str(), &ns)?
                 };
                 Ok(json_response(StatusCode::OK, &KvEpochResponse { epoch }))
             }
@@ -933,7 +935,10 @@ async fn route_request(
                     .get("id")
                     .ok_or_else(|| NodeError::BadRequest("missing id query param".into()))?;
                 let deleted = node.handle_server_delete_subscription(&caller, id).await?;
-                Ok(json_response(StatusCode::OK, &json!({ "deleted": deleted })))
+                Ok(json_response(
+                    StatusCode::OK,
+                    &json!({ "deleted": deleted }),
+                ))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),
         };
@@ -965,10 +970,7 @@ async fn route_request(
                 }
             }
         };
-        node.clear_in_flight(
-            &caller.peer_id,
-            &format!("{}:{}", ack_req.kind, ack_req.id),
-        );
+        node.clear_in_flight(&caller.peer_id, &format!("{}:{}", ack_req.kind, ack_req.id));
         // Trigger immediate next-item push if more items are queued for this peer!
         node.notify_peer_inbox(&caller.peer_id);
         node.notify_scheduler();
@@ -996,11 +998,12 @@ async fn route_request(
                     .ok_or_else(|| {
                         NodeError::BadRequest("missing X-Hyphae-Transfer-Header header".into())
                     })?;
-                let header_bytes = URL_SAFE_NO_PAD
-                    .decode(header_b64)
-                    .map_err(|_| NodeError::BadRequest("invalid transfer header base64url".into()))?;
-                let header_json = String::from_utf8(header_bytes)
-                    .map_err(|_| NodeError::BadRequest("transfer header is not valid UTF-8".into()))?;
+                let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).map_err(|_| {
+                    NodeError::BadRequest("invalid transfer header base64url".into())
+                })?;
+                let header_json = String::from_utf8(header_bytes).map_err(|_| {
+                    NodeError::BadRequest("transfer header is not valid UTF-8".into())
+                })?;
                 let expected_sha = headers
                     .get("x-hyphae-sha256")
                     .and_then(|v| v.to_str().ok())
@@ -1107,7 +1110,11 @@ async fn route_request(
                             node.notify_all_inbox_subscribers();
                             node.notify_scheduler();
                             let etag = format_version_etag(set_res.entry.version);
-                            Ok(json_response_with_etag(StatusCode::OK, &set_res.entry, &etag))
+                            Ok(json_response_with_etag(
+                                StatusCode::OK,
+                                &set_res.entry,
+                                &etag,
+                            ))
                         }
                         Err(StoreError::VersionConflict { current_version }) => {
                             let problem = ProblemDetails::version_conflict(
@@ -1207,7 +1214,9 @@ async fn route_request(
         }
     }
 
-    Err(NodeError::NotFound(format!("route '{method} {path}' not found")))
+    Err(NodeError::NotFound(format!(
+        "route '{method} {path}' not found"
+    )))
 }
 
 fn webhook_outcome_response(
@@ -1555,13 +1564,17 @@ async fn handle_drop_relay_request(
     }
 
     let Some(rest) = path.strip_prefix("/v1/drops/") else {
-        return Err(NodeError::NotFound(format!("route '{method} {path}' not found")));
+        return Err(NodeError::NotFound(format!(
+            "route '{method} {path}' not found"
+        )));
     };
 
     // GET /v1/drops/{id}/stream
     if let Some(raw_id) = rest.strip_suffix("/stream") {
         if raw_id.is_empty() || raw_id.contains('/') {
-            return Err(NodeError::NotFound(format!("route '{method} {path}' not found")));
+            return Err(NodeError::NotFound(format!(
+                "route '{method} {path}' not found"
+            )));
         }
         if method != Method::GET {
             return Err(NodeError::BadRequest("method not allowed".into()));
@@ -1614,7 +1627,9 @@ async fn handle_drop_relay_request(
     // POST /v1/drops/{id}/ack
     if let Some(raw_id) = rest.strip_suffix("/ack") {
         if raw_id.is_empty() || raw_id.contains('/') {
-            return Err(NodeError::NotFound(format!("route '{method} {path}' not found")));
+            return Err(NodeError::NotFound(format!(
+                "route '{method} {path}' not found"
+            )));
         }
         if method != Method::POST {
             return Err(NodeError::BadRequest("method not allowed".into()));
@@ -1701,13 +1716,12 @@ async fn handle_drop_relay_request(
         };
     }
 
-    Err(NodeError::NotFound(format!("route '{method} {path}' not found")))
+    Err(NodeError::NotFound(format!(
+        "route '{method} {path}' not found"
+    )))
 }
 
-fn start_drop_sse_stream(
-    node: Arc<UnifiedNode>,
-    mut sub: DropSubscription,
-) -> Response<BoxedBody> {
+fn start_drop_sse_stream(node: Arc<UnifiedNode>, mut sub: DropSubscription) -> Response<BoxedBody> {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(64);
 
     tokio::spawn(async move {
@@ -1725,7 +1739,11 @@ fn start_drop_sse_stream(
 
         for item in sub.drain_backlog() {
             let encoded = item.to_sse_event().encode();
-            if tx.send(Ok(Frame::data(Bytes::from(encoded)))).await.is_err() {
+            if tx
+                .send(Ok(Frame::data(Bytes::from(encoded))))
+                .await
+                .is_err()
+            {
                 return;
             }
         }

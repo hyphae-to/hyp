@@ -113,10 +113,14 @@ pub fn expand_v1_scopes<S: AsRef<str>>(input: &[S]) -> Result<Vec<String>, Scope
     for item in input {
         match item.as_ref() {
             "*" => expanded_raw.extend(V1_ALL_SCOPES.iter().map(|s| (*s).to_string())),
-            "messages:*" => expanded_raw.extend(["messages:send", "messages:receive"].map(String::from)),
+            "messages:*" => {
+                expanded_raw.extend(["messages:send", "messages:receive"].map(String::from))
+            }
             "events:*" => expanded_raw.push("events:subscribe".to_string()),
             "files:*" => expanded_raw.extend(["files:send", "files:receive"].map(String::from)),
-            "forks:*" => expanded_raw.extend(["forks:send", "forks:receive/full-access"].map(String::from)),
+            "forks:*" => {
+                expanded_raw.extend(["forks:send", "forks:receive/full-access"].map(String::from))
+            }
             other => expanded_raw.push(other.to_string()),
         }
     }
@@ -167,7 +171,12 @@ fn parse_and_format_v1_scope(scope: &str) -> Result<(&'static str, String), Scop
     let &base = V1_BASE_SCOPES
         .iter()
         .find(|&&b| b == base_raw)
-        .ok_or_else(|| fail(format!("unknown scope; known: {}", V1_BASE_SCOPES.join(", "))))?;
+        .ok_or_else(|| {
+            fail(format!(
+                "unknown scope; known: {}",
+                V1_BASE_SCOPES.join(", ")
+            ))
+        })?;
     let Some(rhs_val) = rhs else {
         return Ok((base, base.to_string()));
     };
@@ -539,7 +548,9 @@ pub fn parse_scope_v2(raw: &str) -> Result<ParsedScopeV2, ScopeError> {
                     let mut set = BTreeSet::new();
                     for c in chans.split(',') {
                         if !is_valid_channel(c) {
-                            return Err(fail("channel scope targets must match /^#[a-z0-9][a-z0-9._-]{0,62}$/"));
+                            return Err(fail(
+                                "channel scope targets must match /^#[a-z0-9][a-z0-9._-]{0,62}$/",
+                            ));
                         }
                         set.insert(c.to_string());
                     }
@@ -572,7 +583,8 @@ pub fn parse_scope_v2(raw: &str) -> Result<ParsedScopeV2, ScopeError> {
         "files:receive" => match rhs {
             None | Some("*") => Ok(ParsedScopeV2::FilesReceive { max_bytes: None }),
             Some(sz) => {
-                let bytes = parse_byte_size(sz).ok_or_else(|| fail("invalid byte size in files:receive"))?;
+                let bytes = parse_byte_size(sz)
+                    .ok_or_else(|| fail("invalid byte size in files:receive"))?;
                 Ok(ParsedScopeV2::FilesReceive {
                     max_bytes: Some(bytes),
                 })
@@ -706,7 +718,9 @@ fn parse_stream_subscribe_rhs(spec: &str, raw_scope: &str) -> Result<ParsedScope
                     }
                 }
                 "maxValues" => {
-                    let n: u32 = v.parse().map_err(|_| fail("maxValues must be a positive integer"))?;
+                    let n: u32 = v
+                        .parse()
+                        .map_err(|_| fail("maxValues must be a positive integer"))?;
                     if n == 0 {
                         return Err(fail("maxValues must be > 0"));
                     }
@@ -948,7 +962,10 @@ impl ScopeSet {
                 }
                 // Check `<node>/*` wildcard or node-level allowlist when target is `<node>/<handle>`.
                 if let Some((node, handle)) = target.split_once('/') {
-                    if set.contains(&format!("{node}/*")) || set.contains(node) || set.contains(handle) {
+                    if set.contains(&format!("{node}/*"))
+                        || set.contains(node)
+                        || set.contains(handle)
+                    {
                         return true;
                     }
                 }
@@ -959,7 +976,9 @@ impl ScopeSet {
     }
 
     pub fn may_dm_receive(&self) -> bool {
-        self.rules.iter().any(|r| matches!(r, ParsedScopeV2::DmReceive))
+        self.rules
+            .iter()
+            .any(|r| matches!(r, ParsedScopeV2::DmReceive))
     }
 
     pub fn may_channel_join(&self, channel: &str) -> bool {
@@ -1045,8 +1064,10 @@ impl ScopeSet {
             for (attr, allowed_values) in &constraints.value_allowlists {
                 match extract_confined_values(filters, "exact", attr) {
                     Some(vals) if !vals.is_empty() => {
-                        if let Some(disallowed) = vals.iter().find(|v| !allowed_values.contains(*v)) {
-                            missing_scope = format!("stream:subscribe={topic}[{attr}={disallowed}]");
+                        if let Some(disallowed) = vals.iter().find(|v| !allowed_values.contains(*v))
+                        {
+                            missing_scope =
+                                format!("stream:subscribe={topic}[{attr}={disallowed}]");
                             last_reason = format!(
                                 "value '{disallowed}' for '{attr}' is outside granted allowlist"
                             );
@@ -1233,15 +1254,15 @@ fn extract_all(items: &[Filter], dialect: &str, attribute: &str) -> Option<BTree
 
 fn extract_node(filter: &Filter, dialect: &str, attribute: &str) -> Option<BTreeSet<String>> {
     match filter {
-        Filter::Exact(pairs) if dialect == "exact" => pairs
-            .get(attribute)
-            .map(|v| BTreeSet::from([v.clone()])),
-        Filter::Prefix(pairs) if dialect == "prefix" => pairs
-            .get(attribute)
-            .map(|v| BTreeSet::from([v.clone()])),
-        Filter::Suffix(pairs) if dialect == "suffix" => pairs
-            .get(attribute)
-            .map(|v| BTreeSet::from([v.clone()])),
+        Filter::Exact(pairs) if dialect == "exact" => {
+            pairs.get(attribute).map(|v| BTreeSet::from([v.clone()]))
+        }
+        Filter::Prefix(pairs) if dialect == "prefix" => {
+            pairs.get(attribute).map(|v| BTreeSet::from([v.clone()]))
+        }
+        Filter::Suffix(pairs) if dialect == "suffix" => {
+            pairs.get(attribute).map(|v| BTreeSet::from([v.clone()]))
+        }
         Filter::Exact(_) | Filter::Prefix(_) | Filter::Suffix(_) | Filter::Not(_) => None,
         Filter::All(children) => extract_all(children, dialect, attribute),
         Filter::Any(children) => {
@@ -1460,20 +1481,14 @@ pub fn expand_delegated_human_scopes<S: AsRef<str>>(
 /// - Rejects bare `"*"` unless `allow_wildcard_all == true`.
 /// - Allows at most one trailing `"*"` wildcard; interior wildcards are rejected.
 /// - Non-wildcard characters must match Hyphae node-ID syntax (`/^[a-z0-9][a-z0-9@._-]*$/`).
-pub fn validate_node_prefix_pattern(
-    pattern: &str,
-    allow_wildcard_all: bool,
-) -> Result<(), String> {
+pub fn validate_node_prefix_pattern(pattern: &str, allow_wildcard_all: bool) -> Result<(), String> {
     if pattern.is_empty() || pattern.len() > 65 {
         return Err("nodePrefix must be 1..=65 characters".to_string());
     }
     if pattern.contains("..") || pattern.contains('/') {
         return Err("nodePrefix must not contain '..' or '/'".to_string());
     }
-    if pattern
-        .chars()
-        .any(|c| c.is_control() || c.is_whitespace())
-    {
+    if pattern.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err("nodePrefix must not contain control or whitespace characters".to_string());
     }
     if pattern == "*" {
@@ -1584,9 +1599,11 @@ mod tests {
 
         // Unrestricted or prefix filter -> DENIED!
         assert!(guest.check_stream_subscribe("github", &[]).is_err());
-        assert!(guest
-            .check_stream_subscribe("github", &[prefix("repo", "anthropics/")])
-            .is_err());
+        assert!(
+            guest
+                .check_stream_subscribe("github", &[prefix("repo", "anthropics/")])
+                .is_err()
+        );
 
         // Single exact.repo -> APPROVED with rate limits!
         let ok = guest
@@ -1599,20 +1616,24 @@ mod tests {
         let eleven: Vec<Filter> = (0..11)
             .map(|i| exact("repo", &format!("org/repo-{i}")))
             .collect();
-        assert!(guest
-            .check_stream_subscribe("github", &[Filter::Any(eleven)])
-            .is_err());
+        assert!(
+            guest
+                .check_stream_subscribe("github", &[Filter::Any(eleven)])
+                .is_err()
+        );
 
         // Smuggling an unconstrained branch in `any` -> DENIED!
-        assert!(guest
-            .check_stream_subscribe(
-                "github",
-                &[Filter::Any(vec![
-                    exact("repo", "org/a"),
-                    exact("type", "com.github.push"),
-                ])]
-            )
-            .is_err());
+        assert!(
+            guest
+                .check_stream_subscribe(
+                    "github",
+                    &[Filter::Any(vec![
+                        exact("repo", "org/a"),
+                        exact("type", "com.github.push"),
+                    ])]
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -1622,12 +1643,16 @@ mod tests {
             "future:scope=unknown_v99",
             "files:send=25mb",
         ]);
-        assert!(confined
-            .check_stream_subscribe("github", &[exact("repo", "acme/checkout")])
-            .is_ok());
-        assert!(confined
-            .check_stream_subscribe("github", &[exact("repo", "acme/billing")])
-            .is_err());
+        assert!(
+            confined
+                .check_stream_subscribe("github", &[exact("repo", "acme/checkout")])
+                .is_ok()
+        );
+        assert!(
+            confined
+                .check_stream_subscribe("github", &[exact("repo", "acme/billing")])
+                .is_err()
+        );
         assert!(confined.may_send_files("bob@laptop", Some(25 * 1024 * 1024)));
         assert!(!confined.may_send_files("bob@laptop", Some(25 * 1024 * 1024 + 1)));
 
@@ -1666,7 +1691,10 @@ mod tests {
 
     #[test]
     fn drop_create_scope_parsing_and_grant_checks() {
-        assert_eq!(parse_scope_v2("drop:create").unwrap(), ParsedScopeV2::DropCreate);
+        assert_eq!(
+            parse_scope_v2("drop:create").unwrap(),
+            ParsedScopeV2::DropCreate
+        );
         assert!(parse_scope_v2("drop:create=extra").is_err());
 
         let explicit = ScopeSet::from_strings(&["drop:create"]);

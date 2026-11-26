@@ -251,7 +251,11 @@ impl<'a> EventStore<'a> {
 
     /// Returns telemetry counters for the `PRAGMA data_version` compiled subscription cache.
     pub fn cache_stats(&self) -> EventCacheStats {
-        let guard = self.db.event_cache.lock().expect("event_cache mutex poisoned");
+        let guard = self
+            .db
+            .event_cache
+            .lock()
+            .expect("event_cache mutex poisoned");
         EventCacheStats {
             data_version: guard.data_version,
             cached_topics: guard.by_topic.len(),
@@ -262,7 +266,11 @@ impl<'a> EventStore<'a> {
     }
 
     fn invalidate_cache(&self) {
-        let mut guard = self.db.event_cache.lock().expect("event_cache mutex poisoned");
+        let mut guard = self
+            .db
+            .event_cache
+            .lock()
+            .expect("event_cache mutex poisoned");
         guard.by_topic.clear();
         guard.invalidations += 1;
     }
@@ -279,13 +287,19 @@ impl<'a> EventStore<'a> {
         now_ms: i64,
     ) -> StoreResult<Publisher> {
         if !is_node_id(id) {
-            return Err(StoreError::InvalidInput(format!("invalid publisher id '{id}'")));
+            return Err(StoreError::InvalidInput(format!(
+                "invalid publisher id '{id}'"
+            )));
         }
         if token.is_empty() {
-            return Err(StoreError::InvalidInput("publisher token must be non-empty".to_string()));
+            return Err(StoreError::InvalidInput(
+                "publisher token must be non-empty".to_string(),
+            ));
         }
         if topics.is_empty() {
-            return Err(StoreError::InvalidInput("publisher requires at least one topic".to_string()));
+            return Err(StoreError::InvalidInput(
+                "publisher requires at least one topic".to_string(),
+            ));
         }
         let mut unique_topics = Vec::new();
         let mut seen = HashSet::new();
@@ -371,7 +385,9 @@ impl<'a> EventStore<'a> {
 
     fn validate_subscription_spec(&self, spec: &SubscriptionSpec) -> StoreResult<String> {
         if spec.id.is_empty() || spec.id.len() > 128 {
-            return Err(StoreError::InvalidInput("invalid subscription id".to_string()));
+            return Err(StoreError::InvalidInput(
+                "invalid subscription id".to_string(),
+            ));
         }
         if !is_node_id(&spec.origin_node) {
             return Err(StoreError::InvalidInput(format!(
@@ -380,7 +396,10 @@ impl<'a> EventStore<'a> {
             )));
         }
         if !is_topic(&spec.topic) {
-            return Err(StoreError::InvalidInput(format!("invalid topic '{}'", spec.topic)));
+            return Err(StoreError::InvalidInput(format!(
+                "invalid topic '{}'",
+                spec.topic
+            )));
         }
         if spec.subscriber.is_empty() || spec.subscriber.len() > 128 {
             return Err(StoreError::InvalidInput("invalid subscriber".to_string()));
@@ -431,8 +450,10 @@ impl<'a> EventStore<'a> {
                 )));
             }
             if prev.origin_node != spec.origin_node || prev.topic != spec.topic {
-                tx.conn()
-                    .execute("DELETE FROM batches WHERE subscription_id = ?1", params![&spec.id])?;
+                tx.conn().execute(
+                    "DELETE FROM batches WHERE subscription_id = ?1",
+                    params![&spec.id],
+                )?;
             }
             tx.conn().execute(
                 "UPDATE subscriptions
@@ -455,7 +476,8 @@ impl<'a> EventStore<'a> {
                 tx.conn(),
                 &spec.id,
                 spec.coalesce_seconds,
-                spec.max_batch_age_ms.unwrap_or(self.limits().max_batch_age_ms),
+                spec.max_batch_age_ms
+                    .unwrap_or(self.limits().max_batch_age_ms),
             )?;
         } else {
             let count: i64 = tx.conn().query_row(
@@ -555,8 +577,10 @@ impl<'a> EventStore<'a> {
 
         for prev in existing_by_id.values() {
             if !seen.contains(&prev.id) {
-                tx.conn()
-                    .execute("DELETE FROM batches WHERE subscription_id = ?1", params![&prev.id])?;
+                tx.conn().execute(
+                    "DELETE FROM batches WHERE subscription_id = ?1",
+                    params![&prev.id],
+                )?;
                 tx.conn()
                     .execute("DELETE FROM subscriptions WHERE id = ?1", params![&prev.id])?;
             }
@@ -601,7 +625,8 @@ impl<'a> EventStore<'a> {
                     tx.conn(),
                     &spec.id,
                     spec.coalesce_seconds,
-                    spec.max_batch_age_ms.unwrap_or(self.limits().max_batch_age_ms),
+                    spec.max_batch_age_ms
+                        .unwrap_or(self.limits().max_batch_age_ms),
                 )?;
             } else {
                 tx.conn().execute(
@@ -635,8 +660,10 @@ impl<'a> EventStore<'a> {
     /// Deletes a single subscription and all of its batches.
     pub fn delete_subscription(&self, id: &str) -> StoreResult<bool> {
         let tx = self.db.immediate_tx()?;
-        tx.conn()
-            .execute("DELETE FROM batches WHERE subscription_id = ?1", params![id])?;
+        tx.conn().execute(
+            "DELETE FROM batches WHERE subscription_id = ?1",
+            params![id],
+        )?;
         let changed = tx
             .conn()
             .execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?;
@@ -662,8 +689,10 @@ impl<'a> EventStore<'a> {
             params![id, subscriber],
         )?;
         if changed > 0 {
-            tx.conn()
-                .execute("DELETE FROM batches WHERE subscription_id = ?1", params![id])?;
+            tx.conn().execute(
+                "DELETE FROM batches WHERE subscription_id = ?1",
+                params![id],
+            )?;
         }
         tx.commit()?;
         if changed > 0 {
@@ -952,7 +981,11 @@ impl<'a> EventStore<'a> {
         let digest = sha256_hex(
             format!(
                 "{}\0{}\0{}\0{}\0{}",
-                input.peer_id, input.topic, input.shard_index, input.filters_json, input.coalesce_seconds
+                input.peer_id,
+                input.topic,
+                input.shard_index,
+                input.filters_json,
+                input.coalesce_seconds
             )
             .as_bytes(),
         );
@@ -1023,9 +1056,10 @@ impl<'a> EventStore<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         } else {
-            let mut stmt = self.db.conn().prepare(
-                "SELECT * FROM upstream_pushdowns ORDER BY peer_id, topic, shard_index",
-            )?;
+            let mut stmt = self
+                .db
+                .conn()
+                .prepare("SELECT * FROM upstream_pushdowns ORDER BY peer_id, topic, shard_index")?;
             let rows = stmt
                 .query_map([], decode_pushdown_row)?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1049,21 +1083,22 @@ impl<'a> EventStore<'a> {
     pub fn tick(&self, now_ms: i64) -> StoreResult<EventTickReport> {
         let limits = self.limits().clone();
         let should_prune = {
-            let guard = self.db.event_cache.lock().expect("event_cache mutex poisoned");
+            let guard = self
+                .db
+                .event_cache
+                .lock()
+                .expect("event_cache mutex poisoned");
             guard
                 .last_prune_ms
                 .is_none_or(|last| now_ms - last >= limits.prune_interval_ms)
         };
 
         // Read-only quick check so we avoid acquiring a write lock when idle.
-        let has_due_open: bool = self
-            .db
-            .conn()
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM batches WHERE state = 'open' AND flush_at <= ?1)",
-                params![now_ms],
-                |row| row.get(0),
-            )?;
+        let has_due_open: bool = self.db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM batches WHERE state = 'open' AND flush_at <= ?1)",
+            params![now_ms],
+            |row| row.get(0),
+        )?;
         let has_expired_pending: bool = self.db.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM batches WHERE state = 'pending' AND opened_at <= ?1)",
             params![now_ms - limits.retention_ms],
@@ -1129,7 +1164,11 @@ impl<'a> EventStore<'a> {
 
         tx.commit()?;
         if should_prune {
-            let mut guard = self.db.event_cache.lock().expect("event_cache mutex poisoned");
+            let mut guard = self
+                .db
+                .event_cache
+                .lock()
+                .expect("event_cache mutex poisoned");
             guard.last_prune_ms = Some(now_ms);
         }
         Ok(report)
@@ -1201,10 +1240,9 @@ impl<'a> EventStore<'a> {
                     continue;
                 }
                 let ts: Option<i64> = wake_stmt
-                    .query_row(
-                        params![sub_id, now_ms - HOUR_MS, (cap - 1) as i64],
-                        |row| row.get(0),
-                    )
+                    .query_row(params![sub_id, now_ms - HOUR_MS, (cap - 1) as i64], |row| {
+                        row.get(0)
+                    })
                     .optional()?;
                 if let Some(settled_at) = ts {
                     consider(Some(settled_at + HOUR_MS));

@@ -134,25 +134,26 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
         resolve_state_dir(None, None, None)
     };
 
-    let local_ingest_cfg: LocalIngestConfig = match loaded
-        .as_ref()
-        .and_then(|c| c.raw.get("localIngest"))
-    {
-        Some(val) => match serde_json::from_value(val.clone()) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "CONFIG_ERROR",
-                    format!("Invalid localIngest config in {}: {e}", config_path.display()),
-                    None,
-                );
-            }
-        },
-        None => LocalIngestConfig::default(),
-    };
+    let local_ingest_cfg: LocalIngestConfig =
+        match loaded.as_ref().and_then(|c| c.raw.get("localIngest")) {
+            Some(val) => match serde_json::from_value(val.clone()) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "CONFIG_ERROR",
+                        format!(
+                            "Invalid localIngest config in {}: {e}",
+                            config_path.display()
+                        ),
+                        None,
+                    );
+                }
+            },
+            None => LocalIngestConfig::default(),
+        };
 
     let stdin_json: Option<Map<String, Value>> = match read_optional_stdin_json() {
         Ok(opt) => opt,
@@ -357,14 +358,7 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
             );
         }
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "EMIT_FAILED",
-                e.to_string(),
-                None,
-            );
+            return emit_error(cmd, as_json, EXIT_ERROR, "EMIT_FAILED", e.to_string(), None);
         }
     };
 
@@ -507,7 +501,11 @@ fn build_emit_payload(
         let raw_topic = args
             .topic
             .as_deref()
-            .or_else(|| outer_map.and_then(|m| m.get("topic")).and_then(Value::as_str))
+            .or_else(|| {
+                outer_map
+                    .and_then(|m| m.get("topic"))
+                    .and_then(Value::as_str)
+            })
             .or_else(|| body_map.get("topic").and_then(Value::as_str))
             .unwrap_or(default_topic)
             .trim();
@@ -568,10 +566,7 @@ fn build_emit_payload(
                 .map_err(|e| ("INVALID_EVENT", e.to_string()))?;
             ce
         } else if body_map.contains_key("specversion") {
-            return Err((
-                "INVALID_EVENT",
-                "specversion must be \"1.0\"".to_string(),
-            ));
+            return Err(("INVALID_EVENT", "specversion must be \"1.0\"".to_string()));
         } else {
             build_shorthand_cloudevent(args, body_map, parse_limits)?
         };
@@ -639,8 +634,12 @@ fn build_emit_payload(
         extensions,
     };
 
-    let ce_val = serde_json::to_value(&ce)
-        .map_err(|e| ("INVALID_EVENT", format!("failed to serialize CloudEvent: {e}")))?;
+    let ce_val = serde_json::to_value(&ce).map_err(|e| {
+        (
+            "INVALID_EVENT",
+            format!("failed to serialize CloudEvent: {e}"),
+        )
+    })?;
     let (validated, _) = check_cloudevent_v2_with_limits(&ce_val, parse_limits)
         .map_err(|e| ("INVALID_EVENT", e.to_string()))?;
 
@@ -668,7 +667,10 @@ fn build_shorthand_cloudevent(
             None | Some(Value::Null) => TYPE_SCHEDULED_MESSAGE_V1.to_string(),
             Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
             _ => {
-                return Err(("INVALID_EVENT", "type must be a non-empty string".to_string()));
+                return Err((
+                    "INVALID_EVENT",
+                    "type must be a non-empty string".to_string(),
+                ));
             }
         }
     };
@@ -860,8 +862,12 @@ fn build_shorthand_cloudevent(
         extensions,
     };
 
-    let ce_val = serde_json::to_value(&ce)
-        .map_err(|e| ("INVALID_EVENT", format!("failed to serialize CloudEvent: {e}")))?;
+    let ce_val = serde_json::to_value(&ce).map_err(|e| {
+        (
+            "INVALID_EVENT",
+            format!("failed to serialize CloudEvent: {e}"),
+        )
+    })?;
     let (validated, _) = check_cloudevent_v2_with_limits(&ce_val, parse_limits)
         .map_err(|e| ("INVALID_EVENT", e.to_string()))?;
     Ok(validated)

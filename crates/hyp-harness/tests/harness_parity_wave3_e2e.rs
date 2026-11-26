@@ -296,7 +296,9 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
     fs::create_dir_all(&secrets_dir).unwrap();
     let store = SecretStore::new(&secrets_dir, SecretBackend::File);
     store.set(DEFAULT_OPENCLAW_TOKEN_SECRET, token_val).unwrap();
-    store.set("exfil-other-secret", "TOP_SECRET_OTHER_KEY").unwrap();
+    store
+        .set("exfil-other-secret", "TOP_SECRET_OTHER_KEY")
+        .unwrap();
 
     // Reject non-loopback HTTP AND non-loopback HTTPS (by default) fail-closed!
     for bad_url in ["http://192.168.1.99:18789", "https://evil.example.com"] {
@@ -320,7 +322,10 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
         .with_secret_backend(SecretBackend::File);
     let exfil_probe = probe_openclaw_gateway(&exfil_target, Duration::from_secs(2)).await;
     assert!(!exfil_probe.ok, "arbitrary tokenSecret must fail closed");
-    assert!(probes.lock().unwrap().is_empty(), "rejected tokenSecret must not hit network");
+    assert!(
+        probes.lock().unwrap().is_empty(),
+        "rejected tokenSecret must not hit network"
+    );
 
     // Probe MUST reject `405 Method Not Allowed` from a random non-OpenClaw listener!
     unauth_probe_status.store(405, Ordering::SeqCst);
@@ -488,9 +493,16 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
     let mut oc_no_tok_mcp = TestMcpClient::spawn(oc_no_tok_opts);
     oc_no_tok_mcp.initialize().await;
     let (join_no_tok, err_no_tok) = oc_no_tok_mcp
-        .call_tool("hyp_mesh", json!({ "action": "join", "handle": "claw" }), None)
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "claw" }),
+            None,
+        )
         .await;
-    assert!(!err_no_tok, "openclaw join without token failed: {join_no_tok}");
+    assert!(
+        !err_no_tok,
+        "openclaw join without token failed: {join_no_tok}"
+    );
     let join_no_tok_val: Value = serde_json::from_str(&join_no_tok).unwrap();
     assert_eq!(
         join_no_tok_val["hasLiveTransport"], false,
@@ -547,7 +559,11 @@ async fn x2_openclaw_transport_delivers_metadata_nudge_enforces_auth_and_detache
     oc_mcp.initialize().await;
 
     let (join_txt, join_err) = oc_mcp
-        .call_tool("hyp_mesh", json!({ "action": "join", "handle": "claw" }), None)
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "claw" }),
+            None,
+        )
         .await;
     assert!(!join_err, "openclaw live join failed: {join_txt}");
     let join_val: Value = serde_json::from_str(&join_txt).unwrap();
@@ -903,8 +919,7 @@ async fn x8_codex_uuid_session_auto_attaches_queue_transport_when_rollout_exists
         "expected fake-codex queue metadata-only nudge, got:\n{logged}"
     );
     assert!(
-        !logged.contains("AUTO_WIRED_CODEX_QUEUE_WAKEUP")
-            && !logged.contains("human-verified"),
+        !logged.contains("AUTO_WIRED_CODEX_QUEUE_WAKEUP") && !logged.contains("human-verified"),
         "Codex Queue push MUST NOT leak untrusted DM body into thread prompt:\n{logged}"
     );
     // Unread message MUST remain preserved in SQLite for structured hyp_inbox read!
@@ -950,7 +965,9 @@ async fn x8_codex_uuid_session_auto_attaches_queue_transport_when_rollout_exists
     assert!(!inbox_err, "codex hyp_inbox failed: {inbox_txt}");
     let inbox_val: Value = serde_json::from_str(&inbox_txt).unwrap();
     assert!(
-        !inbox_val["items"][0]["humanVerified"].as_bool().unwrap_or(false),
+        !inbox_val["items"][0]["humanVerified"]
+            .as_bool()
+            .unwrap_or(false),
         "spoofed peer DM must never carry humanVerified=true: {inbox_txt}"
     );
     assert!(
@@ -1077,9 +1094,7 @@ async fn x9_daemon_honors_node_json_t3_block_and_explicit_hint_precedence() {
     )
     .unwrap();
     let store = SecretStore::new(&state_dir, SecretBackend::File);
-    store
-        .set("t3-session-token", custom_secret_val)
-        .unwrap();
+    store.set("t3-session-token", custom_secret_val).unwrap();
 
     // Start LocalDaemon with NO `t3_default_url` / `t3_default_base_dir` overrides so it MUST read `node.json`!
     let node = open_local_node("t3-nodejson@box", &state_dir);
@@ -1284,7 +1299,12 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     .await;
     assert!(reg_res.ok, "session.register failed: {reg_res:?}");
     assert!(
-        reg_res.result.as_ref().unwrap().get("sessionToken").is_none(),
+        reg_res
+            .result
+            .as_ref()
+            .unwrap()
+            .get("sessionToken")
+            .is_none(),
         "session.register MUST NOT return sessionToken: {reg_res:?}"
     );
 
@@ -1445,7 +1465,10 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
             &json!({ "type": "mailbox.drain", "sessionId": victim_sid, "sessionToken": wrong_tok }),
         )
         .await;
-        assert!(!d_res.ok, "mailbox.drain must fail for wrong_tok={wrong_tok:?}");
+        assert!(
+            !d_res.ok,
+            "mailbox.drain must fail for wrong_tok={wrong_tok:?}"
+        );
         assert_eq!(d_res.error.as_deref(), Some("session_token_invalid"));
 
         let c_res = rpc(
@@ -1460,7 +1483,10 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
             }),
         )
         .await;
-        assert!(!c_res.ok, "call.start must fail for wrong_tok={wrong_tok:?}");
+        assert!(
+            !c_res.ok,
+            "call.start must fail for wrong_tok={wrong_tok:?}"
+        );
         assert_eq!(c_res.error.as_deref(), Some("session_token_invalid"));
     }
 
@@ -1608,9 +1634,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     };
     let post_no_tok = tokio::task::spawn_blocking(move || {
         handle_hook_payload_with_session_token(
-            json!({ "session_id": "victim-x5" })
-                .as_object()
-                .unwrap(),
+            json!({ "session_id": "victim-x5" }).as_object().unwrap(),
             &hook_opts,
             None,
             |s, p| daemon_rpc_sync(s, p, Duration::from_secs(2)),
@@ -1777,9 +1801,7 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
     )
     .unwrap();
     let store = SecretStore::new(&state_dir, SecretBackend::File);
-    store
-        .set(DEFAULT_OPENCLAW_TOKEN_SECRET, token_val)
-        .unwrap();
+    store.set(DEFAULT_OPENCLAW_TOKEN_SECRET, token_val).unwrap();
 
     let node = open_local_node("oc-nudge@box", &state_dir);
     let daemon = LocalDaemon::start(
@@ -1903,7 +1925,10 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
     .await;
     assert!(plain_drain.ok);
     assert_eq!(
-        plain_drain.result.unwrap()["items"].as_array().unwrap().len(),
+        plain_drain.result.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
         0,
         "regular drain without includeNudged must NOT re-emit nudged batch"
     );
@@ -2025,7 +2050,11 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
     .await;
     let ack_tok = ack_pre["callToken"].as_str().expect("ack callToken");
     let _ = oc_mcp
-        .call_tool("hyp_inbox", json!({ "ack": true, "_meshCall": ack_tok }), None)
+        .call_tool(
+            "hyp_inbox",
+            json!({ "ack": true, "_meshCall": ack_tok }),
+            None,
+        )
         .await;
     let _ = rpc(
         &sock,
@@ -2171,7 +2200,11 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
     let mut oc_inbox_mcp = TestMcpClient::spawn(oc_inbox_opts);
     oc_inbox_mcp.initialize().await;
     let (j3_txt, j3_err) = oc_inbox_mcp
-        .call_tool("hyp_mesh", json!({ "action": "join", "handle": "claw-inbox" }), None)
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "claw-inbox" }),
+            None,
+        )
         .await;
     assert!(!j3_err, "{j3_txt}");
     let j3_val: Value = serde_json::from_str(&j3_txt).unwrap();
@@ -2228,9 +2261,7 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
     )
     .unwrap();
     let store = SecretStore::new(&state_dir, SecretBackend::File);
-    store
-        .set(DEFAULT_OPENCLAW_TOKEN_SECRET, token_val)
-        .unwrap();
+    store.set(DEFAULT_OPENCLAW_TOKEN_SECRET, token_val).unwrap();
 
     let node = open_local_node("oc-exact@box", &state_dir);
     let daemon = LocalDaemon::start(
@@ -2255,9 +2286,16 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
 
     // 1. Unverified & forged calls MUST fail closed!
     let (_, unv_err) = shared_mcp
-        .call_tool("hyp_mesh", json!({ "action": "join", "handle": "spoof" }), None)
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "spoof" }),
+            None,
+        )
         .await;
-    assert!(unv_err, "unverified non-ephemeral OpenClaw call must fail closed");
+    assert!(
+        unv_err,
+        "unverified non-ephemeral OpenClaw call must fail closed"
+    );
     let (_, forged_err) = shared_mcp
         .call_tool(
             "hyp_mesh",
@@ -2308,7 +2346,11 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
             }),
         )
         .await;
-        assert_eq!(post, json!({}), "after-tool-call must never drain or mutate");
+        assert_eq!(
+            post,
+            json!({}),
+            "after-tool-call must never drain or mutate"
+        );
         out
     }
 
@@ -2342,8 +2384,20 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
     assert!(!jb_err, "session B join failed: {jb_txt}");
 
     // Flip both idle so Queue wakeups flush immediately.
-    let _ = run_hook(&sock, HarnessKind::Openclaw, HookEvent::Stop, json!({ "sessionKey": sk_a })).await;
-    let _ = run_hook(&sock, HarnessKind::Openclaw, HookEvent::Stop, json!({ "sessionKey": sk_b })).await;
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        HookEvent::Stop,
+        json!({ "sessionKey": sk_a }),
+    )
+    .await;
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        HookEvent::Stop,
+        json!({ "sessionKey": sk_b }),
+    )
+    .await;
 
     // 3. Deliver DMs to A and B via default webhook transport -> MUST hit `/hooks/wake` (NEVER `/hooks/agent`)
     //    with EXACT per-session `agentId` + `sessionKey`!
@@ -2374,17 +2428,33 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
 
     {
         let reqs = gw_recorded.lock().unwrap();
-        assert_eq!(reqs.len(), 2, "expected 2 exact per-session /hooks/wake deliveries");
+        assert_eq!(
+            reqs.len(),
+            2,
+            "expected 2 exact per-session /hooks/wake deliveries"
+        );
         for req in reqs.iter() {
-            assert_eq!(req.path, "/hooks/wake", "default OpenClaw webhook MUST be /hooks/wake, never /hooks/agent!");
-            assert!(!req.body.contains("CONFIDENTIAL_FOR_"), "wake nudge must never leak bodies");
+            assert_eq!(
+                req.path, "/hooks/wake",
+                "default OpenClaw webhook MUST be /hooks/wake, never /hooks/agent!"
+            );
+            assert!(
+                !req.body.contains("CONFIDENTIAL_FOR_"),
+                "wake nudge must never leak bodies"
+            );
         }
         let bodies: Vec<Value> = reqs
             .iter()
             .map(|r| serde_json::from_str::<Value>(&r.body).unwrap())
             .collect();
-        let wake_a = bodies.iter().find(|b| b["sessionKey"] == sk_a).expect("exact wake for session A");
-        let wake_b = bodies.iter().find(|b| b["sessionKey"] == sk_b).expect("exact wake for session B");
+        let wake_a = bodies
+            .iter()
+            .find(|b| b["sessionKey"] == sk_a)
+            .expect("exact wake for session A");
+        let wake_b = bodies
+            .iter()
+            .find(|b| b["sessionKey"] == sk_b)
+            .expect("exact wake for session B");
         assert_eq!(wake_a["agentId"], "main");
         assert_eq!(wake_a["mode"], "now");
         assert_eq!(wake_b["agentId"], "ops");
@@ -2402,9 +2472,17 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
         json!({ "sessionKey": sk_b, "agentId": "ops" }),
     )
     .await;
-    let prep_b = drain_b["prependContext"].as_str().expect("prependContext for B");
-    assert!(prep_b.contains("CONFIDENTIAL_FOR_B_ONLY"), "prep_b={prep_b}");
-    assert!(!prep_b.contains("CONFIDENTIAL_FOR_A_ONLY"), "cross-session leak into B!");
+    let prep_b = drain_b["prependContext"]
+        .as_str()
+        .expect("prependContext for B");
+    assert!(
+        prep_b.contains("CONFIDENTIAL_FOR_B_ONLY"),
+        "prep_b={prep_b}"
+    );
+    assert!(
+        !prep_b.contains("CONFIDENTIAL_FOR_A_ONLY"),
+        "cross-session leak into B!"
+    );
 
     let drain_c = run_hook(
         &sock,
@@ -2422,16 +2500,27 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
         json!({ "sessionKey": sk_a, "agentId": "main" }),
     )
     .await;
-    let prep_a = drain_a["prependContext"].as_str().expect("prependContext for A");
-    assert!(prep_a.contains("CONFIDENTIAL_FOR_A_ONLY"), "prep_a={prep_a}");
-    assert!(!prep_a.contains("CONFIDENTIAL_FOR_B_ONLY"), "cross-session leak into A!");
+    let prep_a = drain_a["prependContext"]
+        .as_str()
+        .expect("prependContext for A");
+    assert!(
+        prep_a.contains("CONFIDENTIAL_FOR_A_ONLY"),
+        "prep_a={prep_a}"
+    );
+    assert!(
+        !prep_a.contains("CONFIDENTIAL_FOR_B_ONLY"),
+        "cross-session leak into A!"
+    );
 
     // 5. Connect native `openclaw.service.ready` plugin wake service (priority above webhook!).
     let (svc_r, mut svc_w) = connect_daemon_async(&sock).await.unwrap();
     let mut svc_reader = BufReader::new(svc_r);
-    write_ndjson_line_async(&mut svc_w, &json!({ "type": "openclaw.service.ready", "version": 1 }))
-        .await
-        .unwrap();
+    write_ndjson_line_async(
+        &mut svc_w,
+        &json!({ "type": "openclaw.service.ready", "version": 1 }),
+    )
+    .await
+    .unwrap();
     let ack_line = read_bounded_line_async(&mut svc_reader, MAX_SOCKET_LINE_BYTES)
         .await
         .unwrap()
@@ -2440,24 +2529,53 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
     assert_eq!(svc_ack["type"], "openclaw.service.ack");
     assert_eq!(svc_ack["ok"], true);
 
-    assert_eq!(daemon.session_transport_kind(&sid_a), Some("openclaw_plugin"));
-    assert_eq!(daemon.session_transport_kind(&sid_b), Some("openclaw_plugin"));
+    assert_eq!(
+        daemon.session_transport_kind(&sid_a),
+        Some("openclaw_plugin")
+    );
+    assert_eq!(
+        daemon.session_transport_kind(&sid_b),
+        Some("openclaw_plugin")
+    );
 
     // Regression check: `daemon.status` and `sessions.summary` MUST NOT deadlock while
     // `openclaw_service` is connected (no re-entrant `node.db()` lock!).
     let ds_live = rpc(&sock, &json!({ "type": "daemon.status" })).await;
-    assert!(ds_live.ok, "daemon.status failed while openclaw_plugin connected: {ds_live:?}");
-    let ds_sessions = ds_live.result.unwrap()["sessions"].as_array().unwrap().clone();
     assert!(
-        ds_sessions.iter().any(|s| s["id"] == sid_a && s["transportKind"] == "openclaw_plugin"),
+        ds_live.ok,
+        "daemon.status failed while openclaw_plugin connected: {ds_live:?}"
+    );
+    let ds_sessions = ds_live.result.unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        ds_sessions
+            .iter()
+            .any(|s| s["id"] == sid_a && s["transportKind"] == "openclaw_plugin"),
         "daemon.status must report openclaw_plugin for A: {ds_sessions:?}"
     );
     let sum_live = rpc(&sock, &json!({ "type": "sessions.summary" })).await;
-    assert!(sum_live.ok, "sessions.summary failed while openclaw_plugin connected: {sum_live:?}");
+    assert!(
+        sum_live.ok,
+        "sessions.summary failed while openclaw_plugin connected: {sum_live:?}"
+    );
 
     // Mark both idle again, then ingest into A (accepted) and B (rejected as `openclaw_session_missing`).
-    let _ = run_hook(&sock, HarnessKind::Openclaw, HookEvent::Stop, json!({ "sessionKey": sk_a })).await;
-    let _ = run_hook(&sock, HarnessKind::Openclaw, HookEvent::Stop, json!({ "sessionKey": sk_b })).await;
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        HookEvent::Stop,
+        json!({ "sessionKey": sk_a }),
+    )
+    .await;
+    let _ = run_hook(
+        &sock,
+        HarnessKind::Openclaw,
+        HookEvent::Stop,
+        json!({ "sessionKey": sk_b }),
+    )
+    .await;
     let prev_gw_count = gw_recorded.lock().unwrap().len();
 
     let svc_task = tokio::spawn(async move {
@@ -2519,15 +2637,28 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
 
     let pkt_a = seen_wakes.iter().find(|p| p["sessionKey"] == sk_a).unwrap();
     assert_eq!(pkt_a["agentId"], "main");
-    assert!(!pkt_a["text"].as_str().unwrap().contains("NATIVE_SERVICE_MSG_A"));
+    assert!(
+        !pkt_a["text"]
+            .as_str()
+            .unwrap()
+            .contains("NATIVE_SERVICE_MSG_A")
+    );
 
     let pkt_b = seen_wakes.iter().find(|p| p["sessionKey"] == sk_b).unwrap();
     assert_eq!(pkt_b["agentId"], "ops");
-    assert!(!pkt_b["text"].as_str().unwrap().contains("NATIVE_SERVICE_MISSING_B"));
+    assert!(
+        !pkt_b["text"]
+            .as_str()
+            .unwrap()
+            .contains("NATIVE_SERVICE_MISSING_B")
+    );
 
     // Session B was marked missing (`openclaw_session_missing`), so `openclaw_plugin` no longer
     // claims live delivery for B (falls back or reports unavailable) while preserving B's unread item!
-    assert_ne!(daemon.session_transport_kind(&sid_b), Some("openclaw_plugin"));
+    assert_ne!(
+        daemon.session_transport_kind(&sid_b),
+        Some("openclaw_plugin")
+    );
     assert_eq!(session_status(&sock, &sid_b).await["pending"], 1);
     assert_eq!(session_status(&sock, &sid_a).await["pending"], 1);
 
@@ -2544,7 +2675,10 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
             .as_str()
             .is_some_and(|s| s.contains("NATIVE_SERVICE_MISSING_B"))
     );
-    assert_eq!(daemon.session_transport_kind(&sid_b), Some("openclaw_plugin"));
+    assert_eq!(
+        daemon.session_transport_kind(&sid_b),
+        Some("openclaw_plugin")
+    );
 
     shared_mcp.close().await;
     daemon.stop().await;

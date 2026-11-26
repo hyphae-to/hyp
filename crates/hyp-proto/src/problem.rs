@@ -63,9 +63,15 @@ impl ProblemDetails {
     ) -> Self {
         let missing = missing_scope.into();
         let detail = format!("Scope '{missing}' is not granted for this peer.");
-        let mut p = Self::new("not_granted", "not-granted", "Scope Not Granted", 403, detail)
-            .with_extension("missingScope", json!(missing))
-            .with_extension("currentScopes", json!(current_scopes));
+        let mut p = Self::new(
+            "not_granted",
+            "not-granted",
+            "Scope Not Granted",
+            403,
+            detail,
+        )
+        .with_extension("missingScope", json!(missing))
+        .with_extension("currentScopes", json!(current_scopes));
         if let Some(note) = escalation_note {
             p = p.with_extension("escalationNote", json!(note));
         }
@@ -134,8 +140,14 @@ impl ProblemDetails {
             detail,
         )
         .with_extension("peer", json!(peer))
-        .with_extension("localRange", json!({ "min": local_range.min, "max": local_range.max }))
-        .with_extension("remoteRange", json!({ "min": remote_range.min, "max": remote_range.max }));
+        .with_extension(
+            "localRange",
+            json!({ "min": local_range.min, "max": local_range.max }),
+        )
+        .with_extension(
+            "remoteRange",
+            json!({ "min": remote_range.min, "max": remote_range.max }),
+        );
         if let Some(fix_cmd) = fix {
             p = p.with_extension("fix", json!(fix_cmd));
         }
@@ -216,8 +228,14 @@ impl ProblemDetails {
     }
 
     /// `409` `capability_downgrade_detected` (§3.2).
-    pub fn capability_downgrade_detected(peer: &str, missing_capabilities: &[CapabilityToken]) -> Self {
-        let missing: Vec<&str> = missing_capabilities.iter().map(CapabilityToken::as_str).collect();
+    pub fn capability_downgrade_detected(
+        peer: &str,
+        missing_capabilities: &[CapabilityToken],
+    ) -> Self {
+        let missing: Vec<&str> = missing_capabilities
+            .iter()
+            .map(CapabilityToken::as_str)
+            .collect();
         Self::new(
             "capability_downgrade_detected",
             "capability-downgrade-detected",
@@ -255,7 +273,10 @@ mod tests {
             Some("Upgrade node 'acme-team' to hyp >= 2.1.0"),
         );
         let val = serde_json::to_value(&p).unwrap();
-        assert_eq!(val["type"], "https://hyphae.to/errors/capability-unsupported");
+        assert_eq!(
+            val["type"],
+            "https://hyphae.to/errors/capability-unsupported"
+        );
         assert_eq!(val["title"], "Required Capability Unsupported");
         assert_eq!(val["status"], 501);
         assert_eq!(val["error"], "capability_unsupported");

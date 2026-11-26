@@ -141,7 +141,10 @@ pub fn normalize_mesh_tool_name(raw: &str) -> Option<&'static str> {
             };
             if valid_boundary {
                 let candidate = &raw[i..];
-                if candidate.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+                if candidate
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_')
+                {
                     if let Some(canonical) = exact_known_tool(candidate) {
                         return Some(canonical);
                     }
@@ -270,15 +273,24 @@ mod tests {
     #[test]
     fn resolves_v2_tools_to_matching_v1_daemon_tools() {
         assert_eq!(
-            resolve_v1_daemon_tool("hyp_mesh", json!({"action": "join", "handle": "alice"}).as_object()),
+            resolve_v1_daemon_tool(
+                "hyp_mesh",
+                json!({"action": "join", "handle": "alice"}).as_object()
+            ),
             "hyp_session"
         );
         assert_eq!(
-            resolve_v1_daemon_tool("hyp_mesh", json!({"action": "join", "channel": "#ops"}).as_object()),
+            resolve_v1_daemon_tool(
+                "hyp_mesh",
+                json!({"action": "join", "channel": "#ops"}).as_object()
+            ),
             "hyp_channel"
         );
         assert_eq!(
-            resolve_v1_daemon_tool("hyp_mesh", json!({"action": "leave", "channel": "#ops"}).as_object()),
+            resolve_v1_daemon_tool(
+                "hyp_mesh",
+                json!({"action": "leave", "channel": "#ops"}).as_object()
+            ),
             "hyp_channel"
         );
         assert_eq!(

@@ -39,10 +39,20 @@ fn multi_connection_wal_pragma_data_version_invalidates_filter_cache() {
         .unwrap();
 
     // Ingest 2 events via Conn A: 1st warms cache (miss), 2nd hits cache (hit).
-    let ev1 = CloudEvent::new("ev-1", "github.com/acme/checkout", "com.github.pr", json!({}))
-        .with_extension("repo", "acme/checkout");
-    let ev2 = CloudEvent::new("ev-2", "github.com/acme/checkout", "com.github.pr", json!({}))
-        .with_extension("repo", "acme/checkout");
+    let ev1 = CloudEvent::new(
+        "ev-1",
+        "github.com/acme/checkout",
+        "com.github.pr",
+        json!({}),
+    )
+    .with_extension("repo", "acme/checkout");
+    let ev2 = CloudEvent::new(
+        "ev-2",
+        "github.com/acme/checkout",
+        "com.github.pr",
+        json!({}),
+    )
+    .with_extension("repo", "acme/checkout");
     assert_eq!(
         conn_a
             .events()
@@ -85,13 +95,21 @@ fn multi_connection_wal_pragma_data_version_invalidates_filter_cache() {
     // Conn A ingests a payments event WITHOUT any out-of-band cache invalidation call.
     // `PRAGMA data_version` detects Conn B's commit, invalidates Conn A's compiled filter cache,
     // and routes the event to `sub-b` immediately!
-    let ev_pay = CloudEvent::new("ev-pay", "github.com/acme/payments", "com.github.pr", json!({}))
-        .with_extension("repo", "acme/payments");
+    let ev_pay = CloudEvent::new(
+        "ev-pay",
+        "github.com/acme/payments",
+        "com.github.pr",
+        json!({}),
+    )
+    .with_extension("repo", "acme/payments");
     let res = conn_a
         .events()
         .ingest("acme-team", "github", "gh", &ev_pay, t0 + 20)
         .unwrap();
-    assert_eq!(res.matched, 1, "Conn A must see Conn B's newly added subscription");
+    assert_eq!(
+        res.matched, 1,
+        "Conn A must see Conn B's newly added subscription"
+    );
 
     let stats_after = conn_a.events().cache_stats();
     assert!(
@@ -100,20 +118,30 @@ fn multi_connection_wal_pragma_data_version_invalidates_filter_cache() {
     );
     assert_eq!(stats_after.misses, 2);
 
-    let due_b = conn_b.events().claim_due_batches("sess-b", t0 + 20).unwrap();
+    let due_b = conn_b
+        .events()
+        .claim_due_batches("sess-b", t0 + 20)
+        .unwrap();
     assert_eq!(due_b.len(), 1);
     assert_eq!(due_b[0].events[0].id, "ev-pay");
 
     // Now Conn B deletes `sub-b`; Conn A must immediately stop matching `acme/payments`.
     assert!(conn_b.events().delete_subscription("sub-b").unwrap());
-    let ev_pay2 =
-        CloudEvent::new("ev-pay-2", "github.com/acme/payments", "com.github.pr", json!({}))
-            .with_extension("repo", "acme/payments");
+    let ev_pay2 = CloudEvent::new(
+        "ev-pay-2",
+        "github.com/acme/payments",
+        "com.github.pr",
+        json!({}),
+    )
+    .with_extension("repo", "acme/payments");
     let res2 = conn_a
         .events()
         .ingest("acme-team", "github", "gh", &ev_pay2, t0 + 30)
         .unwrap();
-    assert_eq!(res2.matched, 0, "Conn A must drop deleted subscription via PRAGMA data_version");
+    assert_eq!(
+        res2.matched, 0,
+        "Conn A must drop deleted subscription via PRAGMA data_version"
+    );
 }
 
 #[test]
@@ -309,11 +337,21 @@ fn multi_thread_wal_single_use_grant_claim_and_event_idempotency_race() {
     let results: Vec<(bool, bool)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let claim_winners = results.iter().filter(|(won, _)| *won).count();
     let fresh_ingests = results.iter().filter(|(_, fresh)| *fresh).count();
-    assert_eq!(claim_winners, 1, "exactly one thread must win single-use grant claim");
-    assert_eq!(fresh_ingests, 1, "exactly one thread must record fresh event");
+    assert_eq!(
+        claim_winners, 1,
+        "exactly one thread must win single-use grant claim"
+    );
+    assert_eq!(
+        fresh_ingests, 1,
+        "exactly one thread must record fresh event"
+    );
 
     let db = NodeDb::open(&db_path).unwrap();
     let batches = db.events().list_batches("dedup-sub").unwrap();
-    assert_eq!(batches.len(), 1, "idempotent race must create exactly 1 batch");
+    assert_eq!(
+        batches.len(),
+        1,
+        "idempotent race must create exactly 1 batch"
+    );
     assert_eq!(batches[0].event_count, 1);
 }

@@ -19,13 +19,14 @@ mod common;
 use common::{ManagedProcess, hyp_bin, isolated_cmd, parse_json_stdout};
 use hyp_crypto::SecretBackend;
 use hyp_crypto::transfer::TarInputEntry;
-use hyp_node::engine::{
-    KvNamespaceConfig, KvWriteRequest, NodeConfig, UnifiedNode,
-};
+use hyp_node::engine::{KvNamespaceConfig, KvWriteRequest, NodeConfig, UnifiedNode};
 use hyp_proto::address::NodeId;
 use hyp_proto::manifest::{KvMode, KvWriteModel};
 use hyp_proto::scopes::ScopePreset;
-use hyp_store::{MailboxEntry, MailboxKind, NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, WriteModel, now_ms};
+use hyp_store::{
+    MailboxEntry, MailboxKind, NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, WriteModel,
+    now_ms,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -86,10 +87,11 @@ where
     loop {
         let items = node.peek_local_inbox(session_id, 50).expect("peek inbox");
         if let Some(found) = items.into_iter().find(|e| predicate(e)) {
-            let _ = node
-                .db()
-                .local()
-                .acknowledge_inbox(session_id, &[found.receipt.as_str()], now_ms());
+            let _ = node.db().local().acknowledge_inbox(
+                session_id,
+                &[found.receipt.as_str()],
+                now_ms(),
+            );
             return found;
         }
         let now = tokio::time::Instant::now();
@@ -160,9 +162,15 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
     });
     let solace = UnifiedNode::open(solace_cfg).unwrap();
     let peer_sock = solace_dir.join("peer.sock");
-    let (bound_sock, _unix_srv) = Arc::clone(&solace).serve_unix(peer_sock.clone()).await.unwrap();
+    let (bound_sock, _unix_srv) = Arc::clone(&solace)
+        .serve_unix(peer_sock.clone())
+        .await
+        .unwrap();
     assert_eq!(bound_sock, peer_sock);
-    assert_eq!(solace.peer_socket_path().as_deref(), Some(peer_sock.as_path()));
+    assert_eq!(
+        solace.peer_socket_path().as_deref(),
+        Some(peer_sock.as_path())
+    );
 
     let sock_mode = fs::metadata(&peer_sock).unwrap().permissions().mode() & 0o777;
     assert_eq!(sock_mode, 0o600, "peer.sock must be user-only 0600");
@@ -235,7 +243,10 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
         .send_dm("ops", "alice@macbook/dev", dm_to_alice_secret)
         .await
         .expect("E2EE DM solace -> alice queued for SSE");
-    assert!(sent2.encrypted, "reverse DM over ssh:// MUST remain E2EE encrypted");
+    assert!(
+        sent2.encrypted,
+        "reverse DM over ssh:// MUST remain E2EE encrypted"
+    );
 
     let recv_on_alice = wait_for_mailbox_item(&alice, "alice:s1", |e| {
         e.kind == MailboxKind::Message && e.text.contains(dm_to_alice_secret)
@@ -307,7 +318,10 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
     .await;
     assert!(!recv_transfer.text.contains(file_secret));
     let notice_json: Value = serde_json::from_str(&recv_transfer.text).unwrap();
-    assert_eq!(notice_json["plaintextDigest"], transfer_res.plaintext_digest);
+    assert_eq!(
+        notice_json["plaintextDigest"],
+        transfer_res.plaintext_digest
+    );
     let extracted_path = notice_json["files"][0]["diskPath"]
         .as_str()
         .expect("extracted file diskPath");
@@ -628,7 +642,10 @@ fn cli_tailscale_operational_detection_running_stopped_and_not_installed() {
     let env_ok = parse_json_stdout(&out_ok);
     assert_eq!(env_ok["ok"], true);
     assert_eq!(env_ok["data"]["tailscale"]["state"], "running");
-    assert_eq!(env_ok["data"]["tailscale"]["dnsName"], "acme.tail9f3a.ts.net");
+    assert_eq!(
+        env_ok["data"]["tailscale"]["dnsName"],
+        "acme.tail9f3a.ts.net"
+    );
     assert_eq!(env_ok["data"]["tailscale"]["serve"]["exposed"], true);
     let checks_ok = env_ok["data"]["checks"].as_array().unwrap();
     assert!(
@@ -691,7 +708,8 @@ fn cli_tailscale_operational_detection_running_stopped_and_not_installed() {
             )
             .unwrap();
     }
-    let stopped_json = r#"{"BackendState":"Stopped","Self":{"DNSName":"acme.tail9f3a.ts.net.","Online":false}}"#;
+    let stopped_json =
+        r#"{"BackendState":"Stopped","Self":{"DNSName":"acme.tail9f3a.ts.net.","Online":false}}"#;
 
     let doc_stopped = isolated_cmd(tmp.path())
         .env("HYPHAE_TAILSCALE_STATUS_JSON", stopped_json)

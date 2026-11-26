@@ -99,7 +99,7 @@ struct RefSessionModel {
     focus_allow_vips: bool,
     delivery_mode: String,
     subscriptions: BTreeMap<String, (String, String, String, i64)>, // id -> (topic, origin, mode, coalesce)
-    pending_items: Vec<(String, String)>,                         // (kind, source)
+    pending_items: Vec<(String, String)>,                           // (kind, source)
     quarantined: usize,
     muted_archived: usize,
     session_mutes: BTreeSet<String>,
@@ -192,9 +192,18 @@ impl RefWorldModel {
         );
         for qi in details["queuedItems"].as_array().unwrap() {
             let obj = qi.as_object().unwrap();
-            assert!(!obj.contains_key("text"), "queuedItem MUST NOT contain text");
-            assert!(!obj.contains_key("body"), "queuedItem MUST NOT contain body");
-            assert!(!obj.contains_key("data"), "queuedItem MUST NOT contain data");
+            assert!(
+                !obj.contains_key("text"),
+                "queuedItem MUST NOT contain text"
+            );
+            assert!(
+                !obj.contains_key("body"),
+                "queuedItem MUST NOT contain body"
+            );
+            assert!(
+                !obj.contains_key("data"),
+                "queuedItem MUST NOT contain data"
+            );
             assert!(obj.contains_key("receipt"));
             assert!(obj.contains_key("kind"));
             assert!(obj.contains_key("source"));
@@ -250,7 +259,10 @@ impl RefWorldModel {
         assert_eq!(actual_wks.len(), m.wakeups.len());
         for wk in actual_wks {
             let obj = wk.as_object().unwrap();
-            assert!(!obj.contains_key("note"), "wakeup summary MUST NOT contain note");
+            assert!(
+                !obj.contains_key("note"),
+                "wakeup summary MUST NOT contain note"
+            );
             let id = obj["id"].as_str().unwrap();
             let (label, trig, urg, state) = m.wakeups.get(id).expect("expected wakeup id");
             assert_eq!(obj["label"], *label);
@@ -282,12 +294,19 @@ async fn assert_all_four_oracles_agree(
 
     // Oracle 2 & 3: `sessions.summary` batch RPC
     let batch_res = rpc(sock, json!({ "type": "sessions.summary" })).await;
-    assert!(batch_res.ok, "sessions.summary failed: {:?}", batch_res.error);
+    assert!(
+        batch_res.ok,
+        "sessions.summary failed: {:?}",
+        batch_res.error
+    );
     let batch = Value::Object(batch_res.result.unwrap());
     assert_eq!(batch["schemaVersion"], UI_STATE_SCHEMA_VERSION);
     assert_eq!(batch["daemon"]["online"], true);
     assert_eq!(batch["daemon"]["nodeId"], model.node_id);
-    assert_eq!(batch["daemon"]["quarantinedGlobal"], model.quarantined_global());
+    assert_eq!(
+        batch["daemon"]["quarantinedGlobal"],
+        model.quarantined_global()
+    );
     assert_no_sentinels("sessions.summary", &batch, sentinels);
 
     // Oracle 4: Atomic `<state_dir>/ui/state.json` on disk
@@ -474,12 +493,7 @@ async fn mckeeman_reference_model_differential_parity_and_zero_body_leakage() {
         .unwrap();
     model.sessions.get_mut(s1).unwrap().subscriptions.insert(
         sub.subscription.id.clone(),
-        (
-            "github".into(),
-            "alice@macbook".into(),
-            "queue".into(),
-            15,
-        ),
+        ("github".into(), "alice@macbook".into(), "queue".into(), 15),
     );
 
     // Step 4: Create a durable wakeup with a secret note (must NEVER leak!).
@@ -810,7 +824,10 @@ async fn backend_merge_preserves_herdr_terminal_and_hydrates_on_restart() {
     )
     .await;
     assert!(sum2.ok);
-    assert_eq!(sum2.result.unwrap()["session"]["sessionId"], "claude:merge-1");
+    assert_eq!(
+        sum2.result.unwrap()["session"]["sessionId"],
+        "claude:merge-1"
+    );
 
     // 4. Registering an explicit HerdrTransport also populates live transport & pinned created_ms.
     let mut target = HerdrTarget::new("t8z");
@@ -893,7 +910,10 @@ async fn herdr_anti_recycle_guard_and_sequential_session_ranking() {
         }),
     )
     .await;
-    assert_eq!(old_query.result.unwrap()["session"]["sessionId"], "claude:old");
+    assert_eq!(
+        old_query.result.unwrap()["session"]["sessionId"],
+        "claude:old"
+    );
 
     // Two sequential sessions in the SAME live recycled terminal (created_ms = 2_000_000):
     // newer last_seen (codex:seq2) beats older last_seen (claude:seq1).
@@ -1023,10 +1043,7 @@ async fn ownership_validation_and_malformed_inputs_fail_closed() {
     ];
     for pkt in invalid_packets {
         let res = rpc(sock, pkt.clone()).await;
-        assert!(
-            !res.ok,
-            "expected invalid RPC to fail closed: {pkt}"
-        );
+        assert!(!res.ok, "expected invalid RPC to fail closed: {pkt}");
     }
 
     daemon.stop().await;

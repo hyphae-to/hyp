@@ -39,7 +39,9 @@ pub enum CronError {
     InvalidTimezone(String),
     #[error("cron schedule can never match any valid calendar date: {0}")]
     ImpossibleSchedule(String),
-    #[error("cron shortest interval ({shortest_seconds}s) is below minimum allowed ({min_seconds}s)")]
+    #[error(
+        "cron shortest interval ({shortest_seconds}s) is below minimum allowed ({min_seconds}s)"
+    )]
     IntervalTooShort {
         shortest_seconds: u64,
         min_seconds: u64,
@@ -909,7 +911,10 @@ mod tests {
             sun_0.next_fire_after_utc(base),
             Some(utc_ms(2026, 6, 21, 9, 0, 0))
         );
-        assert_eq!(sun_0.next_fire_after_utc(base), sun_7.next_fire_after_utc(base));
+        assert_eq!(
+            sun_0.next_fire_after_utc(base),
+            sun_7.next_fire_after_utc(base)
+        );
 
         // Range 5-7 includes Fri (5), Sat (6), Sun (0).
         let weekend = CronExpr::parse("0 10 * * 5-7").unwrap();
@@ -1118,8 +1123,14 @@ mod tests {
         assert!(CronTimezone::parse("America/New_York").is_err());
         assert!(CronTimezone::parse("").is_err());
 
-        assert_eq!(serde_json::to_string(&CronTimezone::Local).unwrap(), "\"local\"");
-        assert_eq!(serde_json::to_string(&CronTimezone::Utc).unwrap(), "\"utc\"");
+        assert_eq!(
+            serde_json::to_string(&CronTimezone::Local).unwrap(),
+            "\"local\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CronTimezone::Utc).unwrap(),
+            "\"utc\""
+        );
         assert_eq!(
             serde_json::from_str::<CronTimezone>("\"UTC\"").unwrap(),
             CronTimezone::Utc
@@ -1145,31 +1156,31 @@ mod tests {
         let invalid_cases = [
             "",
             "   ",
-            "* * * *",                 // 4 fields
-            "* * * * * *",             // 6 fields (seconds unsupported)
-            "60 * * * *",              // minute out of range
-            "-1 * * * *",              // negative
-            "* 24 * * *",              // hour out of range
-            "* * 0 * *",               // dom 0
-            "* * 32 * *",              // dom 32
-            "* * * 0 *",               // month 0
-            "* * * 13 *",              // month 13
-            "* * * * 8",               // dow 8
-            "*/0 * * * *",             // zero step
-            "*/61 * * * *",            // step > field size
-            "10-5 * * * *",            // reversed range
-            "1-5-9 * * * *",           // double dash
-            "*/2/3 * * * *",           // double slash
-            "5/15 * * * *",            // single value with step
-            ",5 * * * *",              // leading comma
-            "5, * * * *",              // trailing comma
-            "1,,2 * * * *",            // empty list item
-            "0 9 * * MON",             // named weekday unsupported
-            "0 9 31 2 *",              // impossible Feb 31
-            "0 9 30 2 *",              // impossible Feb 30
-            "0 9 31 4,6,9,11 *",       // impossible 31st in 30-day months
-            "abc * * * *",             // non-numeric
-            "0 9 * * 0-8",             // range end out of bounds
+            "* * * *",           // 4 fields
+            "* * * * * *",       // 6 fields (seconds unsupported)
+            "60 * * * *",        // minute out of range
+            "-1 * * * *",        // negative
+            "* 24 * * *",        // hour out of range
+            "* * 0 * *",         // dom 0
+            "* * 32 * *",        // dom 32
+            "* * * 0 *",         // month 0
+            "* * * 13 *",        // month 13
+            "* * * * 8",         // dow 8
+            "*/0 * * * *",       // zero step
+            "*/61 * * * *",      // step > field size
+            "10-5 * * * *",      // reversed range
+            "1-5-9 * * * *",     // double dash
+            "*/2/3 * * * *",     // double slash
+            "5/15 * * * *",      // single value with step
+            ",5 * * * *",        // leading comma
+            "5, * * * *",        // trailing comma
+            "1,,2 * * * *",      // empty list item
+            "0 9 * * MON",       // named weekday unsupported
+            "0 9 31 2 *",        // impossible Feb 31
+            "0 9 30 2 *",        // impossible Feb 30
+            "0 9 31 4,6,9,11 *", // impossible 31st in 30-day months
+            "abc * * * *",       // non-numeric
+            "0 9 * * 0-8",       // range end out of bounds
         ];
 
         for bad in invalid_cases {

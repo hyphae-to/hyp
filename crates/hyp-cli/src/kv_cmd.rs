@@ -7,9 +7,7 @@ use crate::config_file::{
     load_node_or_legacy_config, resolve_config_path_for_read, resolve_effective_node_id,
     resolve_state_dir,
 };
-use crate::ui::{
-    CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json,
-};
+use crate::ui::{CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
 use clap::{Subcommand, ValueEnum};
 use hyp_store::{KvDeleteInput, KvSetInput, NodeDb, StoreError, WriteModel, now_ms};
 use serde_json::{Value, json};
@@ -194,8 +192,8 @@ pub fn run_kv(command: KvCommand) -> ExitCode {
 fn open_db(state_dir: Option<&PathBuf>) -> Result<(PathBuf, NodeDb), String> {
     let dir = resolve_state_dir(state_dir.map(PathBuf::as_path), None, None);
     let db_path = dir.join("node.sqlite");
-    let db = NodeDb::open(&db_path)
-        .map_err(|e| format!("failed to open {}: {e}", db_path.display()))?;
+    let db =
+        NodeDb::open(&db_path).map_err(|e| format!("failed to open {}: {e}", db_path.display()))?;
     Ok((dir, db))
 }
 
@@ -295,7 +293,10 @@ fn run_kv_get(
                     entry.write_model.as_str(),
                     entry.writer_id
                 );
-                println!("{}", serde_json::to_string_pretty(&entry.value).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&entry.value).unwrap_or_default()
+                );
             }
             ExitCode::from(EXIT_OK)
         }

@@ -21,10 +21,15 @@ const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
 fn sample_event(id: &str, source: &str, event_type: &str, repo: &str) -> CloudEvent {
-    CloudEvent::new(id, source, event_type, json!({ "action": "opened", "number": 42 }))
-        .with_subject("pull/42")
-        .with_extension("repo", repo)
-        .with_time(epoch_ms_to_rfc3339(1_700_000_000_000))
+    CloudEvent::new(
+        id,
+        source,
+        event_type,
+        json!({ "action": "opened", "number": 42 }),
+    )
+    .with_subject("pull/42")
+    .with_extension("repo", repo)
+    .with_time(epoch_ms_to_rfc3339(1_700_000_000_000))
 }
 
 #[test]
@@ -184,7 +189,12 @@ fn events_idempotency_coalescing_wake_cap_and_retention() {
         .unwrap();
 
     // Non-matching event produces 0 matches and clears body while keeping idempotency key.
-    let unrelated = sample_event("ev-unrel", "github.com/acme/other", "com.github.push", "acme/other");
+    let unrelated = sample_event(
+        "ev-unrel",
+        "github.com/acme/other",
+        "com.github.push",
+        "acme/other",
+    );
     let r0 = db
         .events()
         .ingest("acme-team", "github", "gh-hook", &unrelated, t0)
@@ -193,7 +203,12 @@ fn events_idempotency_coalescing_wake_cap_and_retention() {
     assert!(!r0.deduplicated);
 
     // Matching event 1 opens coalescing batch with flush_at = t0 + 10_000.
-    let ev1 = sample_event("ev-1", "github.com/acme/checkout", "com.github.pr", "acme/checkout");
+    let ev1 = sample_event(
+        "ev-1",
+        "github.com/acme/checkout",
+        "com.github.pr",
+        "acme/checkout",
+    );
     let r1 = db
         .events()
         .ingest("acme-team", "github", "gh-hook", &ev1, t0)
@@ -224,23 +239,39 @@ fn events_idempotency_coalescing_wake_cap_and_retention() {
     assert!(matches!(err, StoreError::IdConflict(_)));
 
     // Second matching event merges into the open batch and pushes flush_at forward to t0 + 14_000.
-    let ev2 = sample_event("ev-2", "github.com/acme/checkout", "com.github.pr", "acme/checkout");
+    let ev2 = sample_event(
+        "ev-2",
+        "github.com/acme/checkout",
+        "com.github.pr",
+        "acme/checkout",
+    );
     let r2 = db
         .events()
         .ingest("acme-team", "github", "gh-hook", &ev2, t0 + 4_000)
         .unwrap();
     assert_eq!(r2.batches_created, 0);
     assert_eq!(r2.batches_merged, 1);
-    assert_eq!(db.events().next_deadline_ms(t0 + 4_000).unwrap(), Some(t0 + 14_000));
+    assert_eq!(
+        db.events().next_deadline_ms(t0 + 4_000).unwrap(),
+        Some(t0 + 14_000)
+    );
 
     // Still open -> nothing due yet.
-    assert!(db.events().claim_due_batches("sess-claude", t0 + 13_999).unwrap().is_empty());
+    assert!(
+        db.events()
+            .claim_due_batches("sess-claude", t0 + 13_999)
+            .unwrap()
+            .is_empty()
+    );
 
     // Advance to flush_at -> tick closes the batch into pending.
     let tick = db.events().tick(t0 + 14_000).unwrap();
     assert_eq!(tick.batches_closed, 1);
 
-    let due = db.events().claim_due_batches("sess-claude", t0 + 14_000).unwrap();
+    let due = db
+        .events()
+        .claim_due_batches("sess-claude", t0 + 14_000)
+        .unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].events.len(), 2);
     assert_eq!(due[0].events[0].id, "ev-1");
@@ -260,18 +291,31 @@ fn events_idempotency_coalescing_wake_cap_and_retention() {
             )
             .unwrap()
     );
-    assert!(db.events().claim_due_batches("sess-claude", t0 + 20_000).unwrap().is_empty());
+    assert!(
+        db.events()
+            .claim_due_batches("sess-claude", t0 + 20_000)
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         db.events().next_deadline_ms(t0 + 20_000).unwrap(),
         Some(t0 + 29_000)
     );
 
     // Come off hold and deliver batch 1 (wake 1 of 2/hr).
-    let due_again = db.events().claim_due_batches("sess-claude", t0 + 29_000).unwrap();
+    let due_again = db
+        .events()
+        .claim_due_batches("sess-claude", t0 + 29_000)
+        .unwrap();
     assert_eq!(due_again.len(), 1);
     assert!(
         db.events()
-            .ack_batch("sess-claude", &due_again[0].id, &AckOutcome::Delivered, t0 + 30_000)
+            .ack_batch(
+                "sess-claude",
+                &due_again[0].id,
+                &AckOutcome::Delivered,
+                t0 + 30_000
+            )
             .unwrap()
     );
 
@@ -287,11 +331,19 @@ fn events_idempotency_coalescing_wake_cap_and_retention() {
             .ingest("acme-team", "github", "gh-hook", &ev, t0 + 31_000)
             .unwrap();
     }
-    let due2 = db.events().claim_due_batches("sess-claude", t0 + 31_000).unwrap();
+    let due2 = db
+        .events()
+        .claim_due_batches("sess-claude", t0 + 31_000)
+        .unwrap();
     assert_eq!(due2.len(), 1);
     assert_eq!(due2[0].events.len(), 3);
     db.events()
-        .ack_batch("sess-claude", &due2[0].id, &AckOutcome::Delivered, t0 + 32_000)
+        .ack_batch(
+            "sess-claude",
+            &due2[0].id,
+            &AckOutcome::Delivered,
+            t0 + 32_000,
+        )
         .unwrap();
 
     // Create batch 3 (3 events -> force-closed) -> MUST be delayed by hourly wake cap (2/hr)!
@@ -307,23 +359,39 @@ fn events_idempotency_coalescing_wake_cap_and_retention() {
             .unwrap();
     }
     assert!(
-        db.events().claim_due_batches("sess-claude", t0 + 33_000).unwrap().is_empty(),
+        db.events()
+            .claim_due_batches("sess-claude", t0 + 33_000)
+            .unwrap()
+            .is_empty(),
         "3rd batch in 1h must be delayed by wake cap"
     );
     // Exact wake-cap unblock time is wake_1_settled_at + 1h = t0 + 30_000 + HOUR_MS.
     let unblock = t0 + 30_000 + HOUR_MS;
     assert_eq!(
-        db.events().wake_cap_unblock_at("sub-1", t0 + 33_000).unwrap(),
+        db.events()
+            .wake_cap_unblock_at("sub-1", t0 + 33_000)
+            .unwrap(),
         Some(unblock)
     );
-    assert_eq!(db.events().next_deadline_ms(t0 + 33_000).unwrap(), Some(unblock));
+    assert_eq!(
+        db.events().next_deadline_ms(t0 + 33_000).unwrap(),
+        Some(unblock)
+    );
 
     // At exactly `unblock`, batch 3 becomes due!
-    let due3 = db.events().claim_due_batches("sess-claude", unblock).unwrap();
+    let due3 = db
+        .events()
+        .claim_due_batches("sess-claude", unblock)
+        .unwrap();
     assert_eq!(due3.len(), 1);
     assert_eq!(due3[0].events.len(), 3);
     db.events()
-        .ack_batch("sess-claude", &due3[0].id, &AckOutcome::Delivered, unblock + 100)
+        .ack_batch(
+            "sess-claude",
+            &due3[0].id,
+            &AckOutcome::Delivered,
+            unblock + 100,
+        )
         .unwrap();
 
     // Advance past 24h retention -> settled batches pruned, event bodies cleared, idempotency preserved.
@@ -333,7 +401,13 @@ fn events_idempotency_coalescing_wake_cap_and_retention() {
     assert!(prune24.event_bodies_cleared > 0);
     assert!(
         db.events()
-            .is_known_event("acme-team", "github", "gh-hook", "github.com/acme/checkout", "ev-1")
+            .is_known_event(
+                "acme-team",
+                "github",
+                "gh-hook",
+                "github.com/acme/checkout",
+                "ev-1"
+            )
             .unwrap()
     );
 
@@ -391,7 +465,10 @@ fn events_upstream_pushdown_and_filter_validation() {
         .unwrap();
     assert!(pd.synced_at.is_none());
     assert!(db.events().mark_pushdown_synced(&pd.id, t0 + 100).unwrap());
-    let list = db.events().list_upstream_pushdowns(Some("acme-team")).unwrap();
+    let list = db
+        .events()
+        .list_upstream_pushdowns(Some("acme-team"))
+        .unwrap();
     assert_eq!(list[0].synced_at, Some(t0 + 100));
 
     // Updating filters clears synced_at so sync loop re-pushes upstream.
@@ -523,7 +600,10 @@ fn messages_channels_preserve_e2ee_ciphertext_without_prefix_mutation() {
     assert!(res.failed.is_empty());
 
     // CRITICAL INVARIANT: Payload text MUST NOT be prefixed with `[#incidents] `!
-    let bob_due = db.messages().due_messages("bob@lap", |_| false, t0 + 500).unwrap();
+    let bob_due = db
+        .messages()
+        .due_messages("bob@lap", |_| false, t0 + 500)
+        .unwrap();
     assert_eq!(bob_due.len(), 1);
     assert_eq!(bob_due[0].text, ciphertext);
     assert_eq!(bob_due[0].channel.as_deref(), Some("#incidents"));
@@ -543,19 +623,38 @@ fn messages_channels_preserve_e2ee_ciphertext_without_prefix_mutation() {
             )
             .unwrap()
     );
-    assert_eq!(db.messages().next_deadline_ms(t0 + 600).unwrap(), Some(t0 + 5_600));
+    assert_eq!(
+        db.messages().next_deadline_ms(t0 + 600).unwrap(),
+        Some(t0 + 5_600)
+    );
     assert!(
         db.messages()
-            .ack("bob@lap", &bob_due[0].id, &AckOutcome::Delivered, t0 + 6_000)
+            .ack(
+                "bob@lap",
+                &bob_due[0].id,
+                &AckOutcome::Delivered,
+                t0 + 6_000
+            )
             .unwrap()
     );
 
     // Heartbeat Alice & Bob, let Carol go stale and prune.
-    db.messages().heartbeat_handle("alice@mac", "claude", t0 + 10_000).unwrap();
-    db.messages().heartbeat_handle("bob@lap", "codex", t0 + 10_000).unwrap();
-    let pruned = db.messages().prune_stale_handles(t0 + 5_000, t0 + 10_000).unwrap();
+    db.messages()
+        .heartbeat_handle("alice@mac", "claude", t0 + 10_000)
+        .unwrap();
+    db.messages()
+        .heartbeat_handle("bob@lap", "codex", t0 + 10_000)
+        .unwrap();
+    let pruned = db
+        .messages()
+        .prune_stale_handles(t0 + 5_000, t0 + 10_000)
+        .unwrap();
     assert_eq!(pruned, vec!["carol@dev/gemini"]);
-    let carol_msg = db.messages().get_message("post-1:carol@dev/gemini").unwrap().unwrap();
+    let carol_msg = db
+        .messages()
+        .get_message("post-1:carol@dev/gemini")
+        .unwrap()
+        .unwrap();
     assert_eq!(carol_msg.state, MessageState::Rejected);
     assert_eq!(carol_msg.reason.as_deref(), Some("not_enrolled"));
 
@@ -636,7 +735,10 @@ fn transfers_atomic_blobs_quotas_expiry_and_orphan_sweep() {
         )
         .unwrap();
     assert!(!res1.deduplicated);
-    assert_eq!(db.transfers().read_blob("bob@lap", "tx-1").unwrap(), Some(blob1.clone()));
+    assert_eq!(
+        db.transfers().read_blob("bob@lap", "tx-1").unwrap(),
+        Some(blob1.clone())
+    );
     assert_eq!(db.transfers().read_blob("mallory", "tx-1").unwrap(), None);
 
     #[cfg(unix)]
@@ -720,7 +822,11 @@ fn transfers_atomic_blobs_quotas_expiry_and_orphan_sweep() {
     assert!(matches!(over_global, Err(StoreError::QuotaExceeded(_))));
 
     // Create a stray `.part-*` file and orphan blob, verify sweep_orphans removes ONLY them.
-    fs::write(db.transfers_dir().join("tx-crash.part-deadbeef"), b"partial").unwrap();
+    fs::write(
+        db.transfers_dir().join("tx-crash.part-deadbeef"),
+        b"partial",
+    )
+    .unwrap();
     fs::write(db.transfers_dir().join("tx-orphan-blob"), b"orphan").unwrap();
     let sweep = db.transfers().sweep_orphans().unwrap();
     assert_eq!(sweep.part_files_removed, 1);
@@ -729,14 +835,20 @@ fn transfers_atomic_blobs_quotas_expiry_and_orphan_sweep() {
     assert!(db.transfers_dir().join("tx-2").exists());
 
     // Next deadline must be tx-2 expiry (t0 + 30_000).
-    assert_eq!(db.transfers().next_deadline_ms(t0).unwrap(), Some(t0 + 30_000));
+    assert_eq!(
+        db.transfers().next_deadline_ms(t0).unwrap(),
+        Some(t0 + 30_000)
+    );
 
     // Expire tx-2 via tick -> row marked expired AND blob deleted from disk!
     let tick = db.transfers().tick(t0 + 30_000).unwrap();
     assert_eq!(tick.expired, 1);
     assert_eq!(tick.blobs_removed, 1);
     assert!(!db.transfers_dir().join("tx-2").exists());
-    assert_eq!(db.transfers().get("tx-2").unwrap().unwrap().state, TransferState::Expired);
+    assert_eq!(
+        db.transfers().get("tx-2").unwrap().unwrap().state,
+        TransferState::Expired
+    );
 
     // Ack tx-1 delivered -> blob deleted from disk, scheduler returns None!
     assert!(
@@ -761,10 +873,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 origin_node: "local".to_string(),
                 topic: "kv".to_string(),
                 subscriber: "sess-watcher".to_string(),
-                filters: vec![
-                    Filter::exact("ns", "pair"),
-                    Filter::prefix("key", "plan/"),
-                ],
+                filters: vec![Filter::exact("ns", "pair"), Filter::prefix("key", "plan/")],
                 coalesce_seconds: 0,
                 max_batch_age_ms: None,
                 max_wakes_per_hour: None,
@@ -1023,16 +1132,33 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
         watched_types,
         vec![
             ("to.hyphae.kv.set".to_string(), Some("plan/v1".to_string())),
-            ("to.hyphae.kv.set".to_string(), Some("plan/lock".to_string())),
-            ("to.hyphae.kv.set".to_string(), Some("plan/lock".to_string())),
-            ("to.hyphae.kv.deleted".to_string(), Some("plan/lock".to_string())),
-            ("to.hyphae.kv.set".to_string(), Some("plan/large".to_string())),
+            (
+                "to.hyphae.kv.set".to_string(),
+                Some("plan/lock".to_string())
+            ),
+            (
+                "to.hyphae.kv.set".to_string(),
+                Some("plan/lock".to_string())
+            ),
+            (
+                "to.hyphae.kv.deleted".to_string(),
+                Some("plan/lock".to_string())
+            ),
+            (
+                "to.hyphae.kv.set".to_string(),
+                Some("plan/large".to_string())
+            ),
         ]
     );
 
     // TTL expiry check & next_deadline_ms
     assert_eq!(db.kv().next_deadline_ms().unwrap(), Some(t0 + 10_000));
-    assert!(db.kv().get("local", "pair", "plan/v1", t0 + 10_000).unwrap().is_none());
+    assert!(
+        db.kv()
+            .get("local", "pair", "plan/v1", t0 + 10_000)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(db.kv().tick(t0 + 10_000).unwrap(), 1);
     assert_eq!(db.kv().next_deadline_ms().unwrap(), None);
 
@@ -1053,7 +1179,14 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
         )
         .unwrap();
     assert_eq!(ep.epoch, 1);
-    assert_eq!(db.kv().latest_epoch("local", "pair").unwrap().unwrap().epoch, 1);
+    assert_eq!(
+        db.kv()
+            .latest_epoch("local", "pair")
+            .unwrap()
+            .unwrap()
+            .epoch,
+        1
+    );
 }
 
 #[test]
@@ -1070,9 +1203,16 @@ fn local_state_quarantine_human_review_mutes_and_immutable_gate_audit() {
     ));
 
     // Sessions + handles + plugin targets + bridge links.
-    db.local().register_session("claude:t1", r#"{"kind":"claude"}"#, t0).unwrap();
-    db.local().set_session_handle("claude:t1", Some("claude"), t0 + 1).unwrap();
-    assert_eq!(db.local().session_by_thread_id("t1").unwrap().unwrap().id, "claude:t1");
+    db.local()
+        .register_session("claude:t1", r#"{"kind":"claude"}"#, t0)
+        .unwrap();
+    db.local()
+        .set_session_handle("claude:t1", Some("claude"), t0 + 1)
+        .unwrap();
+    assert_eq!(
+        db.local().session_by_thread_id("t1").unwrap().unwrap().id,
+        "claude:t1"
+    );
 
     db.local()
         .set_plugin_target(&PluginTargetHandoff {
@@ -1179,7 +1319,8 @@ fn local_state_quarantine_human_review_mutes_and_immutable_gate_audit() {
 
     // Double-approving fails closed.
     assert!(matches!(
-        db.local().approve_quarantined(&q2_receipt, "human@cli", t0 + 101),
+        db.local()
+            .approve_quarantined(&q2_receipt, "human@cli", t0 + 101),
         Err(StoreError::InvalidState(_))
     ));
 
@@ -1246,9 +1387,15 @@ fn local_state_quarantine_human_review_mutes_and_immutable_gate_audit() {
     let upd_err = db
         .connection()
         .execute("UPDATE gate_audit SET decision = 'allow'", []);
-    assert!(upd_err.is_err(), "gate_audit UPDATE must be blocked by trigger");
+    assert!(
+        upd_err.is_err(),
+        "gate_audit UPDATE must be blocked by trigger"
+    );
     let del_err = db.connection().execute("DELETE FROM gate_audit", []);
-    assert!(del_err.is_err(), "gate_audit DELETE must be blocked by trigger");
+    assert!(
+        del_err.is_err(),
+        "gate_audit DELETE must be blocked by trigger"
+    );
 }
 
 #[test]
@@ -1412,7 +1559,8 @@ fn peers_manifest_anti_rollback_and_e2ee_anti_downgrade() {
         .claim_grant("g-1", r#"{"binding":"b"}"#, t0 + 1_000)
         .unwrap();
     assert!(matches!(
-        db.peers().claim_grant("g-1", r#"{"binding":"b2"}"#, t0 + 1_001),
+        db.peers()
+            .claim_grant("g-1", r#"{"binding":"b2"}"#, t0 + 1_001),
         Err(StoreError::AlreadyPaired(_))
     ));
     db.peers()
@@ -1529,8 +1677,12 @@ fn scheduler_unifies_exact_earliest_deadline_across_all_subsystems() {
     assert_eq!(db.next_deadline_ms(t0).unwrap(), Some(t0 + 3_000));
 
     // 4. Add message with hold_until at t0 + 2_000 -> earliest moves to t0 + 2_000.
-    db.messages().register_handle("alice@mac", "a", None, t0).unwrap();
-    db.messages().register_handle("bob@lap", "b", None, t0).unwrap();
+    db.messages()
+        .register_handle("alice@mac", "a", None, t0)
+        .unwrap();
+    db.messages()
+        .register_handle("bob@lap", "b", None, t0)
+        .unwrap();
     db.messages()
         .enqueue(
             &EnqueueMessage {
@@ -1578,7 +1730,13 @@ fn scheduler_unifies_exact_earliest_deadline_across_all_subsystems() {
         )
         .unwrap();
     db.events()
-        .ingest("local", "ci", "pub", &sample_event("e1", "ci/1", "ci.run", "a/b"), t0)
+        .ingest(
+            "local",
+            "ci",
+            "pub",
+            &sample_event("e1", "ci/1", "ci.run", "a/b"),
+            t0,
+        )
         .unwrap();
 
     let bd = db.next_deadline_breakdown(t0).unwrap();
@@ -1615,8 +1773,12 @@ fn edge_cases_session_pruning_set_subscriptions_and_staged_transfer_rollback() {
     // 1. Session pruning cascades cleanly across mailbox, per-session mutes, bridge_links, plugin_targets.
     db.local().register_session("s-stale", "{}", t0).unwrap();
     db.local().register_session("s-active", "{}", t0).unwrap();
-    db.local().add_mute("s-stale", "noisy", "human", t0).unwrap();
-    db.local().add_mute("*", "global-muted", "human", t0).unwrap();
+    db.local()
+        .add_mute("s-stale", "noisy", "human", t0)
+        .unwrap();
+    db.local()
+        .add_mute("*", "global-muted", "human", t0)
+        .unwrap();
     db.local()
         .add_bridge_link(&BridgeLink {
             plugin: "slack".into(),
@@ -1665,7 +1827,12 @@ fn edge_cases_session_pruning_set_subscriptions_and_staged_transfer_rollback() {
     assert!(db.local().get_session("s-stale").unwrap().is_some());
     assert_eq!(db.local().pending_count("s-stale").unwrap(), 1);
     assert_eq!(db.local().bridge_links("slack", "ops").unwrap().len(), 1);
-    assert!(db.local().get_plugin_target("slack", "ops").unwrap().is_some());
+    assert!(
+        db.local()
+            .get_plugin_target("slack", "ops")
+            .unwrap()
+            .is_some()
+    );
 
     // Once unread mail is drained (`pending` -> `delivered`), `prune_sessions` cascades cleanly!
     let drained = db.local().drain_inbox("s-stale", 10, t0 + 500).unwrap();
@@ -1675,7 +1842,12 @@ fn edge_cases_session_pruning_set_subscriptions_and_staged_transfer_rollback() {
     assert!(db.local().get_session("s-stale").unwrap().is_none());
     assert!(db.local().get_session("s-active").unwrap().is_some());
     assert!(db.local().bridge_links("slack", "ops").unwrap().is_empty());
-    assert!(db.local().get_plugin_target("slack", "ops").unwrap().is_none());
+    assert!(
+        db.local()
+            .get_plugin_target("slack", "ops")
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(db.local().pending_count("s-stale").unwrap(), 0);
     // Global mute must remain untouched!
     assert_eq!(db.local().list_mutes(None).unwrap().len(), 1);
@@ -1758,7 +1930,10 @@ fn edge_cases_session_pruning_set_subscriptions_and_staged_transfer_rollback() {
         t0,
     );
     assert!(bad.is_err());
-    assert!(!part.exists(), "failed staged upload must delete .part file");
+    assert!(
+        !part.exists(),
+        "failed staged upload must delete .part file"
+    );
 
     db.transfers()
         .submit(
@@ -1855,7 +2030,12 @@ fn v060_backend_merge_and_metadata_read_helpers() {
     let on_t4g = db.local().list_sessions_by_herdr_terminal("t4g").unwrap();
     let ids: Vec<&str> = on_t4g.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, vec!["codex:s2", "claude:s1"]);
-    assert!(db.local().list_sessions_by_herdr_terminal("").unwrap().is_empty());
+    assert!(
+        db.local()
+            .list_sessions_by_herdr_terminal("")
+            .unwrap()
+            .is_empty()
+    );
 
     // 3. list_pending_metadata & quarantined_count never include quarantined or delivered items.
     db.local()
@@ -1959,13 +2139,23 @@ fn v060_backend_merge_and_metadata_read_helpers() {
             .delete_subscription_for_subscriber("sub-owned-by-s1", "codex:s2")
             .unwrap()
     );
-    assert!(db.events().get_subscription("sub-owned-by-s1").unwrap().is_some());
+    assert!(
+        db.events()
+            .get_subscription("sub-owned-by-s1")
+            .unwrap()
+            .is_some()
+    );
     assert!(
         db.events()
             .delete_subscription_for_subscriber("sub-owned-by-s1", "claude:s1")
             .unwrap()
     );
-    assert!(db.events().get_subscription("sub-owned-by-s1").unwrap().is_none());
+    assert!(
+        db.events()
+            .get_subscription("sub-owned-by-s1")
+            .unwrap()
+            .is_none()
+    );
 
     // 6. list_active_wakeups_for_session includes active/paused and excludes cancelled.
     let limits = hyp_store::WakeupLimits::default();
@@ -2163,7 +2353,12 @@ fn g3_coalesce_update_resets_reviewed_at_human_auth_and_gate_reason() {
     assert!(before.reviewed_at.is_some());
     assert_eq!(before.gate_reason.as_deref(), Some("downgraded_to_notify"));
     assert!(before.notified);
-    assert!(db.human().get_mailbox_human_auth(&receipt).unwrap().is_some());
+    assert!(
+        db.human()
+            .get_mailbox_human_auth(&receipt)
+            .unwrap()
+            .is_some()
+    );
 
     // Coalesce a new untrusted payload onto the same receipt!
     let receipt2 = match db

@@ -27,7 +27,10 @@ fn uninstall_script_mirrors_are_byte_identical_and_non_empty() {
     let top_mirror = fs::read(root.join("uninstall.sh")).expect("read uninstall.sh");
     let site_mirror = fs::read(root.join("site/uninstall.sh")).expect("read site/uninstall.sh");
 
-    assert!(!canonical.is_empty(), "scripts/uninstall.sh must not be empty");
+    assert!(
+        !canonical.is_empty(),
+        "scripts/uninstall.sh must not be empty"
+    );
     assert_eq!(
         canonical, top_mirror,
         "uninstall.sh must be byte-identical to scripts/uninstall.sh"
@@ -259,10 +262,18 @@ mod unix_e2e {
         );
 
         // Claude slash commands (4 Hyphae + 1 custom user command)
-        for cmd in ["hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md"] {
+        for cmd in [
+            "hyphae.md",
+            "hyphae-subs.md",
+            "hyphae-focus.md",
+            "hyphae-mute.md",
+        ] {
             write_file(&h.join(".claude/commands").join(cmd), "# hyphae cmd\n");
         }
-        write_file(&h.join(".claude/commands/my-cmd.md"), "# user custom command\n");
+        write_file(
+            &h.join(".claude/commands/my-cmd.md"),
+            "# user custom command\n",
+        );
 
         // Skills across all 10 harness roots (hyphae + hyphae-setup + hyphae-schedule + custom my-skill)
         for root in [
@@ -278,10 +289,19 @@ mod unix_e2e {
             ".t3/skills",
         ] {
             write_file(&h.join(root).join("hyphae/SKILL.md"), "# hyphae\n");
-            write_file(&h.join(root).join("hyphae-setup/SKILL.md"), "# hyphae-setup\n");
-            write_file(&h.join(root).join("hyphae-schedule/SKILL.md"), "# hyphae-schedule\n");
+            write_file(
+                &h.join(root).join("hyphae-setup/SKILL.md"),
+                "# hyphae-setup\n",
+            );
+            write_file(
+                &h.join(root).join("hyphae-schedule/SKILL.md"),
+                "# hyphae-schedule\n",
+            );
         }
-        write_file(&h.join(".claude/skills/my-skill/SKILL.md"), "# custom user skill\n");
+        write_file(
+            &h.join(".claude/skills/my-skill/SKILL.md"),
+            "# custom user skill\n",
+        );
 
         // Antigravity CLI settings.json (chained statusLine + custom user keys) & plugin dir
         write_json(
@@ -416,7 +436,10 @@ fast_mode = true
                 }
             }),
         );
-        write_file(&h.join(".config/opencode/plugins/hyphae.ts"), "export default {};\n");
+        write_file(
+            &h.join(".config/opencode/plugins/hyphae.ts"),
+            "export default {};\n",
+        );
 
         // OpenClaw openclaw.json + official plugin directory
         write_json(
@@ -455,7 +478,10 @@ fast_mode = true
         );
 
         // Herdr & T3 standalone adapter configs
-        write_json(&h.join(".config/herdr/hyphae.json"), &json!({ "hyphae": {} }));
+        write_json(
+            &h.join(".config/herdr/hyphae.json"),
+            &json!({ "hyphae": {} }),
+        );
         write_json(&h.join(".t3/hyphae.json"), &json!({ "hyphae": {} }));
 
         // Native Herdr app mods, keys.json, and symlinked custom layout
@@ -478,8 +504,11 @@ fast_mode = true
         let external_layout_original = "{\n  \"name\": \"custom\",\n  \"pane\": { \"header\": { \"content\": { \"mod\": \"hyphae-pane\" } } }\n}\n".to_string();
         write_file(&external_layout_target, &external_layout_original);
         fs::create_dir_all(herdr_app.join("layouts")).expect("create herdr layouts dir");
-        symlink(&external_layout_target, herdr_app.join("layouts/custom.json"))
-            .expect("symlink custom layout");
+        symlink(
+            &external_layout_target,
+            herdr_app.join("layouts/custom.json"),
+        )
+        .expect("symlink custom layout");
 
         // Installed binaries
         let hyp_bin = h.join(".local/bin/hyp");
@@ -557,9 +586,18 @@ fast_mode = true
         assert!(stdout.contains("Herdr layout notes (will NOT be modified)"));
 
         // Every single file & binary must remain byte-identical!
-        assert_eq!(fs::read(h.join(".claude/settings.json")).unwrap(), claude_before);
-        assert_eq!(fs::read(h.join(".codex/config.toml")).unwrap(), codex_before);
-        assert_eq!(fs::read(h.join(".config/herdr-app/keys.json")).unwrap(), keys_before);
+        assert_eq!(
+            fs::read(h.join(".claude/settings.json")).unwrap(),
+            claude_before
+        );
+        assert_eq!(
+            fs::read(h.join(".codex/config.toml")).unwrap(),
+            codex_before
+        );
+        assert_eq!(
+            fs::read(h.join(".config/herdr-app/keys.json")).unwrap(),
+            keys_before
+        );
         assert!(h.join(".config/hyphae/node.json").exists());
         assert!(h.join(".local/bin/hyp").exists());
         assert!(h.join(".config/herdr-app/mods/hyphae-pane").exists());
@@ -607,33 +645,51 @@ fast_mode = true
 
         // 0. Service plist / unit inside isolated HOME removed
         if cfg!(target_os = "macos") {
-            assert!(!h.join("Library/LaunchAgents/to.hyphae.daemon.plist").exists());
+            assert!(
+                !h.join("Library/LaunchAgents/to.hyphae.daemon.plist")
+                    .exists()
+            );
         } else {
-            assert!(!h.join(".config/systemd/user/hyphae-daemon.service").exists());
+            assert!(
+                !h.join(".config/systemd/user/hyphae-daemon.service")
+                    .exists()
+            );
         }
 
         // 1. Both Claude & Antigravity statusLines restored VERBATIM!
         let claude_settings = read_json(&h.join(".claude/settings.json"));
         assert_eq!(claude_settings["statusLine"], fx.claude_original_statusline);
         assert_eq!(claude_settings["theme"], "dark");
-        assert_eq!(claude_settings["permissions"]["allow"], json!(["Bash(git status)"]));
+        assert_eq!(
+            claude_settings["permissions"]["allow"],
+            json!(["Bash(git status)"])
+        );
         let claude_mode = fs::metadata(h.join(".claude/settings.json"))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(claude_mode, 0o600, "permissions on settings.json must be preserved");
+        assert_eq!(
+            claude_mode, 0o600,
+            "permissions on settings.json must be preserved"
+        );
 
         // Hyphae hooks removed, custom user hooks preserved (including mixed PostToolUse matcher group!)
         assert!(claude_settings["hooks"].get("SessionStart").is_none());
         assert!(claude_settings["hooks"].get("Stop").is_none());
         let pre_groups = claude_settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre_groups.len(), 1);
-        assert_eq!(pre_groups[0]["hooks"][0]["command"], "/usr/local/bin/my-audit-hook");
+        assert_eq!(
+            pre_groups[0]["hooks"][0]["command"],
+            "/usr/local/bin/my-audit-hook"
+        );
         let post_groups = claude_settings["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(post_groups.len(), 1);
         assert_eq!(post_groups[0]["hooks"].as_array().unwrap().len(), 1);
-        assert_eq!(post_groups[0]["hooks"][0]["command"], "/usr/local/bin/my-post-hook");
+        assert_eq!(
+            post_groups[0]["hooks"][0]["command"],
+            "/usr/local/bin/my-post-hook"
+        );
 
         let agy_settings = read_json(&h.join(".gemini/antigravity-cli/settings.json"));
         assert_eq!(agy_settings["statusLine"], fx.agy_original_statusline);
@@ -669,7 +725,10 @@ fast_mode = true
         assert_eq!(cursor_hooks["version"], 1);
         assert!(cursor_hooks["hooks"].get("stop").is_none());
         assert_eq!(
-            cursor_hooks["hooks"]["beforeMCPExecution"].as_array().unwrap().len(),
+            cursor_hooks["hooks"]["beforeMCPExecution"]
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
@@ -686,7 +745,11 @@ fast_mode = true
         assert!(openclaw_json["mcp"]["servers"].get("hyphae").is_none());
         assert!(openclaw_json["mcp"]["servers"].get("weather").is_some());
         assert!(openclaw_json["plugins"]["entries"].get("hyphae").is_none());
-        assert!(openclaw_json["plugins"]["entries"].get("weather-ext").is_some());
+        assert!(
+            openclaw_json["plugins"]["entries"]
+                .get("weather-ext")
+                .is_some()
+        );
         assert_eq!(openclaw_json["plugins"]["allow"], json!(["weather-ext"]));
 
         // 3. Codex config.toml & hooks.json
@@ -701,7 +764,10 @@ fast_mode = true
         assert!(codex_hooks["hooks"].get("Stop").is_none());
         let codex_start = codex_hooks["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(codex_start.len(), 1);
-        assert_eq!(codex_start[0]["hooks"][0]["command"], "/usr/local/bin/codex-custom");
+        assert_eq!(
+            codex_start[0]["hooks"][0]["command"],
+            "/usr/local/bin/codex-custom"
+        );
 
         // 4. Standalone Hyphae files removed; custom user files preserved!
         for gone in [
@@ -733,7 +799,10 @@ fast_mode = true
         }
         assert!(h.join(".claude/commands/my-cmd.md").exists());
         assert!(h.join(".claude/skills/my-skill/SKILL.md").exists());
-        assert!(h.join(".config/herdr-app/mods/user-custom-mod/mod.json").exists());
+        assert!(
+            h.join(".config/herdr-app/mods/user-custom-mod/mod.json")
+                .exists()
+        );
 
         // 5. Herdr keys.json & symlinked layout
         let herdr_keys = read_json(&h.join(".config/herdr-app/keys.json"));
@@ -808,8 +877,14 @@ fast_mode = true
             String::from_utf8_lossy(&setup_out.stderr)
         );
         // Verify setup actually chained both statusLines & wrote configs
-        assert!(h.join(".config/hyphae/claude-statusline-chain.json").exists());
-        assert!(h.join(".config/hyphae/antigravity-statusline-chain.json").exists());
+        assert!(
+            h.join(".config/hyphae/claude-statusline-chain.json")
+                .exists()
+        );
+        assert!(
+            h.join(".config/hyphae/antigravity-statusline-chain.json")
+                .exists()
+        );
         assert!(h.join(".claude/commands/hyphae.md").exists());
         assert!(h.join(".gemini/config/plugins/hyphae/hooks.json").exists());
         assert!(h.join(".config/opencode/plugins/hyphae.ts").exists());
@@ -844,14 +919,46 @@ fast_mode = true
         assert!(codex_after.contains("model = \"gpt-5\""));
         assert!(codex_after.contains("[mcp_servers.mine]"));
 
-        assert!(read_json(&h.join(".claude.json")).get("mcpServers").is_none());
-        assert!(read_json(&h.join(".cursor/mcp.json")).get("mcpServers").is_none());
-        assert!(read_json(&h.join(".cursor/hooks.json")).get("hooks").is_none());
-        assert!(read_json(&h.join(".codex/hooks.json")).get("hooks").is_none());
-        assert!(read_json(&h.join(".gemini/settings.json")).get("mcpServers").is_none());
-        assert!(read_json(&h.join(".gemini/settings.json")).get("hooks").is_none());
-        assert!(read_json(&h.join(".config/opencode/opencode.json")).get("mcp").is_none());
-        assert!(read_json(&h.join(".openclaw/openclaw.json")).get("mcp").is_none());
+        assert!(
+            read_json(&h.join(".claude.json"))
+                .get("mcpServers")
+                .is_none()
+        );
+        assert!(
+            read_json(&h.join(".cursor/mcp.json"))
+                .get("mcpServers")
+                .is_none()
+        );
+        assert!(
+            read_json(&h.join(".cursor/hooks.json"))
+                .get("hooks")
+                .is_none()
+        );
+        assert!(
+            read_json(&h.join(".codex/hooks.json"))
+                .get("hooks")
+                .is_none()
+        );
+        assert!(
+            read_json(&h.join(".gemini/settings.json"))
+                .get("mcpServers")
+                .is_none()
+        );
+        assert!(
+            read_json(&h.join(".gemini/settings.json"))
+                .get("hooks")
+                .is_none()
+        );
+        assert!(
+            read_json(&h.join(".config/opencode/opencode.json"))
+                .get("mcp")
+                .is_none()
+        );
+        assert!(
+            read_json(&h.join(".openclaw/openclaw.json"))
+                .get("mcp")
+                .is_none()
+        );
         assert!(!h.join(".config/hyphae").exists());
         assert!(!h.join(".gemini/config/plugins/hyphae").exists());
         assert!(!h.join(".config/opencode/plugins/hyphae.ts").exists());
@@ -921,7 +1028,9 @@ fast_mode = true
         // Build a shim bin dir exposing `node` + standard POSIX utils, WITHOUT `python3`.
         let no_py_bin = TempDir::new().expect("no-python bin dir");
         symlink(&node_path, no_py_bin.path().join("node")).expect("symlink node");
-        for util in ["awk", "basename", "find", "grep", "id", "rm", "sort", "uname", "wc", "cat"] {
+        for util in [
+            "awk", "basename", "find", "grep", "id", "rm", "sort", "uname", "wc", "cat",
+        ] {
             for dir in ["/usr/bin", "/bin"] {
                 let cand = Path::new(dir).join(util);
                 if cand.is_file() {
@@ -946,7 +1055,10 @@ fast_mode = true
             .env("XDG_CONFIG_HOME", fx_js.home.path().join(".config"))
             .env("XDG_STATE_HOME", fx_js.home.path().join(".local/state"))
             .env("HYPHAE_INSTALL_DIR", fx_js.home.path().join(".local/bin"))
-            .env("HERDR_APP_HOME", fx_js.home.path().join(".config/herdr-app"))
+            .env(
+                "HERDR_APP_HOME",
+                fx_js.home.path().join(".config/herdr-app"),
+            )
             .env("HYPHAE_SECRET_BACKEND", "file")
             .env("CI", "1")
             .stdin(Stdio::null())
@@ -1048,7 +1160,10 @@ fast_mode = true
         let claude_before = fs::read(h_kh.join(".claude/settings.json")).unwrap();
         let out_kh = run_script(&script, h_kh, &["--yes", "--keep-harnesses"]);
         assert_eq!(out_kh.status.code(), Some(0));
-        assert_eq!(fs::read(h_kh.join(".claude/settings.json")).unwrap(), claude_before);
+        assert_eq!(
+            fs::read(h_kh.join(".claude/settings.json")).unwrap(),
+            claude_before
+        );
         assert!(h_kh.join(".claude/skills/hyphae/SKILL.md").exists());
         assert!(h_kh.join(".config/herdr-app/mods/hyphae-pane").exists());
         assert!(!h_kh.join(".config/hyphae").exists());
@@ -1123,8 +1238,14 @@ fast_mode = true
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(h.join(".local/bin/hyp").exists(), "--keep-binary must preserve binary");
-        assert!(h.join(".config/hyphae/node.json").exists(), "--keep-state must preserve state");
+        assert!(
+            h.join(".local/bin/hyp").exists(),
+            "--keep-binary must preserve binary"
+        );
+        assert!(
+            h.join(".config/hyphae/node.json").exists(),
+            "--keep-state must preserve state"
+        );
         // Harnesses were cleaned while custom cmd-shift-h binding was preserved!
         assert!(!h.join(".claude/skills/hyphae").exists());
         let keys = read_json(&h.join(".config/herdr-app/keys.json"));
@@ -1159,7 +1280,10 @@ fast_mode = true
             String::from_utf8_lossy(&dry.stdout),
             String::from_utf8_lossy(&dry.stderr)
         );
-        assert!(h.join(".claude/skills/hyphae-panel/hooks/register.tsx").exists());
+        assert!(
+            h.join(".claude/skills/hyphae-panel/hooks/register.tsx")
+                .exists()
+        );
         assert!(h.join(".config/hyphae/node.json").exists());
 
         // 2. `hyp uninstall --yes --home <tmp>` runs the embedded script and removes everything cleanly.
@@ -1258,14 +1382,31 @@ fast_mode = true
                 }
             }),
         );
-        for cmd in ["hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md"] {
-            write_file(&h.join(".claude/commands").join(cmd), "# default hyphae cmd\n");
+        for cmd in [
+            "hyphae.md",
+            "hyphae-subs.md",
+            "hyphae-focus.md",
+            "hyphae-mute.md",
+        ] {
+            write_file(
+                &h.join(".claude/commands").join(cmd),
+                "# default hyphae cmd\n",
+            );
         }
-        write_file(&h.join(".claude/commands/default-custom.md"), "# keep default cmd\n");
+        write_file(
+            &h.join(".claude/commands/default-custom.md"),
+            "# keep default cmd\n",
+        );
         for skill in ["hyphae", "hyphae-setup", "hyphae-schedule", "hyphae-panel"] {
-            write_file(&h.join(".claude/skills").join(skill).join("SKILL.md"), "# hyphae skill\n");
+            write_file(
+                &h.join(".claude/skills").join(skill).join("SKILL.md"),
+                "# hyphae skill\n",
+            );
         }
-        write_file(&h.join(".claude/skills/my-shared-skill/SKILL.md"), "# keep shared skill\n");
+        write_file(
+            &h.join(".claude/skills/my-shared-skill/SKILL.md"),
+            "# keep shared skill\n",
+        );
 
         // Profile $CLAUDE_CONFIG_DIR:
         // - real .claude.json (profile-specific MCP servers)
@@ -1287,10 +1428,21 @@ fast_mode = true
             .expect("symlink profile settings.json");
         symlink(h.join(".claude/skills"), profile.join("skills"))
             .expect("symlink profile skills dir");
-        for cmd in ["hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md"] {
-            write_file(&profile.join("commands").join(cmd), "# profile hyphae cmd\n");
+        for cmd in [
+            "hyphae.md",
+            "hyphae-subs.md",
+            "hyphae-focus.md",
+            "hyphae-mute.md",
+        ] {
+            write_file(
+                &profile.join("commands").join(cmd),
+                "# profile hyphae cmd\n",
+            );
         }
-        write_file(&profile.join("commands/work-custom.md"), "# keep profile cmd\n");
+        write_file(
+            &profile.join("commands/work-custom.md"),
+            "# keep profile cmd\n",
+        );
 
         // 1. Dry-run reports profile .claude.json & profile commands without duplicating symlinked
         //    settings.json or symlinked skills, and modifies zero files.
@@ -1308,7 +1460,11 @@ fast_mode = true
             !dry_stdout.contains(&profile.join("skills/hyphae").display().to_string()),
             "canonical dedup must avoid listing symlinked profile skills twice:\n{dry_stdout}"
         );
-        assert!(read_json(&profile.join(".claude.json"))["mcpServers"].get("hyphae").is_some());
+        assert!(
+            read_json(&profile.join(".claude.json"))["mcpServers"]
+                .get("hyphae")
+                .is_some()
+        );
 
         // 2. Full uninstall cleans BOTH profiles, restores statusLine verbatim, preserves BOTH symlinks.
         let out = run_script_with_claude_dir(&script, h, Some(&profile), &["--yes"]);
@@ -1363,12 +1519,21 @@ fast_mode = true
         assert_eq!(pre.len(), 1);
         assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/keep-hook");
         assert_eq!(
-            fs::metadata(&default_settings).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&default_settings)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
 
         // Commands & skills cleaned in both places; user custom commands & skills preserved!
-        for cmd in ["hyphae.md", "hyphae-subs.md", "hyphae-focus.md", "hyphae-mute.md"] {
+        for cmd in [
+            "hyphae.md",
+            "hyphae-subs.md",
+            "hyphae-focus.md",
+            "hyphae-mute.md",
+        ] {
             assert!(!h.join(".claude/commands").join(cmd).exists());
             assert!(!profile.join("commands").join(cmd).exists());
         }
@@ -1421,18 +1586,33 @@ fast_mode = true
         let (prof_py, df_py) = setup_symlink_only_profile(tmp_py.path());
         let out_py = run_script_with_claude_dir(&script, tmp_py.path(), Some(&prof_py), &["--yes"]);
         assert_eq!(out_py.status.code(), Some(0));
-        assert!(fs::symlink_metadata(prof_py.join("settings.json")).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(prof_py.join("settings.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(read_json(&df_py)["statusLine"], orig_sl);
         assert!(read_json(&df_py).get("hooks").is_none());
-        assert!(read_json(&prof_py.join(".claude.json"))["mcpServers"].get("hyphae").is_none());
-        assert!(read_json(&prof_py.join(".claude.json"))["mcpServers"].get("keep").is_some());
+        assert!(
+            read_json(&prof_py.join(".claude.json"))["mcpServers"]
+                .get("hyphae")
+                .is_none()
+        );
+        assert!(
+            read_json(&prof_py.join(".claude.json"))["mcpServers"]
+                .get("keep")
+                .is_some()
+        );
 
         if let Ok(which_node) = Command::new("/usr/bin/which").arg("node").output() {
             let node_path = PathBuf::from(String::from_utf8_lossy(&which_node.stdout).trim());
             if which_node.status.success() && node_path.is_file() {
                 let no_py_bin = TempDir::new().expect("no-python bin dir");
                 symlink(&node_path, no_py_bin.path().join("node")).expect("symlink node");
-                for util in ["awk", "basename", "find", "grep", "id", "rm", "sort", "uname", "wc", "cat"] {
+                for util in [
+                    "awk", "basename", "find", "grep", "id", "rm", "sort", "uname", "wc", "cat",
+                ] {
                     for dir in ["/usr/bin", "/bin"] {
                         let cand = Path::new(dir).join(util);
                         if cand.is_file() {
@@ -1465,9 +1645,17 @@ fast_mode = true
                     String::from_utf8_lossy(&out_js.stdout),
                     String::from_utf8_lossy(&out_js.stderr)
                 );
-                assert!(fs::symlink_metadata(prof_js.join("settings.json")).unwrap().file_type().is_symlink());
+                assert!(
+                    fs::symlink_metadata(prof_js.join("settings.json"))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
                 assert_eq!(read_json(&df_py), read_json(&df_js));
-                assert_eq!(read_json(&prof_py.join(".claude.json")), read_json(&prof_js.join(".claude.json")));
+                assert_eq!(
+                    read_json(&prof_py.join(".claude.json")),
+                    read_json(&prof_js.join(".claude.json"))
+                );
             }
         }
 
@@ -1491,7 +1679,9 @@ fast_mode = true
         );
         assert_eq!(guard_out.status.code(), Some(0));
         assert!(
-            read_json(&outside_mcp)["mcpServers"].get("hyphae").is_some(),
+            read_json(&outside_mcp)["mcpServers"]
+                .get("hyphae")
+                .is_some(),
             "hermetic guard must protect external CLAUDE_CONFIG_DIR outside isolated HOME"
         );
         assert!(
@@ -1520,8 +1710,14 @@ fast_mode = true
         let t3_content = "<?xml version=\"1.0\"?><plist><dict><key>Label</key><string>com.t3.t3-mesh</string></dict></plist>\n";
 
         write_file(&t3_plist, t3_content);
-        write_file(&hyphae_plist, "<plist><dict><key>Label</key><string>to.hyphae.daemon</string></dict></plist>\n");
-        write_file(&legacy_hyphae_plist, "<plist><dict><key>Label</key><string>com.hyphae.legacy</string></dict></plist>\n");
+        write_file(
+            &hyphae_plist,
+            "<plist><dict><key>Label</key><string>to.hyphae.daemon</string></dict></plist>\n",
+        );
+        write_file(
+            &legacy_hyphae_plist,
+            "<plist><dict><key>Label</key><string>com.hyphae.legacy</string></dict></plist>\n",
+        );
 
         // Dry-run must NEVER list com.t3.t3-mesh.plist!
         let dry = run_script(&script, h, &["--dry-run"]);
@@ -1560,8 +1756,14 @@ fast_mode = true
             t3_content
         );
         if cfg!(target_os = "macos") {
-            assert!(!hyphae_plist.exists(), "to.hyphae.daemon.plist must be removed");
-            assert!(!legacy_hyphae_plist.exists(), "com.hyphae.legacy.plist must be removed");
+            assert!(
+                !hyphae_plist.exists(),
+                "to.hyphae.daemon.plist must be removed"
+            );
+            assert!(
+                !legacy_hyphae_plist.exists(),
+                "com.hyphae.legacy.plist must be removed"
+            );
         }
     }
 }

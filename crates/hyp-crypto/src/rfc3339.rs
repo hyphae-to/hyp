@@ -84,8 +84,9 @@ pub fn parse_rfc3339_millis(ts: &str) -> Result<i64, CryptoError> {
         )));
     }
     let parse_u = |slice: &[u8]| -> Result<u32, CryptoError> {
-        let s = std::str::from_utf8(slice)
-            .map_err(|_| CryptoError::InvalidPairing(format!("invalid RFC 3339 timestamp '{ts}'")))?;
+        let s = std::str::from_utf8(slice).map_err(|_| {
+            CryptoError::InvalidPairing(format!("invalid RFC 3339 timestamp '{ts}'"))
+        })?;
         if !s.bytes().all(|c| c.is_ascii_digit()) {
             return Err(CryptoError::InvalidPairing(format!(
                 "invalid RFC 3339 timestamp '{ts}'"
@@ -140,8 +141,16 @@ pub fn parse_rfc3339_millis(ts: &str) -> Result<i64, CryptoError> {
         }
         let frac = &b[start..pos];
         let d0 = (frac[0] - b'0') as i64;
-        let d1 = if frac.len() > 1 { (frac[1] - b'0') as i64 } else { 0 };
-        let d2 = if frac.len() > 2 { (frac[2] - b'0') as i64 } else { 0 };
+        let d1 = if frac.len() > 1 {
+            (frac[1] - b'0') as i64
+        } else {
+            0
+        };
+        let d2 = if frac.len() > 2 {
+            (frac[2] - b'0') as i64
+        } else {
+            0
+        };
         millis = d0 * 100 + d1 * 10 + d2;
     }
 

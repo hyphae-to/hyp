@@ -158,7 +158,10 @@ impl<'a> TransferStore<'a> {
             )));
         }
         ensure_dir_0700(self.db.transfers_dir())?;
-        Ok(self.db.transfers_dir().join(format!("{id}.part-{}", uuid_v4())))
+        Ok(self
+            .db
+            .transfers_dir()
+            .join(format!("{id}.part-{}", uuid_v4())))
     }
 
     /// Writes `blob` atomically via `.part-<uuid>` (`0600`) + rename and records metadata inside
@@ -408,7 +411,11 @@ impl<'a> TransferStore<'a> {
     pub fn get(&self, id: &str) -> StoreResult<Option<TransferRecord>> {
         self.db
             .conn()
-            .query_row("SELECT * FROM transfers WHERE id = ?1", params![id], decode_transfer_row)
+            .query_row(
+                "SELECT * FROM transfers WHERE id = ?1",
+                params![id],
+                decode_transfer_row,
+            )
             .optional()?
             .transpose()
     }
@@ -536,9 +543,9 @@ impl<'a> TransferStore<'a> {
     /// Expires pending transfers whose `expires_at <= now_ms` and deletes their blobs from disk.
     pub fn tick(&self, now_ms: i64) -> StoreResult<TransferTickReport> {
         let tx = self.db.immediate_tx()?;
-        let mut stmt = tx.conn().prepare(
-            "SELECT id FROM transfers WHERE state = 'pending' AND expires_at <= ?1",
-        )?;
+        let mut stmt = tx
+            .conn()
+            .prepare("SELECT id FROM transfers WHERE state = 'pending' AND expires_at <= ?1")?;
         let expired_ids: Vec<String> = stmt
             .query_map(params![now_ms], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -657,19 +664,21 @@ fn decode_transfer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<
     let hold_until: i64 = row.get("hold_until")?;
     let settled_at: Option<i64> = row.get("settled_at")?;
 
-    Ok(TransferState::parse(&state_str).map(|state| TransferRecord {
-        id,
-        from_node,
-        to_node,
-        transfer_type,
-        header_json,
-        sha256,
-        size: size.max(0) as u64,
-        sent_at,
-        expires_at,
-        state,
-        reason,
-        hold_until,
-        settled_at,
-    }))
+    Ok(
+        TransferState::parse(&state_str).map(|state| TransferRecord {
+            id,
+            from_node,
+            to_node,
+            transfer_type,
+            header_json,
+            sha256,
+            size: size.max(0) as u64,
+            sent_at,
+            expires_at,
+            state,
+            reason,
+            hold_until,
+            settled_at,
+        }),
+    )
 }

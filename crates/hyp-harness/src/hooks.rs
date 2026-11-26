@@ -47,16 +47,27 @@ impl FromStr for HookEvent {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "pre-tool-use" | "PreToolUse" | "BeforeTool" | "beforeMCPExecution"
-            | "before-mcp-execution" | "before-tool-call" | "before_tool_call"
+            "pre-tool-use"
+            | "PreToolUse"
+            | "BeforeTool"
+            | "beforeMCPExecution"
+            | "before-mcp-execution"
+            | "before-tool-call"
+            | "before_tool_call"
             | "BeforeToolCall" => Ok(HookEvent::PreToolUse),
             "post-tool-use" | "PostToolUse" | "AfterTool" | "after-tool-call"
             | "after_tool_call" | "AfterToolCall" => Ok(HookEvent::PostToolUse),
-            "pre-invocation" | "PreInvocation" | "before-prompt-build" | "before_prompt_build"
-            | "BeforePromptBuild" | "user-prompt-submit" | "UserPromptSubmit"
-            | "before-agent" | "BeforeAgent" | "before-submit-prompt" | "beforeSubmitPrompt" => {
-                Ok(HookEvent::PreInvocation)
-            }
+            "pre-invocation"
+            | "PreInvocation"
+            | "before-prompt-build"
+            | "before_prompt_build"
+            | "BeforePromptBuild"
+            | "user-prompt-submit"
+            | "UserPromptSubmit"
+            | "before-agent"
+            | "BeforeAgent"
+            | "before-submit-prompt"
+            | "beforeSubmitPrompt" => Ok(HookEvent::PreInvocation),
             "stop" | "Stop" | "AfterAgent" | "agent-end" | "agent_end" | "AgentEnd"
             | "run-stopped" | "run_stopped" | "RunStopped" => Ok(HookEvent::Stop),
             "session-start" | "session_start" | "SessionStart" => Ok(HookEvent::SessionStart),
@@ -307,12 +318,11 @@ fn waiter_arm_prompt(
         HarnessKind::Claude => Some(format!(
             "hyphae: Enrolled, but no background waiter is running yet. Start `{cli_command} watch --session {session_id}{socket_flag}` via Monitor (or `{cli_command} wait --session {session_id}{socket_flag}` via background Bash), then end turn."
         )),
-        HarnessKind::Codex
-        | HarnessKind::Cursor
-        | HarnessKind::Gemini
-        | HarnessKind::Opencode => Some(format!(
-            "hyphae: Enrolled, but no background waiter is running yet. Run `{cli_command} wait --session {session_id}{socket_flag}` in background, then end turn."
-        )),
+        HarnessKind::Codex | HarnessKind::Cursor | HarnessKind::Gemini | HarnessKind::Opencode => {
+            Some(format!(
+                "hyphae: Enrolled, but no background waiter is running yet. Run `{cli_command} wait --session {session_id}{socket_flag}` in background, then end turn."
+            ))
+        }
     }
 }
 
@@ -345,18 +355,15 @@ fn insert_transport_hints(
 ) -> bool {
     let mut added = false;
     if harness != HarnessKind::Openclaw {
-        let herdr_tid = hints
-            .herdr_terminal_id
-            .as_deref()
-            .or_else(|| {
-                payload
-                    .get("herdr_terminal_id")
-                    .or_else(|| payload.get("terminal_id"))
-                    .or_else(|| payload.get("terminalId"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| crate::transport::herdr::is_valid_terminal_id(s))
-            });
+        let herdr_tid = hints.herdr_terminal_id.as_deref().or_else(|| {
+            payload
+                .get("herdr_terminal_id")
+                .or_else(|| payload.get("terminal_id"))
+                .or_else(|| payload.get("terminalId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| crate::transport::herdr::is_valid_terminal_id(s))
+        });
         if let Some(tid) = herdr_tid {
             pkt.insert("herdrTerminalId".into(), json!(tid));
             added = true;
@@ -441,12 +448,18 @@ pub fn infer_session_token_from_env() -> Option<String> {
 }
 
 fn attach_session_token(pkt: &mut Map<String, Value>, session_token: Option<&str>) {
-    if let Some(tok) = session_token.map(str::trim).filter(|s| is_valid_session_token(s)) {
+    if let Some(tok) = session_token
+        .map(str::trim)
+        .filter(|s| is_valid_session_token(s))
+    {
         pkt.insert("sessionToken".into(), json!(tok));
     }
 }
 
-fn attach_openclaw_session_hints(pkt: &mut Map<String, Value>, payload: &Map<String, Value>) -> bool {
+fn attach_openclaw_session_hints(
+    pkt: &mut Map<String, Value>,
+    payload: &Map<String, Value>,
+) -> bool {
     let mut added = false;
     let mut validated_sk: Option<String> = None;
     if let Some(raw_sk) = payload
@@ -510,9 +523,7 @@ pub fn export_claude_session_env_file_with_token(
     session_token: Option<&str>,
 ) -> bool {
     if !is_valid_session_id(session_id)
-        || session_id
-            .strip_prefix("claude:")
-            .is_none_or(str::is_empty)
+        || session_id.strip_prefix("claude:").is_none_or(str::is_empty)
     {
         return false;
     }
@@ -606,8 +617,12 @@ where
             pkt.insert("sessionId".into(), json!(session_id));
             pkt.insert("envFileExported".into(), json!(true));
             attach_session_token(&mut pkt, session_token);
-            let _ =
-                insert_transport_hints(&mut pkt, options.harness, payload, &options.transport_hints);
+            let _ = insert_transport_hints(
+                &mut pkt,
+                options.harness,
+                payload,
+                &options.transport_hints,
+            );
             let res = rpc(&options.socket_path, &Value::Object(pkt));
             let derived_token = res
                 .ok
@@ -632,8 +647,12 @@ where
             pkt.insert("harness".into(), json!(options.harness.as_str()));
             pkt.insert("sessionId".into(), json!(session_id));
             attach_session_token(&mut pkt, session_token);
-            let added_hints =
-                insert_transport_hints(&mut pkt, options.harness, payload, &options.transport_hints);
+            let added_hints = insert_transport_hints(
+                &mut pkt,
+                options.harness,
+                payload,
+                &options.transport_hints,
+            );
             if added_hints {
                 let _ = rpc(&options.socket_path, &Value::Object(pkt));
             }
@@ -644,10 +663,7 @@ where
     match options.event {
         HookEvent::PreToolUse => {
             let info = extract_tool_info(options.harness, payload);
-            let Some(normalized) = info
-                .tool_name
-                .as_deref()
-                .and_then(normalize_mesh_tool_name)
+            let Some(normalized) = info.tool_name.as_deref().and_then(normalize_mesh_tool_name)
             else {
                 return default_pre_response(options.harness, options.event);
             };
@@ -885,13 +901,13 @@ where
                 );
             }
 
-            let already_continued =
-                payload.get("continuationActive").and_then(Value::as_bool) == Some(true)
-                    || payload.get("stop_hook_active").and_then(Value::as_bool) == Some(true)
-                    || payload
-                        .get("loop_count")
-                        .and_then(Value::as_f64)
-                        .is_some_and(|n| n > 0.0);
+            let already_continued = payload.get("continuationActive").and_then(Value::as_bool)
+                == Some(true)
+                || payload.get("stop_hook_active").and_then(Value::as_bool) == Some(true)
+                || payload
+                    .get("loop_count")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|n| n > 0.0);
             if already_continued {
                 return json!({});
             }
@@ -951,8 +967,7 @@ pub fn handle_hook_payload(payload: &Map<String, Value>, options: &HandleHookOpt
 pub fn shell_quote_cli(v: &str) -> String {
     if !v.is_empty()
         && v.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'_' | b'.' | b'/' | b':' | b'@' | b'=' | b'-')
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b':' | b'@' | b'=' | b'-')
         })
     {
         v.to_string()
@@ -1047,9 +1062,9 @@ mod tests {
         let has_live = RefCell::new(false);
 
         let mock_rpc = |_sock: &Path, pkt: &Value| match pkt.get("type").and_then(Value::as_str) {
-            Some("call.start") => DaemonRpcResult::ok(
-                json!({"callToken": "tok_123"}).as_object().unwrap().clone(),
-            ),
+            Some("call.start") => {
+                DaemonRpcResult::ok(json!({"callToken": "tok_123"}).as_object().unwrap().clone())
+            }
             Some("mailbox.drain") => {
                 let items = std::mem::take(&mut *queued.borrow_mut());
                 DaemonRpcResult::ok(json!({"items": items}).as_object().unwrap().clone())
@@ -1235,10 +1250,7 @@ mod tests {
                 }
                 HarnessKind::Gemini => {
                     assert_eq!(pre_res["decision"], "allow");
-                    assert_eq!(
-                        pre_res["hookSpecificOutput"]["hookEventName"],
-                        "BeforeTool"
-                    );
+                    assert_eq!(pre_res["hookSpecificOutput"]["hookEventName"], "BeforeTool");
                     assert_eq!(
                         pre_res["hookSpecificOutput"]["tool_input"]["_meshCall"],
                         "tok_abc"
@@ -1513,7 +1525,11 @@ mod tests {
 
     #[test]
     fn openclaw_before_prompt_build_parses_drains_nudged_and_returns_prepend_context() {
-        for raw in ["before-prompt-build", "before_prompt_build", "BeforePromptBuild"] {
+        for raw in [
+            "before-prompt-build",
+            "before_prompt_build",
+            "BeforePromptBuild",
+        ] {
             assert_eq!(
                 raw.parse::<HookEvent>().unwrap(),
                 HookEvent::PreInvocation,
@@ -1526,7 +1542,13 @@ mod tests {
         for raw in ["after-tool-call", "after_tool_call", "AfterToolCall"] {
             assert_eq!(raw.parse::<HookEvent>().unwrap(), HookEvent::PostToolUse);
         }
-        for raw in ["agent-end", "agent_end", "AgentEnd", "run-stopped", "run_stopped"] {
+        for raw in [
+            "agent-end",
+            "agent_end",
+            "AgentEnd",
+            "run-stopped",
+            "run_stopped",
+        ] {
             assert_eq!(raw.parse::<HookEvent>().unwrap(), HookEvent::Stop);
         }
 
@@ -1677,11 +1699,17 @@ mod tests {
         let pkts = recorded.borrow();
         assert_eq!(pkts.len(), 1);
         assert_eq!(pkts[0]["type"], "mailbox.drain");
-        assert_eq!(pkts[0]["sessionId"], "openclaw:agent:main:explicit:oc-sess-1");
+        assert_eq!(
+            pkts[0]["sessionId"],
+            "openclaw:agent:main:explicit:oc-sess-1"
+        );
         assert_eq!(pkts[0]["harness"], "openclaw");
         assert_eq!(pkts[0]["includeNudged"], true);
         assert_eq!(pkts[0]["sessionKey"], "agent:main:explicit:oc-sess-1");
-        assert_eq!(pkts[0]["openclawSessionKey"], "agent:main:explicit:oc-sess-1");
+        assert_eq!(
+            pkts[0]["openclawSessionKey"],
+            "agent:main:explicit:oc-sess-1"
+        );
         assert_eq!(pkts[0]["agentId"], "main");
         assert_eq!(pkts[0]["openclawAgentId"], "main");
 
@@ -1696,16 +1724,16 @@ mod tests {
         let empty = handle_hook_payload_with(
             json!({"session_id": "oc-sess-1"}).as_object().unwrap(),
             &opts(HarnessKind::Openclaw, HookEvent::PreInvocation),
-            |_sock, _| {
-                DaemonRpcResult::ok(json!({"items": []}).as_object().unwrap().clone())
-            },
+            |_sock, _| DaemonRpcResult::ok(json!({"items": []}).as_object().unwrap().clone()),
         );
         assert_eq!(empty, json!({}));
 
         // OpenClaw observational TurnEnd (`agent-end`) sends `session.idle` and returns `{}`
         let idle_pkts = RefCell::new(Vec::<Value>::new());
         let idle_res = handle_hook_payload_with(
-            json!({"sessionKey": "agent:main:explicit:oc-sess-1", "agentId": "main"}).as_object().unwrap(),
+            json!({"sessionKey": "agent:main:explicit:oc-sess-1", "agentId": "main"})
+                .as_object()
+                .unwrap(),
             &opts(HarnessKind::Openclaw, HookEvent::Stop),
             |_sock, pkt| {
                 idle_pkts.borrow_mut().push(pkt.clone());
@@ -1717,7 +1745,10 @@ mod tests {
         assert_eq!(idle_pkts.len(), 1);
         assert_eq!(idle_pkts[0]["type"], "session.idle");
         assert_eq!(idle_pkts[0]["harness"], "openclaw");
-        assert_eq!(idle_pkts[0]["sessionId"], "openclaw:agent:main:explicit:oc-sess-1");
+        assert_eq!(
+            idle_pkts[0]["sessionId"],
+            "openclaw:agent:main:explicit:oc-sess-1"
+        );
     }
 
     #[test]
@@ -1730,7 +1761,10 @@ mod tests {
             "before-submit-prompt",
             "beforeSubmitPrompt",
         ] {
-            assert_eq!(alias.parse::<HookEvent>().unwrap(), HookEvent::PreInvocation);
+            assert_eq!(
+                alias.parse::<HookEvent>().unwrap(),
+                HookEvent::PreInvocation
+            );
         }
 
         let item_rpc = |_sock: &Path, pkt: &Value| {
@@ -1738,7 +1772,10 @@ mod tests {
             assert_eq!(pkt["scope"], "pre_turn");
             assert_eq!(pkt["includeNudged"], true);
             DaemonRpcResult::ok(
-                json!({"items": [{"text": "queued hello"}]}).as_object().unwrap().clone(),
+                json!({"items": [{"text": "queued hello"}]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
             )
         };
 
@@ -1773,10 +1810,7 @@ mod tests {
             &opts(HarnessKind::Gemini, HookEvent::PreInvocation),
             item_rpc,
         );
-        assert_eq!(
-            gemini["hookSpecificOutput"]["hookEventName"],
-            "BeforeAgent"
-        );
+        assert_eq!(gemini["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
 
         let cursor = handle_hook_payload_with(
             json!({"conversation_id": "cur1"}).as_object().unwrap(),

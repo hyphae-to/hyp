@@ -141,7 +141,8 @@ struct HpkeVector {
 }
 
 fn load_fixture() -> CryptoFixture {
-    let f: CryptoFixture = serde_json::from_str(VECTORS_JSON).expect("parse v1_crypto_vectors.json");
+    let f: CryptoFixture =
+        serde_json::from_str(VECTORS_JSON).expect("parse v1_crypto_vectors.json");
     assert_eq!(f.schema_version, 1);
     f
 }
@@ -157,7 +158,8 @@ fn load_key_maps(
     for k in &fixture.keys {
         match k.key_type.as_str() {
             "ed25519" => {
-                let kp = Ed25519KeyPair::from_pkcs8_b64(&k.pkcs8_b64).expect("import Ed25519 PKCS8");
+                let kp =
+                    Ed25519KeyPair::from_pkcs8_b64(&k.pkcs8_b64).expect("import Ed25519 PKCS8");
                 ed.insert(k.name.clone(), kp);
             }
             "x25519" => {
@@ -209,8 +211,18 @@ fn golden_v1_keys_pkcs8_spki_jwk_thumbprint_and_small_order_points() {
                 assert_eq!(kp.public_key_b64(), k.raw_pub_b64, "key {}", k.name);
                 assert_eq!(from_seed.public_key_b64(), k.raw_pub_b64, "seed {}", k.name);
                 assert_eq!(kp.fingerprint(), k.fingerprint, "fp {}", k.name);
-                assert_eq!(kp.export_pkcs8_b64().as_str(), k.pkcs8_b64, "pkcs8 {}", k.name);
-                assert_eq!(kp.public_key().export_spki_der(), spki_der, "spki {}", k.name);
+                assert_eq!(
+                    kp.export_pkcs8_b64().as_str(),
+                    k.pkcs8_b64,
+                    "pkcs8 {}",
+                    k.name
+                );
+                assert_eq!(
+                    kp.public_key().export_spki_der(),
+                    spki_der,
+                    "spki {}",
+                    k.name
+                );
                 assert_eq!(kp.to_jwk(), k.jwk, "jwk {}", k.name);
                 assert_eq!(kp.kid(), k.jwk_thumbprint, "rfc7638 kid {}", k.name);
                 assert_eq!(k.jwk.thumbprint().unwrap(), k.jwk_thumbprint);
@@ -231,8 +243,18 @@ fn golden_v1_keys_pkcs8_spki_jwk_thumbprint_and_small_order_points() {
                 let from_seed = X25519KeyPair::from_bytes(seed).unwrap();
                 assert_eq!(kp.public_key_b64(), k.raw_pub_b64, "key {}", k.name);
                 assert_eq!(from_seed.public_key_b64(), k.raw_pub_b64, "seed {}", k.name);
-                assert_eq!(kp.export_pkcs8_b64().as_str(), k.pkcs8_b64, "pkcs8 {}", k.name);
-                assert_eq!(kp.public_key().export_spki_der(), spki_der, "spki {}", k.name);
+                assert_eq!(
+                    kp.export_pkcs8_b64().as_str(),
+                    k.pkcs8_b64,
+                    "pkcs8 {}",
+                    k.name
+                );
+                assert_eq!(
+                    kp.public_key().export_spki_der(),
+                    spki_der,
+                    "spki {}",
+                    k.name
+                );
                 assert_eq!(kp.to_jwk(), k.jwk, "jwk {}", k.name);
                 assert_eq!(kp.kid(), k.jwk_thumbprint, "rfc7638 kid {}", k.name);
                 assert_eq!(k.jwk.thumbprint().unwrap(), k.jwk_thumbprint);
@@ -339,7 +361,9 @@ fn golden_v1_grants_t3mp1_bindings_entries_revocations_keyregs_and_mutations() {
         assert!(open_grant_v1(&bad_grant_sig, &admin_pk).is_err());
 
         let mut bad_grant_payload = gvec.signed_grant.clone();
-        bad_grant_payload.payload = bad_grant_payload.payload.replace(&gvec.connector_id, "mallory@evil");
+        bad_grant_payload.payload = bad_grant_payload
+            .payload
+            .replace(&gvec.connector_id, "mallory@evil");
         assert!(open_grant_v1(&bad_grant_payload, &admin_pk).is_err());
 
         // 2. `t3mp1_` pairing code parsing + mutated copies fail closed.
@@ -360,8 +384,7 @@ fn golden_v1_grants_t3mp1_bindings_entries_revocations_keyregs_and_mutations() {
 
         // Mutating binding pairing_sig, self_sig, or grant signature all fail closed!
         let mut bad_entry_sig = gvec.entry.clone();
-        bad_entry_sig.binding.pairing_sig =
-            flip_b64url_byte(&bad_entry_sig.binding.pairing_sig, 7);
+        bad_entry_sig.binding.pairing_sig = flip_b64url_byte(&bad_entry_sig.binding.pairing_sig, 7);
         assert!(verify_entry_v1(&bad_entry_sig, &admin_pk).is_err());
 
         let mut bad_entry_self = gvec.entry.clone();
@@ -448,7 +471,11 @@ fn golden_v1_seal_ciphertexts_hyp1_file_packs_and_mutations() {
             assert_eq!(got_file.name, exp_file.name);
             let got_bytes = fs::read(&got_file.path).unwrap();
             let exp_bytes = URL_SAFE_NO_PAD.decode(&exp_file.content_b64).unwrap();
-            assert_eq!(got_bytes, exp_bytes, "file content mismatch for {}", exp_file.name);
+            assert_eq!(
+                got_bytes, exp_bytes,
+                "file content mismatch for {}",
+                exp_file.name
+            );
             assert_eq!(hex::encode(Sha256::digest(&got_bytes)), exp_file.sha256);
         }
 
@@ -474,15 +501,39 @@ fn golden_v1_seal_ciphertexts_hyp1_file_packs_and_mutations() {
         // 4. Mutated copies of `HYP1` pack MUST ALL fail closed!
         let mut bad_magic = plaintext.clone();
         bad_magic[3] = b'2';
-        assert!(unpack_hyp1(&bad_magic, &tmp.path().join(format!("{}_bad_magic", tv.name)), None, None).is_err());
+        assert!(
+            unpack_hyp1(
+                &bad_magic,
+                &tmp.path().join(format!("{}_bad_magic", tv.name)),
+                None,
+                None
+            )
+            .is_err()
+        );
 
         let mut bad_gz = plaintext.clone();
         let mid = bad_gz.len() / 2;
         bad_gz[mid] ^= 0xff;
-        assert!(unpack_hyp1(&bad_gz, &tmp.path().join(format!("{}_bad_gz", tv.name)), None, None).is_err());
+        assert!(
+            unpack_hyp1(
+                &bad_gz,
+                &tmp.path().join(format!("{}_bad_gz", tv.name)),
+                None,
+                None
+            )
+            .is_err()
+        );
 
         let truncated = &plaintext[..plaintext.len().saturating_sub(8)];
-        assert!(unpack_hyp1(truncated, &tmp.path().join(format!("{}_trunc", tv.name)), None, None).is_err());
+        assert!(
+            unpack_hyp1(
+                truncated,
+                &tmp.path().join(format!("{}_trunc", tv.name)),
+                None,
+                None
+            )
+            .is_err()
+        );
     }
 }
 
@@ -512,7 +563,12 @@ fn golden_rfc9180_hpke_aes256gcm_vectors_and_mutations_fail_closed() {
         // 1. Independent Node crypto RFC 9180 HPKE ciphertext decrypts cleanly in Rust!
         let got_pt = hpke::open_base(&enc, recipient, &info, &aad, &ct)
             .unwrap_or_else(|e| panic!("hpke::open_base failed on {}: {e}", vec.name));
-        assert_eq!(&*got_pt, expected_pt.as_slice(), "HPKE plaintext mismatch on {}", vec.name);
+        assert_eq!(
+            &*got_pt,
+            expected_pt.as_slice(),
+            "HPKE plaintext mismatch on {}",
+            vec.name
+        );
 
         // 2. Every nearby mutation MUST fail closed!
         // 2a. Wrong recipient key

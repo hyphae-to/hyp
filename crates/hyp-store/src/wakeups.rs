@@ -366,19 +366,21 @@ impl<'a> WakeupStore<'a> {
                     .validate_min_interval(limits.min_cron_interval_seconds)
                     .map_err(|e| StoreError::InvalidInput(e.to_string()))?;
 
-                let first_base = parsed
-                    .next_fire_after(now_ms, input.timezone)
-                    .ok_or_else(|| {
-                        StoreError::InvalidInput(format!(
-                            "cron expression '{}' has no future fire time after {now_ms}",
-                            parsed.as_str()
-                        ))
-                    })?;
+                let first_base =
+                    parsed
+                        .next_fire_after(now_ms, input.timezone)
+                        .ok_or_else(|| {
+                            StoreError::InvalidInput(format!(
+                                "cron expression '{}' has no future fire time after {now_ms}",
+                                parsed.as_str()
+                            ))
+                        })?;
                 let interval_ms = parsed
                     .next_fire_after(first_base, input.timezone)
                     .map(|n| n.saturating_sub(first_base))
                     .unwrap_or(0);
-                let first_fire = apply_cron_jitter(first_base, interval_ms, &id, input.exact_timing);
+                let first_fire =
+                    apply_cron_jitter(first_base, interval_ms, &id, input.exact_timing);
 
                 (
                     Some(parsed.as_str().to_string()),
@@ -613,16 +615,19 @@ impl<'a> WakeupStore<'a> {
             })?;
             let parsed = CronExpr::parse(raw_cron)
                 .map_err(|e| StoreError::InvalidState(format!("corrupt cron_expr: {e}")))?;
-            let next_base = parsed.next_fire_after(now_ms, existing.timezone).ok_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "cron wakeup '{id}' has no future fire time after {now_ms}"
-                ))
-            })?;
+            let next_base = parsed
+                .next_fire_after(now_ms, existing.timezone)
+                .ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "cron wakeup '{id}' has no future fire time after {now_ms}"
+                    ))
+                })?;
             let interval_ms = parsed
                 .next_fire_after(next_base, existing.timezone)
                 .map(|n| n.saturating_sub(next_base))
                 .unwrap_or(0);
-            next_fire_at = apply_cron_jitter(next_base, interval_ms, &existing.id, existing.exact_timing);
+            next_fire_at =
+                apply_cron_jitter(next_base, interval_ms, &existing.id, existing.exact_timing);
         }
 
         tx.conn().execute(

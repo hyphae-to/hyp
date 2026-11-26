@@ -349,14 +349,7 @@ fn run_uninstall_unix(args: UninstallArgs) -> ExitCode {
     let guard = match TempScriptGuard::write_private(&script_content) {
         Ok(g) => g,
         Err(e) => {
-            return emit_error(
-                "uninstall",
-                false,
-                EXIT_ERROR,
-                "TEMP_SCRIPT_ERROR",
-                e,
-                None,
-            );
+            return emit_error("uninstall", false, EXIT_ERROR, "TEMP_SCRIPT_ERROR", e, None);
         }
     };
 
@@ -467,8 +460,8 @@ async fn fetch_latest_uninstall_script(
                     format!("Refusing unsupported redirect Location '{location}'"),
                 ));
             };
-            let next_uri = validate_uninstall_script_url(&next_url)
-                .map_err(|e| ("UNSAFE_REDIRECT", e))?;
+            let next_uri =
+                validate_uninstall_script_url(&next_url).map_err(|e| ("UNSAFE_REDIRECT", e))?;
             if current_uri.scheme_str() == Some("https") && next_uri.scheme_str() != Some("https") {
                 return Err((
                     "UNSAFE_REDIRECT",

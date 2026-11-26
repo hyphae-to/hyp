@@ -8,11 +8,11 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hyp_crypto::human::{
-    DELEGATED_PROOF_SKEW_MS, DelegatedPairProofV1, HJOIN1_PREFIX, HPUB1_PREFIX,
-    HumanInviteClaimV1, HumanInviteV1, HumanPubCardV1, MAX_DELEGATED_DEVICES_LIMIT,
-    NodeCertPayloadV1, decode_hjoin1, decode_hpub1, encode_hcert1, encode_hjoin1, encode_hpub1,
-    node_cert_sha256, sign_delegated_pair_proof, sign_human_invite, sign_human_invite_claim,
-    sign_node_cert, verify_delegated_pair_proof, verify_human_invite, verify_human_invite_claim,
+    DELEGATED_PROOF_SKEW_MS, DelegatedPairProofV1, HJOIN1_PREFIX, HPUB1_PREFIX, HumanInviteClaimV1,
+    HumanInviteV1, HumanPubCardV1, MAX_DELEGATED_DEVICES_LIMIT, NodeCertPayloadV1, decode_hjoin1,
+    decode_hpub1, encode_hcert1, encode_hjoin1, encode_hpub1, node_cert_sha256,
+    sign_delegated_pair_proof, sign_human_invite, sign_human_invite_claim, sign_node_cert,
+    verify_delegated_pair_proof, verify_human_invite, verify_human_invite_claim,
     verify_human_invite_embedded,
 };
 use hyp_crypto::rfc3339::format_rfc3339_millis;
@@ -115,7 +115,15 @@ fn hjoin1_sign_encode_decode_verify_roundtrip_and_mutated_valid_fail_closed() {
     }
 
     // 6. Invalid nodePrefix patterns fail closed (bare `*`, mid-string `*`, traversal, uppercase, reserved `local`)
-    for bad_prefix in ["*", "**", "phi*lip@mac", "philip@../evil", "Philip@*", "local", ""] {
+    for bad_prefix in [
+        "*",
+        "**",
+        "phi*lip@mac",
+        "philip@../evil",
+        "Philip@*",
+        "local",
+        "",
+    ] {
         let mut inv = sample_invite();
         inv.node_prefix = bad_prefix.to_string();
         assert!(
@@ -174,7 +182,10 @@ fn hpub1_roundtrip_and_validation_fail_closed() {
 
     let decoded = decode_hpub1(&encoded).unwrap();
     assert_eq!(decoded, card);
-    assert_eq!(decoded.signing_jwk.to_ed25519().unwrap(), human_ed.public_key());
+    assert_eq!(
+        decoded.signing_jwk.to_ed25519().unwrap(),
+        human_ed.public_key()
+    );
     assert_eq!(
         decoded.enc_jwk.as_ref().unwrap().to_x25519().unwrap(),
         human_x.public_key()
@@ -190,7 +201,10 @@ fn hpub1_roundtrip_and_validation_fail_closed() {
     let encoded_no_enc = encode_hpub1(&card_no_enc).unwrap();
     let dec2 = decode_hpub1(&encoded_no_enc).unwrap();
     assert_eq!(dec2.human_id, "philip");
-    assert_eq!(dec2.signing_jwk.to_ed25519().unwrap(), human_ed.public_key());
+    assert_eq!(
+        dec2.signing_jwk.to_ed25519().unwrap(),
+        human_ed.public_key()
+    );
     assert!(dec2.enc_jwk.is_none());
 
     // Wrong prefix / wrong curve / invalid humanId fail closed

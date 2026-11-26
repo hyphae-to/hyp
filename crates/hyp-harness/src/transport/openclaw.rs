@@ -87,10 +87,8 @@ pub const REASON_OPENCLAW_RATE_LIMITED: &str = "openclaw_rate_limited";
 pub const REASON_OPENCLAW_REQUEST_REJECTED: &str = "openclaw_request_rejected";
 
 const INVALID_URL_ERR: &str = "OpenClaw Gateway URL must be a loopback origin (e.g. http://127.0.0.1:18789) unless allowRemote=true with https://";
-const INVALID_HOOKS_PATH_ERR: &str =
-    "OpenClaw hooks path must start with '/' and contain no traversal, query, or control characters";
-const INVALID_SESSION_KEY_ERR: &str =
-    "OpenClaw sessionKey must be a non-empty string (<=256 bytes) without whitespace or control characters";
+const INVALID_HOOKS_PATH_ERR: &str = "OpenClaw hooks path must start with '/' and contain no traversal, query, or control characters";
+const INVALID_SESSION_KEY_ERR: &str = "OpenClaw sessionKey must be a non-empty string (<=256 bytes) without whitespace or control characters";
 
 /// Returns `true` iff `name` is the sole allowed OpenClaw Gateway hooks secret name
 /// (`"openclaw-hooks-token"`). Arbitrary `tokenSecret` names from config MUST fail closed
@@ -298,7 +296,10 @@ impl OpenClawTarget {
     pub fn endpoint_url(&self) -> Result<String, String> {
         let origin = normalize_openclaw_base_url_with_remote(&self.base_url, self.allow_remote)?;
         let hooks_path = normalize_openclaw_hooks_path(&self.hooks_path)?;
-        Ok(format!("{origin}{hooks_path}/{}", self.endpoint_mode.as_str()))
+        Ok(format!(
+            "{origin}{hooks_path}/{}",
+            self.endpoint_mode.as_str()
+        ))
     }
 }
 
@@ -365,10 +366,7 @@ impl OpenClawNodeConfig {
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
         };
-        let enabled = obj
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
         let delivery_mode = clean_str("deliveryMode");
         let mode = clean_str("mode").and_then(|s| s.parse::<OpenClawEndpointMode>().ok());
         let allow_remote = obj
@@ -494,9 +492,7 @@ pub fn normalize_openclaw_base_url_with_remote(
             return Err(INVALID_URL_ERR.to_string());
         };
         let ipv6_str = &rest[..close_bracket];
-        let ipv6: Ipv6Addr = ipv6_str
-            .parse()
-            .map_err(|_| INVALID_URL_ERR.to_string())?;
+        let ipv6: Ipv6Addr = ipv6_str.parse().map_err(|_| INVALID_URL_ERR.to_string())?;
         let after_bracket = &rest[close_bracket + 1..];
         let port = parse_optional_port(after_bracket)?;
         (format!("[{ipv6}]"), port)
@@ -1101,7 +1097,9 @@ mod tests {
             normalize_openclaw_base_url_with_remote("https://gw.example.com:443/", true).unwrap(),
             "https://gw.example.com"
         );
-        assert!(normalize_openclaw_base_url_with_remote("http://gw.example.com:18789", true).is_err());
+        assert!(
+            normalize_openclaw_base_url_with_remote("http://gw.example.com:18789", true).is_err()
+        );
 
         for bad in [
             "",
@@ -1227,7 +1225,10 @@ mod tests {
 
     #[test]
     fn http_status_mapping_matches_retryable_and_terminal_contract() {
-        assert_eq!(map_openclaw_http_status(StatusCode::OK), PushOutcome::delivered());
+        assert_eq!(
+            map_openclaw_http_status(StatusCode::OK),
+            PushOutcome::delivered()
+        );
         assert_eq!(
             map_openclaw_http_status(StatusCode::ACCEPTED),
             PushOutcome::delivered()
@@ -1293,7 +1294,10 @@ mod tests {
             Some("main")
         );
         assert_eq!(parse_openclaw_agent_id_from_session_key("main"), None);
-        assert_eq!(parse_openclaw_agent_id_from_session_key("agent::main"), None);
+        assert_eq!(
+            parse_openclaw_agent_id_from_session_key("agent::main"),
+            None
+        );
 
         assert_eq!(
             canonical_openclaw_session_id("agent:main:explicit:thread-2").unwrap(),
@@ -1341,7 +1345,9 @@ mod tests {
             .with_session_key("agent:main:bad\ninjection");
         let transport = OpenClawTransport::new(target);
         assert_eq!(
-            transport.deliver_nudge(1, Some("claw"), "b1", PushMode::Queue).await,
+            transport
+                .deliver_nudge(1, Some("claw"), "b1", PushMode::Queue)
+                .await,
             PushOutcome::reject(REASON_OPENCLAW_INVALID_SESSION_KEY)
         );
     }

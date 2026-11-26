@@ -139,10 +139,22 @@ async fn ed25519_nonce_replay_and_clock_skew_boundary_matrix() {
     let scopes = ScopePreset::Member.expand();
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_am2, _) = hub
-        .create_admin_invite(&admin_ca, "bob@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&alice_am2).await.unwrap();
     bob.accept_am2_invite(&bob_am2).await.unwrap();
@@ -178,7 +190,9 @@ async fn ed25519_nonce_replay_and_clock_skew_boundary_matrix() {
     let (status2, resp2_headers, body2) = HttpClient::collect(resp2, 64 * 1024).await.unwrap();
     assert_eq!(status2, StatusCode::UNAUTHORIZED);
     assert_eq!(
-        resp2_headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        resp2_headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
         Some(CONTENT_TYPE_PROBLEM_JSON)
     );
     let prob2: ProblemDetails = serde_json::from_slice(&body2).unwrap();
@@ -207,7 +221,10 @@ async fn ed25519_nonce_replay_and_clock_skew_boundary_matrix() {
         .with_timestamp_ms(now_ms())
         .with_nonce("fixed-replay-nonce-001");
     let bob_req1 = bob_same_nonce.sign_request(Method::GET, &hub_url, "/v1/channels", None, None);
-    assert_eq!(client.request(bob_req1).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        client.request(bob_req1).await.unwrap().status(),
+        StatusCode::OK
+    );
     let bob_req2 = bob_same_nonce.sign_request(Method::GET, &hub_url, "/v1/channels", None, None);
     assert_eq!(
         client.request(bob_req2).await.unwrap().status(),
@@ -218,8 +235,14 @@ async fn ed25519_nonce_replay_and_clock_skew_boundary_matrix() {
     let fresh_builder = Ed25519AuthBuilder::new("alice@macbook", &alice.identity().signing);
     let req_a = fresh_builder.sign_request(Method::GET, &hub_url, "/v1/channels", None, None);
     let req_b = fresh_builder.sign_request(Method::GET, &hub_url, "/v1/channels", None, None);
-    assert_eq!(client.request(req_a).await.unwrap().status(), StatusCode::OK);
-    assert_eq!(client.request(req_b).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        client.request(req_a).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client.request(req_b).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     // (d) Forged/invalid signature does NOT poison the replay cache for that nonce!
     let unpoisoned = Ed25519AuthBuilder::new("alice@macbook", &alice.identity().signing)
@@ -309,7 +332,10 @@ async fn http_post_messages_rate_limit_429_includes_retry_after_header() {
     let mut hub_cfg = NodeConfig::router(NodeId::new("acme-rl").unwrap(), hub_dir.path());
     hub_cfg.secret_backend = Some(SecretBackend::File);
     hub_cfg.admin_jwk = Some(admin_jwk);
-    hub_cfg.store_config.message_limits.max_per_hour_per_recipient = 3;
+    hub_cfg
+        .store_config
+        .message_limits
+        .max_per_hour_per_recipient = 3;
     let hub = UnifiedNode::open(hub_cfg).unwrap();
     let (hub_addr, _hub_srv) = Arc::clone(&hub).serve(loopback_zero()).await.unwrap();
     let hub_url = format!("http://{hub_addr}");
@@ -325,10 +351,22 @@ async fn http_post_messages_rate_limit_429_includes_retry_after_header() {
     let scopes = ScopePreset::Member.expand();
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_am2, _) = hub
-        .create_admin_invite(&admin_ca, "bob@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&alice_am2).await.unwrap();
     bob.accept_am2_invite(&bob_am2).await.unwrap();
@@ -492,7 +530,12 @@ async fn http_peerlink_streaming_e2ee_transfer_mutated_valid_matrix() {
         benign_secret.as_bytes(),
     );
     let benign_res = alice
-        .send_files("bob@laptop", Some("codex"), &[benign_entry_in], Some("acme-xfer"))
+        .send_files(
+            "bob@laptop",
+            Some("codex"),
+            &[benign_entry_in],
+            Some("acme-xfer"),
+        )
         .await
         .expect("benign send_files must succeed");
     assert_eq!(benign_res.to_node, "bob@laptop");
@@ -522,8 +565,18 @@ async fn http_peerlink_streaming_e2ee_transfer_mutated_valid_matrix() {
         (
             "evil-shell-script",
             vec![
-                stage_tar_entry(src_stage.path(), "readme.txt", "readme.txt", b"innocent decoy"),
-                stage_tar_entry(src_stage.path(), "evil_src", "evil.sh", b"#!/bin/sh\nwhoami\n"),
+                stage_tar_entry(
+                    src_stage.path(),
+                    "readme.txt",
+                    "readme.txt",
+                    b"innocent decoy",
+                ),
+                stage_tar_entry(
+                    src_stage.path(),
+                    "evil_src",
+                    "evil.sh",
+                    b"#!/bin/sh\nwhoami\n",
+                ),
             ],
         ),
         (
@@ -541,7 +594,12 @@ async fn http_peerlink_streaming_e2ee_transfer_mutated_valid_matrix() {
     ];
     for (label, malicious_entries) in malicious_cases {
         let send_res = alice
-            .send_files("bob@laptop", Some("codex"), &malicious_entries, Some("acme-xfer"))
+            .send_files(
+                "bob@laptop",
+                Some("codex"),
+                &malicious_entries,
+                Some("acme-xfer"),
+            )
             .await
             .expect("hub is E2EE-blind so upload succeeds; recipient MUST reject");
 
@@ -590,7 +648,12 @@ async fn http_peerlink_streaming_e2ee_transfer_mutated_valid_matrix() {
         b"DO_NOT_UNPACK_CORRUPT_DISK",
     );
     let xfer_corrupt_disk = alice
-        .send_files("eve@offline", Some("codex"), &[corrupt_disk_entry], Some("acme-xfer"))
+        .send_files(
+            "eve@offline",
+            Some("codex"),
+            &[corrupt_disk_entry],
+            Some("acme-xfer"),
+        )
         .await
         .expect("upload to offline eve succeeds");
 
@@ -604,7 +667,9 @@ async fn http_peerlink_streaming_e2ee_transfer_mutated_valid_matrix() {
         HttpClient::collect(steal_resp, 64 * 1024).await.unwrap();
     assert_eq!(steal_status, StatusCode::UNAUTHORIZED);
     assert_eq!(
-        steal_headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        steal_headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
         Some(CONTENT_TYPE_PROBLEM_JSON)
     );
     let steal_prob: ProblemDetails = serde_json::from_slice(&steal_body).unwrap();
@@ -679,9 +744,10 @@ async fn http_peerlink_streaming_e2ee_transfer_mutated_valid_matrix() {
     put_req
         .headers_mut()
         .insert("x-hyphae-transfer-to", "eve@offline".parse().unwrap());
-    put_req
-        .headers_mut()
-        .insert("x-hyphae-transfer-type", "transfer.stream.v2".parse().unwrap());
+    put_req.headers_mut().insert(
+        "x-hyphae-transfer-type",
+        "transfer.stream.v2".parse().unwrap(),
+    );
     put_req.headers_mut().insert(
         "x-hyphae-transfer-header",
         URL_SAFE_NO_PAD
@@ -765,7 +831,10 @@ async fn http_peerlink_streaming_e2ee_transfer_mutated_valid_matrix() {
     match cap_err {
         NodeError::RemoteProblem(prob) => {
             assert_eq!(prob.status, 403, "expected 403, got {prob:?}");
-            assert_eq!(prob.error, "not_granted", "expected not_granted, got {prob:?}");
+            assert_eq!(
+                prob.error, "not_granted",
+                "expected not_granted, got {prob:?}"
+            );
         }
         other => panic!("expected RemoteProblem(403 not_granted), got {other:?}"),
     }
@@ -773,7 +842,12 @@ async fn http_peerlink_streaming_e2ee_transfer_mutated_valid_matrix() {
     // Conversely, a tiny transfer under the 1 KiB ciphertext cap from `dave` succeeds!
     let tiny_entry = stage_tar_entry(src_stage.path(), "tiny.txt", "tiny.txt", b"ok");
     let small_res = dave
-        .send_files("bob@laptop", Some("codex"), &[tiny_entry], Some("acme-xfer"))
+        .send_files(
+            "bob@laptop",
+            Some("codex"),
+            &[tiny_entry],
+            Some("acme-xfer"),
+        )
         .await
         .expect("tiny transfer within files:send=1kb cap must succeed");
     let small_entry = wait_for_mailbox_item(&bob, "sess-bob", Duration::from_secs(5), |m| {

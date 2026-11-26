@@ -417,7 +417,10 @@ impl CloudEvent {
     /// (so redeliveries with updated receipt timestamps remain idempotent).
     pub fn digest(&self) -> String {
         let mut map = Map::new();
-        map.insert("specversion".to_string(), Value::String(self.specversion.clone()));
+        map.insert(
+            "specversion".to_string(),
+            Value::String(self.specversion.clone()),
+        );
         map.insert("id".to_string(), Value::String(self.id.clone()));
         map.insert("source".to_string(), Value::String(self.source.clone()));
         map.insert("type".to_string(), Value::String(self.event_type.clone()));

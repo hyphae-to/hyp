@@ -49,7 +49,8 @@ fn all_four_tiers_and_focus_mode_with_and_without_vip_interrupt() {
         .with_rule("#deploys", DeliveryUrgency::Mute);
 
     let oncall = ParsedMailboxSource::parse("acme-team", "ops@prod/oncall", MailboxKind::Message);
-    let alice = ParsedMailboxSource::parse("acme-team", "alice@macbook/claude", MailboxKind::Message);
+    let alice =
+        ParsedMailboxSource::parse("acme-team", "alice@macbook/claude", MailboxKind::Message);
     let bob = ParsedMailboxSource::parse("acme-team", "bob@laptop/codex", MailboxKind::Message);
     let pub_gh = ParsedMailboxSource::parse(
         "public.hyphae.to",
@@ -168,8 +169,9 @@ fn muted_items_never_wake_alone_and_piggyback_on_next_delivery() {
         t0 + 2_000,
         false,
     );
-    let notify_batch = pack_delivery_batch(&[notify_item], 12, &SessionDeliveryPolicy::focus_mode())
-        .expect("notify item must still emit 1-line digest");
+    let notify_batch =
+        pack_delivery_batch(&[notify_item], 12, &SessionDeliveryPolicy::focus_mode())
+            .expect("notify item must still emit 1-line digest");
     assert!(notify_batch.notify_only);
     assert!(notify_batch.rendered.contains("hyphae notify · 1 unread"));
     assert!(notify_batch.rendered.contains("· 12 muted"));
@@ -214,7 +216,11 @@ fn burst_storm_auto_demotes_to_noisy_mode_and_recovers_after_cooldown() {
             &cfg,
             t0 + i * 2_000,
         );
-        assert!(!a.noisy_mode, "event {} should not trip noisy mode yet", i + 1);
+        assert!(
+            !a.noisy_mode,
+            "event {} should not trip noisy mode yet",
+            i + 1
+        );
         assert_eq!(a.effective_urgency, DeliveryUrgency::Queue);
     }
 
@@ -284,7 +290,8 @@ fn token_budget_hybrid_packer_prioritizes_critical_dm_and_spills_twenty_noisy_ev
     }
 
     // 1 critical Interrupt DM arriving last chronologically — MUST sort to #1 and pack inline VERBATIM!
-    let critical_body = "PROD P0 ALERT: checkout-api 5xx spike on eu-west-1 — rollback v2.14.9 immediately!";
+    let critical_body =
+        "PROD P0 ALERT: checkout-api 5xx spike on eu-west-1 — rollback v2.14.9 immediately!";
     items.push(make_packable(
         "dm-critical",
         DeliveryUrgency::Interrupt,
@@ -392,7 +399,8 @@ fn single_giant_payload_truncates_with_preview_and_inbox_ids_hint() {
 }
 
 #[test]
-fn filtered_cursor_paginated_query_inbox_across_unread_muted_delivered_and_never_leaks_quarantine() {
+fn filtered_cursor_paginated_query_inbox_across_unread_muted_delivered_and_never_leaks_quarantine()
+{
     let db = NodeDb::open_in_memory().unwrap();
     let engine = DeliveryEngine::new();
     let sid = "claude:inbox-query";
@@ -748,5 +756,10 @@ fn filtered_cursor_paginated_query_inbox_across_unread_muted_delivered_and_never
     )
     .unwrap();
     assert_eq!(deliv.items.len(), 2);
-    assert!(deliv.items.iter().all(|i| i.state == InboxItemState::Delivered));
+    assert!(
+        deliv
+            .items
+            .iter()
+            .all(|i| i.state == InboxItemState::Delivered)
+    );
 }

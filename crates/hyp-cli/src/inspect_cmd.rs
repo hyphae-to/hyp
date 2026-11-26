@@ -296,7 +296,11 @@ fn render_single_session_block(out: &mut String, sess: &Value, peers_online: u64
         format!("{transport_kind} (idle)")
     };
     let focus_disp = if focus_mode {
-        if allow_vips { "ON (VIPs ok)" } else { "ON (strict)" }
+        if allow_vips {
+            "ON (VIPs ok)"
+        } else {
+            "ON (strict)"
+        }
     } else {
         "OFF"
     };
@@ -337,7 +341,14 @@ fn render_single_session_block(out: &mut String, sess: &Value, peers_online: u64
                 .map(|b| {
                     let label = clean_str(b.get("label"));
                     let role = clean_str(b.get("role"));
-                    vec![label, if role.is_empty() { "reader".to_string() } else { role }]
+                    vec![
+                        label,
+                        if role.is_empty() {
+                            "reader".to_string()
+                        } else {
+                            role
+                        },
+                    ]
                 })
                 .collect();
             render_table(out, &["TARGET", "ROLE"], &rows);
@@ -409,7 +420,11 @@ fn render_single_session_block(out: &mut String, sess: &Value, peers_online: u64
                     vec![kind, source, age, urgency, notified]
                 })
                 .collect();
-            render_table(out, &["KIND", "SOURCE", "AGE", "URGENCY", "NOTIFIED"], &rows);
+            render_table(
+                out,
+                &["KIND", "SOURCE", "AGE", "URGENCY", "NOTIFIED"],
+                &rows,
+            );
         }
         _ => {
             let _ = writeln!(out, "  (empty)");
@@ -443,18 +458,17 @@ fn render_single_session_block(out: &mut String, sess: &Value, peers_online: u64
         for r in list {
             let target = clean_str(r.get("target"));
             let delivery = clean_str(r.get("delivery"));
-            rm_rows.push(vec![
-                "rule".to_string(),
-                target,
-                delivery,
-                "-".to_string(),
-            ]);
+            rm_rows.push(vec!["rule".to_string(), target, delivery, "-".to_string()]);
         }
     }
     if rm_rows.is_empty() {
         let _ = writeln!(out, "  (none)");
     } else {
-        render_table(out, &["TYPE", "TARGET / PATTERN", "ACTION / SCOPE", "AGE"], &rm_rows);
+        render_table(
+            out,
+            &["TYPE", "TARGET / PATTERN", "ACTION / SCOPE", "AGE"],
+            &rm_rows,
+        );
     }
 
     // Channels
@@ -579,7 +593,9 @@ pub fn render_inspect_text(payload: &Value, is_all: bool) -> String {
         } else {
             for (idx, sess) in sessions.iter().enumerate() {
                 if idx > 0 {
-                    out.push_str("\n------------------------------------------------------------\n\n");
+                    out.push_str(
+                        "\n------------------------------------------------------------\n\n",
+                    );
                 }
                 render_single_session_block(&mut out, sess, peers_online, now_ms);
             }
@@ -615,7 +631,9 @@ fn collect_warnings_and_next(payload: &Value) -> (Vec<String>, Vec<String>) {
         .unwrap_or(0);
     let q = sess_q.max(global_q);
     if q > 0 {
-        warnings.push(format!("{q} item(s) held in Local Security Gate quarantine"));
+        warnings.push(format!(
+            "{q} item(s) held in Local Security Gate quarantine"
+        ));
         next.push("hyp gate review".to_string());
     }
     (warnings, next)

@@ -508,11 +508,7 @@ pub fn wait_for_session_live(socket_path: &Path, session_id: &str, timeout: Dura
         "sessionId": session_id
     });
     while Instant::now() < deadline {
-        let res = hyp_harness::sock::daemon_rpc_sync(
-            socket_path,
-            &req,
-            Duration::from_millis(500),
-        );
+        let res = hyp_harness::sock::daemon_rpc_sync(socket_path, &req, Duration::from_millis(500));
         if res.ok
             && res
                 .result

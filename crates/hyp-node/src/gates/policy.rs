@@ -1142,7 +1142,10 @@ pub struct SecurityGateConfig {
     pub require_signed_policy: bool,
     /// `SecretStore` key name holding the policy signing HMAC key (MUST be empty or constant
     /// [`DEFAULT_POLICY_SIGNING_SECRET`]; custom overrides are rejected fail-closed).
-    #[serde(default = "default_policy_signing_secret", alias = "policySigningSecret")]
+    #[serde(
+        default = "default_policy_signing_secret",
+        alias = "policySigningSecret"
+    )]
     pub policy_signing_secret: String,
     /// Optional canonical SHA-256 hex digest of `human_authorities` + `min_auth_epoch` bound into
     /// `policy_signature` so unauthorized SQLite modifications fail closed (`gate_policy_tampered`).
@@ -1226,9 +1229,8 @@ pub fn ensure_policy_signing_key(
 fn canonical_policy_jcs(config: &SecurityGateConfig) -> Result<String, GateError> {
     let mut unsigned = config.clone();
     unsigned.policy_signature = None;
-    let value = serde_json::to_value(&unsigned).map_err(|e| {
-        GateError::PolicySignature(format!("failed to serialize gate policy: {e}"))
-    })?;
+    let value = serde_json::to_value(&unsigned)
+        .map_err(|e| GateError::PolicySignature(format!("failed to serialize gate policy: {e}")))?;
     to_jcs_string(&value)
         .map_err(|e| GateError::PolicySignature(format!("failed to canonicalize gate policy: {e}")))
 }
@@ -1247,10 +1249,10 @@ pub fn sign_gate_policy(
     validate_constant_policy_signing_secret(&config.policy_signing_secret)
         .map_err(GateError::PolicySignature)?;
     let key_hex = ensure_policy_signing_key(secrets, DEFAULT_POLICY_SIGNING_SECRET)?;
-    let key_bytes = Zeroizing::new(
-        hex::decode(key_hex.as_bytes())
-            .map_err(|_| GateError::PolicySignature("policy signing key is not valid hex".into()))?,
-    );
+    let key_bytes =
+        Zeroizing::new(hex::decode(key_hex.as_bytes()).map_err(|_| {
+            GateError::PolicySignature("policy signing key is not valid hex".into())
+        })?);
     let canonical = canonical_policy_jcs(config)?;
 
     let mut mac = HmacSha256::new_from_slice(&key_bytes)
@@ -1287,13 +1289,13 @@ pub fn verify_gate_policy_sig(
         ));
     }
 
-    let key_hex = secrets.get(DEFAULT_POLICY_SIGNING_SECRET).map_err(|e| {
-        GateError::PolicySignature(format!("policy signing key unavailable: {e}"))
-    })?;
-    let key_bytes = Zeroizing::new(
-        hex::decode(key_hex.as_bytes())
-            .map_err(|_| GateError::PolicySignature("policy signing key is not valid hex".into()))?,
-    );
+    let key_hex = secrets
+        .get(DEFAULT_POLICY_SIGNING_SECRET)
+        .map_err(|e| GateError::PolicySignature(format!("policy signing key unavailable: {e}")))?;
+    let key_bytes =
+        Zeroizing::new(hex::decode(key_hex.as_bytes()).map_err(|_| {
+            GateError::PolicySignature("policy signing key is not valid hex".into())
+        })?);
     let canonical = canonical_policy_jcs(config)?;
 
     let mut mac = HmacSha256::new_from_slice(&key_bytes)

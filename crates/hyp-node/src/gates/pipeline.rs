@@ -457,7 +457,8 @@ impl SecurityGatePipeline {
         if ctx.trust_tier == TrustTier::HumanVerified {
             let Some(ref auth) = ctx.human_auth else {
                 if let Some(r) = existing_receipt {
-                    let _ = self.reject_existing_in_mailbox(r, ctx, "human_auth_unverified", now_ms)?;
+                    let _ =
+                        self.reject_existing_in_mailbox(r, ctx, "human_auth_unverified", now_ms)?;
                 }
                 return Ok(InboundEvaluation {
                     decision: GateDecision::Block {
@@ -512,7 +513,9 @@ impl SecurityGatePipeline {
             }
             if let Some(ref r) = receipt {
                 let auth_json = serde_json::to_string(auth).map_err(|e| {
-                    GateError::InvalidConfig(format!("failed to serialize verified human claim: {e}"))
+                    GateError::InvalidConfig(format!(
+                        "failed to serialize verified human claim: {e}"
+                    ))
                 })?;
                 let db_guard = self
                     .db
@@ -1162,11 +1165,9 @@ impl SecurityGatePipeline {
                 "gate.quarantined",
                 Some(reason.clone()),
             ),
-            GateDecision::Hold { reason, .. } => (
-                StoreGateDecision::Error,
-                "gate.held",
-                Some(reason.clone()),
-            ),
+            GateDecision::Hold { reason, .. } => {
+                (StoreGateDecision::Error, "gate.held", Some(reason.clone()))
+            }
         };
 
         let mut audit_categories = vec![audit_tag.to_string()];
@@ -1230,7 +1231,9 @@ impl SecurityGatePipeline {
             .db
             .lock()
             .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
-        Ok(db.local().approve_quarantined(receipt_id, reviewer, now_ms)?)
+        Ok(db
+            .local()
+            .approve_quarantined(receipt_id, reviewer, now_ms)?)
     }
 
     /// Human-CLI-only rejection (`hyp inbox reject <receipt> [--mute]`).
@@ -1249,14 +1252,11 @@ impl SecurityGatePipeline {
             .lock()
             .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
         let mute_rule = if mute {
-            let entry = db
-                .local()
-                .get_mailbox_entry(receipt_id)?
-                .ok_or_else(|| {
-                    GateError::Store(hyp_store::StoreError::NotFound(format!(
-                        "receipt '{receipt_id}' not found"
-                    )))
-                })?;
+            let entry = db.local().get_mailbox_entry(receipt_id)?.ok_or_else(|| {
+                GateError::Store(hyp_store::StoreError::NotFound(format!(
+                    "receipt '{receipt_id}' not found"
+                )))
+            })?;
             let pattern = if !entry.source.trim().is_empty() {
                 entry.source
             } else {

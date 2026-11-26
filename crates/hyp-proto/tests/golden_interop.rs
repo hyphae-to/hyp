@@ -378,7 +378,9 @@ fn golden_v1_scopes_expansion_and_scopeset_parity() {
             "set vector {idx} forksOther"
         );
         assert_eq!(s.may_fork_out(), c.fork_out, "set vector {idx} forkOut");
-        let rust_ceiling = s.fork_ceiling().map(|m: RuntimeMode| m.as_str().to_string());
+        let rust_ceiling = s
+            .fork_ceiling()
+            .map(|m: RuntimeMode| m.as_str().to_string());
         assert_eq!(rust_ceiling, c.ceiling, "set vector {idx} ceiling");
     }
 }

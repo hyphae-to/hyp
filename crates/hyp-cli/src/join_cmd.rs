@@ -23,9 +23,7 @@ use crate::config_file::{
     resolve_config_path_for_read, resolve_config_path_for_write, resolve_effective_node_id,
     resolve_home_dir, resolve_state_dir, write_atomic_json,
 };
-use crate::pair::{
-    attempt_delegated_pair_enroll, credential_secret_name, try_reload_live_daemon,
-};
+use crate::pair::{attempt_delegated_pair_enroll, credential_secret_name, try_reload_live_daemon};
 use crate::setup::configure_detected_harnesses_for_join;
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -282,7 +280,16 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         };
         let card_json = match serde_json::to_string(&card) {
             Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "ENCODE_ERROR",
+                    e.to_string(),
+                    None,
+                );
+            }
         };
         if args.print_card {
             if as_json {
@@ -305,7 +312,9 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         }
 
         // Emit card on stderr so user/agent can copy it, then read signed bundle on stdin.
-        eprintln!("Hyphae Remote Device Card (paste into https://hyphae.to/join -> Safari / Remote VPS):");
+        eprintln!(
+            "Hyphae Remote Device Card (paste into https://hyphae.to/join -> Safari / Remote VPS):"
+        );
         eprintln!("{card_json}");
         eprintln!("Waiting for signed handoff bundle JSON on stdin (paste then Ctrl-D)...");
         let _ = io::stderr().flush();
@@ -327,10 +336,11 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
                 );
             }
         };
-        let validated = match validate_handoff_bundle(&bundle, &local_node_id, &keys, already_onboarded) {
-            Ok(v) => v,
-            Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HANDOFF", e, None),
-        };
+        let validated =
+            match validate_handoff_bundle(&bundle, &local_node_id, &keys, already_onboarded) {
+                Ok(v) => v,
+                Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HANDOFF", e, None),
+            };
         return finalize_join(
             cmd,
             &args,
@@ -401,7 +411,9 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
                     as_json,
                     EXIT_USAGE,
                     "INVALID_BUNDLE",
-                    format!("Input is neither an hjoin1_ token nor a valid signed handoff bundle JSON: {e}"),
+                    format!(
+                        "Input is neither an hjoin1_ token nor a valid signed handoff bundle JSON: {e}"
+                    ),
                     None,
                 );
             }
@@ -431,10 +443,11 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
                 );
             }
         };
-        let validated = match validate_handoff_bundle(&bundle, &local_node_id, &keys, already_onboarded) {
-            Ok(v) => v,
-            Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HANDOFF", e, None),
-        };
+        let validated =
+            match validate_handoff_bundle(&bundle, &local_node_id, &keys, already_onboarded) {
+                Ok(v) => v,
+                Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HANDOFF", e, None),
+            };
         return finalize_join(
             cmd,
             &args,
@@ -652,11 +665,29 @@ fn run_headless_local_key_join(
     };
     let hcert1 = match encode_hcert1(&signed_cert) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_FAILED", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_FAILED",
+                e.to_string(),
+                None,
+            );
+        }
     };
     let human_jwk_json = match to_canonical_json(&human_kp.to_jwk()) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_FAILED", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_FAILED",
+                e.to_string(),
+                None,
+            );
+        }
     };
 
     let validated = ValidatedHandoff {
@@ -816,13 +847,17 @@ async fn run_loopback_join_server(
             })?,
         },
     };
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| ("BIND_FAILED", format!("Failed to inspect local address: {e}")))?;
+    let local_addr = listener.local_addr().map_err(|e| {
+        (
+            "BIND_FAILED",
+            format!("Failed to inspect local address: {e}"),
+        )
+    })?;
     let listen_url = format!("http://127.0.0.1:{}", local_addr.port());
 
-    let (done_tx, mut done_rx) =
-        oneshot::channel::<Result<(ValidatedHandoff, Arc<NodeIdentityKeys>), (&'static str, String)>>();
+    let (done_tx, mut done_rx) = oneshot::channel::<
+        Result<(ValidatedHandoff, Arc<NodeIdentityKeys>), (&'static str, String)>,
+    >();
     let state = Arc::new(LoopbackJoinState {
         code_digits,
         failed_attempts: AtomicUsize::new(0),
@@ -1004,8 +1039,12 @@ async fn handle_join_http_request(
     };
 
     // Constant-time 6-digit code check with strict 5-attempt fail-closed lockout!
-    if let Some(resp) = verify_join_code(&state, submitted_code.as_deref(), origin.as_deref(), is_form)
-    {
+    if let Some(resp) = verify_join_code(
+        &state,
+        submitted_code.as_deref(),
+        origin.as_deref(),
+        is_form,
+    ) {
         return resp;
     }
 
@@ -1054,7 +1093,9 @@ async fn handle_join_http_request(
             return if is_form {
                 html_join_response(
                     StatusCode::BAD_REQUEST,
-                    format!("<!doctype html><html><body><h1>Join Failed</h1><p>{msg}</p></body></html>"),
+                    format!(
+                        "<!doctype html><html><body><h1>Join Failed</h1><p>{msg}</p></body></html>"
+                    ),
                 )
             } else {
                 json_join_response(
@@ -1066,38 +1107,38 @@ async fn handle_join_http_request(
         }
     };
 
-    let (node_id, keys) = match resolve_or_pin_loopback_device(
-        &state,
-        Some(&bundle.human_authority.human_id),
-    ) {
-        Ok(pair) => pair,
-        Err(e) => {
-            return json_join_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                origin.as_deref(),
-                json!({ "ok": false, "error": "device_key_error", "message": e }),
-            );
-        }
-    };
-
-    let validated =
-        match validate_handoff_bundle(&bundle, &node_id, &keys, state.already_onboarded) {
-            Ok(v) => v,
+    let (node_id, keys) =
+        match resolve_or_pin_loopback_device(&state, Some(&bundle.human_authority.human_id)) {
+            Ok(pair) => pair,
             Err(e) => {
-                return if is_form {
-                    html_join_response(
-                        StatusCode::BAD_REQUEST,
-                        format!("<!doctype html><html><body><h1>Verification Failed</h1><p>{e}</p></body></html>"),
-                    )
-                } else {
-                    json_join_response(
-                        StatusCode::BAD_REQUEST,
-                        origin.as_deref(),
-                        json!({ "ok": false, "error": "invalid_handoff", "message": e }),
-                    )
-                };
+                return json_join_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    origin.as_deref(),
+                    json!({ "ok": false, "error": "device_key_error", "message": e }),
+                );
             }
         };
+
+    let validated = match validate_handoff_bundle(&bundle, &node_id, &keys, state.already_onboarded)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return if is_form {
+                html_join_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "<!doctype html><html><body><h1>Verification Failed</h1><p>{e}</p></body></html>"
+                    ),
+                )
+            } else {
+                json_join_response(
+                    StatusCode::BAD_REQUEST,
+                    origin.as_deref(),
+                    json!({ "ok": false, "error": "invalid_handoff", "message": e }),
+                )
+            };
+        }
+    };
 
     let resp_node_id = validated.node_id.clone();
     let resp_hub_id = validated.hub_node_id.clone();
@@ -1179,7 +1220,9 @@ fn verify_join_code(
     Some(if is_form {
         html_join_response(
             StatusCode::FORBIDDEN,
-            format!("<!doctype html><html><body><h1>Invalid Code</h1><p>Confirmation code did not match ({remaining} attempt(s) remaining).</p></body></html>"),
+            format!(
+                "<!doctype html><html><body><h1>Invalid Code</h1><p>Confirmation code did not match ({remaining} attempt(s) remaining).</p></body></html>"
+            ),
         )
     } else {
         json_join_response(
@@ -1267,7 +1310,8 @@ fn validate_handoff_bundle(
 
     // Verify NodeCertV1 (`hcert1_`) against human's Ed25519 key AND local device keys!
     let hcert1 = bundle.node_cert.trim().to_string();
-    let signed_cert = decode_hcert1(&hcert1).map_err(|e| format!("invalid hcert1_ nodeCert: {e}"))?;
+    let signed_cert =
+        decode_hcert1(&hcert1).map_err(|e| format!("invalid hcert1_ nodeCert: {e}"))?;
     let cert_payload = verify_node_cert(&signed_cert, &human_pk, now, 1)
         .map_err(|e| format!("nodeCert signature/validity check failed: {e}"))?;
     if cert_payload.human_id != human_id {
@@ -1295,7 +1339,11 @@ fn validate_handoff_bundle(
 
     // If `hjoin1` is included, verify both the invite and the human's signed claim!
     let (hub_node_id, hub_endpoint, hub_fingerprint, claim_request) = if let Some(raw_hjoin1) =
-        bundle.hjoin1.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        bundle
+            .hjoin1
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     {
         let signed_invite =
             decode_hjoin1(raw_hjoin1).map_err(|e| format!("invalid hjoin1_ token: {e}"))?;
@@ -1327,7 +1375,9 @@ fn validate_handoff_bundle(
         let (claim_pk, _) = verify_human_invite_claim(&claim, &claim_sig, now)
             .map_err(|e| format!("humanClaimSig verification failed: {e}"))?;
         if claim_pk != human_pk {
-            return Err("humanClaim signingJwk does not match humanAuthority signingJwk".to_string());
+            return Err(
+                "humanClaim signingJwk does not match humanAuthority signingJwk".to_string(),
+            );
         }
         if claim.invite_id != invite.invite_id
             || claim.hub_node_id != invite.hub_node_id
@@ -1361,7 +1411,9 @@ fn validate_handoff_bundle(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty() && *s != LOCAL_NODE_ID && is_valid_node_id(s))
-            .ok_or_else(|| "bundle must provide valid hubNodeId when hjoin1 is omitted".to_string())?
+            .ok_or_else(|| {
+                "bundle must provide valid hubNodeId when hjoin1 is omitted".to_string()
+            })?
             .to_string();
         (hub_id, ep, bundle.hub_fingerprint.clone(), None)
     };
@@ -1414,7 +1466,12 @@ fn finalize_join(
             "stateDir".to_string(),
             json!(state_dir.display().to_string()),
         );
-        ensure_v2_node_json_defaults(&mut cfg_map, &validated.node_id, NodeProfile::Local, state_dir);
+        ensure_v2_node_json_defaults(
+            &mut cfg_map,
+            &validated.node_id,
+            NodeProfile::Local,
+            state_dir,
+        );
         if let Err(e) = write_atomic_json(config_write, &Value::Object(cfg_map), true) {
             return emit_error(
                 cmd,
@@ -1480,7 +1537,16 @@ fn finalize_join(
 
     let signed_cert_json = match to_canonical_json(&validated.signed_cert) {
         Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "ENCODE_ERROR", e.to_string(), None),
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "ENCODE_ERROR",
+                e.to_string(),
+                None,
+            );
+        }
     };
     if let Err(e) = db.human().put_node_cert(&HumanNodeCertInput {
         node_id: validated.node_id.clone(),
@@ -1577,13 +1643,17 @@ fn finalize_join(
             as_json,
             EXIT_ERROR,
             "DB_ERROR",
-            format!("Failed to register hub peer '{}': {e}", delegated.hub_node_id),
+            format!(
+                "Failed to register hub peer '{}': {e}",
+                delegated.hub_node_id
+            ),
             None,
         );
     }
 
     let hub_sign_jwk = proto_jwk_to_crypto_local(&delegated.manifest_payload.identity.signing_jwk);
-    let hub_enc_jwk = proto_jwk_to_crypto_local(&delegated.manifest_payload.identity.encryption_jwk);
+    let hub_enc_jwk =
+        proto_jwk_to_crypto_local(&delegated.manifest_payload.identity.encryption_jwk);
     let hub_sign_kid = hub_sign_jwk.thumbprint().unwrap_or_default();
     let hub_enc_kid = hub_enc_jwk.thumbprint().unwrap_or_default();
     if let (Ok(sign_json), Ok(enc_json)) = (
@@ -1726,20 +1796,36 @@ fn post_auth_claim(
     claim_req: &AuthClaimRequest,
 ) -> Result<AuthClaimReply, (&'static str, String)> {
     let url = format!("{}/v1/auth/claim", hub_endpoint.trim_end_matches('/'));
-    let uri: http::Uri = url
-        .parse()
-        .map_err(|e| ("INVALID_ENDPOINT", format!("Invalid auth claim URI '{url}': {e}")))?;
-    let body_bytes = serde_json::to_vec(claim_req)
-        .map_err(|e| ("ENCODE_ERROR", format!("Failed to serialize auth claim: {e}")))?;
+    let uri: http::Uri = url.parse().map_err(|e| {
+        (
+            "INVALID_ENDPOINT",
+            format!("Invalid auth claim URI '{url}': {e}"),
+        )
+    })?;
+    let body_bytes = serde_json::to_vec(claim_req).map_err(|e| {
+        (
+            "ENCODE_ERROR",
+            format!("Failed to serialize auth claim: {e}"),
+        )
+    })?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| ("RUNTIME_ERROR", format!("Failed to start async runtime: {e}")))?;
+        .map_err(|e| {
+            (
+                "RUNTIME_ERROR",
+                format!("Failed to start async runtime: {e}"),
+            )
+        })?;
 
     let (status, resp_bytes) = rt.block_on(async {
-        let client = build_http_client::<Full<Bytes>>()
-            .map_err(|e| ("HTTP_ERROR", format!("Failed to initialize HTTP client: {e}")))?;
+        let client = build_http_client::<Full<Bytes>>().map_err(|e| {
+            (
+                "HTTP_ERROR",
+                format!("Failed to initialize HTTP client: {e}"),
+            )
+        })?;
         let req = Request::builder()
             .method(Method::POST)
             .uri(&uri)
@@ -1752,20 +1838,26 @@ fn post_auth_claim(
             .body(Full::new(Bytes::from(body_bytes)))
             .map_err(|e| ("HTTP_ERROR", format!("Failed to build claim request: {e}")))?;
 
-        let resp = tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
-            .await
-            .map_err(|_| {
-                (
-                    "CLAIM_TIMEOUT",
-                    format!("POST {url} timed out after {HTTP_TIMEOUT_SECS}s"),
-                )
-            })?
-            .map_err(|e| ("CLAIM_FAILED", format!("POST {url} failed: {e}")))?;
+        let resp =
+            tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
+                .await
+                .map_err(|_| {
+                    (
+                        "CLAIM_TIMEOUT",
+                        format!("POST {url} timed out after {HTTP_TIMEOUT_SECS}s"),
+                    )
+                })?
+                .map_err(|e| ("CLAIM_FAILED", format!("POST {url} failed: {e}")))?;
 
         let status = resp.status().as_u16();
         let bytes = read_hyper_body_bounded(resp.into_body(), MAX_HTTP_RESP_BYTES)
             .await
-            .map_err(|_| ("CLAIM_FAILED", format!("Failed to read response from {url}")))?;
+            .map_err(|_| {
+                (
+                    "CLAIM_FAILED",
+                    format!("Failed to read response from {url}"),
+                )
+            })?;
         Ok::<(u16, Vec<u8>), (&'static str, String)>((status, bytes))
     })?;
 
@@ -1780,24 +1872,34 @@ fn post_auth_claim(
             let detail = problem
                 .detail
                 .unwrap_or_else(|| format!("{} (HTTP {status})", problem.title));
-            return Err((code, format!("POST {url} rejected ({}): {detail}", problem.error)));
+            return Err((
+                code,
+                format!("POST {url} rejected ({}): {detail}", problem.error),
+            ));
         }
-        let snippet: String = String::from_utf8_lossy(&resp_bytes).chars().take(200).collect();
-        return Err(("CLAIM_FAILED", format!("POST {url} returned HTTP {status}: {snippet}")));
+        let snippet: String = String::from_utf8_lossy(&resp_bytes)
+            .chars()
+            .take(200)
+            .collect();
+        return Err((
+            "CLAIM_FAILED",
+            format!("POST {url} returned HTTP {status}: {snippet}"),
+        ));
     }
 
-    let reply: AuthClaimReply = serde_json::from_slice(&resp_bytes)
-        .map_err(|e| ("CLAIM_INVALID", format!("Invalid AuthClaimReply JSON from {url}: {e}")))?;
+    let reply: AuthClaimReply = serde_json::from_slice(&resp_bytes).map_err(|e| {
+        (
+            "CLAIM_INVALID",
+            format!("Invalid AuthClaimReply JSON from {url}: {e}"),
+        )
+    })?;
     if !reply.ok {
         return Err(("CLAIM_REJECTED", format!("Hub returned ok=false on {url}")));
     }
     Ok(reply)
 }
 
-async fn read_hyper_body_bounded(
-    mut body: Incoming,
-    limit: usize,
-) -> Result<Vec<u8>, StatusCode> {
+async fn read_hyper_body_bounded(mut body: Incoming, limit: usize) -> Result<Vec<u8>, StatusCode> {
     let mut out = Vec::new();
     while let Some(frame_res) = body.frame().await {
         let frame = frame_res.map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1865,7 +1967,9 @@ fn read_bounded_stdin() -> Result<String, String> {
         .read_to_string(&mut buf)
         .map_err(|e| format!("failed to read stdin: {e}"))?;
     if buf.len() > MAX_JOIN_BODY_BYTES {
-        return Err(format!("stdin input exceeds {MAX_JOIN_BODY_BYTES} byte cap"));
+        return Err(format!(
+            "stdin input exceeds {MAX_JOIN_BODY_BYTES} byte cap"
+        ));
     }
     Ok(buf)
 }

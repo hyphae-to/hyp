@@ -363,8 +363,14 @@ mod tests {
     fn differential_against_ring_x25519() {
         let rng = SystemRandom::new();
         for _ in 0..16 {
-            let ring_ephem = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).unwrap();
-            let ring_pub: [u8; 32] = ring_ephem.compute_public_key().unwrap().as_ref().try_into().unwrap();
+            let ring_ephem =
+                agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng).unwrap();
+            let ring_pub: [u8; 32] = ring_ephem
+                .compute_public_key()
+                .unwrap()
+                .as_ref()
+                .try_into()
+                .unwrap();
 
             let mut our_priv = [0u8; 32];
             ring::rand::SecureRandom::fill(&rng, &mut our_priv).unwrap();
@@ -386,7 +392,10 @@ mod tests {
         let priv_key =
             from_hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
         for pt in &LOW_ORDER_X25519_POINTS {
-            assert!(matches!(x25519_dh(&priv_key, pt), Err(CryptoError::SmallOrderKey)));
+            assert!(matches!(
+                x25519_dh(&priv_key, pt),
+                Err(CryptoError::SmallOrderKey)
+            ));
             // Also with MSB set
             let mut pt_msb = *pt;
             pt_msb[31] |= 0x80;

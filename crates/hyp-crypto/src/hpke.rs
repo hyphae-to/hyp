@@ -9,14 +9,14 @@
 //! exact verification against RFC 9180 Appendix A.1.1 / A.2.1 test vectors.
 
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
-use ring::hkdf::{self, KeyType, Salt, HKDF_SHA256};
+use ring::hkdf::{self, HKDF_SHA256, KeyType, Salt};
 use zeroize::Zeroizing;
 
 use crate::error::CryptoError;
 use crate::keys::{X25519KeyPair, X25519PublicKey};
-use crate::x25519::x25519_public_from_private;
 #[cfg(test)]
 use crate::x25519::x25519_dh;
+use crate::x25519::x25519_public_from_private;
 
 /// RFC 9180 §7.1 KEM ID for `DHKEM(X25519, HKDF-SHA256)`.
 pub const KEM_ID_DHKEM_X25519_HKDF_SHA256: u16 = 0x0020;
@@ -90,14 +90,10 @@ impl KeyType for LenKeyType {
 }
 
 /// RFC 9180 §4 `LabeledExtract(salt, label, ikm)` returning raw 32-byte PRK.
-fn labeled_extract(
-    suite_id: &[u8],
-    salt: &[u8],
-    label: &[u8],
-    ikm: &[u8],
-) -> Zeroizing<[u8; 32]> {
-    let mut labeled_ikm =
-        Zeroizing::new(Vec::with_capacity(HPKE_V1.len() + suite_id.len() + label.len() + ikm.len()));
+fn labeled_extract(suite_id: &[u8], salt: &[u8], label: &[u8], ikm: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut labeled_ikm = Zeroizing::new(Vec::with_capacity(
+        HPKE_V1.len() + suite_id.len() + label.len() + ikm.len(),
+    ));
     labeled_ikm.extend_from_slice(HPKE_V1);
     labeled_ikm.extend_from_slice(suite_id);
     labeled_ikm.extend_from_slice(label);
@@ -119,7 +115,9 @@ fn labeled_expand(
     len: usize,
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if len > u16::MAX as usize || len > 255 * 32 {
-        return Err(CryptoError::Hpke(format!("invalid LabeledExpand length {len}")));
+        return Err(CryptoError::Hpke(format!(
+            "invalid LabeledExpand length {len}"
+        )));
     }
     let len_be = (len as u16).to_be_bytes();
     let prk_obj = hkdf::Prk::new_less_safe(HKDF_SHA256, prk);
@@ -220,7 +218,13 @@ fn key_schedule_base(
     let secret = labeled_extract(&suite_id, shared_secret, b"secret", b"");
 
     let key = labeled_expand(&suite_id, &secret, b"key", &ks_context, aead_id.key_len())?;
-    let nonce_vec = labeled_expand(&suite_id, &secret, b"base_nonce", &ks_context, aead_id.nonce_len())?;
+    let nonce_vec = labeled_expand(
+        &suite_id,
+        &secret,
+        b"base_nonce",
+        &ks_context,
+        aead_id.nonce_len(),
+    )?;
     let mut base_nonce = Zeroizing::new([0u8; 12]);
     base_nonce.copy_from_slice(&nonce_vec);
 
@@ -362,7 +366,9 @@ impl ContextR {
             return Err(CryptoError::SequenceOverflow);
         }
         if ct.len() < self.aead_id.tag_len() {
-            return Err(CryptoError::DecryptionFailed("ciphertext shorter than AEAD tag".into()));
+            return Err(CryptoError::DecryptionFailed(
+                "ciphertext shorter than AEAD tag".into(),
+            ));
         }
         let nonce_bytes = compute_nonce(&self.base_nonce, self.seq);
         let unbound = UnboundKey::new(self.aead_id.ring_alg(), &self.key)
@@ -520,19 +526,24 @@ mod tests {
     fn rfc9180_appendix_a_1_1_exact_known_answer_vector() {
         let info = unhex("4f6465206f6e2061204772656369616e2055726e"); // "Ode on a Grecian Urn"
         let ikm_e = unhex("7268600d403fce431561aef583ee1613527cff655c1343f29812e66706df3234");
-        let expected_sk_em = unhex("52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736");
-        let expected_pk_em = unhex("37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431");
+        let expected_sk_em =
+            unhex("52c4a758a802cd8b936eceea314432798d5baf2d7e9235dc084ab1b9cfa2f736");
+        let expected_pk_em =
+            unhex("37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431");
 
         let ikm_r = unhex("6db9df30aa07dd42ee5e8181afdb977e538f5e1fec8a06223f33f7013e525037");
-        let expected_sk_rm = unhex("4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8");
-        let expected_pk_rm = unhex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d");
+        let expected_sk_rm =
+            unhex("4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8");
+        let expected_pk_rm =
+            unhex("3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d");
 
         let expected_ss = unhex("fe0e18c9f024ce43799ae393c7e8fe8fce9d218875e8227b0187c04e7d2ea1fc");
         let expected_ks_ctx = unhex(
             "00725611c9d98c07c03f60095cd32d400d8347d45ed67097bbad50fc56da742d\
              07cb6cffde367bb0565ba28bb02c90744a20f5ef37f30523526106f637abb05449",
         );
-        let expected_secret = unhex("12fff91991e93b48de37e7daddb52981084bd8aa64289c3788471d9a9712f397");
+        let expected_secret =
+            unhex("12fff91991e93b48de37e7daddb52981084bd8aa64289c3788471d9a9712f397");
         let expected_key = unhex("4531685d41d65f03dc48f6b8302c05b0");
         let expected_base_nonce = unhex("56d890e5accaaf011cff4b7d");
         let expected_exp_secret =
@@ -559,11 +570,17 @@ mod tests {
 
         // 3. KeySchedule intermediate values
         let ks_s = key_schedule_base(AeadId::Aes128Gcm, &ss_s, &info).unwrap();
-        assert_eq!(ks_s.key_schedule_context.as_slice(), expected_ks_ctx.as_slice());
+        assert_eq!(
+            ks_s.key_schedule_context.as_slice(),
+            expected_ks_ctx.as_slice()
+        );
         assert_eq!(ks_s.secret.as_slice(), expected_secret.as_slice());
         assert_eq!(ks_s.key.as_slice(), expected_key.as_slice());
         assert_eq!(ks_s.base_nonce.as_slice(), expected_base_nonce.as_slice());
-        assert_eq!(ks_s.exporter_secret.as_slice(), expected_exp_secret.as_slice());
+        assert_eq!(
+            ks_s.exporter_secret.as_slice(),
+            expected_exp_secret.as_slice()
+        );
 
         let ks_r = key_schedule_base(AeadId::Aes128Gcm, &ss_r, &info).unwrap();
         let mut ctx_s = ContextS::from_schedule(AeadId::Aes128Gcm, ks_s);

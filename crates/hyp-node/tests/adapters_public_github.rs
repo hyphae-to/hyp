@@ -11,10 +11,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, header};
 use http_body_util::Full;
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_node::adapters::{
     AdapterError, AdapterHealth, AdapterKind, BoxFuture, CompiledSubscription,
@@ -27,6 +23,10 @@ use hyp_node::adapters::{
 use hyp_proto::cloudevent::CloudEvent;
 use hyp_proto::filter::{DiagnosticCode, DiagnosticSeverity, Filter, matches_filters};
 use hyp_proto::rpc::EventKeyRef;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -87,9 +87,9 @@ impl NodeAdapterHost for RecordingHost {
                 .count();
 
             let mut evs = self.events.lock().await;
-            let is_dup = evs
-                .iter()
-                .any(|(t, existing)| t == topic && existing.id == event.id && existing.source == event.source);
+            let is_dup = evs.iter().any(|(t, existing)| {
+                t == topic && existing.id == event.id && existing.source == event.source
+            });
             let status = if is_dup {
                 PublishStatus::Duplicate
             } else {
@@ -515,7 +515,9 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
     let diag_url = adapter
         .validate_subscription(
             "github",
-            &[exact_repo_filter("https://github.com/anthropics/claude-code")],
+            &[exact_repo_filter(
+                "https://github.com/anthropics/claude-code",
+            )],
         )
         .await;
     assert_eq!(diag_url[0].severity, DiagnosticSeverity::Error);
@@ -523,7 +525,9 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
     // --- Local mode with token from SecretStore allows private repos ---
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = SecretStore::new(tmp.path(), SecretBackend::File);
-    store.set("github-token", "ghp_local_test_token_12345").unwrap();
+    store
+        .set("github-token", "ghp_local_test_token_12345")
+        .unwrap();
     let local_cfg = GitHubPublicConfig {
         api_base_url: mock.base_url(),
         allow_private_with_token: true,
@@ -547,7 +551,10 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
     let diag_local_404 = local_adapter
         .validate_subscription("github", &[exact_repo_filter("nope/missing")])
         .await;
-    assert_eq!(diag_local_404[0].code, DiagnosticCode::RepoNotFoundOrPrivate);
+    assert_eq!(
+        diag_local_404[0].code,
+        DiagnosticCode::RepoNotFoundOrPrivate
+    );
 
     // --- Register 50 subscribers on `anthropics/claude-code` -> EXACTLY 1 ETag poller ---
     let mut subs: Vec<CompiledSubscription> = (0..50)
@@ -563,7 +570,10 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
     adapter.on_subscriptions_changed("github", &subs).await;
 
     let stats_initial = adapter.stats().await;
-    assert_eq!(stats_initial.active_pollers, 1, "50 subs MUST share 1 poller");
+    assert_eq!(
+        stats_initial.active_pollers, 1,
+        "50 subs MUST share 1 poller"
+    );
     assert_eq!(
         stats_initial.refcounts.get("anthropics/claude-code"),
         Some(&50)
@@ -681,11 +691,18 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
     // Invalid HMAC (single-byte flip) MUST fail closed!
     let mut flipped_sig = valid_sig.clone().into_bytes();
     let last_idx = flipped_sig.len() - 1;
-    flipped_sig[last_idx] = if flipped_sig[last_idx] == b'0' { b'1' } else { b'0' };
+    flipped_sig[last_idx] = if flipped_sig[last_idx] == b'0' {
+        b'1'
+    } else {
+        b'0'
+    };
     let flipped_sig_str = String::from_utf8(flipped_sig).unwrap();
 
     let mut bad_headers = HeaderMap::new();
-    bad_headers.insert("x-hub-signature-256", HeaderValue::from_str(&flipped_sig_str).unwrap());
+    bad_headers.insert(
+        "x-hub-signature-256",
+        HeaderValue::from_str(&flipped_sig_str).unwrap(),
+    );
     bad_headers.insert("x-github-event", HeaderValue::from_static("pull_request"));
     bad_headers.insert("x-github-delivery", HeaderValue::from_static("app-deliv-1"));
     assert!(
@@ -698,7 +715,10 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
 
     // Valid HMAC App webhook delivers immediately onto the exact same `github` topic!
     let mut good_headers = HeaderMap::new();
-    good_headers.insert("x-hub-signature-256", HeaderValue::from_str(&valid_sig).unwrap());
+    good_headers.insert(
+        "x-hub-signature-256",
+        HeaderValue::from_str(&valid_sig).unwrap(),
+    );
     good_headers.insert("x-github-event", HeaderValue::from_static("pull_request"));
     good_headers.insert("x-github-delivery", HeaderValue::from_static("app-deliv-1"));
     let app_outcome = adapter
@@ -736,7 +756,12 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
 
     let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        if host.events().await.iter().any(|(_, e)| e.id == "evt-resumed-99") {
+        if host
+            .events()
+            .await
+            .iter()
+            .any(|(_, e)| e.id == "evt-resumed-99")
+        {
             break;
         }
         assert!(
@@ -807,12 +832,13 @@ fn differential_github_webhook_and_events_api_produce_identical_cloudevents() {
         }
     });
 
-    let from_webhook = match normalize_github_webhook("pull_request", "same-event-id", &webhook_payload, ts) {
-        GitHubNormalizeOutcome::Publish(ev) => *ev,
-        GitHubNormalizeOutcome::Ignore(r) => panic!("unexpected ignore: {r}"),
-    };
-    let from_api = normalize_github_api_event("acme/core", &api_event)
-        .expect("API event should normalize");
+    let from_webhook =
+        match normalize_github_webhook("pull_request", "same-event-id", &webhook_payload, ts) {
+            GitHubNormalizeOutcome::Publish(ev) => *ev,
+            GitHubNormalizeOutcome::Ignore(r) => panic!("unexpected ignore: {r}"),
+        };
+    let from_api =
+        normalize_github_api_event("acme/core", &api_event).expect("API event should normalize");
 
     assert_eq!(
         from_webhook, from_api,
@@ -933,7 +959,10 @@ while True:
         let iso = build_isolated_env(&cfg, &parent_env);
         assert!(!iso.contains_key("TOP_SECRET_HOST_TOKEN"));
         assert_eq!(iso.get("HYPHAE_PROTOCOL").map(String::as_str), Some("2"));
-        assert_eq!(iso.get("PLUGIN_CUSTOM_MODE").map(String::as_str), Some("bridge-test"));
+        assert_eq!(
+            iso.get("PLUGIN_CUSTOM_MODE").map(String::as_str),
+            Some("bridge-test")
+        );
 
         let sup = SubprocessSupervisor::new(cfg);
         sup.start(host.clone()).await.expect("start v1 supervisor");
@@ -1215,7 +1244,11 @@ while True:
     #[tokio::test]
     async fn supervisor_node_fs_fd3_child_works_like_v1_js_sdk() {
         // Skip cleanly if `node` isn't installed in PATH on a minimal host.
-        if std::process::Command::new("node").arg("--version").output().is_err() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let host = RecordingHost::new();
@@ -1314,7 +1347,10 @@ async fn github_webhook_hmac_mutations_and_event_types() {
     cfg.allowed_repos = vec!["acme/checkout".to_string()];
 
     let adapter = GitHubWebhookAdapter::new(cfg);
-    adapter.start(host.clone()).await.expect("start github webhook");
+    adapter
+        .start(host.clone())
+        .await
+        .expect("start github webhook");
 
     let cases: &[(&str, &str, Value, &str, Option<&str>)] = &[
         (
@@ -1479,7 +1515,10 @@ async fn github_webhook_hmac_mutations_and_event_types() {
         // 1. Missing X-Hub-Signature-256 fails closed.
         let mut no_sig = HeaderMap::new();
         no_sig.insert("x-github-event", HeaderValue::from_str(ev_name).unwrap());
-        no_sig.insert("x-github-delivery", HeaderValue::from_str(deliv_id).unwrap());
+        no_sig.insert(
+            "x-github-delivery",
+            HeaderValue::from_str(deliv_id).unwrap(),
+        );
         assert!(matches!(
             adapter.ingest_webhook(&no_sig, &body).await,
             Err(AdapterError::Unauthorized(_))
@@ -1526,7 +1565,10 @@ async fn github_webhook_hmac_mutations_and_event_types() {
     .unwrap();
     let other_sig = compute_hmac_sha256_header(secret.as_bytes(), &other_body);
     let mut other_headers = HeaderMap::new();
-    other_headers.insert("x-hub-signature-256", HeaderValue::from_str(&other_sig).unwrap());
+    other_headers.insert(
+        "x-hub-signature-256",
+        HeaderValue::from_str(&other_sig).unwrap(),
+    );
     other_headers.insert("x-github-event", HeaderValue::from_static("issues"));
     other_headers.insert("x-github-delivery", HeaderValue::from_static("deliv-other"));
     assert!(matches!(
@@ -1587,8 +1629,14 @@ async fn prometheus_and_generic_webhook_normalization_and_hmac_mutations() {
 
     // Wrong bearer token fails closed.
     let mut bad_auth = HeaderMap::new();
-    bad_auth.insert("authorization", HeaderValue::from_static("Bearer wrong-tok"));
-    bad_auth.insert("x-webhook-signature-256", HeaderValue::from_str(&prom_sig).unwrap());
+    bad_auth.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer wrong-tok"),
+    );
+    bad_auth.insert(
+        "x-webhook-signature-256",
+        HeaderValue::from_str(&prom_sig).unwrap(),
+    );
     assert!(matches!(
         prom.ingest_webhook(&bad_auth, &am_body).await,
         Err(AdapterError::Unauthorized(_))
@@ -1607,7 +1655,11 @@ async fn prometheus_and_generic_webhook_normalization_and_hmac_mutations() {
     let prom_out = prom.ingest_webhook(&good_prom, &am_body).await.unwrap();
     assert!(matches!(
         prom_out,
-        WebhookIngestOutcome::PublishedMany { stored: 2, duplicates: 0, .. }
+        WebhookIngestOutcome::PublishedMany {
+            stored: 2,
+            duplicates: 0,
+            ..
+        }
     ));
 
     let evs = host.events().await;
@@ -1673,7 +1725,8 @@ async fn prometheus_and_generic_webhook_normalization_and_hmac_mutations() {
     generic.ingest_webhook(&h_good, &ce_body).await.unwrap();
 
     // 2. Plain JSON wrapping (B8: ignores unsigned X-Delivery-Id, derives deterministic SHA-256)
-    let raw_body = serde_json::to_vec(&json!({ "pipeline": "nightly", "status": "passed" })).unwrap();
+    let raw_body =
+        serde_json::to_vec(&json!({ "pipeline": "nightly", "status": "passed" })).unwrap();
     let raw_sig = compute_hmac_sha256_header(b"ci-secret", &raw_body);
     let mut h_wrap = HeaderMap::new();
     h_wrap.insert(
@@ -1692,14 +1745,22 @@ async fn prometheus_and_generic_webhook_normalization_and_hmac_mutations() {
     assert_eq!(all[2].1.event_type, "com.ci.deploy.finished");
     assert_eq!(all[2].1.source, "ci/custom");
     assert_eq!(
-        all[2].1.extensions.get("hyphaesourcekind").and_then(Value::as_str),
+        all[2]
+            .1
+            .extensions
+            .get("hyphaesourcekind")
+            .and_then(Value::as_str),
         Some("external-webhook")
     );
     assert_eq!(all[3].1.id, expected_wrap_id);
     assert_eq!(all[3].1.event_type, "com.ci.build");
     assert_eq!(all[3].1.source, "ci/buildkite");
     assert_eq!(
-        all[3].1.extensions.get("hyphaesourcekind").and_then(Value::as_str),
+        all[3]
+            .1
+            .extensions
+            .get("hyphaesourcekind")
+            .and_then(Value::as_str),
         Some("external-webhook")
     );
     assert_eq!(all[3].1.data.as_ref().unwrap()["pipeline"], "nightly");
@@ -1734,7 +1795,11 @@ async fn handle_multi_token_github(
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
 
-    state.requests.lock().await.push((path.clone(), auth.clone()));
+    state
+        .requests
+        .lock()
+        .await
+        .push((path.clone(), auth.clone()));
 
     let required_auth_for = |repo: &str| -> Option<&'static str> {
         match repo {
@@ -1871,7 +1936,9 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
     use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 
     // 1. Pattern validation rejects `*`, `*/*`, `../bad`, empty fail-closed.
-    for bad in ["*", "*/*", "*/repo", "../bad", "owner/..", "", "   ", "a/b/c"] {
+    for bad in [
+        "*", "*/*", "*/repo", "../bad", "owner/..", "", "   ", "a/b/c",
+    ] {
         assert!(
             normalize_repo_token_pattern(bad).is_err(),
             "pattern {bad:?} must fail closed"
@@ -1910,12 +1977,8 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
     // Store 3 distinct owner/repo tokens in an isolated file SecretStore (ZERO default `github_token`!).
     let tmp = tempfile::tempdir().unwrap();
     let store = SecretStore::new(tmp.path(), SecretBackend::File);
-    store
-        .set("gh-bowd", "hyphae_gh_tok_bowd_a")
-        .unwrap();
-    store
-        .set("gh-bayfold", "hyphae_gh_tok_bayfold_b")
-        .unwrap();
+    store.set("gh-bowd", "hyphae_gh_tok_bowd_a").unwrap();
+    store.set("gh-bayfold", "hyphae_gh_tok_bayfold_b").unwrap();
     store
         .set("gh-bayfold-special", "hyphae_gh_tok_bayfold_special_c")
         .unwrap();

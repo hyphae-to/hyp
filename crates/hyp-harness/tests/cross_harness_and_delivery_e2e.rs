@@ -124,7 +124,10 @@ fn extract_pre_turn_drain_text(harness: HarnessKind, hook_out: &Value) -> String
                 .to_string()
         }
         HarnessKind::Gemini => {
-            assert_eq!(hook_out["hookSpecificOutput"]["hookEventName"], "BeforeAgent");
+            assert_eq!(
+                hook_out["hookSpecificOutput"]["hookEventName"],
+                "BeforeAgent"
+            );
             hook_out["hookSpecificOutput"]["additionalContext"]
                 .as_str()
                 .unwrap_or_default()
@@ -231,7 +234,13 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         let hook_payload = harness_session_payload(*harness, raw_id);
 
         // 1. SessionStart always returns `{}`.
-        let ss = run_hook(&sock, *harness, HookEvent::SessionStart, hook_payload.clone()).await;
+        let ss = run_hook(
+            &sock,
+            *harness,
+            HookEvent::SessionStart,
+            hook_payload.clone(),
+        )
+        .await;
         assert_eq!(ss, json!({}), "SessionStart must return {{}} for {raw_id}");
 
         // 2. Authentic PreToolUse -> CallRegistry -> MCP `hyp_mesh(join)`
@@ -266,7 +275,13 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
         assert!(!dm1_err, "send msg1 to {raw_id} failed: {dm1_txt}");
         wait_for_pending_count(&sock, &session_id, 1).await;
 
-        let post_held = run_hook(&sock, *harness, HookEvent::PostToolUse, hook_payload.clone()).await;
+        let post_held = run_hook(
+            &sock,
+            *harness,
+            HookEvent::PostToolUse,
+            hook_payload.clone(),
+        )
+        .await;
         assert_eq!(
             post_held,
             json!({}),
@@ -274,8 +289,13 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
             harness
         );
 
-        let drain_out =
-            run_hook(&sock, *harness, HookEvent::PreInvocation, hook_payload.clone()).await;
+        let drain_out = run_hook(
+            &sock,
+            *harness,
+            HookEvent::PreInvocation,
+            hook_payload.clone(),
+        )
+        .await;
         let drained_text = extract_pre_turn_drain_text(*harness, &drain_out);
 
         let st_after_drain = session_status(&sock, &session_id).await;
@@ -291,7 +311,10 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
                 .call_verified_for_harness(&sock, *harness, raw_id, "hyp_inbox", delivered_args)
                 .await
         };
-        assert!(!deliv_err, "delivered query failed for {raw_id}: {deliv_txt}");
+        assert!(
+            !deliv_err,
+            "delivered query failed for {raw_id}: {deliv_txt}"
+        );
         let deliv_val: Value = serde_json::from_str(&deliv_txt).unwrap();
         let deliv_items = deliv_val["items"].as_array().unwrap();
 
@@ -313,8 +336,13 @@ async fn suite_1_all_nine_harnesses_live_differential_parity() {
             // OpenClaw `agent_end` is observational-only (`{}`) — flips Active -> Idle without
             // mutating/blocking turn end, preserving DM #2 intact for `before_prompt_build`.
             assert_eq!(stop_drain, json!({}));
-            let oc_next =
-                run_hook(&sock, *harness, HookEvent::PreInvocation, hook_payload.clone()).await;
+            let oc_next = run_hook(
+                &sock,
+                *harness,
+                HookEvent::PreInvocation,
+                hook_payload.clone(),
+            )
+            .await;
             extract_pre_turn_drain_text(*harness, &oc_next)
         } else {
             extract_stop_reason(*harness, &stop_drain)
@@ -450,7 +478,11 @@ async fn suite_2_live_caller_spoofing_and_race_protection_matrix() {
 
     // 1. Unverified `tools/call` (no `_meta`, no `_meshCall`) -> `caller_unverifiable`
     let (unv_txt, unv_err) = mcp
-        .call_tool("hyp_mesh", json!({ "action": "join", "handle": "spoof" }), None)
+        .call_tool(
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "spoof" }),
+            None,
+        )
         .await;
     assert!(unv_err, "unverified call must fail closed");
     assert!(
@@ -473,7 +505,10 @@ async fn suite_2_live_caller_spoofing_and_race_protection_matrix() {
         }),
     )
     .await;
-    let ag_tok = ag_pre["overwrite"]["_meshCall"].as_str().unwrap().to_string();
+    let ag_tok = ag_pre["overwrite"]["_meshCall"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let (first_ag_txt, first_ag_err) = mcp
         .call_tool(
@@ -482,7 +517,10 @@ async fn suite_2_live_caller_spoofing_and_race_protection_matrix() {
             None,
         )
         .await;
-    assert!(!first_ag_err, "1st use of AG token must succeed: {first_ag_txt}");
+    assert!(
+        !first_ag_err,
+        "1st use of AG token must succeed: {first_ag_txt}"
+    );
 
     // Mint Claude callId & consume it once
     let _ = run_hook(
@@ -504,7 +542,10 @@ async fn suite_2_live_caller_spoofing_and_race_protection_matrix() {
             Some(json!({ "claudecode/toolUseId": "toolu_replay_once" })),
         )
         .await;
-    assert!(!first_cl_err, "1st use of Claude callId must succeed: {first_cl_txt}");
+    assert!(
+        !first_cl_err,
+        "1st use of Claude callId must succeed: {first_cl_txt}"
+    );
 
     // Mint cross-tool swap token (PreToolUse for `hyp_inbox`, later used on `hyp_send`)
     let swap_pre = run_hook(
@@ -672,11 +713,26 @@ async fn suite_2_live_caller_spoofing_and_race_protection_matrix() {
         }
     );
 
-    assert!(ag_replay_err && ag_replay_txt.contains("caller_not_found"), "AG replay: {ag_replay_txt}");
-    assert!(cl_replay_err && cl_replay_txt.contains("caller_not_found"), "Claude replay: {cl_replay_txt}");
-    assert!(swap_err && swap_txt.contains("caller_not_found"), "Cross-tool swap: {swap_txt}");
-    assert!(forged_err && forged_txt.contains("caller_not_found"), "Forged token: {forged_txt}");
-    assert!(cancel_err && cancel_txt.contains("caller_not_found"), "Cancelled call.end: {cancel_txt}");
+    assert!(
+        ag_replay_err && ag_replay_txt.contains("caller_not_found"),
+        "AG replay: {ag_replay_txt}"
+    );
+    assert!(
+        cl_replay_err && cl_replay_txt.contains("caller_not_found"),
+        "Claude replay: {cl_replay_txt}"
+    );
+    assert!(
+        swap_err && swap_txt.contains("caller_not_found"),
+        "Cross-tool swap: {swap_txt}"
+    );
+    assert!(
+        forged_err && forged_txt.contains("caller_not_found"),
+        "Forged token: {forged_txt}"
+    );
+    assert!(
+        cancel_err && cancel_txt.contains("caller_not_found"),
+        "Cancelled call.end: {cancel_txt}"
+    );
 
     // 4. `tools/call` racing 20ms BEFORE `PreToolUse` -> wakes cleanly via CallRegistry Notify!
     let sock_race = sock.clone();
@@ -704,7 +760,10 @@ async fn suite_2_live_caller_spoofing_and_race_protection_matrix() {
         )
         .await;
     delayed_hook.await.unwrap();
-    assert!(!race_err, "racing tools/call should resolve via Notify: {race_txt}");
+    assert!(
+        !race_err,
+        "racing tools/call should resolve via Notify: {race_txt}"
+    );
     let race_val: Value = serde_json::from_str(&race_txt).unwrap();
     assert_eq!(race_val["address"], "guard@box/racer");
 
@@ -787,7 +846,10 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         )
         .await;
     assert!(!ack_w_err, "warmup ack failed: {ack_w_txt}");
-    assert_eq!(serde_json::from_str::<Value>(&ack_w_txt).unwrap()["unread"], 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&ack_w_txt).unwrap()["unread"],
+        0
+    );
 
     // Messages #11 and #12 from `noisy` exceed `max_events_per_window = 10` -> trips burst protection!
     for i in 10..12 {
@@ -821,11 +883,11 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         !burst_ctx.contains("tripped-burst-10"),
         "burst-demoted bodies must stay in inbox, got: {burst_ctx}"
     );
-    assert!(daemon.delivery().is_source_noisy(
-        "claude:recv-1",
-        "delivery@box/noisy",
-        now_ms()
-    ));
+    assert!(
+        daemon
+            .delivery()
+            .is_source_noisy("claude:recv-1", "delivery@box/noisy", now_ms())
+    );
 
     // Independent peer `calm` is NOT in Noisy Mode -> delivers verbatim inline at TurnStart/TurnEnd!
     let (_, calm_err) = mcp
@@ -961,8 +1023,16 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         }
     }
     assert_eq!(collected_texts.len(), 15);
-    assert!(collected_texts.iter().any(|t| t.contains("hybrid-noisy-00")));
-    assert!(collected_texts.iter().any(|t| t.contains("hybrid-noisy-14")));
+    assert!(
+        collected_texts
+            .iter()
+            .any(|t| t.contains("hybrid-noisy-00"))
+    );
+    assert!(
+        collected_texts
+            .iter()
+            .any(|t| t.contains("hybrid-noisy-14"))
+    );
 
     // Ack all 15 noisy unread items.
     let (_, ack_15_err) = mcp
@@ -1169,7 +1239,12 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
     let from_val: Value = serde_json::from_str(&from_txt).unwrap();
     let from_items = from_val["items"].as_array().unwrap();
     assert_eq!(from_items.len(), 1);
-    assert!(from_items[0]["text"].as_str().unwrap().contains("CALM_HELD_IN_FOCUS"));
+    assert!(
+        from_items[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("CALM_HELD_IN_FOCUS")
+    );
 
     // Filter by `node` (distinguishes `delivery@box` vs `acme-team` vs non-matching!)
     let (node_local_txt, node_local_err) = mcp
@@ -1236,7 +1311,12 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         .unwrap()
         .clone();
     assert_eq!(ch_items.len(), 1);
-    assert!(ch_items[0]["text"].as_str().unwrap().contains("OPS_CHANNEL_FILTER_TEST"));
+    assert!(
+        ch_items[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("OPS_CHANNEL_FILTER_TEST")
+    );
 
     // `summary: true` omits `text` and returns concise `preview`
     let (sum_txt, sum_err) = mcp
@@ -1254,7 +1334,11 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         .clone();
     assert!(!sum_items.is_empty());
     assert!(sum_items[0].get("text").is_none());
-    assert!(sum_items[0]["preview"].as_str().is_some_and(|p| !p.is_empty()));
+    assert!(
+        sum_items[0]["preview"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty())
+    );
 
     // `state: "delivered"` contains prior delivered items (VIP breakthrough & hybrid inline)
     let (del_txt, del_err) = mcp
@@ -1270,16 +1354,18 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
         .as_array()
         .unwrap()
         .clone();
-    assert!(
-        del_items
-            .iter()
-            .any(|i| i["text"].as_str().unwrap_or("").contains("VIP_HYBRID_INLINE_URGENT"))
-    );
-    assert!(
-        del_items
-            .iter()
-            .any(|i| i["text"].as_str().unwrap_or("").contains("VIP_BREAKS_THROUGH_FOCUS"))
-    );
+    assert!(del_items.iter().any(|i| {
+        i["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("VIP_HYBRID_INLINE_URGENT")
+    }));
+    assert!(del_items.iter().any(|i| {
+        i["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("VIP_BREAKS_THROUGH_FOCUS")
+    }));
 
     // Corrupt cursor fails closed!
     let (bad_cur_txt, bad_cur_err) = mcp
@@ -1290,7 +1376,10 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             json!({ "state": "unread", "cursor": "!!!not-valid-base64!!!" }),
         )
         .await;
-    assert!(bad_cur_err, "corrupt cursor must fail closed, got: {bad_cur_txt}");
+    assert!(
+        bad_cur_err,
+        "corrupt cursor must fail closed, got: {bad_cur_txt}"
+    );
 
     // Quarantined receipt explicitly queried via `ids: [quarantined_receipt]` returns ZERO body!
     let q_decision = daemon
@@ -1324,7 +1413,10 @@ async fn suite_3a_live_delivery_policy_burst_hybrid_packer_truncation_focus_and_
             json!({ "state": "all", "ids": [q_receipt] }),
         )
         .await;
-    assert!(!q_id_err, "ids lookup returned unexpected error: {q_id_txt}");
+    assert!(
+        !q_id_err,
+        "ids lookup returned unexpected error: {q_id_txt}"
+    );
     let q_id_val: Value = serde_json::from_str(&q_id_txt).unwrap();
     assert_eq!(
         q_id_val["items"].as_array().unwrap().len(),
@@ -1365,10 +1457,22 @@ async fn suite_3b_live_e2ee_file_drop_via_mcp() {
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@filebox", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@filebox",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_am2, _) = hub
-        .create_admin_invite(&admin_ca, "bob@filebox", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@filebox",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice_node.accept_am2_invite(&alice_am2).await.unwrap();
     bob_node.accept_am2_invite(&bob_am2).await.unwrap();
@@ -1695,7 +1799,10 @@ async fn suite_4_claude_channel_failure_nack_disconnect_and_timeout_fallback_mat
                 json!({ "state": "unread", "ack": true }),
             )
             .await;
-        assert!(!inbox_err, "hyp_inbox after channel timeout failed: {inbox_txt}");
+        assert!(
+            !inbox_err,
+            "hyp_inbox after channel timeout failed: {inbox_txt}"
+        );
         let inbox_val: Value = serde_json::from_str(&inbox_txt).unwrap();
         let items = inbox_val["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
@@ -1764,9 +1871,8 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
     let gate_db = Arc::new(Mutex::new(
         NodeDb::open(dir.path().join("node.sqlite")).unwrap(),
     ));
-    let pipeline = Arc::new(
-        SecurityGatePipeline::new(SecurityGateConfig::default(), gate_db, None).unwrap(),
-    );
+    let pipeline =
+        Arc::new(SecurityGatePipeline::new(SecurityGateConfig::default(), gate_db, None).unwrap());
 
     let daemon = LocalDaemon::start(
         Arc::clone(&node),
@@ -1822,7 +1928,10 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
             json!({ "to": "slack:ops", "text": "hello" }),
         )
         .await;
-    assert!(no_plug_err && no_plug_txt.contains("no_plugins"), "expected no_plugins: {no_plug_txt}");
+    assert!(
+        no_plug_err && no_plug_txt.contains("no_plugins"),
+        "expected no_plugins: {no_plug_txt}"
+    );
 
     let (unclaimed_txt, unclaimed_err) = mcp
         .call_verified_claude(
@@ -1877,10 +1986,16 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
     assert!(!targets_err, "targets failed: {targets_txt}");
     let targets_val: Value = serde_json::from_str(&targets_txt).unwrap();
     assert_eq!(targets_val["plugins"], json!(["telegram"]));
-    assert_eq!(targets_val["targets"][0]["primarySessionId"], "claude:br-primary");
+    assert_eq!(
+        targets_val["targets"][0]["primarySessionId"],
+        "claude:br-primary"
+    );
     assert_eq!(targets_val["targets"][0]["isPrimary"], true);
     assert_eq!(
-        targets_val["targets"][0]["readers"].as_array().unwrap().len(),
+        targets_val["targets"][0]["readers"]
+            .as_array()
+            .unwrap()
+            .len(),
         2
     );
 
@@ -2006,7 +2121,10 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
             json!({ "to": "telegram:dm-alex", "text": "Taking over as primary writer" }),
         )
         .await;
-    assert!(!r_post_err, "new primary (reader) post failed: {r_post_txt}");
+    assert!(
+        !r_post_err,
+        "new primary (reader) post failed: {r_post_txt}"
+    );
     assert_eq!(recorded_posts.lock().unwrap().len(), 2);
     assert_eq!(
         recorded_posts.lock().unwrap()[1].text,
@@ -2042,7 +2160,10 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
             }),
         )
         .await;
-    assert!(!unlink_all_err, "primary unlink(all:true) failed: {unlink_all_txt}");
+    assert!(
+        !unlink_all_err,
+        "primary unlink(all:true) failed: {unlink_all_txt}"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(&unlink_all_txt).unwrap()["removed"],
         true
@@ -2092,7 +2213,10 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
             json!({ "to": "telegram:dm-alex", "text": "immediate reply after link" }),
         )
         .await;
-    assert!(!auto_send_err, "auto-claimed primary must be able to send immediately: {auto_send_txt}");
+    assert!(
+        !auto_send_err,
+        "auto-claimed primary must be able to send immediately: {auto_send_txt}"
+    );
     assert_eq!(recorded_posts.lock().unwrap().len(), 3);
 
     // 6c. A subsequent `link` by another session MUST stay strictly `reader` (never hijacks primary!).
@@ -2113,7 +2237,10 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
     // 7. First-class bridge reactions: reaction-only, empty removal, combo text+reaction,
     //    fail-closed ownership (`not_target_holder`), Outbound DLP, and input validation!
     assert!(
-        recorded_posts.lock().unwrap()[0].meta.get("reaction").is_none(),
+        recorded_posts.lock().unwrap()[0]
+            .meta
+            .get("reaction")
+            .is_none(),
         "plain text bridge posts must not populate meta.reaction"
     );
 
@@ -2181,7 +2308,10 @@ async fn suite_5_bridge_identity_ownership_handoff_and_outbound_dlp_e2e() {
             }),
         )
         .await;
-    assert!(!combo_err, "primary reaction+text combo failed: {combo_txt}");
+    assert!(
+        !combo_err,
+        "primary reaction+text combo failed: {combo_txt}"
+    );
     {
         let posts = recorded_posts.lock().unwrap();
         assert_eq!(posts.len(), 6);
@@ -2407,8 +2537,12 @@ async fn run_transport_parity_scenario(sock: &Path) -> TransportParitySnapshot {
         .unwrap()
         .len();
 
-    let status = daemon_rpc_async(sock, &json!({ "type": "daemon.status" }), Duration::from_secs(2))
-        .await;
+    let status = daemon_rpc_async(
+        sock,
+        &json!({ "type": "daemon.status" }),
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(status.ok);
     let st_res = status.result.unwrap();
 
@@ -2439,7 +2573,9 @@ async fn suite_6_cross_os_start_tcp_connector_addr_differential_parity() {
     )
     .await
     .unwrap();
-    let tcp_addr = tcp_daemon.tcp_addr().expect("start_tcp must expose tcp_addr");
+    let tcp_addr = tcp_daemon
+        .tcp_addr()
+        .expect("start_tcp must expose tcp_addr");
     let tcp_snapshot = run_transport_parity_scenario(&addr_file).await;
 
     // Also verify `tcp://127.0.0.1:<port>` works identically for synchronous hooks & async RPC!
@@ -2460,13 +2596,10 @@ async fn suite_6_cross_os_start_tcp_connector_addr_differential_parity() {
     //    macOS/Linux; direct `127.0.0.1:<port>` loopback TCP on Windows) and assert 100% parity!
     let native_dir = TempDir::new().unwrap();
     let native_node = open_local_node("xport@box", native_dir.path());
-    let native_daemon = LocalDaemon::start(
-        Arc::clone(&native_node),
-        None,
-        LocalDaemonConfig::default(),
-    )
-    .await
-    .unwrap();
+    let native_daemon =
+        LocalDaemon::start(Arc::clone(&native_node), None, LocalDaemonConfig::default())
+            .await
+            .unwrap();
     let native_target = if cfg!(unix) {
         native_daemon.socket_path().to_path_buf()
     } else {
@@ -2723,9 +2856,8 @@ async fn suite_8_handle_descriptions_multihub_peers_and_configured_bridge_target
     let gate_db = Arc::new(Mutex::new(
         NodeDb::open(dir_alice.path().join("node.sqlite")).unwrap(),
     ));
-    let gate_pipeline = Arc::new(
-        SecurityGatePipeline::new(SecurityGateConfig::default(), gate_db, None).unwrap(),
-    );
+    let gate_pipeline =
+        Arc::new(SecurityGatePipeline::new(SecurityGateConfig::default(), gate_db, None).unwrap());
     let alice_daemon = LocalDaemon::start(
         Arc::clone(&alice),
         Some(Arc::clone(&gate_pipeline)),
@@ -2861,7 +2993,11 @@ async fn suite_8_handle_descriptions_multihub_peers_and_configured_bridge_target
     let t_before: Value = serde_json::from_str(&t_before_txt).unwrap();
     assert_eq!(t_before["plugins"], json!(["telegram"]));
     let target_list = t_before["targets"].as_array().unwrap();
-    assert_eq!(target_list.len(), 2, "expected 2 configured targets: {t_before}");
+    assert_eq!(
+        target_list.len(),
+        2,
+        "expected 2 configured targets: {t_before}"
+    );
     let tg_chat = target_list
         .iter()
         .find(|t| t["plugin"] == "telegram" && t["target"] == "123456789")
@@ -3056,7 +3192,13 @@ async fn suite_9_push_transport_queue_interrupt_stop_silencing_and_hold_fallback
 
     // Without a push transport, Codex Stop hook prompts to arm `hyp wait`.
     let codex_payload = json!({ "thread_id": "thr-p9" });
-    let stop_before = run_hook(&sock, HarnessKind::Codex, HookEvent::Stop, codex_payload.clone()).await;
+    let stop_before = run_hook(
+        &sock,
+        HarnessKind::Codex,
+        HookEvent::Stop,
+        codex_payload.clone(),
+    )
+    .await;
     assert_eq!(stop_before["decision"], "block");
     assert!(
         stop_before["reason"]
@@ -3067,15 +3209,31 @@ async fn suite_9_push_transport_queue_interrupt_stop_silencing_and_hold_fallback
 
     // Attach a live interrupt-capable PushTransport -> Stop hook becomes silent!
     let mock_transport = Arc::new(RecordingPushTransport::new("mock_push", true));
-    daemon.register_session_transport("codex:thr-p9", Arc::clone(&mock_transport) as Arc<dyn PushTransport>);
-    assert_eq!(daemon.session_transport_kind("codex:thr-p9"), Some("mock_push"));
+    daemon.register_session_transport(
+        "codex:thr-p9",
+        Arc::clone(&mock_transport) as Arc<dyn PushTransport>,
+    );
+    assert_eq!(
+        daemon.session_transport_kind("codex:thr-p9"),
+        Some("mock_push")
+    );
 
     let st_live = session_status(&sock, "codex:thr-p9").await;
     assert_eq!(st_live["hasLiveTransport"], true);
     assert_eq!(st_live["transportKind"], "mock_push");
 
-    let stop_with_push = run_hook(&sock, HarnessKind::Codex, HookEvent::Stop, codex_payload.clone()).await;
-    assert_eq!(stop_with_push, json!({}), "Stop hook must stay silent when live PushTransport is attached");
+    let stop_with_push = run_hook(
+        &sock,
+        HarnessKind::Codex,
+        HookEvent::Stop,
+        codex_payload.clone(),
+    )
+    .await;
+    assert_eq!(
+        stop_with_push,
+        json!({}),
+        "Stop hook must stay silent when live PushTransport is attached"
+    );
 
     // 1. Standard DM -> pushed in Queue mode and marked delivered (pending == 0).
     let (_, dm1_err) = sender_mcp
@@ -3167,7 +3325,13 @@ async fn suite_9_push_transport_queue_interrupt_stop_silencing_and_hold_fallback
         "Hold outcome must preserve message unread in durable SQLite"
     );
 
-    let post_drain = run_hook(&sock, HarnessKind::Codex, HookEvent::PostToolUse, codex_payload).await;
+    let post_drain = run_hook(
+        &sock,
+        HarnessKind::Codex,
+        HookEvent::PostToolUse,
+        codex_payload,
+    )
+    .await;
     let drained_txt = extract_drain_text(HarnessKind::Codex, &post_drain);
     assert!(
         drained_txt.contains("preserve-on-hold-fallback"),
@@ -3312,7 +3476,10 @@ esac
         "Herdr terminal push MUST NOT leak untrusted DM body into user prompt:\n{log_contents}"
     );
     // Unread message MUST stay preserved in SQLite until the woken agent reads it via hyp_inbox!
-    assert_eq!(session_status(&sock, "codex:thr-herdr-1").await["pending"], 1);
+    assert_eq!(
+        session_status(&sock, "codex:thr-herdr-1").await["pending"],
+        1
+    );
 
     let inbox_call_id = "call-codex-herdr-inbox-1";
     let pre_inbox = run_hook_with_hints(
@@ -3344,7 +3511,10 @@ esac
         inbox_txt.contains("wake-up-codex-via-herdr"),
         "hyp_inbox must deliver the unread DM body with structured provenance: {inbox_txt}"
     );
-    assert_eq!(session_status(&sock, "codex:thr-herdr-1").await["pending"], 0);
+    assert_eq!(
+        session_status(&sock, "codex:thr-herdr-1").await["pending"],
+        0
+    );
 
     codex_mcp.close().await;
     sender_mcp.close().await;

@@ -122,10 +122,70 @@ async fn delegated_human_join_cli_e2e_full_lifecycle() {
 
     // 2. `hyp auth invite philip`: forbidden scopes & bare `*` nodePrefix MUST fail closed!
     for bad_args in [
-        vec!["auth", "invite", "philip", "--hub", "acme-team", "--endpoint", &hub_url, "--grant", "*", "--state-dir", hub_state_str, "--config", hub_cfg_str, "--json"],
-        vec!["auth", "invite", "philip", "--hub", "acme-team", "--endpoint", &hub_url, "--grant", "bridge:post=slack:ops", "--state-dir", hub_state_str, "--config", hub_cfg_str, "--json"],
-        vec!["auth", "invite", "philip", "--hub", "acme-team", "--endpoint", &hub_url, "--grant", "forward:via=hub", "--state-dir", hub_state_str, "--config", hub_cfg_str, "--json"],
-        vec!["auth", "invite", "philip", "--hub", "acme-team", "--endpoint", &hub_url, "--node-prefix", "*", "--state-dir", hub_state_str, "--config", hub_cfg_str, "--json"],
+        vec![
+            "auth",
+            "invite",
+            "philip",
+            "--hub",
+            "acme-team",
+            "--endpoint",
+            &hub_url,
+            "--grant",
+            "*",
+            "--state-dir",
+            hub_state_str,
+            "--config",
+            hub_cfg_str,
+            "--json",
+        ],
+        vec![
+            "auth",
+            "invite",
+            "philip",
+            "--hub",
+            "acme-team",
+            "--endpoint",
+            &hub_url,
+            "--grant",
+            "bridge:post=slack:ops",
+            "--state-dir",
+            hub_state_str,
+            "--config",
+            hub_cfg_str,
+            "--json",
+        ],
+        vec![
+            "auth",
+            "invite",
+            "philip",
+            "--hub",
+            "acme-team",
+            "--endpoint",
+            &hub_url,
+            "--grant",
+            "forward:via=hub",
+            "--state-dir",
+            hub_state_str,
+            "--config",
+            hub_cfg_str,
+            "--json",
+        ],
+        vec![
+            "auth",
+            "invite",
+            "philip",
+            "--hub",
+            "acme-team",
+            "--endpoint",
+            &hub_url,
+            "--node-prefix",
+            "*",
+            "--state-dir",
+            hub_state_str,
+            "--config",
+            hub_cfg_str,
+            "--json",
+        ],
     ] {
         let out = isolated_cmd(hub_home)
             .args(&bad_args)
@@ -500,9 +560,8 @@ async fn delegated_human_join_cli_e2e_full_lifecycle() {
         p1_stdout.push_str(&line);
         p1_stdout.push('\n');
     }
-    let p1_result: Value = serde_json::from_str(&p1_stdout).unwrap_or_else(|e| {
-        panic!("invalid JSON from hyp join ({e}): stdout={p1_stdout}")
-    });
+    let p1_result: Value = serde_json::from_str(&p1_stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON from hyp join ({e}): stdout={p1_stdout}"));
     assert_eq!(p1_result["ok"], true);
     assert_eq!(p1_result["data"]["nodeId"], p1_node_id);
     assert_eq!(p1_result["data"]["hubNodeId"], "acme-team");
@@ -789,7 +848,12 @@ async fn delegated_human_join_cli_e2e_full_lifecycle() {
         "INTERACTIVE_TTY_REQUIRED"
     );
     assert_eq!(
-        hub.db().peers().get_peer("philip@vps").unwrap().unwrap().status,
+        hub.db()
+            .peers()
+            .get_peer("philip@vps")
+            .unwrap()
+            .unwrap()
+            .status,
         PeerStatus::Active
     );
 
@@ -814,11 +878,9 @@ async fn delegated_human_join_cli_e2e_full_lifecycle() {
             Some("y\n"),
         );
         assert_eq!(
-            pty_res.code,
-            0,
+            pty_res.code, 0,
             "PTY hyp auth revoke --cascade failed: stdout={} tty={}",
-            pty_res.stdout,
-            pty_res.tty
+            pty_res.stdout, pty_res.tty
         );
         let rev_json: Value = serde_json::from_str(&pty_res.stdout).unwrap();
         assert_eq!(rev_json["ok"], true);
@@ -834,7 +896,11 @@ async fn delegated_human_join_cli_e2e_full_lifecycle() {
         assert!(!revoked_peers.contains(&"cibot@runner1"));
 
         // Verify hub DB state: all 3 Philip devices revoked, `cibot@runner1` untouched!
-        for pid in [&p1_node_id, &"philip@vps".to_string(), &"philip@devbox".to_string()] {
+        for pid in [
+            &p1_node_id,
+            &"philip@vps".to_string(),
+            &"philip@devbox".to_string(),
+        ] {
             assert_eq!(
                 hub.db().peers().get_peer(pid).unwrap().unwrap().status,
                 PeerStatus::Revoked,

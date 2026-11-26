@@ -196,7 +196,9 @@ pub(crate) fn confirm_interactive_with<R: BufRead, W: Write>(
     }
     let safe_prompt = sanitize_tty_display(prompt);
     write!(writer, "{safe_prompt}").map_err(|e| ConfirmError::Io(e.to_string()))?;
-    writer.flush().map_err(|e| ConfirmError::Io(e.to_string()))?;
+    writer
+        .flush()
+        .map_err(|e| ConfirmError::Io(e.to_string()))?;
 
     let Some(line) = read_bounded_line(reader, MAX_CONFIRM_LINE_BYTES)
         .map_err(|e| ConfirmError::Io(e.to_string()))?
@@ -225,7 +227,13 @@ pub(crate) fn require_interactive_tty_confirmation(
     let stderr = io::stderr();
     let mut stdin_lock = stdin.lock();
     let mut stderr_lock = stderr.lock();
-    confirm_interactive_with(true, summary_lines, prompt, &mut stdin_lock, &mut stderr_lock)
+    confirm_interactive_with(
+        true,
+        summary_lines,
+        prompt,
+        &mut stdin_lock,
+        &mut stderr_lock,
+    )
 }
 
 /// Requires an interactive human controlling terminal even when `stdin` is piped (e.g.
@@ -645,7 +653,10 @@ impl FilterSnapshot {
             } else {
                 ""
             };
-            diffs.push(format!("enabled: {} -> {}{tag}", before.enabled, self.enabled));
+            diffs.push(format!(
+                "enabled: {} -> {}{tag}",
+                before.enabled, self.enabled
+            ));
         }
         if before.adapter != self.adapter {
             diffs.push(format!("adapter: {} -> {}", before.adapter, self.adapter));
@@ -654,7 +665,10 @@ impl FilterSnapshot {
             diffs.push(format!("model: {} -> {}", before.model, self.model));
         }
         if before.base_url != self.base_url {
-            diffs.push(format!("base_url: {} -> {}", before.base_url, self.base_url));
+            diffs.push(format!(
+                "base_url: {} -> {}",
+                before.base_url, self.base_url
+            ));
         }
         if before.auth_header != self.auth_header {
             diffs.push(format!(
@@ -1208,7 +1222,10 @@ fn format_inbox_disposition_summary(
     mute_pattern: Option<&str>,
 ) -> Vec<String> {
     let mut lines = vec![
-        format!("Quarantined Item Disposition ({})", sanitize_tty_display(action)),
+        format!(
+            "Quarantined Item Disposition ({})",
+            sanitize_tty_display(action)
+        ),
         format!("  Receipt:     {}", sanitize_tty_display(&entry.receipt)),
         format!("  Session:     {}", sanitize_tty_display(&entry.session_id)),
         format!(
@@ -1276,7 +1293,11 @@ fn try_live_gate_reload(
 ) -> DaemonRpcResult {
     let sock =
         resolve_daemon_socket_for_cli(explicit_state_dir, explicit_config, resolved_state_dir);
-    daemon_rpc_sync(&sock, &json!({ "type": "gate.reload" }), LIVE_DAEMON_RPC_TIMEOUT)
+    daemon_rpc_sync(
+        &sock,
+        &json!({ "type": "gate.reload" }),
+        LIVE_DAEMON_RPC_TIMEOUT,
+    )
 }
 
 fn try_live_inbox_wake(
@@ -1995,7 +2016,9 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         let proposal_path = state_dir.join("gate.proposed.json");
         let proposal_val = match serde_json::to_value(&gate_cfg) {
             Ok(v) => v,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None);
+            }
         };
         if let Err(e) = write_atomic_json(&proposal_path, &proposal_val, true) {
             return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
@@ -2040,11 +2063,8 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     let mut locked = false;
     if args.lock {
         let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
-        let existing_tampered = check_existing_gate_tampered(
-            existing_gate.as_ref(),
-            &state_dir,
-            &secrets,
-        );
+        let existing_tampered =
+            check_existing_gate_tampered(existing_gate.as_ref(), &state_dir, &secrets);
         gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
         let mut summary = format_gate_lock_summary(
             existing_gate.as_ref(),
@@ -2100,11 +2120,8 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     } else {
         if was_locked {
             let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
-            let existing_tampered = check_existing_gate_tampered(
-                existing_gate.as_ref(),
-                &state_dir,
-                &secrets,
-            );
+            let existing_tampered =
+                check_existing_gate_tampered(existing_gate.as_ref(), &state_dir, &secrets);
             let snap = FilterSnapshot::from_config(&plugin);
             let mut summary = Vec::new();
             if let Some(ref detail) = existing_tampered {
@@ -2239,7 +2256,11 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             "OK    Configured Security Gate adapter '{}' ({}){}",
             plugin.id,
             args.adapter.as_str(),
-            if locked { " · gate_policy_sig LOCKED" } else { "" }
+            if locked {
+                " · gate_policy_sig LOCKED"
+            } else {
+                ""
+            }
         );
         println!("      Config: {}", config_path.display());
         if let Some(ref sec) = summary_filter.api_key_secret {
@@ -2273,8 +2294,8 @@ fn bind_human_authorities_digest_if_present(
     if !db_path.exists() {
         return Ok(());
     }
-    let db = NodeDb::open(&db_path)
-        .map_err(|e| format!("failed to open {}: {e}", db_path.display()))?;
+    let db =
+        NodeDb::open(&db_path).map_err(|e| format!("failed to open {}: {e}", db_path.display()))?;
     let active = db
         .human()
         .list_authorities(false)
@@ -2352,11 +2373,7 @@ fn check_raw_gate_json_signing_secret(val: &Value, label: &str) -> Result<(), St
     Ok(())
 }
 
-fn run_gate_lock(
-    config: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
-    as_json: bool,
-) -> ExitCode {
+fn run_gate_lock(config: Option<PathBuf>, state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
     let cmd = "gate lock";
     if !is_interactive_tty() {
         return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
@@ -2441,12 +2458,16 @@ fn run_gate_lock(
                     as_json,
                     EXIT_ERROR,
                     "INVALID_GATE_CONFIG",
-                    format!("Malformed staged gate proposal {}: {e}", proposal_path.display()),
+                    format!(
+                        "Malformed staged gate proposal {}: {e}",
+                        proposal_path.display()
+                    ),
                     None,
                 );
             }
         };
-        if let Err(e) = check_raw_gate_json_signing_secret(&raw_proposal_val, "gate.proposed.json") {
+        if let Err(e) = check_raw_gate_json_signing_secret(&raw_proposal_val, "gate.proposed.json")
+        {
             return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e, None);
         }
         let mut proposed_cfg: SecurityGateConfig = match serde_json::from_value(raw_proposal_val) {
@@ -2457,7 +2478,10 @@ fn run_gate_lock(
                     as_json,
                     EXIT_ERROR,
                     "INVALID_GATE_CONFIG",
-                    format!("Malformed staged gate proposal {}: {e}", proposal_path.display()),
+                    format!(
+                        "Malformed staged gate proposal {}: {e}",
+                        proposal_path.display()
+                    ),
                     None,
                 );
             }
@@ -2477,11 +2501,25 @@ fn run_gate_lock(
     }
 
     if let Err(e) = gate_cfg.validate() {
-        return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e.to_string(), None);
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "INVALID_GATE_CONFIG",
+            e.to_string(),
+            None,
+        );
     }
     if gate_cfg.stage2.enabled {
         if let Err(e) = validate_stage2_endpoint_urls(&gate_cfg.stage2) {
-            return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e.to_string(), None);
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_GATE_CONFIG",
+                e.to_string(),
+                None,
+            );
         }
     }
     for f in &gate_cfg.filters {
@@ -2627,7 +2665,10 @@ fn run_gate_lock(
             gate_cfg.policy_signing_secret
         );
         if merged_proposal {
-            println!("      Merged & removed staged proposal {}", proposal_path.display());
+            println!(
+                "      Merged & removed staged proposal {}",
+                proposal_path.display()
+            );
         }
         if daemon_reloaded {
             println!(
@@ -2666,7 +2707,10 @@ fn run_gate_review(
                 EXIT_USAGE,
                 "SHOW_BODY_FORBIDDEN_WITH_JSON",
                 "`--show-body` cannot be combined with `--json`; `hyp gate review --json` is strictly metadata-only.",
-                Some("Run `hyp gate review --show-body` directly in an interactive human terminal.".to_string()),
+                Some(
+                    "Run `hyp gate review --show-body` directly in an interactive human terminal."
+                        .to_string(),
+                ),
             );
         }
         if !is_interactive_tty() {
@@ -2734,7 +2778,10 @@ fn run_gate_review(
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
-            summary: Some(format!("{} quarantined item(s) awaiting human review", rows.len())),
+            summary: Some(format!(
+                "{} quarantined item(s) awaiting human review",
+                rows.len()
+            )),
             data: Some(json!({
                 "count": rows.len(),
                 "items": rows,
@@ -2771,10 +2818,8 @@ fn run_gate_review(
                 }
                 println!("  Bytes:    {}", item.text.len());
                 if show_body {
-                    let snippet: String = sanitize_tty_display(&item.text)
-                        .chars()
-                        .take(240)
-                        .collect();
+                    let snippet: String =
+                        sanitize_tty_display(&item.text).chars().take(240).collect();
                     println!("  Body:     {snippet}");
                 }
                 println!();
@@ -2855,7 +2900,10 @@ fn run_gate_log(
         };
         print_json(&envelope);
     } else {
-        println!("Hyphae Security Gate Audit Log ({} record(s))", entries.len());
+        println!(
+            "Hyphae Security Gate Audit Log ({} record(s))",
+            entries.len()
+        );
         if entries.is_empty() {
             println!("  (no audit entries)");
         } else {
@@ -2938,7 +2986,10 @@ fn run_inbox_approve(
         return emit_confirm_error(cmd, as_json, err);
     }
 
-    match db.local().approve_quarantined(&receipt, &reviewer, now_ms()) {
+    match db
+        .local()
+        .approve_quarantined(&receipt, &reviewer, now_ms())
+    {
         Ok(entry) => {
             drop(db);
             let wake_res =
@@ -3011,7 +3062,14 @@ fn run_inbox_approve(
         Err(StoreError::InvalidState(m)) => {
             emit_error(cmd, as_json, EXIT_ERROR, "INVALID_RECEIPT_STATE", m, None)
         }
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "APPROVE_FAILED", e.to_string(), None),
+        Err(e) => emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "APPROVE_FAILED",
+            e.to_string(),
+            None,
+        ),
     }
 }
 
@@ -3150,9 +3208,7 @@ fn run_inbox_reject(
                         .unwrap_or_default()
                 );
                 if daemon_notified {
-                    println!(
-                        "      Live daemon notified — quarantine badge cleared immediately."
-                    );
+                    println!("      Live daemon notified — quarantine badge cleared immediately.");
                 } else {
                     println!("      Daemon offline — rejection recorded in SQLite.");
                 }
@@ -3165,7 +3221,14 @@ fn run_inbox_reject(
         Err(StoreError::InvalidState(m)) => {
             emit_error(cmd, as_json, EXIT_ERROR, "INVALID_RECEIPT_STATE", m, None)
         }
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "REJECT_FAILED", e.to_string(), None),
+        Err(e) => emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "REJECT_FAILED",
+            e.to_string(),
+            None,
+        ),
     }
 }
 
@@ -3173,7 +3236,10 @@ fn run_inbox_reject(
 mod tests {
     use super::*;
 
-    fn base_args(adapter: CliGateAdapter, auth_header: Option<CliAnthropicAuthHeader>) -> GateInitArgs {
+    fn base_args(
+        adapter: CliGateAdapter,
+        auth_header: Option<CliAnthropicAuthHeader>,
+    ) -> GateInitArgs {
         GateInitArgs {
             adapter,
             id: None,
@@ -3321,7 +3387,10 @@ mod tests {
             None,
         );
         let text = lines.join("\n");
-        assert!(text.contains("merging staged gate.proposed.json"), "text={text}");
+        assert!(
+            text.contains("merging staged gate.proposed.json"),
+            "text={text}"
+        );
         assert!(text.contains("[UPDATED]"), "text={text}");
         assert!(
             text.contains("changed: model: claude-haiku-4-5 -> claude-sonnet-4-5"),
@@ -3357,13 +3426,7 @@ mod tests {
             payload_sha256: Some("0".repeat(64)),
             reviewed_at: None,
         };
-        let summary = format_inbox_disposition_summary(
-            "approve",
-            &entry,
-            "guest",
-            None,
-        )
-        .join("\n");
+        let summary = format_inbox_disposition_summary("approve", &entry, "guest", None).join("\n");
         assert!(summary.contains("rcpt-42"));
         assert!(summary.contains("guest@peer/mallory"));
         assert!(summary.contains("Trust Tier:  guest"));
@@ -3382,10 +3445,15 @@ mod tests {
             "RED ok"
         );
         // 8-bit CSI
-        assert_eq!(sanitize_tty_display("a\u{009B}32mgreen\u{009B}0mb"), "agreenb");
+        assert_eq!(
+            sanitize_tty_display("a\u{009B}32mgreen\u{009B}0mb"),
+            "agreenb"
+        );
         // ANSI OSC terminated by BEL and ST (`ESC \`)
         assert_eq!(
-            sanitize_tty_display("\x1b]0;spoofed title\x07clean\x1b]8;;https://evil.example\x1b\\link\x1b]8;;\x1b\\"),
+            sanitize_tty_display(
+                "\x1b]0;spoofed title\x07clean\x1b]8;;https://evil.example\x1b\\link\x1b]8;;\x1b\\"
+            ),
             "cleanlink"
         );
         // C0/C1 controls + BiDi overrides/isolates/marks
@@ -3458,15 +3526,33 @@ mod tests {
             Some("gate policy signature mismatch"),
         )
         .join("\n");
-        assert!(text.contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"), "text={text}");
-        assert!(text.contains("WARNING — WEAKENING POLICY CHANGES DETECTED"), "text={text}");
+        assert!(
+            text.contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"),
+            "text={text}"
+        );
+        assert!(
+            text.contains("WARNING — WEAKENING POLICY CHANGES DETECTED"),
+            "text={text}"
+        );
         assert!(text.contains("outbound_dlp=false"), "text={text}");
-        assert!(text.contains("Stage 1 outbound DLP secret scanner is DISABLED"), "text={text}");
+        assert!(
+            text.contains("Stage 1 outbound DLP secret scanner is DISABLED"),
+            "text={text}"
+        );
         assert!(text.contains("Filter 'cls-1' disabled"), "text={text}");
         assert!(text.contains("matchers emptied"), "text={text}");
-        assert!(text.contains("threshold raised (0.75 -> 0.99)"), "text={text}");
+        assert!(
+            text.contains("threshold raised (0.75 -> 0.99)"),
+            "text={text}"
+        );
         assert!(text.contains("max_input_chars=8192"), "text={text}");
-        assert!(text.contains("subprocess: args=[--strict, --evil], env_allowlist=[RUST_LOG]"), "text={text}");
-        assert!(!text.contains('\x1b'), "ANSI escape must be stripped: {text}");
+        assert!(
+            text.contains("subprocess: args=[--strict, --evil], env_allowlist=[RUST_LOG]"),
+            "text={text}"
+        );
+        assert!(
+            !text.contains('\x1b'),
+            "ANSI escape must be stripped: {text}"
+        );
     }
 }

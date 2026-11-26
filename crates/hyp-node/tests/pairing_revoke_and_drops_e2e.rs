@@ -553,7 +553,10 @@ async fn p1_10_p2p_and_guest_cannot_poison_routes_or_overwrite_direct_peer() {
     // Direct P2P peer `victim@direct`
     let victim = UnifiedNode::open(make_p2p_config("victim@direct", &victim_dir)).unwrap();
     let (_victim_addr, _victim_srv) = Arc::clone(&victim).serve(loopback_zero()).await.unwrap();
-    victim.register_handle("sess-victim", "claude").await.unwrap();
+    victim
+        .register_handle("sess-victim", "claude")
+        .await
+        .unwrap();
     let (victim_tok, _) = victim
         .create_p2p_invite(vec!["dm:*".into()], vec!["dm:*".into()], 300_000)
         .unwrap();
@@ -587,9 +590,12 @@ async fn p1_10_p2p_and_guest_cannot_poison_routes_or_overwrite_direct_peer() {
         .unwrap();
 
     // Guest-tier hub `public-guest-hub` advertising bogus third-party handles!
-    let guest_hub =
-        UnifiedNode::open(make_router_config("public-guest-hub", &guest_hub_dir, &guest_ca))
-            .unwrap();
+    let guest_hub = UnifiedNode::open(make_router_config(
+        "public-guest-hub",
+        &guest_hub_dir,
+        &guest_ca,
+    ))
+    .unwrap();
     let (_guest_addr, _guest_srv) = Arc::clone(&guest_hub).serve(loopback_zero()).await.unwrap();
     {
         let db = guest_hub.db();
@@ -642,13 +648,7 @@ async fn p1_10_p2p_and_guest_cannot_poison_routes_or_overwrite_direct_peer() {
             .unwrap();
     }
     let (org_am2, _) = org_hub
-        .create_admin_invite(
-            &org_ca,
-            "alice@macbook",
-            &["dm:*"],
-            TrustTier::Org,
-            300_000,
-        )
+        .create_admin_invite(&org_ca, "alice@macbook", &["dm:*"], TrustTier::Org, 300_000)
         .unwrap();
     alice.accept_am2_invite(&org_am2).await.unwrap();
 
@@ -919,7 +919,8 @@ async fn p1_20_sse_worker_stops_on_permanent_403_and_skips_malformed_items() {
                                 tokio::time::sleep(Duration::from_secs(10)).await;
                             });
                             Ok::<_, Infallible>(sse_response(rx))
-                        } else if req.method() == Method::POST && req.uri().path() == "/v1/inbox/ack"
+                        } else if req.method() == Method::POST
+                            && req.uri().path() == "/v1/inbox/ack"
                         {
                             let _ = req.into_body().collect().await;
                             acks.fetch_add(1, Ordering::SeqCst);
@@ -1000,15 +1001,33 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     let scopes = ScopePreset::Member.expand();
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let (am2, _) = hub
-        .create_admin_invite(&admin_ca, "worker@box", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "worker@box",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     worker.accept_am2_invite(&am2).await.unwrap();
 
     // Enroll human Admin (epoch 1) and Signer (epoch 1) on `worker@box`.
     let human_admin = Ed25519KeyPair::generate().unwrap();
     let lost_phone = Ed25519KeyPair::generate().unwrap();
-    enroll_human(&worker, "bogdan", &human_admin, HumanAuthorityRole::Admin, 1);
-    enroll_human(&worker, "bogdan", &lost_phone, HumanAuthorityRole::Signer, 1);
+    enroll_human(
+        &worker,
+        "bogdan",
+        &human_admin,
+        HumanAuthorityRole::Admin,
+        1,
+    );
+    enroll_human(
+        &worker,
+        "bogdan",
+        &lost_phone,
+        HumanAuthorityRole::Signer,
+        1,
+    );
     assert_eq!(worker.db().human().min_auth_epoch().unwrap(), 1);
 
     // N3: Lock a signed SecurityGatePipeline on `worker@box` anchored to `authorities_digest`
@@ -1019,8 +1038,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         human_authorities_digest: Some(initial_digest),
         ..SecurityGateConfig::default()
     };
-    gate_cfg.policy_signature =
-        Some(sign_gate_policy(&gate_cfg, worker.secret_store()).unwrap());
+    gate_cfg.policy_signature = Some(sign_gate_policy(&gate_cfg, worker.secret_store()).unwrap());
     let gate_db = Arc::new(Mutex::new(
         NodeDb::open(worker_dir.path().join("node.sqlite")).unwrap(),
     ));
@@ -1135,7 +1153,11 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         })
         .unwrap()
         .into_iter()
-        .filter(|a| a.categories.iter().any(|c| c == "human.revocation_rejected"))
+        .filter(|a| {
+            a.categories
+                .iter()
+                .any(|c| c == "human.revocation_rejected")
+        })
         .collect();
     assert!(
         rejected_rev_audits.len() >= 2,
@@ -1546,12 +1568,20 @@ async fn h7_drop_relay_xff_honored_only_when_behind_trusted_reverse_proxy() {
         .unwrap();
 
     let r1 = client
-        .request(make_signed_post_drop(&node_direct, addr_direct, "198.51.100.10"))
+        .request(make_signed_post_drop(
+            &node_direct,
+            addr_direct,
+            "198.51.100.10",
+        ))
         .await
         .unwrap();
     assert_eq!(r1.status(), StatusCode::CREATED);
     let r2 = client
-        .request(make_signed_post_drop(&node_direct, addr_direct, "198.51.100.11"))
+        .request(make_signed_post_drop(
+            &node_direct,
+            addr_direct,
+            "198.51.100.11",
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -1573,12 +1603,20 @@ async fn h7_drop_relay_xff_honored_only_when_behind_trusted_reverse_proxy() {
         .unwrap();
 
     let p1 = client
-        .request(make_signed_post_drop(&node_proxied, addr_proxied, "198.51.100.10"))
+        .request(make_signed_post_drop(
+            &node_proxied,
+            addr_proxied,
+            "198.51.100.10",
+        ))
         .await
         .unwrap();
     assert_eq!(p1.status(), StatusCode::CREATED);
     let p2 = client
-        .request(make_signed_post_drop(&node_proxied, addr_proxied, "198.51.100.11"))
+        .request(make_signed_post_drop(
+            &node_proxied,
+            addr_proxied,
+            "198.51.100.11",
+        ))
         .await
         .unwrap();
     assert_eq!(
@@ -1826,7 +1864,8 @@ async fn h16_reserved_secret_names_rejected_in_crypto_and_engine() {
             true,
             "evil-override-value",
         );
-        let env = manual_seal_unchecked(&claim, &human_kp, &node.identity().encryption.public_key());
+        let env =
+            manual_seal_unchecked(&claim, &human_kp, &node.identity().encryption.public_key());
         let err = node.ingest_human_drop(&env, None, true).await.unwrap_err();
         assert!(
             matches!(err, NodeError::Unauthorized(_)),
@@ -1874,7 +1913,13 @@ async fn n1_bearer_token_invalidated_on_revoke_repair_and_key_rotation() {
 
     // 1. Initial pairing issues Bearer token #1.
     let (am2_first, _) = hub
-        .create_admin_invite(&admin_ca, "alice@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@laptop",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&am2_first).await.unwrap();
 
@@ -1909,7 +1954,10 @@ async fn n1_bearer_token_invalidated_on_revoke_repair_and_key_rotation() {
     };
 
     // Bearer #1 works while active.
-    assert_eq!(probe_bearer(&bearer_1).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        probe_bearer(&bearer_1).await.unwrap().status(),
+        StatusCode::OK
+    );
 
     // 2. Revoke `alice@laptop` on `hub` -> Bearer #1 is immediately rejected (401).
     hub.db()
@@ -1925,7 +1973,13 @@ async fn n1_bearer_token_invalidated_on_revoke_repair_and_key_rotation() {
 
     // 3. Re-pair `alice@laptop` with a fresh invite -> Bearer #2 works, Bearer #1 stays dead!
     let (am2_second, _) = hub
-        .create_admin_invite(&admin_ca, "alice@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@laptop",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&am2_second).await.unwrap();
     let bearer_2 = read_hub_bearer(&alice);
@@ -1952,7 +2006,11 @@ async fn n1_bearer_token_invalidated_on_revoke_repair_and_key_rotation() {
         signing_jwk: new_sign_jwk.clone(),
         encryption_jwk: new_enc_jwk.clone(),
     };
-    let proof = alice.identity().signing.sign_jcs("key-reg", &payload).unwrap();
+    let proof = alice
+        .identity()
+        .signing
+        .sign_jcs("key-reg", &payload)
+        .unwrap();
     let put_req_body = serde_json::to_vec(&PutKeyRequest {
         signing_jwk: new_sign_jwk,
         encryption_jwk: new_enc_jwk,

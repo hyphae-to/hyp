@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -218,7 +218,11 @@ pub fn decode_keychain_payload(raw: &str) -> Result<Zeroizing<String>, CryptoErr
 }
 
 /// Formats the `/usr/bin/security -i` stdin command line (zero secrets in argv!).
-pub fn format_security_add_stdin(service: &str, name: &str, value: &str) -> Result<Zeroizing<String>, CryptoError> {
+pub fn format_security_add_stdin(
+    service: &str,
+    name: &str,
+    value: &str,
+) -> Result<Zeroizing<String>, CryptoError> {
     validate_secret_name(name)?;
     if !is_valid_service_name(service) {
         return Err(CryptoError::Keystore(format!(
@@ -432,12 +436,8 @@ impl SecretStore {
         }
         let _ = check_private_owner_and_mode(&path, false)?;
         let raw = fs::read_to_string(&path)?;
-        serde_json::from_str(&raw).map_err(|e| {
-            CryptoError::Keystore(format!(
-                "failed to parse {}: {e}",
-                path.display()
-            ))
-        })
+        serde_json::from_str(&raw)
+            .map_err(|e| CryptoError::Keystore(format!("failed to parse {}: {e}", path.display())))
     }
 
     fn write_index(&self, index: &SecretIndexFile) -> Result<(), CryptoError> {
@@ -608,7 +608,9 @@ impl SecretStore {
                 let ent = ent?;
                 let fname = ent.file_name();
                 let Some(s) = fname.to_str() else { continue };
-                let Some(name) = s.strip_suffix(".secret") else { continue };
+                let Some(name) = s.strip_suffix(".secret") else {
+                    continue;
+                };
                 if validate_secret_name(name).is_err() || by_name.contains_key(name) {
                     continue;
                 }
@@ -782,7 +784,10 @@ impl SecretStore {
             || stderr.to_ascii_lowercase().contains("error:")
         {
             return Err(CryptoError::Keystore(if stderr.is_empty() {
-                format!("macOS Keychain write failed (exit {:?})", output.status.code())
+                format!(
+                    "macOS Keychain write failed (exit {:?})",
+                    output.status.code()
+                )
             } else {
                 stderr
             }));
@@ -804,7 +809,9 @@ impl SecretStore {
         service: &str,
     ) -> Result<Option<Zeroizing<String>>, CryptoError> {
         if !is_valid_service_name(service) {
-            return Err(CryptoError::Keystore("invalid keychain service name".into()));
+            return Err(CryptoError::Keystore(
+                "invalid keychain service name".into(),
+            ));
         }
         let output = Command::new(MACOS_SECURITY_BIN)
             .args(["find-generic-password", "-s", service, "-a", name, "-w"])
@@ -1060,7 +1067,13 @@ mod tests {
 
     #[test]
     fn secret_name_validation_blocks_path_traversal() {
-        for ok in ["github-token", "identity.ed25519", "node-sign-abcdef012345", "a", "0_1.2-3"] {
+        for ok in [
+            "github-token",
+            "identity.ed25519",
+            "node-sign-abcdef012345",
+            "a",
+            "0_1.2-3",
+        ] {
             assert!(validate_secret_name(ok).is_ok(), "expected '{ok}' valid");
         }
         for bad in [
@@ -1077,7 +1090,10 @@ mod tests {
             &"a".repeat(65),
         ] {
             assert!(
-                matches!(validate_secret_name(bad), Err(CryptoError::InvalidSecretName(_))),
+                matches!(
+                    validate_secret_name(bad),
+                    Err(CryptoError::InvalidSecretName(_))
+                ),
                 "expected '{bad}' rejected"
             );
         }
@@ -1093,7 +1109,10 @@ mod tests {
             detect_backend_with(&tmp.path().join("not-created-yet"), None),
             SecretBackend::File
         );
-        assert_eq!(detect_backend_with(tmp.path(), Some("file")), SecretBackend::File);
+        assert_eq!(
+            detect_backend_with(tmp.path(), Some("file")),
+            SecretBackend::File
+        );
 
         let store = SecretStore::file_only(tmp.path());
         let saved = store.set("api-token", "super-secret-value-123").unwrap();
@@ -1104,7 +1123,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let dir_mode = fs::metadata(store.secrets_dir()).unwrap().permissions().mode() & 0o777;
+            let dir_mode = fs::metadata(store.secrets_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             let file_path = store.secret_file_path("api-token").unwrap();
             let file_mode = fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(dir_mode, 0o700);
@@ -1112,7 +1135,10 @@ mod tests {
 
             // Fail closed if permissions become world-readable!
             fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(matches!(store.get("api-token"), Err(CryptoError::Keystore(_))));
+            assert!(matches!(
+                store.get("api-token"),
+                Err(CryptoError::Keystore(_))
+            ));
 
             // Restore 0600 -> succeeds again
             fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1142,7 +1168,10 @@ mod tests {
         let k1 = store.load_or_create_node_keys("alice@macbook").unwrap();
         let k2 = store.load_or_create_node_keys("alice@macbook").unwrap();
         assert_eq!(k1.signing.public_key_bytes(), k2.signing.public_key_bytes());
-        assert_eq!(k1.encryption.public_key_bytes(), k2.encryption.public_key_bytes());
+        assert_eq!(
+            k1.encryption.public_key_bytes(),
+            k2.encryption.public_key_bytes()
+        );
 
         // Legacy v1 id-sign-*/id-enc-* keys are read transparently without changing fingerprints
         let legacy_sign = Ed25519KeyPair::generate().unwrap();
@@ -1152,8 +1181,14 @@ mod tests {
         store.set(&v1_e, &legacy_enc.export_pkcs8_b64()).unwrap();
 
         let loaded = store.load_or_create_node_keys("legacy@host").unwrap();
-        assert_eq!(loaded.signing.public_key_bytes(), legacy_sign.public_key_bytes());
-        assert_eq!(loaded.encryption.public_key_bytes(), legacy_enc.public_key_bytes());
+        assert_eq!(
+            loaded.signing.public_key_bytes(),
+            legacy_sign.public_key_bytes()
+        );
+        assert_eq!(
+            loaded.encryption.public_key_bytes(),
+            legacy_enc.public_key_bytes()
+        );
     }
 
     #[test]
@@ -1242,12 +1277,18 @@ mod tests {
         ));
         // Linux secret-tool: D-Bus unavailable / locked / permission denied / auth failed / exit 2+ -> Err(Keystore)
         for (code, stderr) in [
-            (Some(1), "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY"),
+            (
+                Some(1),
+                "secret-tool: Cannot autolaunch D-Bus without X11 $DISPLAY",
+            ),
             (Some(1), "secret-tool: Keyring is locked"),
             (Some(1), "secret-tool: Permission denied"),
             (Some(1), "secret-tool: auth failed"),
             (Some(1), "secret-tool: authentication cancelled"),
-            (Some(1), "secret-tool: org.freedesktop.secrets service unavailable"),
+            (
+                Some(1),
+                "secret-tool: org.freedesktop.secrets service unavailable",
+            ),
             (Some(2), ""),
             (Some(2), "org.freedesktop.secrets unavailable"),
             (Some(2), "secret-tool: no matching secret found"),
@@ -1287,8 +1328,14 @@ mod tests {
         let err = store
             .load_or_create_node_keys("node-d10@host")
             .expect_err("must not regenerate when key is recorded in index.json");
-        assert!(matches!(err, CryptoError::Keystore(_)), "unexpected err: {err}");
-        assert!(!sign_path.exists(), "must not write a newly generated signing key");
+        assert!(
+            matches!(err, CryptoError::Keystore(_)),
+            "unexpected err: {err}"
+        );
+        assert!(
+            !sign_path.exists(),
+            "must not write a newly generated signing key"
+        );
 
         // Restore signing file -> loads original keys again!
         fs::write(&sign_path, &saved_sign_bytes).unwrap();
@@ -1305,7 +1352,13 @@ mod tests {
         let err2 = store
             .load_or_create_node_keys("node-d10@host")
             .expect_err("must not regenerate partial identity when sibling key exists");
-        assert!(matches!(err2, CryptoError::Keystore(_)), "unexpected err: {err2}");
-        assert!(!enc_path.exists(), "must not silently regenerate missing sibling key");
+        assert!(
+            matches!(err2, CryptoError::Keystore(_)),
+            "unexpected err: {err2}"
+        );
+        assert!(
+            !enc_path.exists(),
+            "must not silently regenerate missing sibling key"
+        );
     }
 }

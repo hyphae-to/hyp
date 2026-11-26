@@ -386,7 +386,8 @@ impl NodeManifestPayload {
                 max: self.protocol_range.max,
             });
         }
-        if self.hyphae_version != LEGACY_V1_VERSION && Version::parse(&self.hyphae_version).is_err() {
+        if self.hyphae_version != LEGACY_V1_VERSION && Version::parse(&self.hyphae_version).is_err()
+        {
             return Err(ManifestError::InvalidSemVer(self.hyphae_version.clone()));
         }
         let issued = parse_rfc3339_utc_nanos(&self.issued_at).ok_or_else(|| {
@@ -408,7 +409,9 @@ impl NodeManifestPayload {
             });
         }
 
-        self.identity.signing_jwk.validate(Some(OkpCurve::Ed25519))?;
+        self.identity
+            .signing_jwk
+            .validate(Some(OkpCurve::Ed25519))?;
         self.identity
             .encryption_jwk
             .validate(Some(OkpCurve::X25519))?;
@@ -613,7 +616,9 @@ pub enum NegotiationError {
     AudienceMismatch { expected: String, got: String },
     #[error("manifest expired at {expires_at} (now: {now})")]
     ManifestExpired { expires_at: String, now: String },
-    #[error("manifest rollback detected for peer {peer}: received {received} < last seen {last_seen}")]
+    #[error(
+        "manifest rollback detected for peer {peer}: received {received} < last seen {last_seen}"
+    )]
     ManifestRollbackDetected {
         peer: String,
         received: u64,
@@ -624,7 +629,9 @@ pub enum NegotiationError {
         peer: String,
         missing: Vec<CapabilityToken>,
     },
-    #[error("protocol incompatible with peer {peer}: local {local_range:?}, remote {remote_range:?}")]
+    #[error(
+        "protocol incompatible with peer {peer}: local {local_range:?}, remote {remote_range:?}"
+    )]
     ProtocolIncompatible {
         peer: String,
         local_range: ProtocolRange,
@@ -673,7 +680,9 @@ impl NegotiationError {
                 peer,
                 *local_range,
                 *remote_range,
-                Some(&format!("Upgrade node '{peer}' or local `hyp` to a compatible major protocol version.")),
+                Some(&format!(
+                    "Upgrade node '{peer}' or local `hyp` to a compatible major protocol version."
+                )),
             ),
             Self::RequiredCapabilityUnsupported {
                 peer,
@@ -807,7 +816,8 @@ pub fn negotiate_capabilities(
         .collect();
 
     // 6. Required E2EE enforcement (local or remote policy).
-    let must_e2ee = e2ee_policy == E2eePolicy::Required || local.require_e2ee || remote.require_e2ee;
+    let must_e2ee =
+        e2ee_policy == E2eePolicy::Required || local.require_e2ee || remote.require_e2ee;
     if must_e2ee && !shared_capabilities.contains(&CapabilityToken::DmE2eeV1) {
         return Err(NegotiationError::RequiredCapabilityUnsupported {
             peer,
@@ -848,12 +858,12 @@ pub fn negotiate_capabilities(
         updated_seen.extend(remote.capabilities.iter().cloned());
     }
 
-    let updated_manifest_version = match (history.last_seen_manifest_version, remote.manifest_version)
-    {
-        (Some(prev), Some(curr)) => Some(prev.max(curr)),
-        (None, Some(curr)) => Some(curr),
-        (prev, None) => prev,
-    };
+    let updated_manifest_version =
+        match (history.last_seen_manifest_version, remote.manifest_version) {
+            (Some(prev), Some(curr)) => Some(prev.max(curr)),
+            (None, Some(curr)) => Some(curr),
+            (prev, None) => prev,
+        };
 
     Ok(NegotiatedSession {
         agreed_protocol,
@@ -920,7 +930,12 @@ mod tests {
         assert_eq!(kid, "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k");
     }
 
-    fn sample_manifest(node: &str, version: &str, manifest_version: u64, caps: Vec<CapabilityToken>) -> NodeManifestPayload {
+    fn sample_manifest(
+        node: &str,
+        version: &str,
+        manifest_version: u64,
+        caps: Vec<CapabilityToken>,
+    ) -> NodeManifestPayload {
         let sign = OkpJwk::new(OkpCurve::Ed25519, &[7u8; 32]);
         let enc = OkpJwk::new(OkpCurve::X25519, &[9u8; 32]);
         let kid = sign.thumbprint_sha256().unwrap();
@@ -973,7 +988,10 @@ mod tests {
 
         // Public manifest with advertised topics MUST fail closed!
         m.audience = "public".to_string();
-        assert!(matches!(m.validate(), Err(ManifestError::PublicManifestLeak)));
+        assert!(matches!(
+            m.validate(),
+            Err(ManifestError::PublicManifestLeak)
+        ));
 
         m.advertised = AdvertisedResources::default();
         m.validate().unwrap();
@@ -1022,7 +1040,10 @@ mod tests {
         assert_eq!(res.agreed_protocol, 2);
         assert_eq!(res.status, NegotiationStatus::Warn);
         assert!(res.shared_capabilities.contains(&CapabilityToken::DmE2eeV1));
-        assert!(res.missing_optional_capabilities.contains(&CapabilityToken::KvE2eeV1));
+        assert!(
+            res.missing_optional_capabilities
+                .contains(&CapabilityToken::KvE2eeV1)
+        );
 
         // Anti-rollback: older manifestVersion 4 < 5 MUST fail closed!
         let history = PeerTrustHistory {
@@ -1040,7 +1061,10 @@ mod tests {
             &history,
         )
         .unwrap_err();
-        assert!(matches!(err, NegotiationError::ManifestRollbackDetected { .. }));
+        assert!(matches!(
+            err,
+            NegotiationError::ManifestRollbackDetected { .. }
+        ));
         assert_eq!(err.to_problem_details().error, "manifest_rollback_detected");
 
         // Anti-downgrade: dropping dm.e2ee.v1 MUST fail closed!
@@ -1059,23 +1083,29 @@ mod tests {
             &history,
         )
         .unwrap_err();
-        assert!(matches!(err2, NegotiationError::CapabilityDowngradeDetected { .. }));
-        assert_eq!(err2.to_problem_details().error, "capability_downgrade_detected");
+        assert!(matches!(
+            err2,
+            NegotiationError::CapabilityDowngradeDetected { .. }
+        ));
+        assert_eq!(
+            err2.to_problem_details().error,
+            "capability_downgrade_detected"
+        );
 
         // Legacy v1 router: fails under E2eePolicy::Required, warns cleanly under E2eePolicy::Prefer.
-        let legacy = PeerCapabilitiesView::synthesize_legacy_v1(
-            NodeId::new("legacy-ops").unwrap(),
-            true,
+        let legacy =
+            PeerCapabilitiesView::synthesize_legacy_v1(NodeId::new("legacy-ops").unwrap(), true);
+        assert!(
+            negotiate_capabilities(
+                &local,
+                &legacy,
+                "alice@macbook",
+                "2026-01-01T12:00:00Z",
+                E2eePolicy::Required,
+                &PeerTrustHistory::default(),
+            )
+            .is_err()
         );
-        assert!(negotiate_capabilities(
-            &local,
-            &legacy,
-            "alice@macbook",
-            "2026-01-01T12:00:00Z",
-            E2eePolicy::Required,
-            &PeerTrustHistory::default(),
-        )
-        .is_err());
 
         let legacy_ok = negotiate_capabilities(
             &local,

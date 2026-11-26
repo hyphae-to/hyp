@@ -357,7 +357,10 @@ pub fn assert_zero_plaintext_in_sqlite(state_dir: &Path, needles: &[&str]) {
         }
         let bytes = fs::read(&p).expect("read sqlite file");
         for &needle in needles {
-            assert!(!needle.is_empty(), "plaintext audit needle must be non-empty");
+            assert!(
+                !needle.is_empty(),
+                "plaintext audit needle must be non-empty"
+            );
             let needle_bytes = needle.as_bytes();
             assert!(
                 !bytes.windows(needle_bytes.len()).any(|w| w == needle_bytes),
@@ -455,10 +458,11 @@ where
     loop {
         let items = node.peek_local_inbox(session_id, 200).expect("peek inbox");
         if let Some(found) = items.into_iter().find(|e| predicate(e)) {
-            let _ = node
-                .db()
-                .local()
-                .acknowledge_inbox(session_id, &[found.receipt.as_str()], now_ms());
+            let _ = node.db().local().acknowledge_inbox(
+                session_id,
+                &[found.receipt.as_str()],
+                now_ms(),
+            );
             return found;
         }
         let now = tokio::time::Instant::now();
@@ -546,10 +550,7 @@ impl NodeAdapterHost for UnifiedNodeAdapterHost {
             let status = if res.deduplicated {
                 PublishStatus::Duplicate
             } else {
-                self.published
-                    .lock()
-                    .await
-                    .push((topic.to_string(), event));
+                self.published.lock().await.push((topic.to_string(), event));
                 PublishStatus::Stored
             };
             Ok(PublishOutcome {

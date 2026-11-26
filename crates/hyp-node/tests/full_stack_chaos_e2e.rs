@@ -43,14 +43,15 @@ use zeroize::Zeroizing;
 
 use hyp_crypto::e2ee::{EpochScope, SignedEpochKeyBundle, open_epoch_bundle};
 use hyp_crypto::rfc3339::format_rfc3339_millis;
-use hyp_crypto::transfer::{TarInputEntry, TarPackOptions, TarUnpackOptions, pack_tar_gz, unpack_tar_gz};
+use hyp_crypto::transfer::{
+    TarInputEntry, TarPackOptions, TarUnpackOptions, pack_tar_gz, unpack_tar_gz,
+};
 use hyp_crypto::{Ed25519KeyPair, SecretBackend, SecretStore};
 use hyp_node::adapters::{
-    AdapterError, AdapterHealth, BoxFuture, CompiledSubscription,
-    GitHubPublicAdapter, GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig,
-    NodeAdapter, NodeAdapterHost, PrometheusWebhookAdapter, PrometheusWebhookConfig,
-    PublishErrorCode, PublishOutcome, PublishStatus, WebhookIngestOutcome,
-    compute_hmac_sha256_header,
+    AdapterError, AdapterHealth, BoxFuture, CompiledSubscription, GitHubPublicAdapter,
+    GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, NodeAdapter, NodeAdapterHost,
+    PrometheusWebhookAdapter, PrometheusWebhookConfig, PublishErrorCode, PublishOutcome,
+    PublishStatus, WebhookIngestOutcome, compute_hmac_sha256_header,
 };
 use hyp_node::engine::http_util::{HttpClient, empty_body, full_body};
 use hyp_node::engine::{
@@ -660,10 +661,22 @@ async fn full_stack_four_node_e2ee_public_github_announcements_and_security_gate
     let member_scopes = ScopePreset::Member.expand();
     let member_refs: Vec<&str> = member_scopes.iter().map(String::as_str).collect();
     let (alice_hub_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &member_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &member_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_hub_am2, _) = hub
-        .create_admin_invite(&admin_ca, "bob@laptop", &member_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &member_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&alice_hub_am2).await.unwrap();
     bob.accept_am2_invite(&bob_hub_am2).await.unwrap();
@@ -682,11 +695,7 @@ async fn full_stack_four_node_e2ee_public_github_announcements_and_security_gate
 
     // Direct P2P `hp2p1_` mutual pairing between Alice and Bob (Bob hosts offer, Alice accepts!)
     let (hp2p_tok, _) = bob
-        .create_p2p_invite(
-            vec!["dm:*".to_string()],
-            vec!["dm:*".to_string()],
-            300_000,
-        )
+        .create_p2p_invite(vec!["dm:*".to_string()], vec!["dm:*".to_string()], 300_000)
         .unwrap();
     let p2p_link = alice
         .accept_p2p_invite(&hp2p_tok, vec!["dm:*".to_string()])
@@ -695,7 +704,10 @@ async fn full_stack_four_node_e2ee_public_github_announcements_and_security_gate
     assert_eq!(p2p_link.peer_id, "bob@laptop");
 
     // Register sessions & handles
-    alice.register_handle("sess-alice-raw", "claude").await.unwrap();
+    alice
+        .register_handle("sess-alice-raw", "claude")
+        .await
+        .unwrap();
     alice
         .register_session("sess-alice-gated", r#"{"kind":"claude","gated":true}"#)
         .unwrap();
@@ -711,7 +723,12 @@ async fn full_stack_four_node_e2ee_public_github_announcements_and_security_gate
         if body.contains("ANTHROPIC_EXPLICIT_ATTACK") {
             (
                 StatusCode::OK,
-                anthropic_json("quarantine", 0.98, &["prompt_injection"], "anthropic detected attack"),
+                anthropic_json(
+                    "quarantine",
+                    0.98,
+                    &["prompt_injection"],
+                    "anthropic detected attack",
+                ),
             )
         } else {
             (
@@ -880,7 +897,8 @@ async fn full_stack_four_node_e2ee_public_github_announcements_and_security_gate
     })
     .await;
     let clean_batch_json: Value = serde_json::from_str(&raw_clean_batch.text).unwrap();
-    let clean_ce: CloudEvent = serde_json::from_value(clean_batch_json["events"][0].clone()).unwrap();
+    let clean_ce: CloudEvent =
+        serde_json::from_value(clean_batch_json["events"][0].clone()).unwrap();
     let clean_ctx = make_gated_event_ctx(
         "sess-alice-gated",
         "public.hyphae.to",
@@ -904,7 +922,11 @@ async fn full_stack_four_node_e2ee_public_github_announcements_and_security_gate
     // Clean PR review is visible in Alice's agent-facing mailbox!
     let agent_inbox_after_clean = alice.peek_local_inbox("sess-alice-gated", 20).unwrap();
     assert_eq!(agent_inbox_after_clean.len(), 1);
-    assert!(agent_inbox_after_clean[0].text.contains("CLEAN_PR_REVIEW_APPROVED"));
+    assert!(
+        agent_inbox_after_clean[0]
+            .text
+            .contains("CLEAN_PR_REVIEW_APPROVED")
+    );
 
     // 2. Attacker PR comment with prompt injection -> arrives at Alice -> CAUGHT & QUARANTINED!
     gh_poll_stage.store(3, Ordering::SeqCst);
@@ -941,9 +963,11 @@ async fn full_stack_four_node_e2ee_public_github_announcements_and_security_gate
     // Hidden from agent `peek_inbox` (still ONLY the 1 clean review!)
     let agent_inbox_after_evil = alice.peek_local_inbox("sess-alice-gated", 20).unwrap();
     assert_eq!(agent_inbox_after_evil.len(), 1);
-    assert!(!agent_inbox_after_evil
-        .iter()
-        .any(|m| m.text.contains("IGNORE PREVIOUS INSTRUCTIONS")));
+    assert!(
+        !agent_inbox_after_evil
+            .iter()
+            .any(|m| m.text.contains("IGNORE PREVIOUS INSTRUCTIONS"))
+    );
 
     // 3. Direct P2P E2EE DM (`dm.e2ee.v1`) Alice -> Bob (zero hub!)
     let direct_secret = "DIRECT-P2P-E2EE-SECRET-4488";
@@ -1023,7 +1047,11 @@ async fn full_stack_four_node_e2ee_public_github_announcements_and_security_gate
         .unwrap();
     assert!(audit_rows.len() >= 3);
     for row in &audit_rows {
-        assert!(!serde_json::to_string(row).unwrap().contains(&synthetic_aws_key));
+        assert!(
+            !serde_json::to_string(row)
+                .unwrap()
+                .contains(&synthetic_aws_key)
+        );
     }
     assert_zero_plaintext_in_sqlite(alice_dir.path(), &synthetic_aws_key);
 
@@ -1139,10 +1167,22 @@ async fn chaos_hub_restart_mid_sse_crash_safe_idempotency() {
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
     let (alice_am2, _) = hub1
-        .create_admin_invite(&admin_ca, "alice@macbook", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_am2, _) = hub1
-        .create_admin_invite(&admin_ca, "bob@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&alice_am2).await.unwrap();
     bob.accept_am2_invite(&bob_am2).await.unwrap();
@@ -1222,7 +1262,8 @@ async fn chaos_hub_restart_mid_sse_crash_safe_idempotency() {
             "com.acme.build.done",
             json!({ "phase": "reboot", "seq": i }),
         );
-        hub2.ingest_inbound_event("acme-team", "builds", &ev).unwrap();
+        hub2.ingest_inbound_event("acme-team", "builds", &ev)
+            .unwrap();
     }
 
     let mut restarted_srv = None;
@@ -1245,7 +1286,11 @@ async fn chaos_hub_restart_mid_sse_crash_safe_idempotency() {
         &bob,
         "sess-bob",
         15,
-        &["reboot-window-ev-0", "reboot-window-ev-1", "reboot-window-ev-2"],
+        &[
+            "reboot-window-ev-0",
+            "reboot-window-ev-1",
+            "reboot-window-ev-2",
+        ],
     )
     .await;
     assert_eq!(reboot_evs.len(), 3);
@@ -1296,7 +1341,11 @@ async fn chaos_hub_restart_mid_sse_crash_safe_idempotency() {
             .map(Result::unwrap)
             .collect();
         // 8 distinct DMs + >=3 event batches across pre-crash, reboot-window, post-reboot
-        assert!(rows.len() >= 11, "expected all DMs + event batches persisted, got {}", rows.len());
+        assert!(
+            rows.len() >= 11,
+            "expected all DMs + event batches persisted, got {}",
+            rows.len()
+        );
         for (item_id, count) in &rows {
             assert_eq!(
                 *count, 1,
@@ -1322,7 +1371,10 @@ async fn chaos_concurrent_channel_epoch_rotation_storm() {
     let mut hub_cfg = NodeConfig::router(NodeId::new("acme-team").unwrap(), hub_dir.path());
     hub_cfg.secret_backend = Some(SecretBackend::File);
     hub_cfg.admin_jwk = Some(OkpJwk::new(OkpCurve::Ed25519, &admin_ca.public_key_bytes()));
-    hub_cfg.store_config.message_limits.max_per_hour_per_recipient = 500;
+    hub_cfg
+        .store_config
+        .message_limits
+        .max_per_hour_per_recipient = 500;
     let hub = UnifiedNode::open(hub_cfg).unwrap();
     let (_hub_addr, _hub_srv) = Arc::clone(&hub).serve(loopback_zero()).await.unwrap();
 
@@ -1343,15 +1395,22 @@ async fn chaos_concurrent_channel_epoch_rotation_storm() {
             .create_admin_invite(&admin_ca, &node_id, &member_refs, TrustTier::Org, 300_000)
             .unwrap();
         node.accept_am2_invite(&am2).await.unwrap();
-        node.register_handle(&format!("sess-{i}"), "agent").await.unwrap();
-        node.join_channel("acme-team/#storm", "agent").await.unwrap();
+        node.register_handle(&format!("sess-{i}"), "agent")
+            .await
+            .unwrap();
+        node.join_channel("acme-team/#storm", "agent")
+            .await
+            .unwrap();
 
         peer_dirs.push(dir);
         peers.push(node);
     }
 
     // Bootstrap Epoch 1 on `#storm`.
-    let ep1 = peers[0].ensure_channel_epoch("acme-team", "#storm").await.unwrap();
+    let ep1 = peers[0]
+        .ensure_channel_epoch("acme-team", "#storm")
+        .await
+        .unwrap();
     assert_eq!(ep1, 1);
 
     let mut all_secrets: Vec<String> = Vec::new();
@@ -1369,7 +1428,10 @@ async fn chaos_concurrent_channel_epoch_rotation_storm() {
                 p_rot_b.rotate_channel_epoch("acme-team", "#storm"),
             );
             let winners: Vec<u64> = [ra, rb].into_iter().filter_map(Result::ok).collect();
-            assert!(!winners.is_empty(), "at least one rotator must succeed at round {round}");
+            assert!(
+                !winners.is_empty(),
+                "at least one rotator must succeed at round {round}"
+            );
             let max_ep = *winners.iter().max().unwrap();
             assert!(
                 max_ep > prev_epoch,
@@ -1392,19 +1454,23 @@ async fn chaos_concurrent_channel_epoch_rotation_storm() {
             }));
         }
         for h in handles {
-            h.await.unwrap().expect("concurrent E2EE channel post must succeed");
+            h.await
+                .unwrap()
+                .expect("concurrent E2EE channel post must succeed");
         }
 
         // Verify peer-0 & peer-3 cleanly decrypt ALL 7 peer messages from this epoch BEFORE
         // advancing the anti-rollback min_epoch ratchet to the next epoch!
         for i in 1..8 {
             let expected = format!("STORM-SECRET-R{round}-PEER{i}-9f8e7d");
-            let entry = wait_for_mailbox_item(&peers[0], "sess-0", 10, |m| m.text == expected).await;
+            let entry =
+                wait_for_mailbox_item(&peers[0], "sess-0", 10, |m| m.text == expected).await;
             assert!(entry.source.contains("#storm"));
         }
         for i in [0usize, 1, 2, 4, 5, 6, 7] {
             let expected = format!("STORM-SECRET-R{round}-PEER{i}-9f8e7d");
-            let entry = wait_for_mailbox_item(&peers[3], "sess-3", 10, |m| m.text == expected).await;
+            let entry =
+                wait_for_mailbox_item(&peers[3], "sess-3", 10, |m| m.text == expected).await;
             assert!(entry.source.contains("#storm"));
         }
     }
@@ -1440,7 +1506,8 @@ async fn chaos_concurrent_channel_epoch_rotation_storm() {
         .unwrap();
 
     // Active member `peer-1` receives & decrypts cleanly!
-    let p1_got = wait_for_mailbox_item(&peers[1], "sess-1", 5, |m| m.text == post_evict_secret).await;
+    let p1_got =
+        wait_for_mailbox_item(&peers[1], "sess-1", 5, |m| m.text == post_evict_secret).await;
     assert!(p1_got.source.contains("#storm"));
 
     // Removed member `peer-7` CANNOT unwrap the post-eviction epoch bundle!
@@ -1530,11 +1597,18 @@ async fn chaos_kv_cas_thundering_herd_linearizability() {
     }
 
     let watcher_dir = TempDir::new().unwrap();
-    let mut watcher_cfg = NodeConfig::local(NodeId::new("watcher@herd").unwrap(), watcher_dir.path());
+    let mut watcher_cfg =
+        NodeConfig::local(NodeId::new("watcher@herd").unwrap(), watcher_dir.path());
     watcher_cfg.secret_backend = Some(SecretBackend::File);
     let watcher = UnifiedNode::open(watcher_cfg).unwrap();
     let (watcher_am2, _) = hub
-        .create_admin_invite(&admin_ca, "watcher@herd", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "watcher@herd",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     watcher.accept_am2_invite(&watcher_am2).await.unwrap();
     watcher
@@ -1629,7 +1703,11 @@ async fn chaos_kv_cas_thundering_herd_linearizability() {
         for t in tasks {
             match t.await.unwrap() {
                 Ok(entry) => {
-                    assert_eq!(entry.version, cur_ver + 1, "winner must advance by exactly +1");
+                    assert_eq!(
+                        entry.version,
+                        cur_ver + 1,
+                        "winner must advance by exactly +1"
+                    );
                     round_winners += 1;
                 }
                 Err(NodeError::RemoteProblem(prob)) => {
@@ -1642,7 +1720,9 @@ async fn chaos_kv_cas_thundering_herd_linearizability() {
                     );
                     round_conflicts += 1;
                 }
-                Err(other) => panic!("unexpected non-409 error in CAS herd round {round}: {other:?}"),
+                Err(other) => {
+                    panic!("unexpected non-409 error in CAS herd round {round}: {other:?}")
+                }
             }
         }
 
@@ -1730,7 +1810,13 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
     let carol = UnifiedNode::open(carol_cfg).unwrap();
 
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &full_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &full_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_am2, _) = hub
         .create_admin_invite(&admin_ca, "bob@laptop", &full_refs, TrustTier::Org, 300_000)
@@ -1753,9 +1839,15 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
     bob.register_handle("sess-bob", "codex").await.unwrap();
     carol.register_handle("sess-carol", "reader").await.unwrap();
 
-    alice.join_channel("acme-team/#ops", "claude").await.unwrap();
+    alice
+        .join_channel("acme-team/#ops", "claude")
+        .await
+        .unwrap();
     bob.join_channel("acme-team/#ops", "codex").await.unwrap();
-    carol.join_channel("acme-team/#ops", "reader").await.unwrap();
+    carol
+        .join_channel("acme-team/#ops", "reader")
+        .await
+        .unwrap();
 
     // Baseline: Bob works before revocation!
     bob.send_dm("codex", "alice@macbook/claude", "bob-before-revoke")
@@ -1774,7 +1866,10 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
             .map(|g| g.id)
             .collect()
     };
-    assert!(!bob_grants.is_empty(), "Bob must have an inbound grant on Hub");
+    assert!(
+        !bob_grants.is_empty(),
+        "Bob must have an inbound grant on Hub"
+    );
     for gid in &bob_grants {
         let rev_payload = json!({ "grantId": gid, "peerId": "bob@laptop", "revoked": true });
         let signed_rev = admin_ca.sign_jcs("revocation", &rev_payload).unwrap();
@@ -1883,10 +1978,8 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
         .post_channel("acme-team/#ops", "claude", "alice-still-healthy")
         .await
         .unwrap();
-    let carol_read = wait_for_mailbox_item(&carol, "sess-carol", 5, |m| {
-        m.text == "alice-still-healthy"
-    })
-    .await;
+    let carol_read =
+        wait_for_mailbox_item(&carol, "sess-carol", 5, |m| m.text == "alice-still-healthy").await;
     assert!(carol_read.source.contains("#ops"));
 
     // --- PART B: Tampered On-Disk Gate Policy Immediately Locks Down to `gate_policy_tampered` ---
@@ -1932,7 +2025,11 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
 
     // Persist signed gate policy to disk (`alice_dir/gate_policy.json`).
     let policy_path = alice_dir.path().join("gate_policy.json");
-    fs::write(&policy_path, serde_json::to_string_pretty(&signed_cfg).unwrap()).unwrap();
+    fs::write(
+        &policy_path,
+        serde_json::to_string_pretty(&signed_cfg).unwrap(),
+    )
+    .unwrap();
 
     let gate_db = Arc::new(StdMutex::new(
         NodeDb::open(alice_dir.path().join("node.sqlite")).unwrap(),
@@ -2005,7 +2102,9 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
                 assert_eq!(reason, "gate_policy_tampered");
                 assert!(!notice.contains("TAMPER_CANARY_MUST_NOT_LEAK"));
             }
-            other => panic!("expected Quarantine(gate_policy_tampered) for {tier:?}, got {other:?}"),
+            other => {
+                panic!("expected Quarantine(gate_policy_tampered) for {tier:?}, got {other:?}")
+            }
         }
         assert!(eval.categories.contains(&"gate.tampered".to_string()));
     }
@@ -2036,7 +2135,10 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
     let mut hub_cfg = NodeConfig::router(NodeId::new("acme-team").unwrap(), hub_dir.path());
     hub_cfg.secret_backend = Some(SecretBackend::File);
     hub_cfg.admin_jwk = Some(OkpJwk::new(OkpCurve::Ed25519, &admin_ca.public_key_bytes()));
-    hub_cfg.store_config.message_limits.max_per_hour_per_recipient = 500;
+    hub_cfg
+        .store_config
+        .message_limits
+        .max_per_hour_per_recipient = 500;
     let hub = UnifiedNode::open(hub_cfg).unwrap();
     let (hub_addr, _hub_srv) = Arc::clone(&hub).serve(loopback_zero()).await.unwrap();
 
@@ -2055,10 +2157,22 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
 
     let (alice_am2, _) = hub
-        .create_admin_invite(&admin_ca, "alice@macbook", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "alice@macbook",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     let (bob_am2, _) = hub
-        .create_admin_invite(&admin_ca, "bob@laptop", &scope_refs, TrustTier::Org, 300_000)
+        .create_admin_invite(
+            &admin_ca,
+            "bob@laptop",
+            &scope_refs,
+            TrustTier::Org,
+            300_000,
+        )
         .unwrap();
     alice.accept_am2_invite(&alice_am2).await.unwrap();
     bob.accept_am2_invite(&bob_am2).await.unwrap();
@@ -2085,11 +2199,15 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
                 builder = builder.header(AUTHORIZATION, auth);
             }
             let req = builder.body(full_body(body)).unwrap();
-            let resp = client.request(req).await.expect("hub must not drop connection or panic");
+            let resp = client
+                .request(req)
+                .await
+                .expect("hub must not drop connection or panic");
             let (status, headers, resp_bytes) =
                 HttpClient::collect(resp, 1024 * 1024).await.unwrap();
             assert_eq!(
-                status, expected_status,
+                status,
+                expected_status,
                 "path={path}: expected {expected_status}, got {status}; body={}",
                 String::from_utf8_lossy(&resp_bytes)
             );
@@ -2099,10 +2217,14 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
                 Some(CONTENT_TYPE_PROBLEM_JSON),
                 "4xx must use RFC 9457 application/problem+json"
             );
-            let prob: ProblemDetails = serde_json::from_slice(&resp_bytes).expect("valid ProblemDetails");
+            let prob: ProblemDetails =
+                serde_json::from_slice(&resp_bytes).expect("valid ProblemDetails");
             assert_eq!(prob.status, expected_status.as_u16());
             if let Some(exp_code) = expected_err {
-                assert_eq!(prob.error, exp_code, "path={path}: unexpected problem error code");
+                assert_eq!(
+                    prob.error, exp_code,
+                    "path={path}: unexpected problem error code"
+                );
             }
         }
     };
@@ -2181,7 +2303,12 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
     .await;
 
     // 3. Malformed / truncated JSON across multiple endpoints -> 400 `invalid_json`
-    for path in ["/v1/messages", "/v1/events", "/v1/subscriptions", "/v1/pair"] {
+    for path in [
+        "/v1/messages",
+        "/v1/events",
+        "/v1/subscriptions",
+        "/v1/pair",
+    ] {
         let bad_json = b"{ \"truncated\": [1, 2, ".to_vec();
         let auth = (path != "/v1/pair").then(|| sign_alice("POST", path, &bad_json));
         let method = if path == "/v1/subscriptions" {
@@ -2227,7 +2354,12 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
     }
 
     // 5. Spoofed `hyphaevia` routing loop -> 400 `routing_loop`
-    let mut loop_ce = CloudEvent::new("fuzz-loop-1", "alice@macbook/fuzz", "com.acme.ping", json!({}));
+    let mut loop_ce = CloudEvent::new(
+        "fuzz-loop-1",
+        "alice@macbook/fuzz",
+        "com.acme.ping",
+        json!({}),
+    );
     loop_ce.set_extension(EXT_ORIGIN, "alice@macbook");
     loop_ce.set_extension(EXT_VIA, "alice@macbook,acme-team");
     loop_ce.set_extension(EXT_HOPS, "1");
@@ -2244,7 +2376,12 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
     .await;
 
     // 6. Exceeded `hyphaehops` hop cap -> 400 `hop_limit_exceeded`
-    let mut hops_ce = CloudEvent::new("fuzz-hops-1", "alice@macbook/fuzz", "com.acme.ping", json!({}));
+    let mut hops_ce = CloudEvent::new(
+        "fuzz-hops-1",
+        "alice@macbook/fuzz",
+        "com.acme.ping",
+        json!({}),
+    );
     hops_ce.set_extension(EXT_ORIGIN, "alice@macbook");
     hops_ce.set_extension(EXT_VIA, "alice@macbook,relay-1");
     hops_ce.set_extension(EXT_HOPS, "4");
@@ -2324,12 +2461,16 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
         scopes: ScopeSet::from_strings(&["dm:*"]),
         trust_tier: TrustTier::Org,
     };
-    let (valid_signed, mut expired_payload, _) = hub.build_signed_manifest(Some(&alice_auth)).unwrap();
+    let (valid_signed, mut expired_payload, _) =
+        hub.build_signed_manifest(Some(&alice_auth)).unwrap();
     expired_payload.manifest_version += 10;
     expired_payload.issued_at = format_rfc3339_millis(now_ms() - 7_200_000);
     expired_payload.expires_at = format_rfc3339_millis(now_ms() - 3_600_000);
     let exp_canon = expired_payload.to_canonical_payload().unwrap();
-    let exp_sig = hub.identity().signing.sign_domain_b64("manifest", exp_canon.as_bytes());
+    let exp_sig = hub
+        .identity()
+        .signing
+        .sign_domain_b64("manifest", exp_canon.as_bytes());
     let expired_manifest = SignedNodeManifest {
         payload: exp_canon,
         sig: exp_sig,
@@ -2354,7 +2495,8 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
     // 11. Bad `X-Hub-Signature-256` against live `GitHubWebhookAdapter` fails closed!
     let wh_host = UnifiedNodeAdapterHost::new(Arc::clone(&hub));
     let wh_secret = "chaos-webhook-secret";
-    let wh_adapter = GitHubWebhookAdapter::new(GitHubWebhookConfig::new("gh-fuzz", "alerts", wh_secret));
+    let wh_adapter =
+        GitHubWebhookAdapter::new(GitHubWebhookConfig::new("gh-fuzz", "alerts", wh_secret));
     wh_adapter.start(wh_host).await.unwrap();
     let wh_body = serde_json::to_vec(&json!({
         "action": "opened",
@@ -2366,10 +2508,17 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
     let valid_hmac = compute_hmac_sha256_header(wh_secret.as_bytes(), &wh_body);
     let mut flipped_hmac = valid_hmac.into_bytes();
     let last = flipped_hmac.len() - 1;
-    flipped_hmac[last] = if flipped_hmac[last] == b'0' { b'1' } else { b'0' };
+    flipped_hmac[last] = if flipped_hmac[last] == b'0' {
+        b'1'
+    } else {
+        b'0'
+    };
     let mut bad_wh_headers = HeaderMap::new();
     bad_wh_headers.insert("x-github-event", HeaderValue::from_static("issues"));
-    bad_wh_headers.insert("x-github-delivery", HeaderValue::from_static("fuzz-deliv-1"));
+    bad_wh_headers.insert(
+        "x-github-delivery",
+        HeaderValue::from_static("fuzz-deliv-1"),
+    );
     bad_wh_headers.insert(
         "x-hub-signature-256",
         HeaderValue::from_str(&String::from_utf8(flipped_hmac).unwrap()).unwrap(),
@@ -2607,7 +2756,10 @@ async fn chaos_public_github_scale_and_app_failover() {
         let diags = adapter
             .validate_subscription("github", &[exact_repo_filter(repo)])
             .await;
-        assert!(diags.is_empty(), "public repo {repo} should pass: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "public repo {repo} should pass: {diags:?}"
+        );
     }
 
     // 2. Register 30 concurrent subscribers (6 per public repo) -> EXACTLY 5 pollers (NEVER 30)!
@@ -2627,7 +2779,10 @@ async fn chaos_public_github_scale_and_app_failover() {
     adapter.on_subscriptions_changed("github", &subs).await;
 
     let stats_initial = adapter.stats().await;
-    assert_eq!(stats_initial.active_pollers, 5, "30 subs across 5 repos MUST spawn exact 5 pollers");
+    assert_eq!(
+        stats_initial.active_pollers, 5,
+        "30 subs across 5 repos MUST spawn exact 5 pollers"
+    );
     for repo in public_repos {
         assert_eq!(stats_initial.refcounts.get(repo), Some(&6));
     }
@@ -2637,7 +2792,9 @@ async fn chaos_public_github_scale_and_app_failover() {
     loop {
         let ready = {
             let map304 = state.poll_304_counts.lock().unwrap();
-            public_repos.iter().all(|r| map304.get(*r).copied().unwrap_or(0) >= 1)
+            public_repos
+                .iter()
+                .all(|r| map304.get(*r).copied().unwrap_or(0) >= 1)
         };
         if ready && host.published_ids().await.len() >= 5 {
             break;
@@ -2650,16 +2807,37 @@ async fn chaos_public_github_scale_and_app_failover() {
     }
 
     // 3. Install GitHub App on 2 repos (`org/repo-0`, `org/repo-1`) -> ONLY those 2 pause; 3 keep polling!
-    adapter.register_app_installation("org/repo-0").await.unwrap();
-    adapter.register_app_installation("org/repo-1").await.unwrap();
+    adapter
+        .register_app_installation("org/repo-0")
+        .await
+        .unwrap();
+    adapter
+        .register_app_installation("org/repo-1")
+        .await
+        .unwrap();
     assert_eq!(adapter.stats().await.active_pollers, 3);
 
     tokio::time::sleep(Duration::from_millis(40)).await;
     let paused_r0_before = *state.poll_counts.lock().unwrap().get("org/repo-0").unwrap();
     let paused_r1_before = *state.poll_counts.lock().unwrap().get("org/repo-1").unwrap();
-    let active_r2_304_before = *state.poll_304_counts.lock().unwrap().get("org/repo-2").unwrap();
-    let active_r3_304_before = *state.poll_304_counts.lock().unwrap().get("org/repo-3").unwrap();
-    let active_r4_304_before = *state.poll_304_counts.lock().unwrap().get("org/repo-4").unwrap();
+    let active_r2_304_before = *state
+        .poll_304_counts
+        .lock()
+        .unwrap()
+        .get("org/repo-2")
+        .unwrap();
+    let active_r3_304_before = *state
+        .poll_304_counts
+        .lock()
+        .unwrap()
+        .get("org/repo-3")
+        .unwrap();
+    let active_r4_304_before = *state
+        .poll_304_counts
+        .lock()
+        .unwrap()
+        .get("org/repo-4")
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(110)).await;
     assert_eq!(
@@ -2673,10 +2851,26 @@ async fn chaos_public_github_scale_and_app_failover() {
         "org/repo-1 poller must stay paused while App installed"
     );
     assert!(
-        *state.poll_304_counts.lock().unwrap().get("org/repo-2").unwrap() > active_r2_304_before
-            && *state.poll_304_counts.lock().unwrap().get("org/repo-3").unwrap()
+        *state
+            .poll_304_counts
+            .lock()
+            .unwrap()
+            .get("org/repo-2")
+            .unwrap()
+            > active_r2_304_before
+            && *state
+                .poll_304_counts
+                .lock()
+                .unwrap()
+                .get("org/repo-3")
+                .unwrap()
                 > active_r3_304_before
-            && *state.poll_304_counts.lock().unwrap().get("org/repo-4").unwrap()
+            && *state
+                .poll_304_counts
+                .lock()
+                .unwrap()
+                .get("org/repo-4")
+                .unwrap()
                 > active_r4_304_before,
         "remaining 3 repos must continue ETag 304 polling while repo-0 & repo-1 use App push"
     );
@@ -2709,8 +2903,14 @@ async fn chaos_public_github_scale_and_app_failover() {
         resume.insert("org/repo-0".to_string());
         resume.insert("org/repo-1".to_string());
     }
-    adapter.unregister_app_installation("org/repo-0").await.unwrap();
-    adapter.unregister_app_installation("org/repo-1").await.unwrap();
+    adapter
+        .unregister_app_installation("org/repo-0")
+        .await
+        .unwrap();
+    adapter
+        .unregister_app_installation("org/repo-1")
+        .await
+        .unwrap();
     assert_eq!(adapter.stats().await.active_pollers, 5);
 
     let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2833,7 +3033,10 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
     .unwrap();
     let gh_sig = compute_hmac_sha256_header(gh_secret.as_bytes(), &gh_body);
     let mut gh_hdrs = HeaderMap::new();
-    gh_hdrs.insert("x-hub-signature-256", HeaderValue::from_str(&gh_sig).unwrap());
+    gh_hdrs.insert(
+        "x-hub-signature-256",
+        HeaderValue::from_str(&gh_sig).unwrap(),
+    );
     gh_hdrs.insert("x-github-event", HeaderValue::from_static("issues"));
     gh_hdrs.insert("x-github-delivery", HeaderValue::from_static("ops-gh-88"));
     gh_wh.ingest_webhook(&gh_hdrs, &gh_body).await.unwrap();
@@ -2863,7 +3066,10 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
         "x-webhook-signature-256",
         HeaderValue::from_str(&prom_sig).unwrap(),
     );
-    prom_wh.ingest_webhook(&prom_hdrs, &prom_body).await.unwrap();
+    prom_wh
+        .ingest_webhook(&prom_hdrs, &prom_body)
+        .await
+        .unwrap();
 
     let expected_gh_id = format!("gh-{}", hyp_store::sha256_hex(&gh_body));
 
@@ -2893,9 +3099,11 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
                 .acknowledge_inbox("sess-raw", &refs, now_ms());
         }
         if arrived_wh_events.iter().any(|e| e.id == expected_gh_id)
-            && arrived_wh_events
-                .iter()
-                .any(|e| serde_json::to_string(&e.data).unwrap().contains("CheckoutErrorBudget"))
+            && arrived_wh_events.iter().any(|e| {
+                serde_json::to_string(&e.data)
+                    .unwrap()
+                    .contains("CheckoutErrorBudget")
+            })
         {
             break;
         }
@@ -2935,7 +3143,11 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
     let evil_src = alice_dir.path().join("evil-src");
     fs::create_dir_all(evil_src.join(".git/hooks")).unwrap();
     fs::write(evil_src.join("ok.txt"), b"benign").unwrap();
-    fs::write(evil_src.join(".git/hooks/post-checkout"), b"#!/bin/sh\nid\n").unwrap();
+    fs::write(
+        evil_src.join(".git/hooks/post-checkout"),
+        b"#!/bin/sh\nid\n",
+    )
+    .unwrap();
     let mut tar_bytes = Vec::new();
     pack_tar_gz(
         &[
@@ -3068,7 +3280,11 @@ while True:
             assert!(sup.oversized_frames_rejected() >= 1);
 
             let reply = sup
-                .post("ops", BTreeMap::from([("text".to_string(), json!("ack"))]), Duration::from_secs(3))
+                .post(
+                    "ops",
+                    BTreeMap::from([("text".to_string(), json!("ack"))]),
+                    Duration::from_secs(3),
+                )
                 .await
                 .unwrap();
             assert_eq!(reply, json!({ "delivered": true }));

@@ -613,9 +613,9 @@ impl RotatingHmacKeys {
             ));
         }
 
-        let decoded = URL_SAFE_NO_PAD
-            .decode(encoded.as_bytes())
-            .map_err(|_| DropRelayError::Unauthorized("malformed drop capability encoding".into()))?;
+        let decoded = URL_SAFE_NO_PAD.decode(encoded.as_bytes()).map_err(|_| {
+            DropRelayError::Unauthorized("malformed drop capability encoding".into())
+        })?;
         let raw = Zeroizing::new(decoded);
         if raw.len() != DROP_CAP_RAW_LEN {
             return Err(DropRelayError::Unauthorized(
@@ -623,9 +623,8 @@ impl RotatingHmacKeys {
             ));
         }
 
-        let token_role = DropCapRole::from_byte(raw[0]).ok_or_else(|| {
-            DropRelayError::Unauthorized("unknown drop capability role".into())
-        })?;
+        let token_role = DropCapRole::from_byte(raw[0])
+            .ok_or_else(|| DropRelayError::Unauthorized("unknown drop capability role".into()))?;
         if token_role != expected_role {
             return Err(DropRelayError::Unauthorized(
                 "drop capability role mismatch".into(),
@@ -985,9 +984,7 @@ impl DropRelay {
 
         let creator = creator_node_id.trim();
         if creator.is_empty() || creator.len() > MAX_CREATOR_NODE_ID_LEN {
-            return Err(DropRelayError::BadRequest(
-                "invalid creator_node_id".into(),
-            ));
+            return Err(DropRelayError::BadRequest("invalid creator_node_id".into()));
         }
 
         let ip_key = normalize_ip(client_ip);
@@ -1044,9 +1041,7 @@ impl DropRelay {
             if after_sweep >= max_per_node {
                 let retry_after_secs = state.earliest_expiry_retry_after(now_ms, Some(creator));
                 return Err(DropRelayError::RateLimited {
-                    reason: format!(
-                        "per-node active drop limit ({max_per_node}) reached"
-                    ),
+                    reason: format!("per-node active drop limit ({max_per_node}) reached"),
                     retry_after_secs,
                 });
             }
@@ -1334,7 +1329,11 @@ impl DropRelay {
         }
 
         // Enforce SSE concurrency limits (per-drop, per-IP, global).
-        let per_drop_count = state.per_drop_sse_streams.get(drop_id).copied().unwrap_or(0);
+        let per_drop_count = state
+            .per_drop_sse_streams
+            .get(drop_id)
+            .copied()
+            .unwrap_or(0);
         if per_drop_count >= self.config.max_sse_streams_per_drop {
             return Err(DropRelayError::RateLimited {
                 reason: format!(
@@ -1384,10 +1383,7 @@ impl DropRelay {
             .per_drop_sse_streams
             .entry(drop_id.to_string())
             .or_insert(0) += 1;
-        *state
-            .per_ip_sse_streams
-            .entry(ip_key.clone())
-            .or_insert(0) += 1;
+        *state.per_ip_sse_streams.entry(ip_key.clone()).or_insert(0) += 1;
 
         Ok(DropSubscription {
             drop_id: drop_id.to_string(),
@@ -1628,8 +1624,7 @@ impl DropSubscription {
                     }
                 }
                 Err(
-                    broadcast::error::TryRecvError::Empty
-                    | broadcast::error::TryRecvError::Closed,
+                    broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed,
                 ) => return None,
             }
         }

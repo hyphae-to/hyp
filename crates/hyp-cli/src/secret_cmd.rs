@@ -156,9 +156,7 @@ fn resolve_store(state_dir: Option<&PathBuf>) -> (PathBuf, SecretStore) {
 fn collect_secret_refs_recursive(val: &Value, prefix: &str, target: &str, out: &mut Vec<String>) {
     match val {
         Value::Object(map) => {
-            if map.len() == 1
-                && map.get("secret").and_then(Value::as_str) == Some(target)
-            {
+            if map.len() == 1 && map.get("secret").and_then(Value::as_str) == Some(target) {
                 out.push(prefix.to_string());
                 return;
             }
@@ -192,7 +190,11 @@ fn find_secret_references_in_node_json(
 ) -> Vec<String> {
     let cfg_path = resolve_config_path_for_read(
         None,
-        if explicit_state { Some(state_dir) } else { None },
+        if explicit_state {
+            Some(state_dir)
+        } else {
+            None
+        },
         None,
     );
     let Ok(root) = read_json_value(&cfg_path) else {
@@ -228,7 +230,9 @@ fn run_secret_set(
             EXIT_USAGE,
             "MISSING_NAME",
             "Missing secret name (pass `<name>` or `--name <name>`)",
-            Some("Example: printf '%s' \"$API_KEY\" | hyp secret set anthropic-api-key".to_string()),
+            Some(
+                "Example: printf '%s' \"$API_KEY\" | hyp secret set anthropic-api-key".to_string(),
+            ),
         );
     };
 
@@ -498,11 +502,7 @@ fn run_secret_list(state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
     ExitCode::from(EXIT_OK)
 }
 
-fn run_secret_delete(
-    name: Option<String>,
-    state_dir: Option<PathBuf>,
-    as_json: bool,
-) -> ExitCode {
+fn run_secret_delete(name: Option<String>, state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
     let cmd = "secret delete";
     let Some(name) = name else {
         return emit_error(
@@ -1153,8 +1153,12 @@ async fn capture_secret_via_web(
     let csrf_nonce = random_b64url(24)?;
     let expected_path = format!("/s/{url_token}");
     let safe_name = escape_html(name);
-    let form_html =
-        render_web_capture_form_html(&safe_name, store.backend().as_str(), &expected_path, &csrf_nonce);
+    let form_html = render_web_capture_form_html(
+        &safe_name,
+        store.backend().as_str(),
+        &expected_path,
+        &csrf_nonce,
+    );
 
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
