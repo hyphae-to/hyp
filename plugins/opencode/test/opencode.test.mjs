@@ -353,8 +353,17 @@ test("createHyphaeTuiController reacts to atomic ui/state.json writes via fs.wat
   fs.mkdirSync(uiDir, { recursive: true });
   const statePath = path.join(uiDir, "state.json");
 
+  // fs.watch can return before macOS starts delivering directory events.
+  // Confirm readiness with an unrelated file before testing a single atomic rename.
+  const probeName = ".watch-ready";
+  let watcherReady = false;
   const updates = [];
   const controller = createHyphaeTuiController({
+    watch: (dir, options, listener) =>
+      fs.watch(dir, options, (event, name) => {
+        if (name === probeName) watcherReady = true;
+        listener(event, name);
+      }),
     homeDir: tmp,
     env: {},
     getSessionInfo: () => ({ sessionID: "ses-123", rootSessionID: "ses-123" }),
@@ -365,13 +374,20 @@ test("createHyphaeTuiController reacts to atomic ui/state.json writes via fs.wat
     assert.equal(controller.getState().snapshot, null);
     assert.equal(controller.getState().statusLine, undefined);
 
+    const readyDeadline = Date.now() + 10_000;
+    while (!watcherReady && Date.now() < readyDeadline) {
+      fs.appendFileSync(path.join(uiDir, probeName), ".");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(watcherReady, "fs.watch must receive events in the UI directory");
+
     // Atomic temp + rename mimicking LocalDaemon's debounced UI projector.
     const tmpFile = path.join(uiDir, "state.json.tmp");
     fs.writeFileSync(tmpFile, JSON.stringify(sampleSnapshot()), "utf8");
     fs.renameSync(tmpFile, statePath);
 
     // Wait reactively (bounded timeout) for fs.watch debounce delivery.
-    const deadline = Date.now() + 2_000;
+    const deadline = Date.now() + 10_000;
     while (Date.now() < deadline && !controller.getState().active) {
       await new Promise((r) => setTimeout(r, 25));
     }

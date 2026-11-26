@@ -616,7 +616,8 @@ esac
             r#"$log = '{log}'
 $modeFile = '{mode}'
 $store = if ($env:PASSWORD_STORE_DIR) {{ $env:PASSWORD_STORE_DIR }} else {{ '{default_store}' }}
-Add-Content -Path $log -Value ("CALL(GPG_OPTS=$($env:PASSWORD_STORE_GPG_OPTS)|GPG_TTY=$($env:GPG_TTY)|PINENTRY=$($env:PINENTRY_USER_DATA)|GNUPGHOME=$($env:GNUPGHOME)): " + (($args | ForEach-Object {{ "[$_]" }}) -join " "))
+$gpgTty = if ([Environment]::GetEnvironmentVariables().Contains('GPG_TTY')) {{ 'SET' }} else {{ 'UNSET' }}
+Add-Content -Path $log -Value ("CALL(GPG_OPTS=$($env:PASSWORD_STORE_GPG_OPTS)|GPG_TTY=$gpgTty|PINENTRY=$($env:PINENTRY_USER_DATA)|GNUPGHOME=$($env:GNUPGHOME)): " + (($args | ForEach-Object {{ "[$_]" }}) -join " "))
 if ($env:PASSWORD_STORE_GPG_OPTS -notmatch '--batch' -or $env:PASSWORD_STORE_GPG_OPTS -notmatch '--no-tty') {{
   [Console]::Error.WriteLine('gpg: missing --batch/--no-tty'); exit 98
 }}
