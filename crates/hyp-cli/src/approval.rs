@@ -1,4 +1,4 @@
-//! Passkey approval ceremony for gate lock/unlock and authority changes (`#10` — G1, H1, H2).
+//! Live per-operation Passkey approval for gate policy and authority changes (`#10` — G1, H1, H2).
 //!
 //! A guarded command builds the [`HumanApprovalActionV1`] it wants to apply, prints an approval
 //! URL, and waits for a Passkey Admin to sign that exact action.
@@ -11,8 +11,7 @@
 //!   shows those signed fields, never unsigned text.
 //! - `claimId` and `nonce` are both consumed in `human_claim_nonces`, so an approval works once.
 //!
-//! The signed approval comes back over one of three transports: a Blind Drop Relay slot, a one-shot
-//! loopback listener, or a file (`--no-wait` then `--approval-file`).
+//! The signed approval comes back over a live Blind Drop Relay slot or one-shot loopback listener.
 
 use crate::auth_cmd::{
     apply_enroll_cors as apply_cors, extract_portal_origin, json_enroll_response as json_response,
@@ -20,15 +19,14 @@ use crate::auth_cmd::{
 };
 use crate::config_file::{
     ensure_dir, load_node_or_legacy_config, read_json_object_or_empty, resolve_effective_node_id,
+    write_atomic_file,
 };
 use crate::drop_cmd::{
     collect_bounded_body, create_relay_drop_slot, decode_drop_envelope, validate_relay_url,
     wait_for_relay_drop,
 };
 use crate::gate_cmd::sanitize_tty_display;
-use crate::ui::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
-};
+use crate::ui::{EXIT_ERROR, EXIT_USAGE, emit_error};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
@@ -47,8 +45,12 @@ use hyp_node::engine::{
     CreateDropRequest, DROP_CAP_HEADER, DropCapRole, DropRelay, DropRelayConfig,
     DropSubscriberAuth, resolve_drop_portal_url,
 };
-use hyp_node::gates::policy::{SecurityGateConfig, is_passkey_backed_admin, verify_gate_lock};
-use hyp_store::{GateLockSealRecord, HumanAuthorityRecord, HumanClaimKind, NodeDb, now_ms};
+use hyp_node::gates::policy::{
+    SecurityGateConfig, is_passkey_backed_admin, verify_gate_policy_for_node,
+};
+use hyp_store::{
+    GateLockSealRecord, HumanAuthorityRecord, HumanClaimKind, NodeDb, StoreError, now_ms,
+};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -56,7 +58,7 @@ use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use serde_json::{Map, Value, json};
 use std::convert::Infallible;
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,12 +84,6 @@ pub struct ApprovalCeremonyArgs {
     /// Do not automatically open a browser tab for the Passkey approval URL
     #[arg(long)]
     pub no_open: bool,
-    /// Print the Passkey approval URL and exit without waiting or mutating state
-    #[arg(long)]
-    pub no_wait: bool,
-    /// Verify a Passkey-signed hdrop1_ token (or HumanDropEnvelopeV1 JSON) from a file instead of waiting
-    #[arg(long)]
-    pub approval_file: Option<PathBuf>,
 }
 
 impl Default for ApprovalCeremonyArgs {
@@ -97,17 +93,15 @@ impl Default for ApprovalCeremonyArgs {
             local: false,
             ttl: DEFAULT_APPROVAL_TTL_SECS,
             no_open: false,
-            no_wait: false,
-            approval_file: None,
         }
     }
 }
 
-/// Lock state of the gate as the CLI sees it, from [`verify_gate_lock`].
+/// Integrity of existing policy evidence. This never authorizes a mutation.
 #[derive(Debug, Clone)]
-pub(crate) struct ExternalLockState {
-    /// True if the gate is locked or its lock failed verification (fail closed).
-    pub locked: bool,
+pub(crate) struct PolicyIntegrityState {
+    /// True when signed evidence exists or verification failed (fail closed).
+    pub approved: bool,
     /// Why the existing seal or policy failed verification, if it did.
     pub tampered_reason: Option<String>,
 }
@@ -120,26 +114,15 @@ pub(crate) struct VerifiedApproval {
     pub signed_claim_json: String,
     pub human_id: String,
     pub kid: String,
-}
-
-/// Returned when `--no-wait` is set so callers/agents can forward the URL out-of-band.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingApproval {
-    pub url: String,
-    pub mode: &'static str,
-    pub drop_id: Option<String>,
-    pub relay: Option<String>,
-    pub expires_at: String,
-    pub authority_human_id: String,
-    pub authority_kid: String,
-    pub action: HumanApprovalActionV1,
-    pub summary: Vec<String>,
+    claim_id: String,
+    replay_expires_at: i64,
+    commit_expires_at: i64,
+    expected_state: Value,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum CeremonyOutcome {
     Approved(Box<VerifiedApproval>),
-    Pending(Box<PendingApproval>),
 }
 
 #[derive(Debug, Clone)]
@@ -203,14 +186,49 @@ fn find_active_passkey_admins(
         .collect())
 }
 
-/// Returns `true` if `state_dir/node.sqlite` has at least one active Passkey-backed `Admin`.
-pub(crate) fn has_active_passkey_admin(state_dir: &Path, secrets: &SecretStore) -> bool {
-    let db_path = state_dir.join("node.sqlite");
-    db_path.exists()
-        && NodeDb::open(&db_path)
-            .ok()
-            .and_then(|db| find_active_passkey_admins(&db, secrets).ok())
-            .is_some_and(|admins| !admins.is_empty())
+/// Bootstrap is permitted only before any Passkey admin was enrolled. Revocation, expiry,
+/// or a missing shell secret never turns an existing installation back into a new one.
+/// Database errors are protected, not bootstrap permission.
+pub(crate) fn has_passkey_history(state_dir: &Path) -> bool {
+    let path = state_dir.join("node.sqlite");
+    path.exists()
+        && NodeDb::open(&path)
+            .and_then(|db| db.human().requires_live_approval())
+            .unwrap_or(true)
+}
+
+/// A revocation must be signed by an admin who remains eligible after that operation.
+fn survives_operation(authority: &HumanAuthorityRecord, action: &HumanApprovalActionV1) -> bool {
+    if matches!(
+        action.action,
+        HumanApprovalActionKind::AuthAdd | HumanApprovalActionKind::AuthAdmit
+    ) {
+        if action.target_kid.as_deref() != Some(&authority.kid) {
+            return true;
+        }
+        let Some(input) = action.parameters.as_ref().and_then(|p| p.get("authority")) else {
+            return false;
+        };
+        return input.get("role").and_then(Value::as_str) == Some("admin")
+            && input.get("auth_epoch").and_then(Value::as_u64) == Some(authority.auth_epoch)
+            && input.get("prf_salt").and_then(Value::as_str).is_some();
+    }
+    if action.action != HumanApprovalActionKind::AuthRevoke {
+        return true;
+    }
+    let Some(parameters) = action.parameters.as_ref() else {
+        return false;
+    };
+    let Some(epoch) = parameters.get("newMinAuthEpoch").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(targets) = parameters.get("targets").and_then(Value::as_array) else {
+        return false;
+    };
+    authority.auth_epoch >= epoch
+        && !targets
+            .iter()
+            .any(|target| target.get("kid").and_then(Value::as_str) == Some(authority.kid.as_str()))
 }
 
 /// Picks the newest active Passkey Admin to address the approval link to. Fails closed with
@@ -231,9 +249,14 @@ pub(crate) fn select_passkey_admin(
         .or_else(|| admins.iter().max_by_key(|rec| rec.created_at))
         .cloned()
         .ok_or_else(|| {
+            if db.human().requires_live_approval().unwrap_or(true) {
+                return CeremonyError::new("PASSKEY_AUTHORITY_REQUIRED",
+                    "No current Passkey Admin is eligible to approve new changes. Revocation or epoch reduction does not reopen bootstrap; current policy remains in effect.")
+                    .with_next(format!("hyp auth list --state-dir {} --json", state_dir.display()));
+            }
             CeremonyError::new(
                 "PASSKEY_AUTHORITY_REQUIRED",
-                "No enrolled Passkey Admin authority found. Locking/unlocking the Security Gate or mutating authorities requires a browser Passkey Admin (local CLI PKCS#8 keys in SecretStore cannot satisfy the human boundary).",
+                "No enrolled Passkey Admin authority found. Changing the Security Gate or human authorities requires a browser Passkey Admin (local CLI PKCS#8 keys in SecretStore cannot satisfy the human boundary).",
             )
             .with_next(format!(
                 "hyp auth init --web --state-dir {}",
@@ -242,13 +265,13 @@ pub(crate) fn select_passkey_admin(
         })
 }
 
-/// Reports whether the gate is locked, failing closed (`locked` + `tampered_reason`) when the
-/// config, the database, or the lock itself cannot be read or verified.
-pub(crate) fn inspect_external_lock_state(
+/// Inspects existing policy integrity evidence, failing closed on unreadable or invalid state.
+/// Mutation authorization always requires a separate live approval.
+pub(crate) fn inspect_policy_integrity(
     config_path: &Path,
     state_dir: &Path,
     secrets: &SecretStore,
-) -> ExternalLockState {
+) -> PolicyIntegrityState {
     let verify = || -> Result<bool, String> {
         let gate_cfg = match read_json_object_or_empty(config_path)
             .map_err(|e| format!("failed to read node.json: {e}"))?
@@ -265,17 +288,19 @@ pub(crate) fn inspect_external_lock_state(
             NodeDb::open_in_memory()
         }
         .map_err(|e| format!("failed to open node.sqlite: {e}"))?;
-        verify_gate_lock(&gate_cfg, &db, Some(secrets))
-            .map(|state| state.locked)
+        let loaded = load_node_or_legacy_config(config_path).ok();
+        let node_id = resolve_effective_node_id(loaded.as_ref(), Some(&db));
+        verify_gate_policy_for_node(&gate_cfg, &db, Some(secrets), Some(&node_id))
+            .map(|state| state.approved)
             .map_err(|e| e.to_string())
     };
     match verify() {
-        Ok(locked) => ExternalLockState {
-            locked,
+        Ok(approved) => PolicyIntegrityState {
+            approved,
             tampered_reason: None,
         },
-        Err(reason) => ExternalLockState {
-            locked: true,
+        Err(reason) => PolicyIntegrityState {
+            approved: true,
             tampered_reason: Some(reason),
         },
     }
@@ -307,6 +332,9 @@ pub(crate) fn persist_passkey_gate_seal(
     db: &NodeDb,
     verified: &VerifiedApproval,
 ) -> Result<GateLockSealRecord, String> {
+    db.local()
+        .ensure_metadata("node_id", &verified.action.node_id)
+        .map_err(|e| e.to_string())?;
     db.human()
         .put_gate_lock_seal(
             verified.action.seal_seq,
@@ -321,7 +349,6 @@ pub(crate) fn base_approval_action(
     action: HumanApprovalActionKind,
     node_id: String,
     seal_seq: u64,
-    locked: bool,
 ) -> HumanApprovalActionV1 {
     HumanApprovalActionV1 {
         v: 1,
@@ -330,7 +357,7 @@ pub(crate) fn base_approval_action(
         nonce: String::new(),
         exp: String::new(),
         seal_seq,
-        locked,
+        locked: true,
         policy_sha256: None,
         authorities_digest: None,
         target_human_id: None,
@@ -338,74 +365,134 @@ pub(crate) fn base_approval_action(
         target_role: None,
         bump_epoch: None,
         cascade: None,
+        parameters: None,
     }
 }
 
-/// Formats and prints `--no-wait` output consistently for both `--json` and human terminals.
-pub(crate) fn emit_pending_approval(
-    cmd: &str,
-    as_json: bool,
-    pending: &PendingApproval,
-) -> ExitCode {
-    let action = &pending.action;
-    let action_name = action.action.as_str();
-    let next = vec![if pending.mode == "relay" {
-        "Forward the approval URL to the Passkey Admin device (or re-run without --no-wait to wait automatically).".to_string()
-    } else {
-        "Open the approval URL on the Passkey Admin device, copy the signed hdrop1_ token to a file, then re-run with --approval-file <path>.".to_string()
-    }];
-
-    if as_json {
-        print_json(&JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
-                "Generated Passkey approval URL for '{action_name}' on node '{}' (waiting skipped via --no-wait)",
-                action.node_id
-            )),
-            data: Some(json!({
-                "pending": true,
-                "mode": pending.mode,
-                "url": pending.url,
-                "action": action_name,
-                "nodeId": action.node_id,
-                "nonce": action.nonce,
-                "sealSeq": action.seal_seq,
-                "locked": action.locked,
-                "policySha256": action.policy_sha256,
-                "authoritiesDigest": action.authorities_digest,
-                "dropId": pending.drop_id,
-                "relay": pending.relay,
-                "authorityHumanId": pending.authority_human_id,
-                "authorityKid": pending.authority_kid,
-                "expiresAt": pending.expires_at,
-                "diff": pending.summary,
-            })),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        });
-    } else {
-        println!(
-            "OK    Passkey approval required for '{action_name}' on '{}'",
-            action.node_id
-        );
-        println!("      URL:       {}", pending.url);
-        println!(
-            "      Authority: {} (kid={})",
-            pending.authority_human_id, pending.authority_kid
-        );
-        println!("      Expires:   {}", pending.expires_at);
-        println!("      Mode:      {}", pending.mode);
-        if !pending.summary.is_empty() {
-            println!("      Changes:");
-            for line in &pending.summary {
-                println!("        {}", sanitize_tty_display(line));
+/// Final compare, replay consumption, mutation and seal share one serialized SQLite writer.
+/// A normal config-write failure rolls back authority/delegation/cascade changes, nonce and seal.
+/// Config and SQLite are separate resources: a crash or SQLite commit failure can leave config
+/// disagreeing with the old persisted seal, which remains fail closed rather than granting access.
+pub(crate) fn execute_approved_operation<T>(
+    config_read: &Path,
+    config_write: &Path,
+    db: &NodeDb,
+    verified: &VerifiedApproval,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    eprintln!("Applying approved operation...");
+    db.with_write_transaction(|| {
+        let fail = StoreError::InvalidState;
+        if approval_snapshot(config_read, db).map_err(|e| fail(e.message))?
+            != verified.expected_state
+        {
+            return Err(fail(
+                "approval prestate changed before commit; request a fresh approval".into(),
+            ));
+        }
+        let now = now_unix_ms();
+        if now >= verified.commit_expires_at {
+            return Err(fail("approval expired before commit".into()));
+        }
+        let original = match std::fs::read(config_write) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(fail(e.to_string())),
+        };
+        for replay_key in [
+            format!("an_{}", verified.action.nonce),
+            verified.claim_id.clone(),
+        ] {
+            if !db.human().consume_claim_nonce(
+                &replay_key,
+                &verified.kid,
+                HumanClaimKind::Approval,
+                verified.replay_expires_at,
+                now,
+            )? {
+                return Err(fail("approval already used (replay rejected)".into()));
             }
         }
-        print_next_steps(&next);
-    }
-    ExitCode::from(EXIT_OK)
+        let result = operation().and_then(|value| {
+            let raw = read_json_object_or_empty(config_write)?;
+            let loaded = load_node_or_legacy_config(config_write).map_err(|e| e.to_string())?;
+            if resolve_effective_node_id(Some(&loaded), Some(db)) != verified.action.node_id {
+                return Err("resulting node identity differs from the signed approval".into());
+            }
+            let policy: SecurityGateConfig = serde_json::from_value(
+                raw.get("gate")
+                    .cloned()
+                    .ok_or("resulting policy is missing")?,
+            )
+            .map_err(|e| e.to_string())?;
+            if hyp_node::gates::gate_policy_sha256(&policy)
+                .map_err(|e| e.to_string())?
+                .as_str()
+                != verified
+                    .action
+                    .policy_sha256
+                    .as_deref()
+                    .ok_or("signed policy hash missing")?
+            {
+                return Err("resulting policy differs from the signed approval".into());
+            }
+            if db
+                .human()
+                .authorities_digest()
+                .map_err(|e| e.to_string())?
+                .as_str()
+                != verified
+                    .action
+                    .authorities_digest
+                    .as_deref()
+                    .ok_or("signed authority digest missing")?
+            {
+                return Err("resulting authority digest differs from the signed approval".into());
+            }
+            if let Some(epoch) = verified
+                .action
+                .parameters
+                .as_ref()
+                .and_then(|p| p.get("newMinAuthEpoch"))
+                .and_then(Value::as_u64)
+            {
+                if db.human().min_auth_epoch().map_err(|e| e.to_string())? != epoch {
+                    return Err("resulting minimum epoch differs from the signed approval".into());
+                }
+            }
+            let seal = db
+                .human()
+                .get_gate_lock_seal()
+                .map_err(|e| e.to_string())?
+                .ok_or("approved policy evidence was not persisted")?;
+            if seal.seal_seq != verified.action.seal_seq
+                || seal.signed_claim_json != verified.signed_claim_json
+            {
+                return Err("persisted policy evidence differs from the approval".into());
+            }
+            Ok(value)
+        });
+        if let Err(error) = &result {
+            let restored = match original {
+                Some(bytes)
+                    if std::fs::read(config_write).ok().as_deref() != Some(bytes.as_slice()) =>
+                {
+                    write_atomic_file(config_write, &bytes, true)
+                }
+                None if config_write.exists() => {
+                    std::fs::remove_file(config_write).map_err(|e| e.to_string())
+                }
+                _ => Ok(()),
+            };
+            if let Err(restore_error) = restored {
+                return Err(fail(format!(
+                    "{error}; config restore failed: {restore_error}; policy remains fail closed"
+                )));
+            }
+        }
+        result.map_err(fail)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Everything needed to print an approval URL for one ceremony.
@@ -504,10 +591,56 @@ impl ApprovalLink<'_> {
     }
 }
 
-/// Runs a complete Passkey approval ceremony for `action` and returns the verified approval, or
-/// the pending URL when `--no-wait` is set. `summary` is shown on the local terminal only; it is
+fn approval_snapshot(config_read: &Path, db: &NodeDb) -> Result<Value, CeremonyError> {
+    let config = match std::fs::read(config_read) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(CeremonyError::new("CONFIG_ERROR", e.to_string())),
+    };
+    let human = db.human();
+    Ok(json!({
+        "config": config,
+        "authorities": human.list_authorities(true).map_err(|e| CeremonyError::new("DB_ERROR", e.to_string()))?,
+        "epoch": human.min_auth_epoch().map_err(|e| CeremonyError::new("DB_ERROR", e.to_string()))?,
+        "seal": human.get_gate_lock_seal().map_err(|e| CeremonyError::new("DB_ERROR", e.to_string()))?,
+    }))
+}
+
+/// Runs a live Passkey approval ceremony for exactly one operation. `summary` is shown on the local terminal only; it is
 /// not part of what the Passkey signs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_passkey_approval_ceremony(
+    state_dir: &Path,
+    config_read: &Path,
+    db: &NodeDb,
+    secrets: &SecretStore,
+    action: HumanApprovalActionV1,
+    summary: &[String],
+    ceremony: &ApprovalCeremonyArgs,
+) -> Result<CeremonyOutcome, CeremonyError> {
+    let before = approval_snapshot(config_read, db)?;
+    let outcome = run_passkey_approval_ceremony_inner(
+        state_dir,
+        config_read,
+        db,
+        secrets,
+        action,
+        summary,
+        ceremony,
+    )?;
+    if approval_snapshot(config_read, db)? != before {
+        return Err(CeremonyError::new(
+            "APPROVAL_STATE_CHANGED",
+            "Policy or authorities changed during approval; request a fresh approval for the current state.",
+        ));
+    }
+    let CeremonyOutcome::Approved(mut verified) = outcome;
+    verified.expected_state = before;
+    Ok(CeremonyOutcome::Approved(verified))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_passkey_approval_ceremony_inner(
     state_dir: &Path,
     config_read: &Path,
     db: &NodeDb,
@@ -537,21 +670,32 @@ pub(crate) fn run_passkey_approval_ceremony(
     let exclude_kid = (action.action == HumanApprovalActionKind::AuthRevoke)
         .then_some(action.target_kid.as_deref())
         .flatten();
-    let admin = select_passkey_admin(db, secrets, state_dir, exclude_kid)?;
+    let admin = if matches!(
+        action.action,
+        HumanApprovalActionKind::AuthRevoke
+            | HumanApprovalActionKind::AuthAdd
+            | HumanApprovalActionKind::AuthAdmit
+    ) {
+        find_active_passkey_admins(db, secrets)
+            .map_err(|e| CeremonyError::new("DB_ERROR", e))?
+            .into_iter()
+            .filter(|admin| survives_operation(admin, &action))
+            .max_by_key(|admin| admin.created_at)
+            .ok_or_else(|| {
+                CeremonyError::new(
+                    "PASSKEY_AUTHORITY_REQUIRED",
+                    "No Passkey Admin can approve and remain active after this authority change",
+                )
+            })?
+    } else {
+        select_passkey_admin(db, secrets, state_dir, exclude_kid)?
+    };
     let identity = secrets.load_or_create_node_keys(&node_id).map_err(|e| {
         CeremonyError::new(
             "NODE_KEY_ERROR",
             format!("Failed to load node identity keys: {e}"),
         )
     })?;
-
-    // `--approval-file <path>`: verify an approval collected earlier with `--no-wait`.
-    if let Some(ref approval_path) = ceremony.approval_file {
-        let envelope = read_approval_envelope_file(approval_path)?;
-        let verified =
-            verify_approval_envelope(&envelope, &identity, db, secrets, &action, None, false)?;
-        return Ok(CeremonyOutcome::Approved(Box::new(verified)));
-    }
 
     let config_err = |e: String| CeremonyError::new("CONFIG_ERROR", e);
     let raw_cfg = |key: &str| loaded.as_ref().and_then(|c| c.raw.get(key));
@@ -614,19 +758,6 @@ pub(crate) fn run_passkey_approval_ceremony(
             .max(db.human().min_auth_epoch().unwrap_or(1)),
         action: &action,
     };
-    let pending = |url: String, mode, drop_id, relay, expires_at| {
-        Ok(CeremonyOutcome::Pending(Box::new(PendingApproval {
-            url,
-            mode,
-            drop_id,
-            relay,
-            expires_at,
-            authority_human_id: admin.human_id.clone(),
-            authority_kid: admin.kid.clone(),
-            action: action.clone(),
-            summary: summary.to_vec(),
-        })))
-    };
     let open_browser = !should_skip_browser_open(ceremony.no_open, secrets);
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -662,15 +793,6 @@ pub(crate) fn run_passkey_approval_ceremony(
                 post_cap: &created.post_cap,
             }),
         )?;
-        if ceremony.no_wait {
-            return pending(
-                url,
-                "relay",
-                Some(created.drop_id),
-                Some(relay_base.clone()),
-                expires_at,
-            );
-        }
         link.announce(&url, &expires_at, summary, open_browser);
         let (verified, _ack, _warnings) = rt
             .block_on(wait_for_relay_drop(
@@ -688,7 +810,6 @@ pub(crate) fn run_passkey_approval_ceremony(
                         secrets,
                         &action,
                         Some(&created.drop_id),
-                        true,
                     )
                     .map_err(|e| e.message)
                 },
@@ -700,12 +821,6 @@ pub(crate) fn run_passkey_approval_ceremony(
                 )
             })?;
         return Ok(CeremonyOutcome::Approved(Box::new(verified)));
-    }
-
-    // Transport 2: `--no-wait` without a relay prints an offline link for `--approval-file`.
-    if ceremony.no_wait {
-        let url = link.url(&action.exp, None)?;
-        return pending(url, "offline", None, None, action.exp.clone());
     }
 
     // Transport 3: one-shot loopback listener on 127.0.0.1:0.
@@ -721,24 +836,6 @@ pub(crate) fn run_passkey_approval_ceremony(
     Ok(CeremonyOutcome::Approved(Box::new(verified)))
 }
 
-fn read_approval_envelope_file(path: &Path) -> Result<HumanDropEnvelopeV1, CeremonyError> {
-    let file_err = |what: &str, e: io::Error| {
-        CeremonyError::new(
-            "APPROVAL_FILE_ERROR",
-            format!("Failed to {what} --approval-file {}: {e}", path.display()),
-        )
-    };
-    let meta = std::fs::metadata(path).map_err(|e| file_err("stat", e))?;
-    if meta.len() > MAX_APPROVAL_BYTES as u64 {
-        return Err(CeremonyError::usage(
-            "APPROVAL_TOO_LARGE",
-            format!("--approval-file exceeds {MAX_APPROVAL_BYTES} byte safety cap"),
-        ));
-    }
-    let raw = std::fs::read_to_string(path).map_err(|e| file_err("read", e))?;
-    decode_drop_envelope(&raw).map_err(|e| CeremonyError::new("INVALID_APPROVAL_ENVELOPE", e))
-}
-
 /// Names the first field where the signed action differs from the requested one.
 fn first_action_mismatch(
     expected: &HumanApprovalActionV1,
@@ -751,16 +848,17 @@ fn first_action_mismatch(
     };
     exp.keys()
         .chain(act.keys())
-        .find(|key| exp.get(*key) != act.get(*key))
+        .find(|key| {
+            let canonical = |value: Option<&Value>| value.and_then(|v| to_canonical_json(v).ok());
+            canonical(exp.get(*key)) != canonical(act.get(*key))
+        })
         .cloned()
 }
 
-/// Strictly verifies a received Passkey-signed approval envelope fail-closed and consumes both
-/// `claim.claim_id` and `action.nonce` in `human_claim_nonces`.
+/// Strictly verifies a received Passkey-signed approval envelope fail closed. The final writer
+/// transaction consumes `claim.claim_id` and `action.nonce` together with the approved mutation.
 ///
-/// `live` is true when the envelope answers the URL this process just printed, so `nonce` and
-/// `exp` must match too. With `--approval-file` the URL came from an earlier `--no-wait` run whose
-/// nonce this process never saw; every other field is still bound.
+/// The nonce and expiry must match this live process. Offline approvals are never accepted.
 fn verify_approval_envelope(
     envelope: &HumanDropEnvelopeV1,
     identity: &NodeIdentityKeys,
@@ -768,7 +866,6 @@ fn verify_approval_envelope(
     secrets: &SecretStore,
     expected_action: &HumanApprovalActionV1,
     expected_drop_id: Option<&str>,
-    live: bool,
 ) -> Result<VerifiedApproval, CeremonyError> {
     let rejected = |code, msg: String| CeremonyError::new(code, msg);
     let db_err = |e: hyp_store::StoreError| CeremonyError::new("DB_ERROR", e.to_string());
@@ -864,12 +961,8 @@ fn verify_approval_envelope(
         ));
     }
 
-    let mut expected = expected_action.clone();
-    if !live {
-        expected.nonce.clone_from(&signed_action.nonce);
-        expected.exp.clone_from(&signed_action.exp);
-    }
-    if let Some(field) = first_action_mismatch(&expected, &signed_action) {
+    let expected = expected_action;
+    if let Some(field) = first_action_mismatch(expected, &signed_action) {
         return Err(rejected(
             "APPROVAL_MISMATCH",
             format!(
@@ -879,31 +972,16 @@ fn verify_approval_envelope(
         ));
     }
 
-    // Consume BOTH the ceremony nonce AND the claim_id so neither can ever be replayed.
+    if !survives_operation(&authority, &signed_action) {
+        return Err(rejected(
+            "APPROVAL_SIGNER_MISMATCH",
+            "Approver must remain an active Passkey Admin after the operation".into(),
+        ));
+    }
+
     let claim_exp_ms = parse_rfc3339_millis(&claim.expires_at)
         .map_err(|e| invalid(format!("Invalid claim expiresAt: {e}")))?;
     let replay_exp_ms = claim_exp_ms.max(action_exp_ms);
-    for replay_key in [
-        format!("an_{}", signed_action.nonce),
-        claim.claim_id.clone(),
-    ] {
-        let fresh = db
-            .human()
-            .consume_claim_nonce(
-                &replay_key,
-                &authority.kid,
-                HumanClaimKind::Approval,
-                replay_exp_ms,
-                now,
-            )
-            .map_err(db_err)?;
-        if !fresh {
-            return Err(rejected(
-                "APPROVAL_REPLAYED",
-                "Approval has already been used (replay rejected)".to_string(),
-            ));
-        }
-    }
 
     let signed_claim_json = to_canonical_json(&signed).map_err(|e| {
         CeremonyError::new(
@@ -916,6 +994,10 @@ fn verify_approval_envelope(
         signed_claim_json,
         human_id: authority.human_id,
         kid: authority.kid,
+        claim_id: claim.claim_id,
+        replay_expires_at: replay_exp_ms,
+        commit_expires_at: claim_exp_ms.min(action_exp_ms),
+        expected_state: Value::Null,
     })
 }
 
@@ -1027,7 +1109,6 @@ async fn run_loopback_approval_ceremony(
                     secrets,
                     link.action,
                     Some(&created.drop_id),
-                    true,
                 ) {
                     Ok(verified) => {
                         let _ = sub.reply_tx.send(Ok((verified.human_id.clone(), verified.kid.clone())));
@@ -1180,4 +1261,216 @@ async fn accept_loopback_post(
         "humanId": human_id,
         "kid": kid,
     }))
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+    use hyp_store::{
+        HumanAuthorityInput, HumanAuthorityRole, HumanAuthorityStatus, HumanDelegationPolicyInput,
+    };
+    use tempfile::TempDir;
+
+    fn authority(id: &str) -> HumanAuthorityInput {
+        HumanAuthorityInput {
+            human_id: id.into(),
+            kid: format!("{id}_key"),
+            label: id.into(),
+            role: HumanAuthorityRole::Signer,
+            jwk_json: "{}".into(),
+            enc_jwk_json: None,
+            prf_salt: None,
+            auth_epoch: 1,
+        }
+    }
+
+    // These fixtures represent the output of verification. Real Passkey signatures and their
+    // active-authority requirements are exercised by the live CLI/browser integration tests.
+    fn approved(
+        db: &NodeDb,
+        config: &Path,
+        digest: String,
+    ) -> (VerifiedApproval, SecurityGateConfig) {
+        let mut policy = SecurityGateConfig {
+            require_signed_policy: true,
+            human_authorities_digest: Some(digest.clone()),
+            ..Default::default()
+        };
+        policy.policy_signature = None;
+        let mut action =
+            base_approval_action(HumanApprovalActionKind::AuthAdd, "commit@box".into(), 1);
+        action.nonce = "commit_nonce".into();
+        action.exp = format_rfc3339_millis(now_unix_ms() + 300_000);
+        action.target_human_id = Some("member".into());
+        action.target_kid = Some("member_key".into());
+        action.target_role = Some("signer".into());
+        action.policy_sha256 = Some(hyp_node::gates::gate_policy_sha256(&policy).unwrap());
+        action.authorities_digest = Some(digest);
+        (
+            VerifiedApproval {
+                action,
+                signed_claim_json: "{}".into(),
+                human_id: "admin".into(),
+                kid: "admin_key".into(),
+                claim_id: "commit_claim".into(),
+                replay_expires_at: now_unix_ms() + 300_000,
+                commit_expires_at: now_unix_ms() + 300_000,
+                expected_state: approval_snapshot(config, db).unwrap(),
+            },
+            policy,
+        )
+    }
+
+    fn replay_count(db: &NodeDb) -> i64 {
+        db.connection()
+            .query_row(
+                "SELECT count(*) FROM human_claim_nonces WHERE kind='approval'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn shorter_claim_lifetime_is_rechecked_after_waiting_for_the_final_writer() {
+        let tmp = TempDir::new().unwrap();
+        let db = NodeDb::open_in_memory().unwrap();
+        let config = tmp.path().join("node.json");
+        std::fs::write(&config, b"{\"nodeId\":\"commit@box\"}").unwrap();
+        let (mut verified, _) = approved(&db, &config, db.human().authorities_digest().unwrap());
+        // The proof was verified while both lifetimes were live. Waiting for the writer
+        // crosses the shorter claim expiry while action and replay retention remain live.
+        verified.commit_expires_at = now_unix_ms() - 1;
+        assert!(parse_rfc3339_millis(&verified.action.exp).unwrap() > now_unix_ms());
+        assert!(verified.replay_expires_at > now_unix_ms());
+        let error = execute_approved_operation::<()>(&config, &config, &db, &verified, || {
+            panic!("expired proof must never reach the mutation")
+        })
+        .unwrap_err();
+        assert!(error.contains("expired before commit"), "{error}");
+        assert_eq!(replay_count(&db), 0);
+        assert!(db.human().get_gate_lock_seal().unwrap().is_none());
+    }
+
+    #[test]
+    fn ordinary_file_write_failure_rolls_back_authorities_reductions_delegation_replay_and_seal() {
+        let tmp = TempDir::new().unwrap();
+        let db = NodeDb::open(tmp.path().join("node.sqlite")).unwrap();
+        let config = tmp.path().join("node.json");
+        let original = b"{\"nodeId\":\"commit@box\"}\n";
+        std::fs::write(&config, original).unwrap();
+        let mut admin = authority("admin");
+        admin.role = HumanAuthorityRole::Admin;
+        db.human().upsert_authority(&admin, now_ms()).unwrap();
+        let member = authority("member");
+        let digest = db
+            .human()
+            .projected_authorities_digest_after_upsert(&member)
+            .unwrap();
+        let (verified, _) = approved(&db, &config, digest);
+        let blocked = tmp.path().join("directory-is-not-a-file");
+        std::fs::create_dir(&blocked).unwrap();
+        let error = execute_approved_operation(&config, &config, &db, &verified, || {
+            db.human()
+                .upsert_authority(&member, now_ms())
+                .map_err(|e| e.to_string())?;
+            db.human()
+                .upsert_delegation_policy(
+                    &HumanDelegationPolicyInput {
+                        human_id: "member".into(),
+                        node_prefix: "member@*".into(),
+                        scopes: vec!["dm:send".into()],
+                        max_devices: 3,
+                        delegation_enabled: true,
+                    },
+                    now_ms(),
+                )
+                .map_err(|e| e.to_string())?;
+            db.human()
+                .revoke_authority_monotonic("admin", "admin_key", 2, "{}", now_ms())
+                .map_err(|e| e.to_string())?;
+            persist_passkey_gate_seal(&db, &verified)?;
+            write_atomic_file(&blocked, b"{}", true)
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("rename"),
+            "the actual filesystem write must be reached: {error}"
+        );
+        assert!(
+            db.human()
+                .get_active_authority_by_kid("member_key")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.human()
+                .get_authority("admin", "admin_key")
+                .unwrap()
+                .unwrap()
+                .status,
+            HumanAuthorityStatus::Active
+        );
+        assert_eq!(db.human().min_auth_epoch().unwrap(), 1);
+        assert!(
+            db.human()
+                .get_delegation_policy("member")
+                .unwrap()
+                .is_none()
+        );
+        assert!(db.human().get_gate_lock_seal().unwrap().is_none());
+        assert_eq!(replay_count(&db), 0);
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn stale_projection_before_ceremony_snapshot_cannot_commit_under_the_signed_digest() {
+        let tmp = TempDir::new().unwrap();
+        let db = NodeDb::open(tmp.path().join("node.sqlite")).unwrap();
+        let config = tmp.path().join("node.json");
+        let original = b"{\"nodeId\":\"commit@box\"}\n";
+        std::fs::write(&config, original).unwrap();
+        let member = authority("member");
+        let projected = db
+            .human()
+            .projected_authorities_digest_after_upsert(&member)
+            .unwrap();
+        // The operation was projected before a concurrent writer, but the ceremony snapshot
+        // sees the later state. Only the signed-result check catches this particular window.
+        db.human()
+            .upsert_authority(&authority("concurrent"), now_ms())
+            .unwrap();
+        let (verified, policy) = approved(&db, &config, projected);
+        let error = execute_approved_operation(&config, &config, &db, &verified, || {
+            db.human()
+                .upsert_authority(&member, now_ms())
+                .map_err(|e| e.to_string())?;
+            persist_passkey_gate_seal(&db, &verified)?;
+            crate::config_file::write_atomic_json(
+                &config,
+                &json!({"nodeId":"commit@box", "gate":policy}),
+                true,
+            )
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("resulting authority digest differs"),
+            "{error}"
+        );
+        assert!(
+            db.human()
+                .get_active_authority_by_kid("member_key")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.human()
+                .get_active_authority_by_kid("concurrent_key")
+                .unwrap()
+                .is_some()
+        );
+        assert!(db.human().get_gate_lock_seal().unwrap().is_none());
+        assert_eq!(replay_count(&db), 0);
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+    }
 }

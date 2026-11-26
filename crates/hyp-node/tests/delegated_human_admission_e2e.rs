@@ -615,3 +615,128 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
         other => panic!("expected RemoteProblem after revocation, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn passkey_managed_nodes_allow_signed_reductions_but_reject_offline_grants() {
+    use hyp_crypto::human::{HumanRevocationPayloadV1, sign_human_revocation};
+    use hyp_store::{HumanAuthorityInput, HumanAuthorityRole};
+    let legacy_dir = TempDir::new().unwrap();
+    let managed_dir = TempDir::new().unwrap();
+    let ca = Ed25519KeyPair::generate().unwrap();
+    let target = Ed25519KeyPair::generate().unwrap();
+    let passkey = Ed25519KeyPair::generate().unwrap();
+    let open = |dir: &TempDir| {
+        let mut cfg = NodeConfig::router(NodeId::new("migration-hub").unwrap(), dir.path());
+        cfg.secret_backend = Some(SecretBackend::File);
+        cfg.admin_jwk = Some(OkpJwk::new(OkpCurve::Ed25519, &ca.public_key_bytes()));
+        UnifiedNode::open(cfg).unwrap()
+    };
+    let legacy = open(&legacy_dir);
+    let managed = open(&managed_dir);
+    for node in [&legacy, &managed] {
+        for (id, key, role) in [
+            ("ca", &ca, HumanAuthorityRole::Admin),
+            ("member", &target, HumanAuthorityRole::Signer),
+        ] {
+            node.db()
+                .human()
+                .upsert_authority(
+                    &HumanAuthorityInput {
+                        human_id: id.into(),
+                        kid: key.kid(),
+                        label: id.into(),
+                        role,
+                        jwk_json: serde_json::to_string(&key.to_jwk()).unwrap(),
+                        enc_jwk_json: None,
+                        prf_salt: None,
+                        auth_epoch: 1,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+        }
+    }
+    managed
+        .db()
+        .human()
+        .upsert_authority(
+            &HumanAuthorityInput {
+                human_id: "passkey-admin".into(),
+                kid: passkey.kid(),
+                label: "passkey".into(),
+                role: HumanAuthorityRole::Admin,
+                jwk_json: serde_json::to_string(&passkey.to_jwk()).unwrap(),
+                enc_jwk_json: None,
+                prf_salt: Some("passkey-salt".into()),
+                auth_epoch: 1,
+            },
+            now_ms(),
+        )
+        .unwrap();
+    let revocation = sign_human_revocation(
+        &HumanRevocationPayloadV1 {
+            v: 1,
+            human_id: "member".into(),
+            revoked_kid: target.kid(),
+            new_min_auth_epoch: 1,
+            revoked_at: format_rfc3339_millis(now_ms()),
+            reason: "retired".into(),
+            issuer_kid: ca.kid(),
+        },
+        &ca,
+    )
+    .unwrap();
+    legacy.ingest_human_revocation(&revocation).unwrap();
+    managed.ingest_human_revocation(&revocation).unwrap();
+    assert!(
+        managed
+            .db()
+            .human()
+            .get_active_authority_by_kid(&target.kid())
+            .unwrap()
+            .is_none()
+    );
+    let before = managed.db().human().list_authorities(true).unwrap();
+    assert!(matches!(
+        managed
+            .revoke_human_authority_cascade("member", None, false, "{}")
+            .await,
+        Err(NodeError::Unauthorized(_))
+    ));
+    let invited = Ed25519KeyPair::generate().unwrap();
+    let make_request = |node: &UnifiedNode| {
+        let (hjoin1, invite) = mint_hjoin1(
+            &ca,
+            "migration-hub",
+            "http://127.0.0.1:1234",
+            &node.identity().signing.public_key().fingerprint(),
+            "invited",
+            "invited@*",
+            2,
+        );
+        let claim = HumanInviteClaimV1 {
+            invite_id: invite.invite_id,
+            hub_node_id: "migration-hub".into(),
+            human_id: "invited".into(),
+            signing_jwk: invited.to_jwk(),
+            enc_jwk: None,
+            prf_salt: None,
+            timestamp: format_rfc3339_millis(now_ms()),
+        };
+        let claim_sig = sign_human_invite_claim(&claim, &invited).unwrap();
+        AuthClaimRequest {
+            hjoin1,
+            claim,
+            claim_sig,
+            label: None,
+        }
+    };
+    legacy
+        .handle_auth_claim_request(&make_request(&legacy))
+        .unwrap();
+    assert!(matches!(
+        managed.handle_auth_claim_request(&make_request(&managed)),
+        Err(NodeError::Unauthorized(_))
+    ));
+    assert_eq!(managed.db().human().list_authorities(true).unwrap(), before);
+}

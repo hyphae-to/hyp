@@ -60,7 +60,7 @@ use hyp_node::engine::server::extract_drop_relay_client_ip;
 use hyp_node::engine::{
     DropRelayConfig, E2eePolicy, NodeConfig, NodeError, SubscribeRequest, UnifiedNode,
 };
-use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline, sign_gate_policy};
+use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::NodeId;
 use hyp_proto::cloudevent::{CloudEvent as ProtoCloudEvent, TYPE_HUMAN_REVOCATION_V1};
 use hyp_proto::scopes::ScopePreset;
@@ -1011,7 +1011,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         .unwrap();
     worker.accept_am2_invite(&am2).await.unwrap();
 
-    // Enroll human Admin (epoch 1) and Signer (epoch 1) on `worker@box`.
+    // Enroll human Admin (epoch 3) and Signer (epoch 1) on `worker@box`.
     let human_admin = Ed25519KeyPair::generate().unwrap();
     let lost_phone = Ed25519KeyPair::generate().unwrap();
     enroll_human(
@@ -1019,7 +1019,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         "bogdan",
         &human_admin,
         HumanAuthorityRole::Admin,
-        1,
+        3,
     );
     enroll_human(
         &worker,
@@ -1030,15 +1030,67 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     );
     assert_eq!(worker.db().human().min_auth_epoch().unwrap(), 1);
 
-    // N3: Lock a signed SecurityGatePipeline on `worker@box` anchored to `authorities_digest`
-    // BEFORE any revocation arrives.
+    // This subscriber has a real Passkey-managed policy, not only a legacy HMAC policy.
+    worker
+        .db()
+        .human()
+        .upsert_authority(
+            &HumanAuthorityInput {
+                human_id: "bogdan".into(),
+                kid: human_admin.kid(),
+                label: "Passkey Admin".into(),
+                role: HumanAuthorityRole::Admin,
+                jwk_json: serde_json::to_string(&human_admin.to_jwk()).unwrap(),
+                enc_jwk_json: None,
+                prf_salt: Some("passkey-admin-salt".into()),
+                auth_epoch: 3,
+            },
+            now_ms(),
+        )
+        .unwrap();
+    assert!(worker.db().human().requires_live_approval().unwrap());
     let initial_digest = worker.db().human().authorities_digest().unwrap();
-    let mut gate_cfg = SecurityGateConfig {
+    let gate_cfg = SecurityGateConfig {
         require_signed_policy: true,
-        human_authorities_digest: Some(initial_digest),
+        human_authorities_digest: Some(initial_digest.clone()),
         ..SecurityGateConfig::default()
     };
-    gate_cfg.policy_signature = Some(sign_gate_policy(&gate_cfg, worker.secret_store()).unwrap());
+    let now = now_ms();
+    let approved = hyp_crypto::human::HumanApprovalActionV1 {
+        v: 1,
+        action: hyp_crypto::human::HumanApprovalActionKind::GateApply,
+        node_id: worker.node_id().to_string(),
+        nonce: "initial_policy_nonce".into(),
+        exp: format_rfc3339_millis(now + 300_000),
+        seal_seq: 1,
+        locked: true,
+        policy_sha256: Some(hyp_node::gates::gate_policy_sha256(&gate_cfg).unwrap()),
+        authorities_digest: Some(initial_digest),
+        target_human_id: None,
+        target_kid: None,
+        target_role: None,
+        bump_epoch: None,
+        cascade: None,
+        parameters: None,
+    };
+    let mut approval_claim = build_directive_claim(
+        "bogdan",
+        &human_admin,
+        3,
+        worker.node_id().as_str(),
+        &worker.identity().encryption.public_key(),
+        None,
+        &to_canonical_json(&approved).unwrap(),
+        now,
+        now + 300_000,
+    );
+    approval_claim.kind = HumanDropKind::Approval;
+    let signed_policy = hyp_crypto::human::sign_human_claim(&approval_claim, &human_admin).unwrap();
+    worker
+        .db()
+        .human()
+        .put_gate_lock_seal(1, &serde_json::to_string(&signed_policy).unwrap(), now)
+        .unwrap();
     let gate_db = Arc::new(Mutex::new(
         NodeDb::open(worker_dir.path().join("node.sqlite")).unwrap(),
     ));
@@ -1049,6 +1101,29 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     )
     .unwrap();
     assert!(!worker_gate.is_policy_tampered());
+
+    // Prove the directive path is valid before the remote reduction, with this managed gate.
+    let before_claim = build_directive_claim(
+        "bogdan",
+        &lost_phone,
+        1,
+        worker.node_id().as_str(),
+        &worker.identity().encryption.public_key(),
+        Some("ops"),
+        "valid before revocation",
+        now,
+        now + 300_000,
+    );
+    let before_envelope = seal_human_drop(
+        &before_claim,
+        &lost_phone,
+        &worker.identity().encryption.public_key(),
+    )
+    .unwrap();
+    worker
+        .ingest_human_drop(&before_envelope, Some(&worker_gate), false)
+        .await
+        .unwrap();
 
     // Subscribe `worker@box` to `acme-hub.security`.
     worker
@@ -1197,6 +1272,14 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         TYPE_HUMAN_REVOCATION_V1,
         serde_json::to_value(&valid_rev).unwrap(),
     );
+    // Shell-origin publication cannot introduce a reduction on a managed subscriber.
+    assert!(
+        worker
+            .publish_event("local.security", rev_ce.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(worker.db().human().min_auth_epoch().unwrap(), 1);
     hub.publish_event("local.security", rev_ce).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
@@ -1286,6 +1369,74 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         .unwrap();
     assert_eq!(worker.db().human().min_auth_epoch().unwrap(), 3);
     assert!(!worker_gate.is_policy_tampered());
+    // The post-commit broadcast path may replay precisely the reduction already applied.
+    worker
+        .publish_event(
+            "local.security",
+            ProtoCloudEvent::new(
+                format!("local-replay-{}", uuid_v4()),
+                "human:bogdan",
+                TYPE_HUMAN_REVOCATION_V1,
+                serde_json::to_value(&valid_rev).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    // A verified self-revocation of the historical policy signer still reduces live trust.
+    // Its already-persisted policy stays valid; neither the old seal nor revoked history
+    // authorizes a new operation or reopens bootstrap when the last admin is unavailable.
+    let admin_reduction = sign_human_revocation(
+        &HumanRevocationPayloadV1 {
+            v: 1,
+            human_id: "bogdan".into(),
+            revoked_kid: human_admin.kid(),
+            new_min_auth_epoch: 3,
+            revoked_at: format_rfc3339_millis(now_ms()),
+            reason: "retired last admin".into(),
+            issuer_kid: human_admin.kid(),
+        },
+        &human_admin,
+    )
+    .unwrap();
+    worker.ingest_human_revocation(&admin_reduction).unwrap();
+    worker.ingest_human_revocation(&admin_reduction).unwrap();
+    assert!(
+        worker
+            .db()
+            .human()
+            .get_active_authority_by_kid(&human_admin.kid())
+            .unwrap()
+            .is_none()
+    );
+    assert!(worker.db().human().requires_live_approval().unwrap());
+    worker_gate.verify_policy_integrity().unwrap();
+    worker_gate.verify_policy_change_approval().unwrap();
+    assert_eq!(
+        worker
+            .db()
+            .human()
+            .get_gate_lock_seal()
+            .unwrap()
+            .unwrap()
+            .signed_claim_json,
+        serde_json::to_string(&signed_policy).unwrap()
+    );
+
+    let mut unsigned_change = worker_gate.config().clone();
+    unsigned_change.stage1.outbound_dlp_enabled = false;
+    let changed_pipeline = SecurityGatePipeline::new(
+        unsigned_change,
+        Arc::new(Mutex::new(
+            NodeDb::open(worker_dir.path().join("node.sqlite")).unwrap(),
+        )),
+        Some(Arc::new(worker.secret_store().clone())),
+    )
+    .unwrap();
+    assert!(
+        changed_pipeline.verify_policy_change_approval().is_err(),
+        "a historical signature cannot authorize a different live policy"
+    );
 
     // 4. N3 tamper check: enrolling an unauthorized new authority row directly in SQLite STILL
     //    flips the locked gate immediately to tampered!

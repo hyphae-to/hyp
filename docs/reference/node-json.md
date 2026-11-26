@@ -84,7 +84,7 @@ Interactive onboarding asks whether to enable the tool. For noninteractive setup
 After editing `node.json`, restart the daemon and reconnect the MCP client. Run `hyp setup --refresh-skills` to update generated harness skills.
 
 ### Security Gate (`gate`)
-Managed via `hyp gate propose` + `hyp gate lock` (writes `gate_policy_sig` over canonical JCS of `gate` + `human_authorities_digest`). Remote Stage 2 classifier URLs reject non-loopback `http://` fail-closed.
+Managed via `hyp gate propose` + `hyp gate apply` (writes `gate_policy_sig` over canonical JCS of `gate` + `human_authorities_digest`). Remote Stage 2 classifier URLs reject non-loopback `http://` fail-closed.
 
 ### Optional Blocks (`dropRelay`, `t3`, `openclaw`, `revival`)
 - `dropRelay`: `{ "enabled": true, "maxMemoryMb": 256 }` for the in-node strictly RAM-only Blind Drop Relay.

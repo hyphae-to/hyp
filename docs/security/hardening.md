@@ -20,7 +20,7 @@ Isolate the agent's OS UID from your primary user account that owns Hyphae's key
 
 When running coding agents in containers (Docker, Podman, Lima, OrbStack, Firecracker):
 - Give the container its own isolated `HYPHAE_STATE_DIR` and `HYPHAE_SECRET_BACKEND=file` (zero host Keychain access).
-- Keep the host's `hyp gate lock`, `hyp auth`, and `hyp inbox approve`/`reject` operations strictly on the host outside the container.
+- Keep the host's `hyp gate apply`, `hyp auth`, and `hyp inbox approve`/`reject` operations strictly on the host outside the container.
 - Use `hyp exec --env VAR=<secret> -- <cmd>` only for narrow application secrets intended for that environment — never place Hyphae system keys or host-wide credentials in the container's `SecretStore`.
 
 ---

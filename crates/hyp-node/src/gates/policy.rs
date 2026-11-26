@@ -1294,10 +1294,15 @@ pub fn is_passkey_backed_admin(
     min_auth_epoch: u64,
     secrets: Option<&SecretStore>,
 ) -> bool {
-    if rec.status != HumanAuthorityStatus::Active
-        || rec.role != HumanAuthorityRole::Admin
-        || rec.auth_epoch < min_auth_epoch
-    {
+    rec.status == HumanAuthorityStatus::Active
+        && rec.auth_epoch >= min_auth_epoch
+        && is_enrolled_passkey_admin(rec, secrets)
+}
+
+/// Historical enrollment evidence; current status/epoch must be checked separately for live
+/// authority. Durable policy signatures are evidence of a previously accepted operation.
+fn is_enrolled_passkey_admin(rec: &HumanAuthorityRecord, secrets: Option<&SecretStore>) -> bool {
+    if rec.role != HumanAuthorityRole::Admin {
         return false;
     }
     if rec
@@ -1318,19 +1323,20 @@ pub fn is_passkey_backed_admin(
 
 /// A `gate_lock_seal` row whose Passkey signature and bindings verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedGateSeal {
+pub struct VerifiedGatePolicy {
     pub seal_seq: u64,
-    pub locked: bool,
+    pub approved: bool,
     pub human_id: String,
     pub authority_kid: String,
 }
 
-/// Verified lock state of the Security Gate policy.
+/// Verified durable policy evidence. `approved` is an integrity result, never permission
+/// to modify policy or authorities. Historical unlock records have `approved = false`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GateLockState {
-    pub locked: bool,
+pub struct GatePolicyIntegrity {
+    pub approved: bool,
     /// The Passkey seal in `node.sqlite`, when one exists (it may record an unlock).
-    pub seal: Option<VerifiedGateSeal>,
+    pub seal: Option<VerifiedGatePolicy>,
 }
 
 fn seal_err(msg: impl Into<String>) -> GateError {
@@ -1344,39 +1350,40 @@ fn verify_gate_lock_seal(
     config: &SecurityGateConfig,
     db: &NodeDb,
     secrets: Option<&SecretStore>,
-) -> Result<VerifiedGateSeal, GateError> {
+    node_id: &str,
+) -> Result<VerifiedGatePolicy, GateError> {
     let signed: SignedHumanClaimV1 = serde_json::from_str(&seal.signed_claim_json)
         .map_err(|e| seal_err(format!("malformed gate_lock_seal signed claim: {e}")))?;
     let unverified: HumanClaimV1 = serde_json::from_str(&signed.payload)
         .map_err(|e| seal_err(format!("malformed gate_lock_seal claim payload: {e}")))?;
 
-    let min_epoch = db.human().min_auth_epoch()?;
+    // Only the fresh ceremony path may install this row. A subsequent authenticated reduction
+    // must not invalidate the already-persisted policy or turn historical evidence into current
+    // eligibility. A writer who can replace SQLite can backdate/restore signatures; that is
+    // outside the same-user database threat boundary, not solved by checking current status.
     let rec = db
         .human()
-        .get_active_authority_by_kid(&unverified.human_kid)?
-        .ok_or_else(|| {
-            seal_err(format!(
-                "gate_lock_seal signer kid '{}' is unknown or revoked",
-                unverified.human_kid
-            ))
-        })?;
-    if !is_passkey_backed_admin(&rec, min_epoch, secrets) {
-        return Err(seal_err(format!(
-            "gate_lock_seal signer '{}' ({}) is not an active Passkey-backed admin authority",
-            rec.human_id, rec.kid
-        )));
+        .get_authority(&unverified.human_id, &unverified.human_kid)?
+        .ok_or_else(|| seal_err("gate_lock_seal signer is not an enrolled authority"))?;
+    if !is_enrolled_passkey_admin(&rec, secrets) {
+        return Err(seal_err(
+            "gate_lock_seal signer is not an enrolled Passkey-backed admin",
+        ));
     }
     let pk = serde_json::from_str::<OkpJwk>(&rec.jwk_json)
         .map_err(|e| seal_err(format!("malformed authority jwk_json for lock seal: {e}")))?
         .to_ed25519()
         .map_err(|e| seal_err(format!("invalid Ed25519 authority key for lock seal: {e}")))?;
-    let (claim, action) = verify_signed_approval_claim(&signed, &pk, min_epoch)
+    let (claim, action) = verify_signed_approval_claim(&signed, &pk, rec.auth_epoch)
         .map_err(|e| seal_err(format!("gate_lock_seal Passkey signature invalid: {e}")))?;
 
     if claim.human_id != rec.human_id || claim.auth_epoch != rec.auth_epoch {
         return Err(seal_err(
             "gate_lock_seal signer identity or authEpoch does not match the enrolled authority",
         ));
+    }
+    if action.node_id != node_id || claim.audience.node_id != node_id {
+        return Err(seal_err("stored policy approval belongs to another node"));
     }
     if action.seal_seq != seal.seal_seq {
         return Err(seal_err(
@@ -1423,9 +1430,9 @@ fn verify_gate_lock_seal(
         }
     }
 
-    Ok(VerifiedGateSeal {
+    Ok(VerifiedGatePolicy {
         seal_seq: seal.seal_seq,
-        locked: action.locked,
+        approved: action.locked,
         human_id: rec.human_id,
         authority_kid: rec.kid,
     })
@@ -1436,23 +1443,53 @@ fn verify_gate_lock_seal(
 /// 1. A Passkey `gate_lock_seal` in `node.sqlite` is checked first and is authoritative when it
 ///    records a lock, so editing or deleting `gate` in `node.json` can never silently unlock.
 /// 2. Otherwise `node.json` decides: unlocked, or a legacy HMAC `policy_signature` lock.
-pub fn verify_gate_lock(
+pub fn verify_gate_policy_integrity(
     config: &SecurityGateConfig,
     db: &NodeDb,
     secrets: Option<&SecretStore>,
-) -> Result<GateLockState, GateError> {
+) -> Result<GatePolicyIntegrity, GateError> {
+    let node_id = db.local().get_metadata("node_id")?;
+    verify_gate_policy_for_node(config, db, secrets, node_id.as_deref())
+}
+
+/// Verify durable policy evidence against the actual local node identity. The explicit identity
+/// supports pre-daemon installations whose database did not yet contain `metadata.node_id`.
+pub fn verify_gate_policy_for_node(
+    config: &SecurityGateConfig,
+    db: &NodeDb,
+    secrets: Option<&SecretStore>,
+    node_id: Option<&str>,
+) -> Result<GatePolicyIntegrity, GateError> {
+    if let (Some(stored), Some(expected)) = (db.local().get_metadata("node_id")?, node_id) {
+        if stored != expected {
+            return Err(seal_err(
+                "configured node identity differs from the database identity",
+            ));
+        }
+    }
     let seal = db
         .human()
         .get_gate_lock_seal()?
-        .map(|s| verify_gate_lock_seal(&s, config, db, secrets))
+        .map(|s| {
+            verify_gate_lock_seal(
+                &s,
+                config,
+                db,
+                secrets,
+                node_id.ok_or_else(|| seal_err("local node identity unavailable"))?,
+            )
+        })
         .transpose()?;
-    if seal.as_ref().is_some_and(|s| s.locked) {
-        return Ok(GateLockState { locked: true, seal });
+    if seal.as_ref().is_some_and(|s| s.approved) {
+        return Ok(GatePolicyIntegrity {
+            approved: true,
+            seal,
+        });
     }
 
     if !config.require_signed_policy && config.policy_signature.is_none() {
-        return Ok(GateLockState {
-            locked: false,
+        return Ok(GatePolicyIntegrity {
+            approved: false,
             seal,
         });
     }
@@ -1469,7 +1506,10 @@ pub fn verify_gate_lock(
     }
     let store = secrets.ok_or_else(|| seal_err("policy signing SecretStore unavailable"))?;
     verify_gate_policy_sig(config, sig, store)?;
-    Ok(GateLockState { locked: true, seal })
+    Ok(GatePolicyIntegrity {
+        approved: true,
+        seal,
+    })
 }
 
 /// Computes a tamper-evident domain-separated HMAC-SHA256 signature over the canonical RFC 8785 JCS

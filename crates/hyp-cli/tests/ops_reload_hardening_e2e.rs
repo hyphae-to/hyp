@@ -233,7 +233,7 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     let startup = daemon.read_json_line(STARTUP_TIMEOUT);
     assert_eq!(startup["ok"], true, "daemon startup failed: {startup}");
 
-    // 2. Initialize local admin authority (`hyp auth init`), configure & lock gate (`hyp gate init` + `hyp gate lock`).
+    // 2. Initialize local admin authority (`hyp auth init`), configure & lock gate (`hyp gate init` + `hyp gate apply`).
     let init_out = isolated_cmd(&home)
         .args([
             "auth",
@@ -255,7 +255,7 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     // 2b. Enroll a Passkey Admin at epoch 2 (survives H5 `--bump-epoch` from 1 -> 2 when revoking bob!)
     let mut passkey = TestPasskeyAdmin::generate("alice-passkey", "touchid-admin");
     passkey.auth_epoch = 2;
-    passkey.enroll_via_auth_add_pty(&home, &state_dir, None);
+    passkey.seed_existing_passkey_fixture(&state_dir);
 
     // Configure a Stage-1-only gate policy (zero external LLM / Ollama calls) and lock it via Passkey!
     fs::write(
@@ -276,7 +276,7 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
         &home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--state-dir",
             state_str,
             "--local",

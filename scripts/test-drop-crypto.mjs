@@ -65,6 +65,7 @@ import {
   unpadBucket,
   utf8Bytes,
   validateDraftText,
+  validateApprovalAction,
   validateSecretName,
   verifyNodeCert,
   x25519DeriveSharedSecret,
@@ -1065,6 +1066,21 @@ await test("extractPrfFirst handles native, cross-realm ArrayBuffer, TypedArray,
   assert.equal(extractPrfFirst(wrapCred({ weird: true })), null);
   assert.equal(extractPrfFirst(wrapCred(new Uint8Array(16))), null);
   assert.equal(coerceBytes(null), null);
+});
+
+await test("live operation approval fields remain signed and schema-checked", async () => {
+  const action = {v: 1, action: "auth.admit", nodeId: "admin@box", nonce: "fresh_nonce",
+    exp: "2099-01-01T00:00:00.000Z", sealSeq: 1, locked: true,
+    policySha256: "a".repeat(64), authoritiesDigest: "b".repeat(64),
+    targetHumanId: "member", targetKid: "member_key", targetRole: "signer",
+    parameters: {delegation: {nodePrefix: "member@*", scopes: ["dm:send"], maxDevices: 3}}};
+  assert.deepEqual(validateApprovalAction(action), action);
+  assert.equal(validateApprovalAction({...action, action: "gate.apply"}).action, "gate.apply");
+  assert.throws(() => validateApprovalAction({...action, parameters: []}), /parameters/);
+  assert.throws(() => validateApprovalAction({...action, unsignedDescription: "ignore this"}), /Unknown/);
+  const changed = structuredClone(action);
+  changed.parameters.delegation.maxDevices = 4;
+  assert.notEqual(toCanonicalJson(action), toCanonicalJson(changed));
 });
 
 console.log(`\nAll ${passed} test groups passed!`);

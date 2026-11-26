@@ -2,6 +2,7 @@
 //! `BEGIN IMMEDIATE` schema migrations with automatic pre-migration `VACUUM INTO` backups,
 //! and RAII transaction helper.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -265,14 +266,26 @@ pub(crate) struct EventCacheState {
 pub(crate) struct ImmediateTx<'a> {
     conn: &'a Connection,
     committed: bool,
+    nested: bool,
 }
 
 impl<'a> ImmediateTx<'a> {
     pub(crate) fn begin(conn: &'a Connection) -> StoreResult<Self> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
+        let nested = false;
         Ok(Self {
             conn,
             committed: false,
+            nested,
+        })
+    }
+
+    fn savepoint(conn: &'a Connection) -> StoreResult<Self> {
+        conn.execute_batch("SAVEPOINT hyp_store_nested")?;
+        Ok(Self {
+            conn,
+            committed: false,
+            nested: true,
         })
     }
 
@@ -281,7 +294,11 @@ impl<'a> ImmediateTx<'a> {
     }
 
     pub(crate) fn commit(mut self) -> StoreResult<()> {
-        self.conn.execute_batch("COMMIT")?;
+        self.conn.execute_batch(if self.nested {
+            "RELEASE SAVEPOINT hyp_store_nested"
+        } else {
+            "COMMIT"
+        })?;
         self.committed = true;
         Ok(())
     }
@@ -290,7 +307,11 @@ impl<'a> ImmediateTx<'a> {
 impl Drop for ImmediateTx<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            let _ = self.conn.execute_batch(if self.nested {
+                "ROLLBACK TO SAVEPOINT hyp_store_nested; RELEASE SAVEPOINT hyp_store_nested"
+            } else {
+                "ROLLBACK"
+            });
         }
     }
 }
@@ -330,6 +351,16 @@ impl Drop for ForeignKeysGuard<'_> {
     }
 }
 
+struct WriteScope<'a> {
+    depth: &'a Cell<usize>,
+    previous: usize,
+}
+impl Drop for WriteScope<'_> {
+    fn drop(&mut self) {
+        self.depth.set(self.previous);
+    }
+}
+
 /// Unified Hyphae v2 SQLite WAL database handle (`node.sqlite`).
 ///
 /// Owns one `rusqlite::Connection` configured for WAL concurrency and exposes scoped store views
@@ -337,6 +368,7 @@ impl Drop for ForeignKeysGuard<'_> {
 /// the unified exact deadline scheduler (`next_deadline_ms()` / `tick()`).
 pub struct NodeDb {
     conn: Connection,
+    write_scope_depth: Cell<usize>,
     db_path: Option<PathBuf>,
     transfers_dir: PathBuf,
     /// Temporary directory created automatically for `open_in_memory()` transfer blobs;
@@ -390,6 +422,7 @@ impl NodeDb {
 
         Ok(Self {
             conn,
+            write_scope_depth: Cell::new(0),
             db_path: Some(path),
             transfers_dir,
             ephemeral_transfers_dir: None,
@@ -422,6 +455,7 @@ impl NodeDb {
 
         Ok(Self {
             conn,
+            write_scope_depth: Cell::new(0),
             db_path: None,
             transfers_dir,
             ephemeral_transfers_dir,
@@ -503,7 +537,33 @@ impl NodeDb {
     }
 
     pub(crate) fn immediate_tx(&self) -> StoreResult<ImmediateTx<'_>> {
-        ImmediateTx::begin(&self.conn)
+        if self.write_scope_depth.get() > 0 {
+            ImmediateTx::savepoint(&self.conn)
+        } else {
+            ImmediateTx::begin(&self.conn)
+        }
+    }
+
+    /// Serialize a group of store mutations under one immediate writer transaction. Subsystem
+    /// methods use nested savepoints and cannot commit the outer operation independently.
+    /// Every write rolls back if the operation or final commit fails.
+    pub fn with_write_transaction<T, E>(
+        &self,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let transaction = self.immediate_tx()?;
+        let previous = self.write_scope_depth.get();
+        let _scope = WriteScope {
+            depth: &self.write_scope_depth,
+            previous,
+        };
+        self.write_scope_depth.set(previous + 1);
+        let result = operation()?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     // ---- Scoped subsystem store accessors ----
