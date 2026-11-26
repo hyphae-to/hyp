@@ -14,8 +14,8 @@ use crate::approval::{
 };
 use crate::config_file::{
     ensure_dir, ensure_v2_node_json_defaults, load_node_or_legacy_config, open_secret_store,
-    read_json_object_or_empty, resolve_config_path_for_read, resolve_config_path_for_write,
-    resolve_effective_node_id, resolve_state_dir, write_atomic_json,
+    resolve_config_path_for_read, resolve_config_path_for_write, resolve_effective_node_id,
+    resolve_state_dir, write_atomic_json,
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -36,6 +36,7 @@ use hyp_node::gates::policy::{
     Stage2Matchers, TierDeliveryAction, TrustTier, gate_policy_sha256, verify_gate_policy_for_node,
 };
 use hyp_node::gates::stage2::validate_stage2_endpoint_urls;
+use hyp_node::node_file::NodeFile;
 use hyp_store::{
     GateAuditQuery, GateDecision as StoreGateDecision, GateState, MailboxEntry, MuteRuleInput,
     NodeDb, StoreError, now_ms,
@@ -2076,7 +2077,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     let config_path =
         resolve_config_path_for_write(args.config.as_deref(), args.state_dir.as_deref(), None);
 
-    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
         Ok(m) => m,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
     };
@@ -2270,7 +2271,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         if let Err(error) =
             execute_approved_operation(&config_path, &config_path, &db, &verified, || {
                 persist_passkey_gate_seal(&db, &verified)?;
-                write_atomic_json(&config_path, &Value::Object(cfg_map), true)
+                NodeFile::write_document(&config_path, cfg_map)
             })
         {
             return emit_error(
@@ -2489,7 +2490,7 @@ fn run_gate_apply(
         );
     }
 
-    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
         Ok(m) => m,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
     };
@@ -2714,7 +2715,7 @@ fn run_gate_apply(
     if let Err(error) =
         execute_approved_operation(&config_path, &config_path, &db, &verified, || {
             persist_passkey_gate_seal(&db, &verified)?;
-            write_atomic_json(&config_path, &Value::Object(cfg_map), true)
+            NodeFile::write_document(&config_path, cfg_map)
         })
     {
         return emit_error(
@@ -2863,7 +2864,7 @@ fn run_gate_remove(
         );
     }
 
-    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
         Ok(m) => m,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
     };
@@ -3069,7 +3070,7 @@ fn run_gate_remove(
         if let Err(error) =
             execute_approved_operation(&config_path, &config_path, &db, &verified, || {
                 persist_passkey_gate_seal(&db, &verified)?;
-                write_atomic_json(&config_path, &Value::Object(cfg_map), true)
+                NodeFile::write_document(&config_path, cfg_map)
             })
         {
             return emit_error(

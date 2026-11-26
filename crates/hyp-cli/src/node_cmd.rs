@@ -12,37 +12,29 @@ use crate::config_file::{
 use crate::drop_cmd::validate_relay_url;
 use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
 use clap::{Args, Subcommand, ValueEnum};
-use hyp_crypto::CryptoError;
-use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
-use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
+use hyp_crypto::keystore::SecretBackend;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_harness::daemon::{
     BoxFuture as DaemonBoxFuture, DEFAULT_PEERS_RELOAD_TIMEOUT, DaemonError, DeliveryRetryConfig,
     LocalDaemon, LocalDaemonConfig, PeersReloader, WakeRecoveryConfig,
 };
+use hyp_harness::node_config::parse_plugins_config;
+use hyp_harness::plugin_runtime::{self, ParsedPlugin};
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
-use hyp_node::adapters::github_public::normalize_repo_token_pattern;
-use hyp_node::adapters::supervisor::is_secret_like_env_key;
-use hyp_node::adapters::{
-    AdapterKind, GitHubPublicAdapter, GitHubPublicConfig, GitHubWebhookAdapter,
-    GitHubWebhookConfig, SubprocessConfig,
-};
-use hyp_node::engine::config::{ForwardingPolicy, validate_trusted_proxy_cidr};
+use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig, GitHubWebhookAdapter};
 use hyp_node::engine::{
-    DEFAULT_PEER_SOCKET_FILENAME, DEFAULT_WAKE_CHECK_INTERVAL_SECS, DropRelayConfig, E2eePolicy,
-    EscalationConfig, GuestPairingConfig, KvNamespaceConfig, LocalIngestConfig, LocalIngestServer,
+    DEFAULT_PEER_SOCKET_FILENAME, DEFAULT_WAKE_CHECK_INTERVAL_SECS, E2eePolicy, LocalIngestServer,
     NodeConfig, NodeProfile, PeerReconcileReport, TopicConfig, UnifiedNode,
     normalize_drop_portal_url, spawn_wake_watcher,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
-use hyp_proto::address::{
-    LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_kv_namespace, is_valid_node_id, is_valid_topic,
+use hyp_node::node_file::runtime::{
+    filter_colliding_webhook_sources, parse_github_public_source, parse_pairing_admin_key,
+    parse_webhook_sources,
 };
-use hyp_proto::manifest::{KvMode, KvWriteModel, OkpCurve as ProtoOkpCurve, OkpJwk as ProtoOkpJwk};
-use hyp_proto::scopes::ScopePreset;
+use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_node_id, is_valid_topic};
 use hyp_store::NodeDb;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -378,7 +370,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
     let mut startup_warnings: Vec<String> = Vec::new();
     let mut github_public_cfg: Option<GitHubPublicConfig> = None;
-    let mut webhook_sources = ParsedWebhookSources::default();
+    let mut webhook_sources = Vec::new();
     let mut enable_kv = None;
     let mut delivery_retry_cfg = DeliveryRetryConfig::default();
     let mut wake_recovery_cfg = WakeRecoveryConfig::default();
@@ -394,7 +386,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             E2eePolicy::Prefer
         };
 
-        if let Err(e) = parse_node_runtime_policies(&cfg.raw, &mut node_cfg) {
+        if let Err(e) = cfg.file.apply_runtime_policies(&mut node_cfg) {
             return emit_error(
                 cmd,
                 as_json,
@@ -405,7 +397,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             );
         }
 
-        enable_kv = match crate::config_file::kv_tool_override(cfg.raw.get("kv")) {
+        enable_kv = match cfg.file.kv_tool_override() {
             Ok(enable_kv) => enable_kv,
             Err(e) => {
                 return emit_error(
@@ -422,7 +414,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         // Parse optional `kvNamespaces[]` (simple strings or structured objects) into
         // `NodeConfig.kv_namespaces` so `/v1/manifest` and `LocalDaemon::has_kv_capability()`
         // advertise `hyp_kv` accurately.
-        match parse_kv_namespaces(&cfg.raw, &mut startup_warnings) {
+        match cfg.file.kv_namespaces(&mut startup_warnings) {
             Ok(namespaces) => node_cfg.kv_namespaces = namespaces,
             Err(e) => {
                 return emit_error(
@@ -440,8 +432,8 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Parse optional `localIngest` policy (default enabled: true!).
-        if let Some(li_val) = cfg.raw.get("localIngest") {
-            match serde_json::from_value::<LocalIngestConfig>(li_val.clone()) {
+        if let Some(local_ingest) = &cfg.file.local_ingest {
+            match local_ingest {
                 Ok(li) => {
                     let bare_default = li
                         .default_topic
@@ -461,7 +453,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                             None,
                         );
                     }
-                    node_cfg.local_ingest = li;
+                    node_cfg.local_ingest = li.clone();
                 }
                 Err(e) => {
                     return emit_error(
@@ -477,7 +469,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Parse optional `deliveryRetry` (with legacy fallbacks `codexResume`, `herdrSpawnAllowlist`).
-        match parse_delivery_retry_config(&cfg.raw) {
+        match cfg.file.delivery_retry() {
             Ok(dr_cfg) => delivery_retry_cfg = dr_cfg,
             Err(e) => {
                 return emit_error(
@@ -495,7 +487,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Parse optional `wakeRecovery` sleep/wake detector & recovery settings.
-        match parse_wake_recovery_config(&cfg.raw) {
+        match cfg.file.wake_recovery() {
             Ok(wr_cfg) => wake_recovery_cfg = wr_cfg,
             Err(e) => {
                 return emit_error(
@@ -510,7 +502,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Parse optional RFC 0004 `delivery.midturnQueueDigestSeconds`.
-        match parse_midturn_queue_digest_seconds(&cfg.raw) {
+        match cfg.file.midturn_queue_digest_seconds() {
             Ok(secs) => midturn_queue_digest_seconds = secs,
             Err(e) => {
                 return emit_error(
@@ -525,8 +517,8 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Parse optional `dropRelay` (RAM-only Blind Drop Relay) and `dropRelayUrl`.
-        if let Some(dr_val) = cfg.raw.get("dropRelay") {
-            match serde_json::from_value::<DropRelayConfig>(dr_val.clone()) {
+        if let Some(drop_relay) = &cfg.file.drop_relay {
+            match drop_relay {
                 Ok(dr) => {
                     if dr.max_memory_mb == 0 {
                         return emit_error(
@@ -558,7 +550,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                             Some("Set allowedOrigins to [\"https://hyphae.to\"].".to_string()),
                         );
                     }
-                    node_cfg.drop_relay = dr;
+                    node_cfg.drop_relay = dr.clone();
                 }
                 Err(e) => {
                     return emit_error(
@@ -572,13 +564,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 }
             }
         }
-        if let Some(raw_url) = cfg
-            .raw
-            .get("dropRelayUrl")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(raw_url) = cfg.file.drop_relay_url.as_deref() {
             match validate_relay_url(raw_url) {
                 Ok(valid_url) => node_cfg.drop_relay_url = Some(valid_url),
                 Err(e) => {
@@ -595,47 +581,33 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Parse optional `dropPortalUrl` (fail closed on invalid URLs).
-        if let Some(dp_val) = cfg.raw.get("dropPortalUrl") {
-            if !dp_val.is_null() {
-                let Some(raw_url) = dp_val.as_str() else {
+        if let Some(drop_portal) = &cfg.file.drop_portal_url {
+            match drop_portal
+                .as_deref()
+                .map_err(|e| e.to_string())
+                .and_then(normalize_drop_portal_url)
+            {
+                Ok(valid_url) => node_cfg.drop_portal_url = Some(valid_url),
+                Err(e) => {
                     return emit_error(
                         cmd,
                         as_json,
                         EXIT_ERROR,
                         "CONFIG_ERROR",
-                        format!(
-                            "Invalid dropPortalUrl in {}: must be a string",
-                            cfg.path.display()
-                        ),
+                        format!("Invalid dropPortalUrl in {}: {e}", cfg.path.display()),
                         Some(
                             "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
                                 .to_string(),
                         ),
                     );
-                };
-                match normalize_drop_portal_url(raw_url) {
-                    Ok(valid_url) => node_cfg.drop_portal_url = Some(valid_url),
-                    Err(e) => {
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
-                            "CONFIG_ERROR",
-                            format!("Invalid dropPortalUrl in {}: {e}", cfg.path.display()),
-                            Some(
-                                "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
-                                    .to_string(),
-                            ),
-                        );
-                    }
                 }
             }
         }
 
         // Parse optional `escalation` hints (default + byScope).
-        if let Some(esc_val) = cfg.raw.get("escalation") {
-            match serde_json::from_value::<EscalationConfig>(esc_val.clone()) {
-                Ok(esc) => node_cfg.escalation = esc,
+        if let Some(escalation) = &cfg.file.escalation {
+            match escalation {
+                Ok(esc) => node_cfg.escalation = esc.clone(),
                 Err(e) => {
                     return emit_error(
                         cmd,
@@ -650,19 +622,17 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Parse opt-in `guestPairing` policy (matching `hyp deploy init public-node`).
-        if let Some(gp_val) = cfg.raw.get("guestPairing") {
-            match parse_guest_pairing_config(gp_val, cfg.raw.get("rateLimits")) {
-                Ok(gp) => node_cfg.guest_pairing = gp,
-                Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "CONFIG_ERROR",
-                        format!("Invalid guestPairing config in {}: {e}", cfg.path.display()),
-                        None,
-                    );
-                }
+        match cfg.file.guest_pairing() {
+            Ok(gp) => node_cfg.guest_pairing = gp,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "CONFIG_ERROR",
+                    format!("Invalid guestPairing config in {}: {e}", cfg.path.display()),
+                    None,
+                );
             }
         }
 
@@ -670,7 +640,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
         // Parse optional `pairing.adminKey` (OKP Ed25519 JWK object, 43-char base64url raw pubkey,
         // or `{ "secret": "<name>" }` reference) so `POST /v1/pair` can verify Org Admin-CA `am2_` grants.
-        if let Some(admin_key_val) = cfg.raw.get("pairing").and_then(|p| p.get("adminKey")) {
+        if let Some(admin_key_val) = cfg.file.pairing.as_ref().and_then(|p| p.admin_key.as_ref()) {
             match parse_pairing_admin_key(admin_key_val, &secrets, &mut startup_warnings) {
                 Ok(maybe_jwk) => node_cfg.admin_jwk = maybe_jwk,
                 Err(e) => {
@@ -690,18 +660,16 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         // Parse GitHub polling and repository webhook sources.
-        if let Some(sources_val) = cfg.raw.get("sources") {
-            let public_read_only = cfg
-                .raw
-                .get("publicReadOnly")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            match parse_github_public_source(
-                sources_val,
-                &secrets,
-                public_read_only,
-                &mut startup_warnings,
-            ) {
+        if let Some(sources) = cfg.file.source_entries().transpose() {
+            let public_read_only = cfg.file.public_read_only.unwrap_or(false);
+            match sources.map_err(str::to_owned).and_then(|entries| {
+                parse_github_public_source(
+                    entries,
+                    &secrets,
+                    public_read_only,
+                    &mut startup_warnings,
+                )
+            }) {
                 Ok(Some(gh_cfg)) => {
                     if !node_cfg.topics.iter().any(|t| t.topic == gh_cfg.topic) {
                         node_cfg.topics.push(TopicConfig {
@@ -733,7 +701,11 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 }
             }
 
-            match parse_webhook_sources(sources_val, &secrets, &mut startup_warnings) {
+            match parse_webhook_sources(
+                sources.unwrap_or_default(),
+                &secrets,
+                &mut startup_warnings,
+            ) {
                 Ok(mut parsed) => {
                     filter_colliding_webhook_sources(
                         &mut parsed,
@@ -741,7 +713,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                         github_public_cfg.as_ref().map(|g| g.topic.as_str()),
                         &mut startup_warnings,
                     );
-                    for gh in &parsed.github {
+                    for gh in &parsed {
                         if !node_cfg.topics.iter().any(|t| t.topic == gh.topic) {
                             node_cfg.topics.push(TopicConfig {
                                 topic: gh.topic.clone(),
@@ -772,88 +744,22 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         // local-only (`exposeTopic: false`) so paired remote peers with `stream:subscribe=*`
         // (`member`/`observer`/`full`) never silently read private local chat DMs or personal
         // subprocess event sources unless explicitly opted in via `plugins[].exposeTopic: true`.
-        let explicit_topics = parse_explicit_topic_names(cfg.raw.get("topics"));
+        let explicit_topics = &cfg.file.explicit_topics;
 
         // Parse optional `plugins[]` external bridge/source subprocess entries.
         // Fault isolation: individual malformed/misconfigured plugin entries or missing secrets
         // emit startup warnings and record their status without aborting `hyp node start`.
-        if let Some(plugins_val) = cfg.raw.get("plugins") {
-            if !plugins_val.is_null() {
-                let plugins = parse_plugins_config(
-                    plugins_val,
-                    cfg.path.parent(),
-                    &state_dir,
-                    &explicit_topics,
-                    &secrets,
-                    &mut startup_warnings,
-                    &mut skipped_plugin_statuses,
-                );
-                for p in &plugins {
-                    match p.config.kind {
-                        AdapterKind::Bridge => {
-                            if p.expose_topic {
-                                if !node_cfg.topics.iter().any(|t| t.topic == p.config.id) {
-                                    node_cfg.topics.push(TopicConfig {
-                                        topic: p.config.id.clone(),
-                                        kind: Some("bridge".to_string()),
-                                        description: Some(format!(
-                                            "External bridge plugin '{}'",
-                                            p.config.id
-                                        )),
-                                        metadata: None,
-                                        has_provisioned_publisher: true,
-                                    });
-                                }
-                            } else if is_valid_topic(&p.config.id) {
-                                node_cfg.local_only_topics.insert(p.config.id.clone());
-                            }
-                        }
-                        AdapterKind::Source => {
-                            let mut has_invalid_target = false;
-                            for target in &p.config.targets {
-                                if is_valid_topic(target) {
-                                    if !node_cfg.topics.iter().any(|t| t.topic == *target) {
-                                        node_cfg.topics.push(TopicConfig {
-                                            topic: target.clone(),
-                                            kind: Some("source".to_string()),
-                                            description: Some(format!(
-                                                "External source plugin '{}'",
-                                                p.config.id
-                                            )),
-                                            metadata: None,
-                                            has_provisioned_publisher: true,
-                                        });
-                                    }
-                                    if !p.expose_topic {
-                                        node_cfg.local_only_topics.insert(target.clone());
-                                    }
-                                } else {
-                                    has_invalid_target = true;
-                                }
-                            }
-                            if has_invalid_target && is_valid_topic(&p.config.id) {
-                                if !node_cfg.topics.iter().any(|t| t.topic == p.config.id) {
-                                    node_cfg.topics.push(TopicConfig {
-                                        topic: p.config.id.clone(),
-                                        kind: Some("source".to_string()),
-                                        description: Some(format!(
-                                            "External source plugin '{}'",
-                                            p.config.id
-                                        )),
-                                        metadata: None,
-                                        has_provisioned_publisher: true,
-                                    });
-                                }
-                                if !p.expose_topic {
-                                    node_cfg.local_only_topics.insert(p.config.id.clone());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                parsed_plugins = plugins;
-            }
+        if let Some(plugins) = &cfg.file.plugins {
+            parsed_plugins = parse_plugins_config(
+                plugins,
+                cfg.path.parent(),
+                &state_dir,
+                explicit_topics,
+                &secrets,
+                &mut startup_warnings,
+                &mut skipped_plugin_statuses,
+            );
+            plugin_runtime::configure_plugin_topics(&mut node_cfg, &parsed_plugins);
         }
     }
 
@@ -936,7 +842,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             };
 
         // Attach compiled-in pure-Rust webhook adapters BEFORE serving HTTP!
-        for gh_cfg in webhook_sources.github {
+        for gh_cfg in webhook_sources {
             let adapter = Arc::new(GitHubWebhookAdapter::new(gh_cfg));
             node.attach_github_webhook(adapter)
                 .await
@@ -947,14 +853,14 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
 
         let has_gate_cfg = loaded
             .as_ref()
-            .and_then(|c| c.raw.get("gate"))
+            .and_then(|c| c.file.gate.as_ref())
             .is_some();
         let has_gate_seal = crate::approval::has_gate_lock_seal(&state_dir);
         let (gate_pipeline, gate_db_shared) =
             if start_local_daemon || start_local_ingest || has_gate_cfg || has_gate_seal {
-            let gate_cfg: SecurityGateConfig = match loaded.as_ref().and_then(|c| c.raw.get("gate"))
+            let gate_cfg: SecurityGateConfig = match loaded.as_ref().and_then(|c| c.file.gate.as_ref())
             {
-                Some(gate_val) => serde_json::from_value(gate_val.clone())
+                Some(gate) => gate.clone()
                     .map_err(|e| format!("Invalid gate configuration in node.json: {e}"))?,
                 None => SecurityGateConfig::default(),
             };
@@ -1440,8 +1346,8 @@ fn reload_gate_pipeline_from_disk(
                 target_path.display()
             )
         })?;
-        match loaded.raw.get("gate") {
-            Some(gate_val) => serde_json::from_value(gate_val.clone()).map_err(|e| {
+        match loaded.file.gate {
+            Some(gate) => gate.map_err(|e| {
                 format!(
                     "Invalid gate configuration in {}: {e}",
                     target_path.display()
@@ -1492,1992 +1398,50 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-fn parse_guest_pairing_config(
-    gp_val: &Value,
-    rate_limits_val: Option<&Value>,
-) -> Result<GuestPairingConfig, String> {
-    let obj = gp_val
-        .as_object()
-        .ok_or_else(|| "guestPairing must be a JSON object".to_string())?;
-    let mut cfg = GuestPairingConfig::default();
-
-    if let Some(enabled) = obj.get("enabled").and_then(Value::as_bool) {
-        cfg.enabled = enabled;
-    }
-    if let Some(max_repos) = obj.get("maxReposPerGuest").and_then(Value::as_u64) {
-        if max_repos == 0 {
-            return Err("guestPairing.maxReposPerGuest must be > 0".to_string());
-        }
-        cfg.max_repos_per_guest = max_repos as usize;
-    }
-    if let Some(max_batches) = obj.get("maxBatchesPerHour").and_then(Value::as_u64) {
-        if max_batches == 0 {
-            return Err("guestPairing.maxBatchesPerHour must be > 0".to_string());
-        }
-        cfg.max_batches_per_hour = max_batches.min(u32::MAX as u64) as u32;
-    }
-    if let Some(max_joins) = obj
-        .get("maxJoinsPerMinute")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            rate_limits_val
-                .and_then(|rl| rl.get("guestJoinRequestsPerMinute"))
-                .and_then(Value::as_u64)
-        })
-    {
-        cfg.max_joins_per_minute = max_joins.min(u32::MAX as u64) as u32;
-    }
-    if let Some(scopes_val) = obj.get("scopes") {
-        let arr = scopes_val
-            .as_array()
-            .ok_or_else(|| "guestPairing.scopes must be an array of scope strings".to_string())?;
-        let mut parsed = Vec::with_capacity(arr.len());
-        for item in arr {
-            let s = item
-                .as_str()
-                .ok_or_else(|| "guestPairing.scopes entries must be strings".to_string())?;
-            parsed.push(s.to_string());
-        }
-        if !parsed.is_empty() {
-            cfg.scopes = parsed;
-        }
-    } else {
-        cfg.scopes = if cfg.max_repos_per_guest == 10 && cfg.max_batches_per_hour == 60 {
-            ScopePreset::GuestRo.expand()
-        } else {
-            vec![format!(
-                "stream:subscribe=github[require=exact.repo;maxValues={};maxBatchesPerHour={}]",
-                cfg.max_repos_per_guest, cfg.max_batches_per_hour
-            )]
-        };
-    }
-
-    Ok(cfg)
-}
-
-fn parse_ed25519_jwk_str_or_b64(raw: &str, context: &str) -> Result<ProtoOkpJwk, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{context} cannot be empty"));
-    }
-    if trimmed.starts_with('{') {
-        let val: Value =
-            serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON in {context}: {e}"))?;
-        return parse_ed25519_jwk_object(&val, context);
-    }
-    if trimmed.len() != 43 {
-        return Err(format!(
-            "{context} string must be a 43-character unpadded base64url Ed25519 public key (got {} chars)",
-            trimmed.len()
-        ));
-    }
-    let crypto_jwk = CryptoOkpJwk {
-        kty: "OKP".to_string(),
-        crv: "Ed25519".to_string(),
-        x: trimmed.to_string(),
-    };
-    crypto_jwk
-        .to_ed25519()
-        .map_err(|e| format!("invalid Ed25519 public key in {context}: {e}"))?;
-    let proto_jwk = ProtoOkpJwk {
-        kty: "OKP".to_string(),
-        crv: ProtoOkpCurve::Ed25519,
-        x: trimmed.to_string(),
-    };
-    proto_jwk
-        .validate(Some(ProtoOkpCurve::Ed25519))
-        .map_err(|e| format!("invalid Ed25519 public key in {context}: {e}"))?;
-    Ok(proto_jwk)
-}
-
-fn parse_ed25519_jwk_object(val: &Value, context: &str) -> Result<ProtoOkpJwk, String> {
-    let obj = val.as_object().ok_or_else(|| {
-        format!("{context} must be an OKP Ed25519 JWK object or 43-char base64url string")
-    })?;
-    if obj.contains_key("d") {
-        return Err(format!(
-            "{context} must be a public OKP Ed25519 JWK (private key field 'd' is forbidden in node.json)"
-        ));
-    }
-    let crypto_jwk: CryptoOkpJwk = serde_json::from_value(val.clone())
-        .map_err(|e| format!("malformed OKP Ed25519 JWK in {context}: {e}"))?;
-    if crypto_jwk.kty != "OKP" || crypto_jwk.crv != "Ed25519" {
-        return Err(format!(
-            "{context} must have kty=\"OKP\" and crv=\"Ed25519\", got kty={:?} crv={:?}",
-            crypto_jwk.kty, crypto_jwk.crv
-        ));
-    }
-    crypto_jwk
-        .to_ed25519()
-        .map_err(|e| format!("invalid Ed25519 public key in {context}: {e}"))?;
-    let proto_jwk = ProtoOkpJwk {
-        kty: "OKP".to_string(),
-        crv: ProtoOkpCurve::Ed25519,
-        x: crypto_jwk.x,
-    };
-    proto_jwk
-        .validate(Some(ProtoOkpCurve::Ed25519))
-        .map_err(|e| format!("invalid Ed25519 public key in {context}: {e}"))?;
-    Ok(proto_jwk)
-}
-
-fn parse_pairing_admin_key(
-    val: &Value,
-    secrets: &hyp_crypto::SecretStore,
-    warnings: &mut Vec<String>,
-) -> Result<Option<ProtoOkpJwk>, String> {
-    if val.is_null() {
-        return Ok(None);
-    }
-    if let Some(s) = val.as_str() {
-        return parse_ed25519_jwk_str_or_b64(s, "pairing.adminKey").map(Some);
-    }
-    if let Some(obj) = val.as_object() {
-        if obj.len() == 1 && obj.contains_key("secret") {
-            let secret_name = obj
-                .get("secret")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "pairing.adminKey.secret must be a string".to_string())?;
-            validate_secret_name(secret_name).map_err(|e| {
-                format!("invalid secret name '{secret_name}' in pairing.adminKey: {e}")
-            })?;
-            return match secrets.get(secret_name) {
-                Ok(secret) => parse_ed25519_jwk_str_or_b64(
-                    &secret,
-                    &format!("pairing.adminKey (secret '{secret_name}')"),
-                )
-                .map(Some),
-                Err(CryptoError::SecretNotFound(_)) => {
-                    warnings.push(format!(
-                        "Secret '{secret_name}' referenced by pairing.adminKey is not set; am2_ Admin-CA pairing disabled until `hyp secret set {secret_name}` is configured."
-                    ));
-                    Ok(None)
-                }
-                Err(e) => Err(format!(
-                    "failed to load pairing.adminKey secret '{secret_name}': {e}"
-                )),
-            };
-        }
-        return parse_ed25519_jwk_object(val, "pairing.adminKey").map(Some);
-    }
-    Err("pairing.adminKey must be an OKP Ed25519 JWK object, a 43-char base64url public key string, or { \"secret\": \"<name>\" }".to_string())
-}
-
-fn parse_secret_ref_name(val: &Value, field_name: &str) -> Result<Option<String>, String> {
-    if val.is_null() {
-        return Ok(None);
-    }
-    if val.is_string() {
-        return Err(format!(
-            "'{field_name}' must use {{ \"secret\": \"<name>\" }} (plaintext credentials are forbidden in node.json)"
-        ));
-    }
-    let obj = val
-        .as_object()
-        .ok_or_else(|| format!("'{field_name}' must be an object {{ \"secret\": \"<name>\" }}"))?;
-    let name = obj
-        .get("secret")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("'{field_name}' missing string 'secret' reference"))?;
-    validate_secret_name(name)
-        .map_err(|e| format!("invalid secret name '{name}' in '{field_name}': {e}"))?;
-    Ok(Some(name.to_string()))
-}
-
-#[derive(Default)]
-struct ParsedWebhookSources {
-    github: Vec<GitHubWebhookConfig>,
-}
-
-/// Guest topic collision guard: refuses (with a clear startup warning + skip) wiring any webhook
-/// adapter onto topic `"github"` when `guestPairing.enabled == true` or onto any topic already
-/// owned by a `github-public` source.
-fn filter_colliding_webhook_sources(
-    parsed: &mut ParsedWebhookSources,
-    guest_pairing_enabled: bool,
-    github_public_topic: Option<&str>,
-    warnings: &mut Vec<String>,
-) {
-    let collision_reason = |topic: &str| -> Option<&'static str> {
-        if topic == "github" && guest_pairing_enabled {
-            return Some("guestPairing is enabled on topic 'github'");
-        }
-        if let Some(gh_pub_topic) = github_public_topic {
-            if topic == gh_pub_topic {
-                return Some("a github-public source already owns this topic");
-            }
-        }
-        None
-    };
-
-    parsed.github.retain(|cfg| {
-        if let Some(reason) = collision_reason(&cfg.topic) {
-            warnings.push(format!(
-                "Skipping github-webhook source '{}' on topic '{}': {reason}; configure a distinct private topic.",
-                cfg.id, cfg.topic
-            ));
-            false
-        } else {
-            true
-        }
-    });
-}
-
-fn parse_trusted_proxies_array(val: &Value, field: &str) -> Result<Vec<String>, String> {
-    let arr = val
-        .as_array()
-        .ok_or_else(|| format!("{field} must be an array of IP/CIDR strings"))?;
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
-        let s = item
-            .as_str()
-            .ok_or_else(|| format!("{field} entries must be IP/CIDR strings"))?
-            .trim();
-        let _ =
-            validate_trusted_proxy_cidr(s).map_err(|e| format!("invalid entry in {field}: {e}"))?;
-        out.push(s.to_string());
-    }
-    Ok(out)
-}
-
-fn parse_node_runtime_policies(raw: &Value, node_cfg: &mut NodeConfig) -> Result<(), String> {
-    if let Some(fwd_val) = raw.get("forwarding") {
-        if !fwd_val.is_null() {
-            if fwd_val.get("maxHops").and_then(Value::as_u64) == Some(0) {
-                return Err(
-                    "invalid forwarding policy: forwarding.maxHops must be >= 1 (default 2, max 4)"
-                        .to_string(),
-                );
-            }
-            let fp: ForwardingPolicy = serde_json::from_value(fwd_val.clone())
-                .map_err(|e| format!("invalid forwarding policy: {e}"))?;
-            if fp.max_hops == 0 {
-                return Err(
-                    "invalid forwarding policy: forwarding.maxHops must be >= 1 (default 2, max 4)"
-                        .to_string(),
-                );
-            }
-            node_cfg.forwarding = fp;
-        }
-    }
-
-    // H7: Prefer explicit `trustedProxies` CIDR list (top-level overrides `listen.trustedProxies`).
-    // For backwards compatibility with existing configs that only set `behindReverseProxy: true`,
-    // map strictly to loopback-only `["127.0.0.1/32", "::1/128"]` (NEVER trusting RFC1918/VPC peers).
-    let listen_trusted = match raw.get("listen").and_then(|l| l.get("trustedProxies")) {
-        Some(v) if !v.is_null() => Some(parse_trusted_proxies_array(v, "listen.trustedProxies")?),
-        _ => None,
-    };
-    let top_trusted = match raw.get("trustedProxies") {
-        Some(v) if !v.is_null() => Some(parse_trusted_proxies_array(v, "trustedProxies")?),
-        _ => None,
-    };
-
-    if let Some(list) = top_trusted.or(listen_trusted) {
-        node_cfg.trusted_proxies = list;
-    } else {
-        let listen_proxy = match raw.get("listen").and_then(|l| l.get("behindReverseProxy")) {
-            Some(v) if !v.is_null() => Some(
-                v.as_bool()
-                    .ok_or_else(|| "listen.behindReverseProxy must be a boolean".to_string())?,
-            ),
-            _ => None,
-        };
-        let top_proxy = match raw.get("behindReverseProxy") {
-            Some(v) if !v.is_null() => Some(
-                v.as_bool()
-                    .ok_or_else(|| "behindReverseProxy must be a boolean".to_string())?,
-            ),
-            _ => None,
-        };
-        if let Some(val) = top_proxy.or(listen_proxy) {
-            node_cfg.trusted_proxies = if val {
-                vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
-            } else {
-                Vec::new()
-            };
-        }
-    }
-
-    Ok(())
-}
-
-/// Parses `"kvNamespaces"` from `node.json` into [`KvNamespaceConfig`] entries.
-///
-/// Accepts both simple string entries (e.g. `["shared", "deploy-state"]`) and structured objects
-/// (e.g. `{ "namespace": "shared", "mode": "e2ee", "writeModel": "shared" }` or `"name"`).
-/// Validates every namespace name fail-closed with [`is_valid_kv_namespace`] and deduplicates
-/// duplicate namespace names while emitting a startup warning.
-fn parse_kv_namespaces(
-    raw: &Value,
-    warnings: &mut Vec<String>,
-) -> Result<Vec<KvNamespaceConfig>, String> {
-    let Some(val) = raw.get("kvNamespaces") else {
-        return Ok(Vec::new());
-    };
-    if val.is_null() {
-        return Ok(Vec::new());
-    }
-    let arr = val
-        .as_array()
-        .ok_or_else(|| "kvNamespaces must be an array".to_string())?;
-
-    let mut out = Vec::with_capacity(arr.len());
-    let mut seen = HashSet::new();
-
-    for (idx, item) in arr.iter().enumerate() {
-        let cfg = match item {
-            Value::String(s) => {
-                let name = s.trim();
-                if !is_valid_kv_namespace(name) {
-                    return Err(format!(
-                        "kvNamespaces[{idx}] invalid namespace name '{name}': must match /^[a-z0-9][a-z0-9._-]{{0,63}}$/"
-                    ));
-                }
-                KvNamespaceConfig {
-                    name: name.to_string(),
-                    mode: KvMode::E2ee,
-                    write_model: KvWriteModel::Shared,
-                }
-            }
-            Value::Object(obj) => {
-                let name_field = match obj.get("name") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(s)) => Some(s.trim()),
-                    Some(_) => {
-                        return Err(format!("kvNamespaces[{idx}].name must be a string"));
-                    }
-                };
-                let ns_field = match obj.get("namespace") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(s)) => Some(s.trim()),
-                    Some(_) => {
-                        return Err(format!("kvNamespaces[{idx}].namespace must be a string"));
-                    }
-                };
-                let name = match (name_field, ns_field) {
-                    (Some(a), Some(b)) if a != b => {
-                        return Err(format!(
-                            "kvNamespaces[{idx}] specifies conflicting 'name' ('{a}') and 'namespace' ('{b}')"
-                        ));
-                    }
-                    (Some(a), _) => a,
-                    (None, Some(b)) => b,
-                    (None, None) => {
-                        return Err(format!(
-                            "kvNamespaces[{idx}] object must specify 'namespace' (or 'name')"
-                        ));
-                    }
-                };
-                if !is_valid_kv_namespace(name) {
-                    return Err(format!(
-                        "kvNamespaces[{idx}] invalid namespace name '{name}': must match /^[a-z0-9][a-z0-9._-]{{0,63}}$/"
-                    ));
-                }
-
-                let mode = match obj.get("mode") {
-                    None | Some(Value::Null) => KvMode::E2ee,
-                    Some(Value::String(raw_mode)) => {
-                        match raw_mode.trim().to_ascii_lowercase().as_str() {
-                            "e2ee" => KvMode::E2ee,
-                            "plaintext" => KvMode::Plaintext,
-                            other => {
-                                return Err(format!(
-                                    "kvNamespaces[{idx}].mode invalid value '{other}': expected 'e2ee' or 'plaintext'"
-                                ));
-                            }
-                        }
-                    }
-                    Some(_) => {
-                        return Err(format!("kvNamespaces[{idx}].mode must be a string"));
-                    }
-                };
-
-                let write_model_val = obj.get("writeModel").or_else(|| obj.get("write_model"));
-                let write_model = match write_model_val {
-                    None | Some(Value::Null) => KvWriteModel::Shared,
-                    Some(Value::String(raw_wm)) => {
-                        match raw_wm.trim().to_ascii_lowercase().as_str() {
-                            "shared" | "cas" => KvWriteModel::Shared,
-                            "owner" => KvWriteModel::Owner,
-                            "allowlist" => KvWriteModel::Allowlist,
-                            other => {
-                                return Err(format!(
-                                    "kvNamespaces[{idx}].writeModel invalid value '{other}': expected 'shared', 'owner', 'allowlist', or 'cas'"
-                                ));
-                            }
-                        }
-                    }
-                    Some(_) => {
-                        return Err(format!("kvNamespaces[{idx}].writeModel must be a string"));
-                    }
-                };
-
-                KvNamespaceConfig {
-                    name: name.to_string(),
-                    mode,
-                    write_model,
-                }
-            }
-            _ => {
-                return Err(format!(
-                    "kvNamespaces[{idx}] must be a namespace string or object"
-                ));
-            }
-        };
-
-        if !seen.insert(cfg.name.clone()) {
-            warnings.push(format!(
-                "Duplicate kvNamespaces entry '{}' ignored (keeping first definition).",
-                cfg.name
-            ));
-            continue;
-        }
-        out.push(cfg);
-    }
-
-    Ok(out)
-}
-
-fn validate_webhook_source_id(id: &str, field: &str) -> Result<String, String> {
-    let trimmed = id.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > 64
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
-    {
-        return Err(format!("invalid {field} '{id}'"));
-    }
-    Ok(trimmed.to_string())
-}
-
-fn parse_optional_string_vec(
-    obj: &serde_json::Map<String, Value>,
-    key: &str,
-    field: &str,
-) -> Result<Vec<String>, String> {
-    let Some(val) = obj.get(key) else {
-        return Ok(Vec::new());
-    };
-    if val.is_null() {
-        return Ok(Vec::new());
-    }
-    let arr = val
-        .as_array()
-        .ok_or_else(|| format!("{field} must be an array of strings"))?;
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
-        let s = item
-            .as_str()
-            .ok_or_else(|| format!("{field} entries must be strings"))?
-            .trim();
-        if !s.is_empty() {
-            out.push(s.to_string());
-        }
-    }
-    Ok(out)
-}
-
-fn parse_webhook_sources(
-    sources_val: &Value,
-    secrets: &hyp_crypto::SecretStore,
-    warnings: &mut Vec<String>,
-) -> Result<ParsedWebhookSources, String> {
-    let arr = sources_val
-        .as_array()
-        .ok_or_else(|| "sources must be a JSON array".to_string())?;
-
-    let mut out = ParsedWebhookSources::default();
-    let mut gh_ids: HashSet<String> = HashSet::new();
-
-    for entry in arr {
-        let Some(obj) = entry.as_object() else {
-            continue;
-        };
-        if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
-            continue;
-        }
-        let Some(kind) = obj.get("kind").and_then(Value::as_str) else {
-            continue;
-        };
-
-        match kind {
-            "github-webhook" => {
-                let raw_id = obj.get("id").and_then(Value::as_str).unwrap_or("github");
-                let id = validate_webhook_source_id(raw_id, "sources[github-webhook].id")?;
-                if !gh_ids.insert(id.clone()) {
-                    return Err(format!("duplicate github-webhook source id '{id}'"));
-                }
-                let topic = obj
-                    .get("topic")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("github")
-                    .to_string();
-                if !is_valid_topic(&topic) {
-                    return Err(format!(
-                        "invalid topic '{topic}' in github-webhook source '{id}'"
-                    ));
-                }
-                let secret_val = obj
-                    .get("secret")
-                    .or_else(|| obj.get("webhookSecret"))
-                    .ok_or_else(|| {
-                        format!(
-                            "sources[github-webhook:'{id}'] requires 'secret': {{ \"secret\": \"<name>\" }}"
-                        )
-                    })?;
-                let secret_name = parse_secret_ref_name(
-                    secret_val,
-                    &format!("sources[github-webhook:'{id}'].secret"),
-                )?
-                .ok_or_else(|| {
-                    format!(
-                        "sources[github-webhook:'{id}'] requires non-null 'secret': {{ \"secret\": \"<name>\" }}"
-                    )
-                })?;
-                let secret = secrets.get(&secret_name).map_err(|e| {
-                    format!("failed to load secret '{secret_name}' for github-webhook '{id}': {e}")
-                })?;
-                if secret.is_empty() {
-                    return Err(format!(
-                        "secret '{secret_name}' for github-webhook '{id}' must not be empty"
-                    ));
-                }
-                let mut cfg = GitHubWebhookConfig::new(id.clone(), topic, secret.as_str());
-                cfg.allowed_repos = parse_optional_string_vec(
-                    obj,
-                    "allowedRepos",
-                    &format!("sources[github-webhook:'{id}'].allowedRepos"),
-                )?;
-                cfg.allowed_orgs = parse_optional_string_vec(
-                    obj,
-                    "allowedOrgs",
-                    &format!("sources[github-webhook:'{id}'].allowedOrgs"),
-                )?;
-                if let Some(max_b) = obj.get("maxBodyBytes").and_then(Value::as_u64) {
-                    if max_b == 0 {
-                        return Err(format!(
-                            "sources[github-webhook:'{id}'].maxBodyBytes must be >= 1"
-                        ));
-                    }
-                    cfg.max_body_bytes = usize::try_from(max_b).unwrap_or(usize::MAX);
-                }
-                out.github.push(cfg);
-            }
-            "prometheus-webhook" | "webhook-stream" => {
-                let plugin = if kind == "prometheus-webhook" {
-                    "prometheus"
-                } else {
-                    "webhook"
-                };
-                warnings.push(format!(
-                    "Skipping retired source kind '{kind}'. Run `hyp plugin install {plugin} --json` and migrate this source to plugins[]. See https://github.com/hyphae-to/hyp/blob/main/docs/plugins.md#webhook-plugin-migration."
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    Ok(out)
-}
-
-fn parse_github_public_source(
-    sources_val: &Value,
-    secrets: &hyp_crypto::SecretStore,
-    public_read_only: bool,
-    warnings: &mut Vec<String>,
-) -> Result<Option<GitHubPublicConfig>, String> {
-    let arr = sources_val
-        .as_array()
-        .ok_or_else(|| "sources must be a JSON array".to_string())?;
-
-    let mut active_cfg: Option<GitHubPublicConfig> = None;
-    let mut extra_enabled = 0usize;
-
-    for entry in arr {
-        let Some(obj) = entry.as_object() else {
-            continue;
-        };
-        if obj.get("kind").and_then(Value::as_str) != Some("github-public") {
-            continue;
-        }
-        if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
-            continue;
-        }
-
-        if active_cfg.is_some() {
-            extra_enabled += 1;
-            continue;
-        }
-
-        let mut cfg = GitHubPublicConfig::default();
-        if let Some(id) = obj.get("id").and_then(Value::as_str) {
-            if !id.trim().is_empty() {
-                cfg.id = id.trim().to_string();
-            }
-        }
-        if let Some(topic) = obj.get("topic").and_then(Value::as_str) {
-            if !topic.trim().is_empty() {
-                cfg.topic = topic.trim().to_string();
-            }
-        }
-        if let Some(api_base) = obj.get("apiBaseUrl").and_then(Value::as_str) {
-            if !api_base.trim().is_empty() {
-                cfg.api_base_url = api_base.trim().to_string();
-            }
-        }
-        if let Some(min_poll) = obj.get("minPollIntervalSeconds").and_then(Value::as_u64) {
-            let dur = Duration::from_secs(min_poll);
-            cfg.min_poll_interval = dur;
-            if cfg.base_poll_interval > dur {
-                cfg.base_poll_interval = dur;
-            }
-        }
-        if let Some(base_poll) = obj.get("basePollIntervalSeconds").and_then(Value::as_u64) {
-            cfg.base_poll_interval = Duration::from_secs(base_poll);
-        }
-        if let Some(grace) = obj.get("graceWindowSeconds").and_then(Value::as_u64) {
-            cfg.teardown_grace = Duration::from_secs(grace);
-        }
-        if let Some(max_pollers_val) = obj.get("maxActivePollers") {
-            if !max_pollers_val.is_null() {
-                let Some(n) = max_pollers_val.as_u64() else {
-                    return Err("sources[].maxActivePollers must be a positive integer".to_string());
-                };
-                if n == 0 {
-                    return Err("sources[].maxActivePollers must be >= 1".to_string());
-                }
-                cfg.max_active_pollers = usize::try_from(n).unwrap_or(usize::MAX);
-            }
-        }
-        if !public_read_only {
-            if let Some(allow_priv) = obj.get("allowPrivateWithToken").and_then(Value::as_bool) {
-                cfg.allow_private_with_token = allow_priv;
-            }
-        }
-
-        if let Some(tok_val) = obj.get("githubToken") {
-            if let Some(secret_name) = parse_secret_ref_name(tok_val, "sources[].githubToken")? {
-                match secrets.get(&secret_name) {
-                    Ok(secret) => cfg.github_token = Some(secret),
-                    Err(CryptoError::SecretNotFound(_)) => {
-                        warnings.push(format!(
-                            "Secret '{secret_name}' is not set; starting github-public in unauthenticated public GitHub mode (60 req/hr). Run `hyp secret set {secret_name}` for 5,000 req/hr."
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "failed to load GitHub token secret '{secret_name}': {e}"
-                        ));
-                    }
-                }
-            }
-        }
-
-        if let Some(repo_tokens_val) = obj.get("repoTokens") {
-            if !repo_tokens_val.is_null() {
-                let repo_tokens_obj = repo_tokens_val.as_object().ok_or_else(|| {
-                    "sources[].repoTokens must be a JSON object mapping \"owner/*\" or \"owner/repo\" to { \"secret\": \"<name>\" }".to_string()
-                })?;
-                let mut seen_patterns: HashSet<String> = HashSet::new();
-                for (raw_pattern, secret_val) in repo_tokens_obj {
-                    let canonical = normalize_repo_token_pattern(raw_pattern).map_err(|e| {
-                        format!("invalid sources[].repoTokens pattern '{raw_pattern}': {e}")
-                    })?;
-                    if !seen_patterns.insert(canonical.clone()) {
-                        return Err(format!(
-                            "duplicate normalized sources[].repoTokens pattern '{canonical}' (from '{raw_pattern}')"
-                        ));
-                    }
-                    let field_label = format!("sources[].repoTokens['{raw_pattern}']");
-                    if let Some(secret_name) = parse_secret_ref_name(secret_val, &field_label)? {
-                        match secrets.get(&secret_name) {
-                            Ok(secret) => {
-                                cfg.repo_tokens.insert(canonical, secret);
-                            }
-                            Err(CryptoError::SecretNotFound(_)) => {
-                                warnings.push(format!(
-                                    "Secret '{secret_name}' for github-public repoTokens['{canonical}'] is not set; repos matching '{canonical}' will fall back to default/unauthenticated mode until `hyp secret set {secret_name} --web` is configured."
-                                ));
-                            }
-                            Err(e) => {
-                                return Err(format!(
-                                    "failed to load GitHub token secret '{secret_name}' for {field_label}: {e}"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        active_cfg = Some(cfg);
-    }
-
-    if extra_enabled > 0 {
-        warnings.push(
-            "Multiple enabled github-public sources found; only the first is active. Consolidate multiple GitHub tokens into sources[0].repoTokens (e.g. { \"owner/*\": { \"secret\": \"...\" } })."
-                .to_string(),
-        );
-    }
-
-    Ok(active_cfg)
-}
-
-fn parse_delivery_retry_fields(
-    obj: &serde_json::Map<String, Value>,
-    cfg: &mut DeliveryRetryConfig,
-) -> Result<(), String> {
-    if let Some(arr) = obj
-        .get("holdRetryBackoffMs")
-        .or_else(|| obj.get("hold_retry_backoff_ms"))
-        .and_then(Value::as_array)
-    {
-        let mut backoff = Vec::with_capacity(arr.len());
-        for item in arr {
-            let ms = item.as_u64().ok_or_else(|| {
-                "deliveryRetry.holdRetryBackoffMs entries must be non-negative integers".to_string()
-            })?;
-            backoff.push(ms);
-        }
-        if !backoff.is_empty() {
-            cfg.hold_retry_backoff_ms = backoff;
-        }
-    }
-    if let Some(max_att) = obj
-        .get("holdRetryMaxAttempts")
-        .or_else(|| obj.get("hold_retry_max_attempts"))
-        .and_then(Value::as_u64)
-    {
-        cfg.hold_retry_max_attempts = max_att.min(u32::MAX as u64) as u32;
-    }
-    if let Some(resume) = obj
-        .get("codexResume")
-        .or_else(|| obj.get("codex_resume"))
-        .and_then(Value::as_bool)
-    {
-        cfg.codex_resume = resume;
-    }
-    if let Some(arr) = obj
-        .get("herdrSpawnAllowlist")
-        .or_else(|| obj.get("herdr_spawn_allowlist"))
-        .and_then(Value::as_array)
-    {
-        let mut allow = Vec::with_capacity(arr.len());
-        for item in arr {
-            let s = item.as_str().ok_or_else(|| {
-                "deliveryRetry.herdrSpawnAllowlist entries must be strings".to_string()
-            })?;
-            allow.push(s.to_string());
-        }
-        cfg.herdr_spawn_allowlist = allow;
-    }
-    Ok(())
-}
-
-fn parse_delivery_retry_config(raw: &Value) -> Result<DeliveryRetryConfig, String> {
-    let mut cfg = DeliveryRetryConfig::default();
-    let Some(root) = raw.as_object() else {
-        return Ok(cfg);
-    };
-
-    // Legacy fallback: honor retry/revival fields from older `sources[kind="wakeup"]` entries.
-    if let Some(sources) = root.get("sources").and_then(Value::as_array) {
-        for entry in sources {
-            if let Some(obj) = entry.as_object() {
-                if obj.get("kind").and_then(Value::as_str) == Some("wakeup") {
-                    parse_delivery_retry_fields(obj, &mut cfg)?;
-                }
-            }
-        }
-    }
-
-    // Legacy fallback: top-level `codexResume` / `herdrSpawnAllowlist` / retry keys.
-    parse_delivery_retry_fields(root, &mut cfg)?;
-
-    // Primary v0.5.0 `deliveryRetry` object takes precedence.
-    if let Some(dr_val) = root.get("deliveryRetry") {
-        let obj = dr_val
-            .as_object()
-            .ok_or_else(|| "deliveryRetry must be a JSON object".to_string())?;
-        parse_delivery_retry_fields(obj, &mut cfg)?;
-    }
-
-    Ok(cfg)
-}
-
-fn parse_wake_recovery_config(raw: &Value) -> Result<WakeRecoveryConfig, String> {
-    let mut cfg = WakeRecoveryConfig::default();
-    let Some(wr_val) = raw.as_object().and_then(|o| o.get("wakeRecovery")) else {
-        return Ok(cfg);
-    };
-    let obj = wr_val
-        .as_object()
-        .ok_or_else(|| "wakeRecovery must be a JSON object".to_string())?;
-    if let Some(raw_enabled) = obj.get("enabled") {
-        cfg.enabled = raw_enabled
-            .as_bool()
-            .ok_or_else(|| "wakeRecovery.enabled must be a boolean".to_string())?;
-    }
-    if let Some(raw_secs) = obj
-        .get("minSleepSeconds")
-        .or_else(|| obj.get("min_sleep_seconds"))
-    {
-        let secs = raw_secs
-            .as_u64()
-            .filter(|&v| v >= 1)
-            .ok_or_else(|| "wakeRecovery.minSleepSeconds must be an integer >= 1".to_string())?;
-        cfg.min_sleep_seconds = secs;
-    }
-    if let Some(raw_active) = obj
-        .get("notifyInterruptedActive")
-        .or_else(|| obj.get("notify_interrupted_active"))
-    {
-        cfg.notify_interrupted_active = raw_active
-            .as_bool()
-            .ok_or_else(|| "wakeRecovery.notifyInterruptedActive must be a boolean".to_string())?;
-    }
-    if let Some(raw_all) = obj
-        .get("notifyAllEnrolled")
-        .or_else(|| obj.get("notify_all_enrolled"))
-    {
-        cfg.notify_all_enrolled = raw_all
-            .as_bool()
-            .ok_or_else(|| "wakeRecovery.notifyAllEnrolled must be a boolean".to_string())?;
-    }
-    Ok(cfg)
-}
-
-fn parse_midturn_queue_digest_seconds(raw: &Value) -> Result<u64, String> {
-    match raw.pointer("/delivery/midturnQueueDigestSeconds") {
-        None => Ok(hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS),
-        Some(val) => val.as_u64().ok_or_else(|| {
-            "delivery.midturnQueueDigestSeconds must be a non-negative integer".to_string()
-        }),
-    }
-}
-
-const fn plugin_kind_str(kind: AdapterKind) -> &'static str {
-    match kind {
-        AdapterKind::Bridge => "bridge",
-        AdapterKind::Source => "source",
-        AdapterKind::Harness => "harness",
-        AdapterKind::PeerLink => "peer_link",
-    }
-}
-
-struct ParsedPlugin {
-    config: SubprocessConfig,
-    expose_topic: bool,
-    has_webhook_post_url: bool,
-}
-
-fn parse_explicit_topic_names(topics_val: Option<&Value>) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let Some(arr) = topics_val.and_then(Value::as_array) else {
-        return out;
-    };
-    for item in arr {
-        if let Some(s) = item.as_str() {
-            let trimmed = s.trim().to_ascii_lowercase();
-            if !trimmed.is_empty() {
-                out.insert(trimmed);
-            }
-        } else if let Some(s) = item
-            .as_object()
-            .and_then(|o| o.get("topic"))
-            .and_then(Value::as_str)
-        {
-            let trimmed = s.trim().to_ascii_lowercase();
-            if !trimmed.is_empty() {
-                out.insert(trimmed);
-            }
-        }
-    }
-    out
-}
-
-/// Official event-source plugins whose `plugins[]` entry defaults to `kind: "source"` (1-to-many
-/// `hyp_stream` topic) when `kind` is omitted. An explicit `kind` always wins.
-const OFFICIAL_SOURCE_PLUGIN_IDS: &[&str] = &[
-    "agentmail",
-    "sentry",
-    "gmail",
-    "google-calendar",
-    "vercel",
-    "notion",
-];
-
-fn push_plugin_error(
-    id: &str,
-    kind: Option<AdapterKind>,
-    targets: Option<&[String]>,
-    reason: String,
-    warnings: &mut Vec<String>,
-    skipped_statuses: &mut Vec<Value>,
-) {
-    warnings.push(format!(
-        "Skipping misconfigured plugin '{id}' (daemon continuing): {reason}"
-    ));
-    let mut entry = serde_json::Map::new();
-    entry.insert("id".to_string(), json!(id));
-    if let Some(k) = kind {
-        entry.insert("kind".to_string(), json!(plugin_kind_str(k)));
-    }
-    if let Some(t) = targets {
-        entry.insert("targets".to_string(), json!(t));
-    }
-    entry.insert("status".to_string(), json!("error"));
-    entry.insert("error".to_string(), json!(reason));
-    entry.insert("lastError".to_string(), json!(reason));
-    skipped_statuses.push(Value::Object(entry));
-}
-
-/// Parses and validates `plugins[]` from `node.json`, accepting both `"exec"` and `"command"`,
-/// resolving `{ "secret": "<name>" }` references via `SecretStore`, warning on plaintext
-/// secret-like env values, and isolating individual malformed/misconfigured plugin entries into
-/// startup warnings + error/skipped statuses so a single bad plugin never aborts `hyp node start`.
-fn parse_plugins_config(
-    plugins_val: &Value,
-    config_dir: Option<&Path>,
-    state_dir: &Path,
-    explicit_topics: &HashSet<String>,
-    secrets: &hyp_crypto::SecretStore,
-    warnings: &mut Vec<String>,
-    skipped_statuses: &mut Vec<Value>,
-) -> Vec<ParsedPlugin> {
-    let Some(arr) = plugins_val.as_array() else {
-        let reason = "plugins must be a JSON array".to_string();
-        warnings.push(format!(
-            "Skipping 'plugins' configuration (daemon continuing): {reason}"
-        ));
-        skipped_statuses.push(json!({
-            "id": "plugins",
-            "status": "error",
-            "error": reason,
-            "lastError": reason,
-        }));
-        return Vec::new();
-    };
-
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut configs: Vec<ParsedPlugin> = Vec::new();
-
-    for (idx, entry) in arr.iter().enumerate() {
-        let fallback_id = format!("plugins[{idx}]");
-        let Some(obj) = entry.as_object() else {
-            push_plugin_error(
-                &fallback_id,
-                None,
-                None,
-                format!("plugins[{idx}] must be a JSON object"),
-                warnings,
-                skipped_statuses,
-            );
-            continue;
-        };
-
-        if obj.get("enabled").and_then(Value::as_bool) == Some(false) {
-            continue;
-        }
-
-        let Some(raw_id) = obj
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            push_plugin_error(
-                &fallback_id,
-                None,
-                None,
-                format!("plugins[{idx}].id must be a non-empty string"),
-                warnings,
-                skipped_statuses,
-            );
-            continue;
-        };
-        let id = raw_id.to_ascii_lowercase();
-        if !is_valid_handle(&id) {
-            push_plugin_error(
-                raw_id,
-                None,
-                None,
-                format!(
-                    "plugins[{idx}].id '{raw_id}' is not a valid identifier (expected /^[a-z0-9][a-z0-9._-]{{0,63}}$/)"
-                ),
-                warnings,
-                skipped_statuses,
-            );
-            continue;
-        }
-        if !seen_ids.insert(id.clone()) {
-            push_plugin_error(
-                &id,
-                None,
-                None,
-                format!("duplicate plugin id '{id}' in plugins[]"),
-                warnings,
-                skipped_statuses,
-            );
-            continue;
-        }
-
-        let explicit_kind = match obj.get("kind") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) if s == "bridge" => Some(AdapterKind::Bridge),
-            Some(Value::String(s)) if s == "source" => Some(AdapterKind::Source),
-            Some(other) => {
-                push_plugin_error(
-                    &id,
-                    None,
-                    None,
-                    format!(
-                        "plugins[{id}].kind {other} is invalid (expected 'bridge' or 'source')"
-                    ),
-                    warnings,
-                    skipped_statuses,
-                );
-                continue;
-            }
-        };
-
-        let exec_opt = match obj.get("exec") {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
-            Some(_) => Err(format!("plugins[{id}].exec must be a non-empty string")),
-        };
-        let command_opt = match obj.get("command") {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
-            Some(_) => Err(format!("plugins[{id}].command must be a non-empty string")),
-        };
-        let exec = match (exec_opt, command_opt) {
-            (Ok(Some(e)), Ok(Some(c))) => {
-                if e != c {
-                    warnings.push(format!(
-                        "plugins[{id}] defines both 'exec' and 'command' with different values; preferring 'exec'."
-                    ));
-                }
-                e
-            }
-            (Ok(Some(e)), Ok(None)) => e,
-            (Ok(None), Ok(Some(c))) => c,
-            (Err(e), _) | (_, Err(e)) => {
-                push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
-                continue;
-            }
-            (Ok(None), Ok(None)) => {
-                push_plugin_error(
-                    &id,
-                    explicit_kind,
-                    None,
-                    format!("plugins[{id}] must specify a non-empty 'exec' or 'command' string"),
-                    warnings,
-                    skipped_statuses,
-                );
-                continue;
-            }
-        };
-
-        let args = match obj.get("args") {
-            None | Some(Value::Null) => Ok(Vec::new()),
-            Some(val) => match val.as_array() {
-                Some(raw_args) => {
-                    let mut out = Vec::with_capacity(raw_args.len());
-                    let mut err = None;
-                    for (aidx, item) in raw_args.iter().enumerate() {
-                        if let Some(s) = item.as_str() {
-                            out.push(s.to_string());
-                        } else {
-                            err = Some(format!("plugins[{id}].args[{aidx}] must be a string"));
-                            break;
-                        }
-                    }
-                    match err {
-                        Some(e) => Err(e),
-                        None => Ok(out),
-                    }
-                }
-                None => Err(format!("plugins[{id}].args must be an array of strings")),
-            },
-        };
-        let args = match args {
-            Ok(v) => v,
-            Err(e) => {
-                push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
-                continue;
-            }
-        };
-
-        let cwd = match obj.get("cwd") {
-            None | Some(Value::Null) => Ok(None),
-            Some(val) => match val.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(raw_cwd) => {
-                    let path = PathBuf::from(raw_cwd);
-                    if path.is_absolute() {
-                        Ok(Some(path))
-                    } else if let Some(base) = config_dir {
-                        Ok(Some(base.join(path)))
-                    } else {
-                        Ok(Some(path))
-                    }
-                }
-                None => Err(format!("plugins[{id}].cwd must be a non-empty string")),
-            },
-        };
-        let cwd = match cwd {
-            Ok(v) => v,
-            Err(e) => {
-                push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
-                continue;
-            }
-        };
-
-        let explicit_targets_res = match obj.get("targets") {
-            None | Some(Value::Null) => {
-                if id == "telegram" {
-                    Ok(None)
-                } else {
-                    Err(format!(
-                        "plugins[{id}].targets must be a non-empty array of strings"
-                    ))
-                }
-            }
-            Some(val) => match val.as_array() {
-                Some(raw_targets) => {
-                    let mut out = Vec::with_capacity(raw_targets.len());
-                    let mut err = None;
-                    for (tidx, item) in raw_targets.iter().enumerate() {
-                        if let Some(s) = item.as_str().map(str::trim).filter(|t| !t.is_empty()) {
-                            if !out.iter().any(|existing: &String| existing == s) {
-                                out.push(s.to_string());
-                            }
-                        } else {
-                            err = Some(format!(
-                                "plugins[{id}].targets[{tidx}] must be a non-empty string"
-                            ));
-                            break;
-                        }
-                    }
-                    match err {
-                        Some(e) => Err(e),
-                        None if out.is_empty() => {
-                            if id == "telegram" {
-                                Ok(None)
-                            } else {
-                                Err(format!(
-                                    "plugins[{id}].targets must contain at least one target"
-                                ))
-                            }
-                        }
-                        None => Ok(Some(out)),
-                    }
-                }
-                None => Err(format!(
-                    "plugins[{id}].targets must be a non-empty array of strings"
-                )),
-            },
-        };
-        let explicit_targets = match explicit_targets_res {
-            Ok(v) => v,
-            Err(e) => {
-                push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
-                continue;
-            }
-        };
-
-        let mut env_map: BTreeMap<String, String> = BTreeMap::new();
-        let mut secret_env_refs: Vec<(String, String)> = Vec::new();
-        let mut redacted_values: Vec<String> = Vec::new();
-        let mut secret_skip_reason: Option<String> = None;
-        let mut config_error_reason: Option<String> = None;
-        let mut plaintext_warnings: Vec<String> = Vec::new();
-
-        if let Some(env_val) = obj.get("env") {
-            if !env_val.is_null() {
-                match env_val.as_object() {
-                    None => {
-                        config_error_reason =
-                            Some(format!("plugins[{id}].env must be a JSON object"));
-                    }
-                    Some(env_obj) => {
-                        for (env_key, val) in env_obj {
-                            if env_key.trim().is_empty() {
-                                config_error_reason = Some(format!(
-                                    "plugins[{id}].env contains an empty variable name"
-                                ));
-                                break;
-                            }
-                            match val {
-                                Value::String(s) => {
-                                    if !s.trim().is_empty() && is_secret_like_env_key(env_key) {
-                                        plaintext_warnings.push(format!(
-                                            "plugins[{id}].env.{env_key} uses a plaintext secret value in node.json; store it with `hyp secret set <name>` and reference {{ \"secret\": \"<name>\" }} instead."
-                                        ));
-                                        redacted_values.push(s.clone());
-                                    }
-                                    env_map.insert(env_key.clone(), s.clone());
-                                }
-                                Value::Object(ref_obj) => {
-                                    let Some(secret_name) = ref_obj
-                                        .get("secret")
-                                        .and_then(Value::as_str)
-                                        .filter(|_| ref_obj.len() == 1)
-                                    else {
-                                        config_error_reason = Some(format!(
-                                            "plugins[{id}].env.{env_key} must be a string or {{ \"secret\": \"<name>\" }}"
-                                        ));
-                                        break;
-                                    };
-                                    if let Err(e) = validate_secret_name(secret_name) {
-                                        config_error_reason = Some(format!(
-                                            "invalid secret name '{secret_name}' in plugins[{id}].env.{env_key}: {e}"
-                                        ));
-                                        break;
-                                    }
-                                    match secrets.get(secret_name) {
-                                        Ok(secret) => {
-                                            redacted_values.push((*secret).clone());
-                                            env_map.insert(env_key.clone(), (*secret).clone());
-                                            secret_env_refs
-                                                .push((env_key.clone(), secret_name.to_string()));
-                                        }
-                                        Err(CryptoError::SecretNotFound(_)) => {
-                                            secret_skip_reason = Some(format!(
-                                                "plugins[{id}].env.{env_key} references missing secret '{secret_name}'; run `hyp secret set {secret_name}`"
-                                            ));
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            secret_skip_reason = Some(format!(
-                                                "failed to load secret '{secret_name}' for plugins[{id}].env.{env_key}: {e}"
-                                            ));
-                                            break;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    config_error_reason = Some(format!(
-                                        "plugins[{id}].env.{env_key} must be a string or {{ \"secret\": \"<name>\" }}"
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let has_webhook_post_url = env_map
-            .get("WEBHOOK_POST_URL")
-            .is_some_and(|v| !v.trim().is_empty());
-        let kind = match explicit_kind {
-            Some(k) => k,
-            None => {
-                if id == "prometheus"
-                    || OFFICIAL_SOURCE_PLUGIN_IDS.contains(&id.as_str())
-                    || (id == "webhook" && !has_webhook_post_url)
-                {
-                    AdapterKind::Source
-                } else {
-                    AdapterKind::Bridge
-                }
-            }
-        };
-
-        let status_targets_fallback = [crate::plugin_cmd::DEFAULT_TELEGRAM_TARGET.to_string()];
-        let status_targets_slice = explicit_targets
-            .as_deref()
-            .unwrap_or(&status_targets_fallback);
-
-        if let Some(reason) = config_error_reason {
-            push_plugin_error(
-                &id,
-                Some(kind),
-                Some(status_targets_slice),
-                reason,
-                warnings,
-                skipped_statuses,
-            );
-            continue;
-        }
-
-        if let Some(reason) = secret_skip_reason {
-            warnings.push(format!(
-                "Skipping plugin '{id}' (daemon continuing): {reason}"
-            ));
-            skipped_statuses.push(json!({
-                "id": id,
-                "kind": plugin_kind_str(kind),
-                "targets": status_targets_slice,
-                "status": "skipped",
-                "error": reason,
-                "lastError": reason,
-            }));
-            continue;
-        }
-
-        let targets = match explicit_targets {
-            Some(explicit) => explicit,
-            None => {
-                // Only `id == "telegram"` reaches here when `targets` is omitted/empty:
-                // resolve bot username via Telegram `getMe` with fail-safe fallback to `"personal"`.
-                let resolved = match env_map.get("TELEGRAM_BOT_TOKEN").map(String::as_str) {
-                    Some(token) if !token.trim().is_empty() => {
-                        let api_base = env_map
-                            .get("TELEGRAM_API_BASE")
-                            .map(String::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty());
-                        crate::plugin_cmd::resolve_telegram_default_target_with_token(
-                            token, api_base,
-                        )
-                    }
-                    _ => crate::plugin_cmd::TelegramTargetResolution {
-                        target: crate::plugin_cmd::DEFAULT_TELEGRAM_TARGET.to_string(),
-                        source: "fallback",
-                        warning: None,
-                    },
-                };
-                if let Some(w) = resolved.warning {
-                    warnings.push(w);
-                }
-                vec![resolved.target]
-            }
-        };
-
-        warnings.extend(plaintext_warnings);
-
-        // Issue #25 (B6): Default `exposeTopic` strictly to `false` for BOTH `bridge` and `source`
-        // subprocess plugins unless the user explicitly opts in via `"exposeTopic": true`
-        // (or lists a bridge's topic in top-level `topics[]`).
-        let explicit_expose = match obj.get("exposeTopic") {
-            None | Some(Value::Null) => None,
-            Some(Value::Bool(b)) => Some(*b),
-            Some(_) => {
-                warnings.push(format!(
-                    "plugins[{id}].exposeTopic must be a boolean; defaulting to local-only (false)."
-                ));
-                Some(false)
-            }
-        };
-        let expose_topic = match explicit_expose {
-            Some(explicit) => explicit,
-            None => match kind {
-                AdapterKind::Bridge => explicit_topics.contains(&id),
-                AdapterKind::Source => false,
-                _ => false,
-            },
-        };
-
-        let mut cfg = SubprocessConfig::new(id.clone(), kind, exec, args, targets);
-        cfg.cwd = cwd;
-        cfg.env = env_map;
-        // Plugins keep small private cursors (polling offsets, dedupe sets) under the node's state
-        // dir so a restart resumes instead of re-baselining. An explicit plugins[].env value wins.
-        cfg.env
-            .entry("HYPHAE_STATE_DIR".to_string())
-            .or_insert_with(|| state_dir.display().to_string());
-        if !secret_env_refs.is_empty() {
-            let store_for_respawn = secrets.clone();
-            let plugin_id_for_err = id.clone();
-            cfg.env_resolver = Some(Arc::new(move || {
-                let mut resolved = BTreeMap::new();
-                for (env_key, secret_name) in &secret_env_refs {
-                    let val = store_for_respawn.get(secret_name).map_err(|e| {
-                        format!(
-                            "plugins[{plugin_id_for_err}].env.{env_key} failed to load secret '{secret_name}': {e}"
-                        )
-                    })?;
-                    resolved.insert(env_key.clone(), (*val).clone());
-                }
-                Ok(resolved)
-            }));
-        }
-
-        cfg.stderr_log_path = Some(state_dir.join("logs").join(format!("plugin-{id}.log")));
-        cfg.redacted_values = redacted_values;
-        configs.push(ParsedPlugin {
-            config: cfg,
-            expose_topic,
-            has_webhook_post_url,
-        });
-    }
-
-    configs
-}
-
-mod plugin_runtime {
-    use super::{ParsedPlugin, plugin_kind_str};
-    use crate::config_file::write_atomic_json;
-    use hyp_harness::daemon::{BoxFuture as DaemonBoxFuture, BridgePoster, LocalDaemon};
-    use hyp_node::adapters::webhooks::{EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK};
-    use hyp_node::adapters::{
-        AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, NodeAdapter,
-        NodeAdapterHost, PublishErrorCode, PublishOutcome, PublishStatus, SubprocessSupervisor,
-    };
-    use hyp_node::engine::{NodeError, UnifiedNode};
-    use hyp_proto::address::{LOCAL_NODE_ID, is_valid_topic};
-    use hyp_proto::cloudevent::CloudEvent as ProtoCloudEvent;
-    use hyp_proto::rpc::EventKeyRef;
-    use serde_json::{Map, Value, json};
-    use std::collections::{BTreeMap, HashSet, VecDeque};
-    use std::path::PathBuf;
-    use std::sync::{Arc, Mutex, Weak};
-    use std::time::Duration;
-
-    const DEFAULT_PLUGIN_POST_TIMEOUT: Duration = Duration::from_secs(15);
-    const LOCAL_BRIDGE_DEDUP_CAPACITY: usize = 4096;
-
-    /// Bounded local `(source, id)` deduplicator used for local-only bridge plugins so duplicate
-    /// inbound bridge deliveries return `PublishStatus::Duplicate` without publishing private
-    /// messages onto remote-subscribable `EventStore` topics.
-    struct LocalEventDedup {
-        order: VecDeque<(String, String)>,
-        seen: HashSet<(String, String)>,
-    }
-
-    impl LocalEventDedup {
-        fn new() -> Self {
-            Self {
-                order: VecDeque::new(),
-                seen: HashSet::new(),
-            }
-        }
-
-        fn contains(&self, source: &str, id: &str) -> bool {
-            self.seen.contains(&(source.to_string(), id.to_string()))
-        }
-
-        /// Returns `true` if `(source, id)` is newly inserted; `false` if already seen.
-        fn insert(&mut self, source: String, id: String) -> bool {
-            let key = (source, id);
-            if !self.seen.insert(key.clone()) {
-                return false;
-            }
-            self.order.push_back(key);
-            while self.order.len() > LOCAL_BRIDGE_DEDUP_CAPACITY {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.seen.remove(&evicted);
-                }
-            }
-            true
-        }
-    }
-
-    /// Shared live plugin status registry wired into `NodePluginHost::update_status` so health
-    /// transitions, restart counts, crash loops, and redacted `lastError` values immediately
-    /// update `node.status.json` for `hyp status` and `hyp doctor`.
-    pub(super) struct PluginStatusRegistry {
-        entries: Mutex<Vec<Value>>,
-        status_doc: Arc<Mutex<Option<(PathBuf, Value)>>>,
-    }
-
-    struct PluginHealthUpdate<'a> {
-        plugin_id: &'a str,
-        kind: AdapterKind,
-        targets: &'a [String],
-        health: &'a AdapterHealth,
-        restarts: u64,
-        crash_loop_backoff: bool,
-        log_path: Option<&'a PathBuf>,
-    }
-
-    impl PluginStatusRegistry {
-        fn new(
-            initial_entries: Vec<Value>,
-            status_doc: Arc<Mutex<Option<(PathBuf, Value)>>>,
-        ) -> Self {
-            Self {
-                entries: Mutex::new(initial_entries),
-                status_doc,
-            }
-        }
-
-        pub(super) fn snapshot(&self) -> Vec<Value> {
-            self.entries
-                .lock()
-                .expect("plugin status registry lock poisoned")
-                .clone()
-        }
-
-        pub(super) fn flush_to_status_doc(&self) {
-            let latest = self.snapshot();
-            let mut guard = self.status_doc.lock().expect("status_doc lock poisoned");
-            if let Some((ref path, ref mut doc)) = *guard {
-                if let Some(obj) = doc.as_object_mut() {
-                    obj.insert("plugins".to_string(), Value::Array(latest));
-                }
-                let _ = write_atomic_json(path, doc, true);
-            }
-        }
-
-        fn upsert_entry(&self, entry: Value) {
-            let entry_id = entry
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            {
-                let mut entries = self
-                    .entries
-                    .lock()
-                    .expect("plugin status registry lock poisoned");
-                if let Some(ref id) = entry_id {
-                    if let Some(existing) = entries
-                        .iter_mut()
-                        .find(|e| e.get("id").and_then(Value::as_str) == Some(id.as_str()))
-                    {
-                        *existing = entry;
-                    } else {
-                        entries.push(entry);
-                    }
-                } else {
-                    entries.push(entry);
-                }
-            }
-            self.flush_to_status_doc();
-        }
-
-        fn update_health(&self, update: PluginHealthUpdate<'_>) {
-            let (status_str, last_error) = match update.health {
-                AdapterHealth::Starting => ("starting", None),
-                AdapterHealth::Healthy => ("running", None),
-                AdapterHealth::Degraded(reason) => (
-                    if update.crash_loop_backoff {
-                        "crash_loop_backoff"
-                    } else {
-                        "degraded"
-                    },
-                    Some(reason.as_str()),
-                ),
-                AdapterHealth::Stopped => ("stopped", None),
-            };
-            let mut map = serde_json::Map::new();
-            map.insert("id".to_string(), json!(update.plugin_id));
-            map.insert("kind".to_string(), json!(plugin_kind_str(update.kind)));
-            map.insert("targets".to_string(), json!(update.targets));
-            map.insert("status".to_string(), json!(status_str));
-            map.insert("restarts".to_string(), json!(update.restarts));
-            if let Some(err) = last_error {
-                map.insert("lastError".to_string(), json!(err));
-                map.insert("error".to_string(), json!(err));
-            }
-            if let Some(lp) = update.log_path {
-                map.insert("logPath".to_string(), json!(lp.display().to_string()));
-            }
-            self.upsert_entry(Value::Object(map));
-        }
-    }
-
-    struct NodePluginHost {
-        plugin_id: String,
-        kind: AdapterKind,
-        targets: Vec<String>,
-        expose_topic: bool,
-        node: Weak<UnifiedNode>,
-        daemon: Option<Weak<LocalDaemon>>,
-        supervisor: Weak<SubprocessSupervisor>,
-        registry: Arc<PluginStatusRegistry>,
-        local_dedup: Mutex<LocalEventDedup>,
-    }
-
-    impl NodeAdapterHost for NodePluginHost {
-        fn publish_event<'a>(
-            &'a self,
-            to: &'a str,
-            event: ProtoCloudEvent,
-        ) -> AdapterBoxFuture<'a, Result<PublishOutcome, AdapterError>> {
-            Box::pin(async move {
-                // Keep private local chat bridge messages strictly local-only unless the user
-                // explicitly exposed the bridge topic in `node.json` (`topics[]` or `exposeTopic: true`).
-                if self.kind == AdapterKind::Bridge && !self.expose_topic {
-                    let already_seen = self
-                        .local_dedup
-                        .lock()
-                        .expect("local bridge dedup lock poisoned")
-                        .contains(&event.source, &event.id);
-                    if already_seen {
-                        return Ok(PublishOutcome {
-                            status: PublishStatus::Duplicate,
-                            matched: 0,
-                        });
-                    }
-                    let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) else {
-                        return Err(AdapterError::PublishFailed {
-                            code: PublishErrorCode::Unavailable,
-                            message: format!(
-                                "local daemon unavailable for bridge '{}:{}'",
-                                self.plugin_id, to
-                            ),
-                        });
-                    };
-                    let rendered = render_bridge_cloudevent(&event);
-                    let delivered = daemon
-                        .deliver_bridge_inbound(&self.plugin_id, to, &event.id, &rendered)
-                        .await
-                        .map_err(|err| AdapterError::PublishFailed {
-                            code: PublishErrorCode::Unavailable,
-                            message: format!(
-                                "bridge inbound delivery failed for '{}:{}': {err}",
-                                self.plugin_id, to
-                            ),
-                        })?;
-                    if delivered == 0 {
-                        return Err(AdapterError::PublishFailed {
-                            code: PublishErrorCode::Unavailable,
-                            message: format!(
-                                "no local session is linked to bridge '{}:{}'; refusing to drop inbound message",
-                                self.plugin_id, to
-                            ),
-                        });
-                    }
-                    self.local_dedup
-                        .lock()
-                        .expect("local bridge dedup lock poisoned")
-                        .insert(event.source.clone(), event.id.clone());
-                    return Ok(PublishOutcome {
-                        status: PublishStatus::Stored,
-                        matched: delivered,
-                    });
-                }
-
-                let Some(node) = self.node.upgrade() else {
-                    return Err(AdapterError::NotRunning("unified-node".to_string()));
-                };
-
-                let mut event = event;
-                if self.kind == AdapterKind::Source {
-                    // Issue #38: Enforce `hyphaesourcekind = "external-webhook"` server-side on
-                    // every CloudEvent emitted by a subprocess `kind: "source"` plugin (overwriting
-                    // any missing or forged value) so Security Gate ALWAYS caps trust tier to
-                    // `GateTrustTier::ExternalWebhook` (including across Hub fan-out).
-                    event.set_extension(EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK);
-                }
-
-                let topic = match self.kind {
-                    AdapterKind::Bridge => self.plugin_id.as_str(),
-                    _ => {
-                        if is_valid_topic(to) {
-                            to
-                        } else {
-                            self.plugin_id.as_str()
-                        }
-                    }
-                };
-                let qualified = format!("{LOCAL_NODE_ID}.{topic}");
-                let res = node
-                    .publish_event(&qualified, event.clone())
-                    .await
-                    .map_err(|err| {
-                        let code = match &err {
-                            NodeError::PayloadTooLarge(_) => PublishErrorCode::TooLarge,
-                            NodeError::CloudEvent(_) | NodeError::BadRequest(_) => {
-                                PublishErrorCode::InvalidEvent
-                            }
-                            NodeError::Conflict(_) => PublishErrorCode::IdConflict,
-                            _ => PublishErrorCode::Unavailable,
-                        };
-                        AdapterError::PublishFailed {
-                            code,
-                            message: err.to_string(),
-                        }
-                    })?;
-
-                let mut matched = res.matched;
-                // Issue #39 (B1): Hand freshly stored subprocess source events to matching
-                // same-node session mailboxes immediately (`coalesceSeconds: 0` + backlog drain),
-                // matching compiled-in adapters and `LocalIngestServer`.
-                if !res.deduplicated && res.matched > 0 && self.kind == AdapterKind::Source {
-                    if let Err(err) =
-                        hyp_node::adapters::deliver_source_topic_to_local_sessions(&node, topic)
-                    {
-                        eprintln!(
-                            "WARN  plugin '{}' event stored but local delivery on topic '{topic}' failed: {err}",
-                            self.plugin_id
-                        );
-                    }
-                }
-                if !res.deduplicated && self.kind == AdapterKind::Bridge {
-                    if let Some(daemon) = self.daemon.as_ref().and_then(Weak::upgrade) {
-                        let rendered = render_bridge_cloudevent(&event);
-                        if let Ok(delivered) = daemon
-                            .deliver_bridge_inbound(&self.plugin_id, to, &event.id, &rendered)
-                            .await
-                        {
-                            matched = matched.saturating_add(delivered);
-                        }
-                    }
-                }
-
-                let status = if res.deduplicated {
-                    PublishStatus::Duplicate
-                } else {
-                    PublishStatus::Stored
-                };
-                Ok(PublishOutcome { status, matched })
-            })
-        }
-
-        fn update_status<'a>(
-            &'a self,
-            _adapter_id: &'a str,
-            health: AdapterHealth,
-        ) -> AdapterBoxFuture<'a, ()> {
-            Box::pin(async move {
-                let (restarts, crash_loop_backoff, log_path) = match self.supervisor.upgrade() {
-                    Some(sup) => (
-                        sup.restart_count(),
-                        sup.is_crash_loop_backoff(),
-                        sup.stderr_log_path(),
-                    ),
-                    None => (0, false, None),
-                };
-                self.registry.update_health(PluginHealthUpdate {
-                    plugin_id: &self.plugin_id,
-                    kind: self.kind,
-                    targets: &self.targets,
-                    health: &health,
-                    restarts,
-                    crash_loop_backoff,
-                    log_path: log_path.as_ref(),
-                });
-            })
-        }
-
-        fn report_delivery_failed<'a>(
-            &'a self,
-            adapter_id: &'a str,
-            target: &'a str,
-            events: Vec<EventKeyRef>,
-            reason: &'a str,
-        ) -> AdapterBoxFuture<'a, ()> {
-            Box::pin(async move {
-                eprintln!(
-                    "WARN  plugin '{adapter_id}' delivery_failed target={target} count={} reason={reason}",
-                    events.len()
-                );
-            })
-        }
-    }
-
-    struct SupervisorBridgePoster {
-        supervisor: Arc<SubprocessSupervisor>,
-    }
-
-    impl BridgePoster for SupervisorBridgePoster {
-        fn post<'a>(
-            &'a self,
-            _plugin: &'a str,
-            target: &'a str,
-            text: &'a str,
-            meta: &'a Map<String, Value>,
-        ) -> DaemonBoxFuture<'a, Result<Value, (String, String)>> {
-            Box::pin(async move {
-                let mut params: BTreeMap<String, Value> = BTreeMap::new();
-                for (k, v) in meta {
-                    if k != "text" {
-                        params.insert(k.clone(), v.clone());
-                    }
-                }
-                params.insert("text".to_string(), Value::String(text.to_string()));
-                self.supervisor
-                    .post(target, params, DEFAULT_PLUGIN_POST_TIMEOUT)
-                    .await
-                    .map_err(|err| match err {
-                        AdapterError::NotRunning(m) => ("plugin_not_running".to_string(), m),
-                        AdapterError::Timeout(m) => ("plugin_timeout".to_string(), m),
-                        AdapterError::RequestFailed(m) => ("plugin_post_failed".to_string(), m),
-                        other => ("plugin_error".to_string(), other.to_string()),
-                    })
-            })
-        }
-    }
-
-    /// Renders an inbound bridge CloudEvent body without repeating `[plugin:target]`
-    /// (which the delivery packer already puts in the `[hyphae · plugin:target]` header).
-    fn render_bridge_cloudevent(event: &ProtoCloudEvent) -> String {
-        let obj = event.data.as_ref().and_then(Value::as_object);
-        let msg_ref = obj
-            .and_then(|o| o.get("message_id"))
-            .and_then(|v| match v {
-                Value::Number(n) => Some(format!("#{n}")),
-                Value::String(s) if !s.trim().is_empty() => Some(format!("#{}", s.trim())),
-                _ => None,
-            })
-            .or_else(|| {
-                event.subject.as_deref().and_then(|subj| {
-                    let trimmed = subj.trim();
-                    if trimmed.is_empty() {
-                        return None;
-                    }
-                    match trimmed.rsplit_once('/') {
-                        Some((_, tail)) if !tail.is_empty() => Some(format!("#{tail}")),
-                        _ => Some(trimmed.to_string()),
-                    }
-                })
-            });
-
-        if let Some(obj) = obj {
-            if let Some(text) = obj.get("text").and_then(Value::as_str) {
-                let sender = obj
-                    .get("from_username")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|u| format!("@{}", u.trim_start_matches('@')))
-                    .or_else(|| {
-                        obj.get("from_name")
-                            .or_else(|| obj.get("from"))
-                            .or_else(|| obj.get("sender"))
-                            .or_else(|| obj.get("author"))
-                            .or_else(|| obj.get("user"))
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(ToString::to_string)
-                    });
-
-                return match (sender, msg_ref) {
-                    (Some(s), Some(m)) => format!("{s} ({m}): {text}"),
-                    (Some(s), None) => format!("{s}: {text}"),
-                    (None, Some(m)) => format!("({m}) {text}"),
-                    (None, None) => text.to_string(),
-                };
-            }
-        }
-
-        if let Some(ref data) = event.data {
-            if let Some(s) = data.as_str() {
-                return match msg_ref {
-                    Some(m) => format!("({m}) {s}"),
-                    None => s.to_string(),
-                };
-            }
-            if let Ok(compact) = serde_json::to_string(data) {
-                return match msg_ref {
-                    Some(m) => format!("({m}) {compact}"),
-                    None => compact,
-                };
-            }
-        }
-        match msg_ref {
-            Some(m) => format!("({m}) {} ({})", event.event_type, event.source),
-            None => format!("{} ({})", event.event_type, event.source),
-        }
-    }
-
-    pub(super) async fn start_plugins(
-        plugins: Vec<ParsedPlugin>,
-        skipped_statuses: Vec<Value>,
-        status_doc: Arc<Mutex<Option<(PathBuf, Value)>>>,
-        node: &Arc<UnifiedNode>,
-        local_daemon: Option<&Arc<LocalDaemon>>,
-        startup_warnings: &mut Vec<String>,
-    ) -> (Vec<Arc<SubprocessSupervisor>>, Arc<PluginStatusRegistry>) {
-        let registry = Arc::new(PluginStatusRegistry::new(skipped_statuses, status_doc));
-        let mut started: Vec<Arc<SubprocessSupervisor>> = Vec::with_capacity(plugins.len());
-
-        for parsed in plugins {
-            let cfg = parsed.config;
-            let plugin_id = cfg.id.clone();
-            let kind = cfg.kind;
-            let targets = cfg.targets.clone();
-            let log_path = cfg.stderr_log_path.clone();
-            let sup = Arc::new(SubprocessSupervisor::new(cfg));
-            let host: Arc<dyn NodeAdapterHost> = Arc::new(NodePluginHost {
-                plugin_id: plugin_id.clone(),
-                kind,
-                targets: targets.clone(),
-                expose_topic: parsed.expose_topic,
-                node: Arc::downgrade(node),
-                daemon: local_daemon.map(Arc::downgrade),
-                supervisor: Arc::downgrade(&sup),
-                registry: Arc::clone(&registry),
-                local_dedup: Mutex::new(LocalEventDedup::new()),
-            });
-
-            if let Err(err) = sup.start(host).await {
-                startup_warnings.push(format!(
-                    "Plugin '{plugin_id}' failed to start and was skipped (daemon continuing): {err}"
-                ));
-                registry.upsert_entry(json!({
-                    "id": plugin_id,
-                    "kind": plugin_kind_str(kind),
-                    "targets": targets,
-                    "status": "failed",
-                    "restarts": 0,
-                    "error": err.to_string(),
-                    "lastError": err.to_string(),
-                    "logPath": log_path.map(|p| p.display().to_string()),
-                }));
-                continue;
-            }
-
-            let register_poster = kind == AdapterKind::Bridge
-                || (plugin_id == "webhook" && parsed.has_webhook_post_url);
-            if register_poster {
-                if let Some(daemon) = local_daemon {
-                    daemon.register_bridge_poster_with_targets(
-                        &plugin_id,
-                        targets.clone(),
-                        Arc::new(SupervisorBridgePoster {
-                            supervisor: Arc::clone(&sup),
-                        }),
-                    );
-                } else {
-                    startup_warnings.push(format!(
-                        "Bridge plugin '{plugin_id}' started without local IPC socket; local sessions require local socket."
-                    ));
-                }
-            }
-
-            let live_health = sup.health();
-            let live_log = sup.stderr_log_path();
-            registry.update_health(PluginHealthUpdate {
-                plugin_id: &plugin_id,
-                kind,
-                targets: &targets,
-                health: &live_health,
-                restarts: sup.restart_count(),
-                crash_loop_backoff: sup.is_crash_loop_backoff(),
-                log_path: live_log.as_ref(),
-            });
-            started.push(sup);
-        }
-
-        (started, registry)
-    }
-
-    pub(super) async fn notify_plugins_wake(
-        plugins: &[Arc<SubprocessSupervisor>],
-        slept_for: Duration,
-    ) {
-        let mut join_set = tokio::task::JoinSet::new();
-        for sup in plugins {
-            let sup = Arc::clone(sup);
-            join_set.spawn(async move {
-                let _ = sup.send_system_wake(slept_for).await;
-            });
-        }
-        while join_set.join_next().await.is_some() {}
-    }
-
-    pub(super) async fn stop_plugins(plugins: Vec<Arc<SubprocessSupervisor>>) {
-        for sup in plugins {
-            let _ = sup.stop().await;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use hyp_crypto::keystore::{SecretBackend, SecretStore};
+    use hyp_node::adapters::{AdapterKind, GitHubWebhookConfig};
+    use hyp_node::engine::KvNamespaceConfig;
+    use hyp_proto::manifest::{KvMode, KvWriteModel};
+    use std::collections::HashSet;
+
+    fn parse_plugins_fixture(
+        plugins: &Value,
+        config_dir: Option<&Path>,
+        state_dir: &Path,
+        explicit_topics: &HashSet<String>,
+        secrets: &SecretStore,
+        warnings: &mut Vec<String>,
+        skipped_statuses: &mut Vec<Value>,
+    ) -> Vec<ParsedPlugin> {
+        let file: hyp_node::node_file::NodeFile =
+            serde_json::from_value(json!({ "plugins": plugins })).unwrap();
+        parse_plugins_config(
+            &file.plugins.unwrap(),
+            config_dir,
+            state_dir,
+            explicit_topics,
+            secrets,
+            warnings,
+            skipped_statuses,
+        )
+    }
+
+    fn parse_webhook_fixture(
+        sources: &Value,
+        secrets: &SecretStore,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<GitHubWebhookConfig>, String> {
+        let file: hyp_node::node_file::NodeFile =
+            serde_json::from_value(json!({ "sources": sources })).unwrap();
+        parse_webhook_sources(
+            file.source_entries()?.unwrap_or_default(),
+            secrets,
+            warnings,
+        )
+    }
 
     #[test]
     fn parse_webhook_sources_resolves_secret_refs_and_rejects_plaintext() {
@@ -3495,11 +1459,11 @@ mod tests {
             }
         ]);
         let mut warnings = Vec::new();
-        let parsed = parse_webhook_sources(&sources, &secrets, &mut warnings)
+        let parsed = parse_webhook_fixture(&sources, &secrets, &mut warnings)
             .expect("valid webhook sources");
-        assert_eq!(parsed.github.len(), 1);
-        assert_eq!(parsed.github[0].id, "gh-main");
-        assert_eq!(parsed.github[0].allowed_repos, vec!["acme/app"]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "gh-main");
+        assert_eq!(parsed[0].allowed_repos, vec!["acme/app"]);
         // Plaintext secret MUST fail closed.
         let plaintext = json!([
             {
@@ -3509,7 +1473,7 @@ mod tests {
                 "secret": "hardcoded-plaintext-secret"
             }
         ]);
-        assert!(parse_webhook_sources(&plaintext, &secrets, &mut warnings).is_err());
+        assert!(parse_webhook_fixture(&plaintext, &secrets, &mut warnings).is_err());
 
         for (kind, plugin) in [
             ("prometheus-webhook", "prometheus"),
@@ -3518,22 +1482,26 @@ mod tests {
             let enabled = json!([{ "kind": kind, "id": "configured" }]);
             warnings.clear();
             assert!(
-                parse_webhook_sources(&enabled, &secrets, &mut warnings)
+                parse_webhook_fixture(&enabled, &secrets, &mut warnings)
                     .unwrap()
-                    .github
                     .is_empty()
             );
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains(&format!("hyp plugin install {plugin} --json")));
             let disabled = json!([{ "kind": kind, "id": "configured", "enabled": false }]);
             warnings.clear();
-            assert!(parse_webhook_sources(&disabled, &secrets, &mut warnings).is_ok());
+            assert!(parse_webhook_fixture(&disabled, &secrets, &mut warnings).is_ok());
             assert!(warnings.is_empty());
         }
     }
 
     #[test]
     fn parse_wake_recovery_config_handles_defaults_camel_snake_and_rejects_invalid() {
+        let parse_wake_recovery_config = |doc: &Value| {
+            serde_json::from_value::<hyp_node::node_file::NodeFile>(doc.clone())
+                .unwrap()
+                .wake_recovery()
+        };
         let def = parse_wake_recovery_config(&json!({})).expect("defaults");
         assert_eq!(def, WakeRecoveryConfig::default());
 
@@ -3579,6 +1547,11 @@ mod tests {
 
     #[test]
     fn parse_node_runtime_policies_loads_forwarding_trusted_proxies_and_guest_collision_guard() {
+        let parse_node_runtime_policies = |raw: &Value, config: &mut NodeConfig| {
+            serde_json::from_value::<hyp_node::node_file::NodeFile>(raw.clone())
+                .unwrap()
+                .apply_runtime_policies(config)
+        };
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = NodeConfig::router(NodeId::new("hub-1").unwrap(), tmp.path());
         let raw = json!({
@@ -3625,21 +1598,25 @@ mod tests {
         assert!(cfg.trusted_proxies.is_empty());
 
         // Guest topic collision guard skips webhook adapters colliding with guestPairing / github-public!
-        let mut parsed = ParsedWebhookSources {
-            github: vec![
-                GitHubWebhookConfig::new("gh-public-collide", "github", "sec1"),
-                GitHubWebhookConfig::new("gh-private", "github-private", "sec2"),
-            ],
-        };
+        let mut parsed = vec![
+            GitHubWebhookConfig::new("gh-public-collide", "github", "sec1"),
+            GitHubWebhookConfig::new("gh-private", "github-private", "sec2"),
+        ];
         let mut warnings = Vec::new();
         filter_colliding_webhook_sources(&mut parsed, true, Some("github"), &mut warnings);
-        assert_eq!(parsed.github.len(), 1);
-        assert_eq!(parsed.github[0].id, "gh-private");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "gh-private");
         assert_eq!(warnings.len(), 1);
     }
 
     #[test]
     fn parse_kv_namespaces_supports_strings_objects_dedup_and_fail_closed_validation() {
+        let parse_kv_namespaces = |raw: &Value, warnings: &mut Vec<String>| {
+            serde_json::from_value::<hyp_node::node_file::NodeFile>(raw.clone())
+                .unwrap()
+                .kv_namespaces(warnings)
+        };
+
         // 1. Absent / null -> empty vec, zero warnings.
         let mut warnings = Vec::new();
         assert!(
@@ -3720,6 +1697,22 @@ mod tests {
         }
     }
 
+    fn parse_github_public_fixture(
+        sources: &Value,
+        secrets: &SecretStore,
+        public_read_only: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<GitHubPublicConfig>, String> {
+        let file: hyp_node::node_file::NodeFile =
+            serde_json::from_value(json!({ "sources": sources })).unwrap();
+        parse_github_public_source(
+            file.source_entries()?.unwrap_or_default(),
+            secrets,
+            public_read_only,
+            warnings,
+        )
+    }
+
     #[test]
     fn parse_github_public_source_repo_tokens_missing_secret_isolation_and_duplicate_warning() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3756,7 +1749,7 @@ mod tests {
         ]);
 
         let mut warnings = Vec::new();
-        let cfg = parse_github_public_source(&sources, &secrets, false, &mut warnings)
+        let cfg = parse_github_public_fixture(&sources, &secrets, false, &mut warnings)
             .expect("valid repoTokens with missing secondary secret should succeed")
             .expect("expected active github-public config");
 
@@ -3809,7 +1802,7 @@ mod tests {
             }
         ]);
         let mut warnings = Vec::new();
-        let err = parse_github_public_source(&plaintext_sources, &secrets, false, &mut warnings)
+        let err = parse_github_public_fixture(&plaintext_sources, &secrets, false, &mut warnings)
             .expect_err("plaintext repoTokens value must fail closed");
         assert!(
             err.contains("plaintext credentials are forbidden"),
@@ -3827,7 +1820,7 @@ mod tests {
                     }
                 }
             ]);
-            let err = parse_github_public_source(&bad_sources, &secrets, false, &mut warnings)
+            let err = parse_github_public_fixture(&bad_sources, &secrets, false, &mut warnings)
                 .expect_err("invalid repoTokens pattern must fail closed");
             assert!(
                 err.contains("invalid sources[].repoTokens pattern"),
@@ -3843,7 +1836,7 @@ mod tests {
                 "maxActivePollers": 0
             }
         ]);
-        assert!(parse_github_public_source(&bad_cap, &secrets, false, &mut warnings).is_err());
+        assert!(parse_github_public_fixture(&bad_cap, &secrets, false, &mut warnings).is_err());
     }
 
     fn extract_json_fences_with_plugins(markdown: &str) -> Vec<Value> {
@@ -3947,7 +1940,7 @@ mod tests {
         let mut warnings = Vec::new();
         let mut skipped = Vec::new();
         let explicit_topics = HashSet::new();
-        let parsed = parse_plugins_config(
+        let parsed = parse_plugins_fixture(
             &plugins,
             None,
             tmp.path(),
@@ -4060,7 +2053,7 @@ mod tests {
             for (idx, snippet) in snippets.iter().enumerate() {
                 let mut warnings = Vec::new();
                 let mut skipped = Vec::new();
-                let parsed = parse_plugins_config(
+                let parsed = parse_plugins_fixture(
                     &snippet["plugins"],
                     None,
                     tmp.path(),
@@ -4134,7 +2127,7 @@ mod tests {
         // 1. Omitted targets on id="telegram" resolves bot username via getMe!
         let mut warnings_ok = Vec::new();
         let mut skipped_ok = Vec::new();
-        let parsed_ok = parse_plugins_config(
+        let parsed_ok = parse_plugins_fixture(
             &json!([{
                 "id": "telegram",
                 "command": "node",
@@ -4160,7 +2153,7 @@ mod tests {
         // 2. HTTP 500 from getMe falls back to ["personal"] without blocking startup or leaking token!
         let mut warnings_fail = Vec::new();
         let mut skipped_fail = Vec::new();
-        let parsed_fail = parse_plugins_config(
+        let parsed_fail = parse_plugins_fixture(
             &json!([{
                 "id": "telegram",
                 "command": "node",
@@ -4254,7 +2247,7 @@ mod tests {
 
         let mut warnings = Vec::new();
         let mut skipped = Vec::new();
-        let parsed = parse_plugins_config(
+        let parsed = parse_plugins_fixture(
             &plugins,
             None,
             tmp.path(),
@@ -4310,7 +2303,11 @@ mod tests {
 
     #[test]
     fn parse_midturn_queue_digest_seconds_defaults_accepts_zero_and_rejects_bad_types() {
-        let parse = |v: Value| parse_midturn_queue_digest_seconds(&v);
+        let parse = |v: Value| {
+            serde_json::from_value::<hyp_node::node_file::NodeFile>(v)
+                .unwrap()
+                .midturn_queue_digest_seconds()
+        };
         assert_eq!(
             parse(json!({})).unwrap(),
             hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS

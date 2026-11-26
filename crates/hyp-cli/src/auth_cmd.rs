@@ -17,8 +17,8 @@ use crate::approval::{
 };
 use crate::config_file::{
     ct_eq, default_node_id, ensure_dir, load_node_or_legacy_config, open_secret_store,
-    read_json_object_or_empty, resolve_config_path_for_read, resolve_config_path_for_write,
-    resolve_effective_node_id, resolve_state_dir, write_atomic_json,
+    resolve_config_path_for_read, resolve_config_path_for_write, resolve_effective_node_id,
+    resolve_state_dir,
 };
 use crate::gate_cmd::{
     ConfirmError, emit_confirm_error, require_controlling_tty_confirmation,
@@ -55,6 +55,7 @@ use hyp_node::gates::policy::{
     DEFAULT_POLICY_SIGNING_SECRET, SecurityGateConfig, gate_policy_sha256,
     local_admin_secret_names_for_kid,
 };
+use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id};
 use hyp_proto::cloudevent::{
     CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EXT_LOCAL_EVENT_SIG, TYPE_HUMAN_REVOCATION_V1,
@@ -737,7 +738,7 @@ struct ApprovedPolicyUpdate {
 
 impl ApprovedPolicyUpdate {
     fn prepare(config_path: &Path, db: &NodeDb, authorities_digest: &str) -> Result<Self, String> {
-        let cfg_map = read_json_object_or_empty(config_path)?;
+        let cfg_map = NodeFile::read_document_or_empty(config_path)?;
         let mut gate_cfg: SecurityGateConfig = match cfg_map.get("gate") {
             Some(v) => serde_json::from_value(v.clone())
                 .map_err(|e| format!("malformed gate config in {}: {e}", config_path.display()))?,
@@ -771,7 +772,7 @@ impl ApprovedPolicyUpdate {
             .or_insert_with(|| json!(verified.action.node_id));
         let gate_val = serde_json::to_value(&self.gate_cfg).map_err(|e| e.to_string())?;
         self.cfg_map.insert("gate".to_string(), gate_val);
-        write_atomic_json(config_write, &Value::Object(self.cfg_map), true)?;
+        NodeFile::write_document(config_write, self.cfg_map)?;
         Ok(self.seal_seq)
     }
 }

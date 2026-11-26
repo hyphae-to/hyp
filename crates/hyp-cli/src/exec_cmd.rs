@@ -18,8 +18,7 @@
 //! - Direct `Command::new(program).args(args)` execution with ZERO shell invocation.
 
 use crate::config_file::{
-    load_node_or_legacy_config, open_secret_store, read_json_value, resolve_config_path_for_read,
-    resolve_state_dir,
+    load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read, resolve_state_dir,
 };
 use crate::ui::{EXIT_ERROR, EXIT_USAGE};
 use base64::Engine as _;
@@ -29,6 +28,7 @@ use hyp_crypto::CryptoError;
 use hyp_crypto::human::is_reserved_secret_name;
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_node::engine::http_util::percent_encode;
+use hyp_node::node_file::NodeFile;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
@@ -728,7 +728,7 @@ fn resolve_exec_state_dir(
         let mut docs = vec![loaded.raw];
         let state_cfg = resolve_config_path_for_read(None, Some(&dir), None);
         if state_cfg.exists() && state_cfg != cfg_path {
-            if let Ok(extra_doc) = read_json_value(&state_cfg) {
+            if let Ok(extra_doc) = NodeFile::read_document(&state_cfg) {
                 docs.push(extra_doc);
             }
         }
@@ -739,7 +739,7 @@ fn resolve_exec_state_dir(
         let mut docs = Vec::new();
         let state_cfg = resolve_config_path_for_read(None, Some(sd), None);
         if state_cfg.exists() {
-            let doc = read_json_value(&state_cfg).map_err(|_| {
+            let doc = NodeFile::read_document(&state_cfg).map_err(|_| {
                 "node.json in --state-dir is not valid JSON (failing closed on secret isolation)"
                     .to_string()
             })?;
@@ -751,7 +751,7 @@ fn resolve_exec_state_dir(
     let default_cfg = resolve_config_path_for_read(None, None, None);
     let mut docs = Vec::new();
     let cfg_for_resolve = if default_cfg.exists() {
-        let doc = read_json_value(&default_cfg).map_err(|_| {
+        let doc = NodeFile::read_document(&default_cfg).map_err(|_| {
             "Default node.json is not valid JSON (failing closed on secret isolation)".to_string()
         })?;
         docs.push(doc);

@@ -36,6 +36,7 @@ use hyp_crypto::pairing::{
 use hyp_harness::hooks::shell_quote_cli;
 use hyp_harness::protocol::HarnessKind;
 use hyp_node::engine::NodeProfile;
+use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_store::{NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, now_ms};
 use serde::Serialize;
@@ -1007,7 +1008,7 @@ fn run_onboard_deterministic(
     let previous_config_path =
         resolve_config_path_for_read(None, args.state_dir.as_deref(), Some(&home));
     let existing_config = previous_config_path.exists();
-    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
         Ok(m) => m,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
     };
@@ -1152,7 +1153,7 @@ fn run_onboard_deterministic(
         );
     }
 
-    if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
+    if let Err(e) = NodeFile::write_document(&config_path, cfg_map) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
 
@@ -2285,10 +2286,8 @@ pub fn detect_harness_statuses(
                         .join("SKILL.md");
                     let legacy = home.join(".t3").join("hyphae.json");
                     let in_node_cfg = config_path
-                        .and_then(|cp| fs::read_to_string(cp).ok())
-                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                        .and_then(|v| v.get("t3").cloned())
-                        .is_some();
+                        .and_then(|path| NodeFile::read_document(path).ok())
+                        .is_some_and(|document| document.get("t3").is_some());
                     let loc = if in_node_cfg {
                         config_path
                             .map(|cp| cp.display().to_string())
@@ -4262,7 +4261,7 @@ pub fn apply_openclaw_config(
     //    or updating an existing `"openclaw"` block so `LocalDaemon` honors the user's choice.
     if let Some(cfg_path) = config_path {
         if cfg_path.exists() {
-            let mut node_cfg = read_json_object_or_empty(cfg_path)?;
+            let mut node_cfg = NodeFile::read_document_or_empty(cfg_path)?;
             let existing_oc = node_cfg.get("openclaw").and_then(Value::as_object).cloned();
             let should_update = delivery_mode == OpenClawDeliveryMode::Inbox
                 || existing_oc
@@ -4276,7 +4275,9 @@ pub fn apply_openclaw_config(
                     Value::String(delivery_mode.as_str().to_string()),
                 );
                 node_cfg.insert("openclaw".to_string(), Value::Object(oc_block));
-                maybe_write_json(cfg_path, &Value::Object(node_cfg), true, dry_run)?;
+                if !dry_run {
+                    NodeFile::write_document(cfg_path, node_cfg)?;
+                }
                 files.push(cfg_path.display().to_string());
             }
         }
@@ -4395,7 +4396,7 @@ fn setup_t3(
     ];
 
     if config_path.exists() {
-        let mut node_cfg = read_json_object_or_empty(config_path)?;
+        let mut node_cfg = NodeFile::read_document_or_empty(config_path)?;
         let mut t3_entry = node_cfg
             .get("t3")
             .and_then(Value::as_object)
@@ -4411,7 +4412,9 @@ fn setup_t3(
             .entry("tokenSecret".to_string())
             .or_insert_with(|| json!("t3-session-token"));
         node_cfg.insert("t3".to_string(), Value::Object(t3_entry));
-        maybe_write_json(config_path, &Value::Object(node_cfg), true, dry_run)?;
+        if !dry_run {
+            NodeFile::write_document(config_path, node_cfg)?;
+        }
         files.push(config_path.display().to_string());
     }
 

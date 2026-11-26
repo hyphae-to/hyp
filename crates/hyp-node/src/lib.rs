@@ -3,6 +3,8 @@
 //! and Local Security Gates (Stage 1 deterministic + Stage 2 isolated LLM guard).
 
 pub mod adapters;
+pub mod atomic_file;
 pub mod delivery;
 pub mod engine;
 pub mod gates;
+pub mod node_file;

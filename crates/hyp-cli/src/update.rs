@@ -12,8 +12,8 @@
 
 use crate::config_file::{
     build_http_client, ct_eq, default_node_id, ensure_v2_node_json_defaults,
-    load_node_or_legacy_config, read_json_object_or_empty, resolve_config_path_for_read,
-    resolve_config_path_for_write, resolve_state_dir, write_atomic_json,
+    load_node_or_legacy_config, resolve_config_path_for_read, resolve_config_path_for_write,
+    resolve_state_dir,
 };
 use crate::ui::{
     CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json,
@@ -28,6 +28,7 @@ use hyp_crypto::pairing::validate_http_endpoint_origin;
 use hyp_crypto::rfc3339::parse_rfc3339_millis;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
 use hyp_node::engine::NodeProfile;
+use hyp_node::node_file::NodeFile;
 use hyp_store::{NodeDb, PeerRecord, now_ms};
 use hyper::body::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -690,7 +691,7 @@ fn run_update_channel(
         Some(setting) => {
             let cfg_path =
                 resolve_config_path_for_write(config.as_deref(), state_dir.as_deref(), None);
-            let mut map = match read_json_object_or_empty(&cfg_path) {
+            let mut map = match NodeFile::read_document_or_empty(&cfg_path) {
                 Ok(m) => m,
                 Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
             };
@@ -708,7 +709,7 @@ fn run_update_channel(
             update_obj.insert("channel".to_string(), json!(setting.as_str()));
             map.insert("update".to_string(), Value::Object(update_obj));
 
-            if let Err(e) = write_atomic_json(&cfg_path, &Value::Object(map), true) {
+            if let Err(e) = NodeFile::write_document(&cfg_path, map) {
                 return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
             }
             if as_json {

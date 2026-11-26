@@ -353,35 +353,17 @@ impl Default for OpenClawNodeConfig {
 }
 
 impl OpenClawNodeConfig {
-    /// Extracts `"openclaw": { "enabled", "deliveryMode", "url", "hooksPath", "agentId", "mode", "tokenSecret", "allowRemote" }`
-    /// from a parsed `node.json` document.
-    pub fn from_node_json(doc: &Value) -> Self {
-        let Some(obj) = doc.get("openclaw").and_then(Value::as_object) else {
-            return Self::default();
-        };
-        let clean_str = |key: &str| {
-            obj.get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-        };
-        let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-        let delivery_mode = clean_str("deliveryMode");
-        let mode = clean_str("mode").and_then(|s| s.parse::<OpenClawEndpointMode>().ok());
-        let allow_remote = obj
-            .get("allowRemote")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+    /// Applies transport defaults to the optional OpenClaw block from node.json.
+    pub fn from_node_file(config: hyp_node::node_file::OpenClawFile) -> Self {
         Self {
-            enabled,
-            delivery_mode,
-            url: clean_str("url"),
-            hooks_path: clean_str("hooksPath"),
-            agent_id: clean_str("agentId"),
-            mode,
-            token_secret: clean_str("tokenSecret"),
-            allow_remote,
+            enabled: config.enabled.unwrap_or(true),
+            delivery_mode: config.delivery_mode,
+            url: config.url,
+            hooks_path: config.hooks_path,
+            agent_id: config.agent_id,
+            mode: config.mode.and_then(|mode| mode.parse().ok()),
+            token_secret: config.token_secret,
+            allow_remote: config.allow_remote.unwrap_or(false),
         }
     }
 

@@ -4,6 +4,7 @@
 
 pub mod github_public;
 pub mod supervisor;
+pub mod telegram;
 pub mod trait_def;
 pub mod webhooks;
 

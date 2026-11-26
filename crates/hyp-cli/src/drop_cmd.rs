@@ -10,9 +10,8 @@
 use crate::auth_cmd::CliDropKind;
 use crate::config_file::{
     build_http_client, default_node_id, ensure_dir, ensure_v2_node_json_defaults,
-    load_node_or_legacy_config, open_secret_store, read_json_object_or_empty,
-    resolve_config_path_for_read, resolve_config_path_for_write, resolve_effective_node_id,
-    resolve_state_dir, write_atomic_json,
+    load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read,
+    resolve_config_path_for_write, resolve_effective_node_id, resolve_state_dir, write_atomic_json,
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -38,6 +37,7 @@ use hyp_node::engine::{
     IngestedHumanDrop, NodeConfig, NodeProfile, UnifiedNode, resolve_drop_portal_url,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
+use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{NodeId, is_valid_handle};
 use hyp_store::NodeDb;
 use hyper::body::Bytes;
@@ -1710,7 +1710,7 @@ fn run_relay_set(
     let config_path =
         resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
 
-    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
         Ok(m) => m,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
     };
@@ -1725,7 +1725,7 @@ fn run_relay_set(
         Value::String(normalized.clone()),
     );
 
-    if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
+    if let Err(e) = NodeFile::write_document(&config_path, cfg_map) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
 

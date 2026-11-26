@@ -4466,20 +4466,9 @@ fn resolve_t3_url_from_home(
     let config_path = existing_node
         .map(|node| node.config_path.clone())
         .unwrap_or_else(|| home.join(".config").join("hyphae").join("node.json"));
-    if let Ok(raw) = fs::read_to_string(&config_path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(url) = val
-                .get("t3")
-                .and_then(|t| t.get("url"))
-                .and_then(serde_json::Value::as_str)
-            {
-                if let Some(clean) = sanitize_http_url(Some(url)) {
-                    return Some(clean);
-                }
-            }
-        }
-    }
-    None
+    let (file, _) = hyp_node::node_file::NodeFile::read(&config_path).ok()?;
+    let t3 = file.t3?;
+    sanitize_http_url(t3.url.as_deref())
 }
 
 fn resolve_manual_guide_deeplink(

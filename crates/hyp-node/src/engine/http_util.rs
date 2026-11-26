@@ -568,6 +568,25 @@ pub struct HttpClient {
     ssh_shutdown: Arc<watch::Sender<bool>>,
 }
 
+/// Builds a shared `hyper 1` + `hyper-rustls` client (ring + webpki-roots, HTTPS + loopback HTTP).
+pub fn build_http_client<B>()
+-> Result<Client<hyper_rustls::HttpsConnector<HttpConnector>, B>, String>
+where
+    B: hyper::body::Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let connector = HttpsConnectorBuilder::new()
+        .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
+        .map_err(|e| format!("TLS connector initialization failed: {e}"))?
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
 impl HttpClient {
     /// Constructs a new `HttpClient` with `rustls` (`ring` + `webpki-roots`),
     /// permitting HTTPS, loopback HTTP, and strictly validated `ssh://` peer transports.

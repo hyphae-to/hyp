@@ -51,6 +51,7 @@ use hyp_node::engine::{
 use hyp_node::gates::{
     GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
 };
+pub use hyp_node::node_file::DeliveryRetryConfig;
 use hyp_proto::cloudevent::{CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EXT_TRACEPARENT};
 use hyp_proto::filter::Filter as ProtoFilter;
 use hyp_store::{
@@ -232,27 +233,6 @@ pub struct InboundItem {
     pub text: String,
     pub kind: MailboxKind,
     pub trust_tier: GateTrustTier,
-}
-
-/// Tier 3 bounded `Hold` retry backoff and opt-in Tier 4 cold-revival configuration
-/// for [`LocalDaemon`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeliveryRetryConfig {
-    pub hold_retry_backoff_ms: Vec<u64>,
-    pub hold_retry_max_attempts: u32,
-    pub codex_resume: bool,
-    pub herdr_spawn_allowlist: Vec<String>,
-}
-
-impl Default for DeliveryRetryConfig {
-    fn default() -> Self {
-        Self {
-            hold_retry_backoff_ms: vec![5_000, 15_000, 30_000, 60_000],
-            hold_retry_max_attempts: 6,
-            codex_resume: false,
-            herdr_spawn_allowlist: Vec::new(),
-        }
-    }
 }
 
 /// Configuration for [`LocalDaemon`].
@@ -3115,9 +3095,9 @@ impl LocalDaemonInner {
     }
 
     fn openclaw_gateway_push_enabled(&self) -> bool {
-        read_node_json_for_state_dir(&self.node.config().state_dir)
-            .as_ref()
-            .map(OpenClawNodeConfig::from_node_json)
+        read_node_file_for_state_dir(&self.node.config().state_dir)
+            .and_then(|file| file.openclaw)
+            .map(OpenClawNodeConfig::from_node_file)
             .unwrap_or_default()
             .gateway_push_enabled()
     }
@@ -3147,9 +3127,9 @@ impl LocalDaemonInner {
         let session_key = validate_openclaw_session_key(suffix).ok()?;
         let agent_id = parse_openclaw_agent_id_from_session_key(&session_key)
             .or_else(|| {
-                read_node_json_for_state_dir(&self.node.config().state_dir)
-                    .as_ref()
-                    .map(OpenClawNodeConfig::from_node_json)
+                read_node_file_for_state_dir(&self.node.config().state_dir)
+                    .and_then(|file| file.openclaw)
+                    .map(OpenClawNodeConfig::from_node_file)
                     .and_then(|cfg| cfg.agent_id)
             })
             .unwrap_or_else(|| DEFAULT_OPENCLAW_AGENT_ID.to_string());
@@ -8676,42 +8656,9 @@ fn compute_batch_idempotency_id(session_id: &str, batch: &PackedDeliveryBatch) -
     digest[..24].to_string()
 }
 
-#[derive(Debug, Clone, Default)]
-struct NodeJsonT3Config {
-    url: Option<String>,
-    base_dir: Option<PathBuf>,
-    token_secret: Option<String>,
-    allow_remote: bool,
-}
-
-impl NodeJsonT3Config {
-    fn from_node_json(doc: &Value) -> Self {
-        let Some(obj) = doc.get("t3").and_then(Value::as_object) else {
-            return Self::default();
-        };
-        let clean_str = |key: &str| {
-            obj.get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-        };
-        let allow_remote = obj
-            .get("allowRemote")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        Self {
-            url: clean_str("url"),
-            base_dir: clean_str("baseDir").map(PathBuf::from),
-            token_secret: clean_str("tokenSecret"),
-            allow_remote,
-        }
-    }
-}
-
 /// Reads `node.json` (or legacy `connector.json`) adjacent to `state_dir`, falling back to
 /// `$HYPHAE_CONFIG` when no config file sits directly inside `state_dir`.
-fn read_node_json_for_state_dir(state_dir: &Path) -> Option<Value> {
+fn read_node_file_for_state_dir(state_dir: &Path) -> Option<hyp_node::node_file::NodeFile> {
     let mut candidates = vec![
         state_dir.join("node.json"),
         state_dir.join("connector.json"),
@@ -8724,12 +8671,8 @@ fn read_node_json_for_state_dir(state_dir: &Path) -> Option<Value> {
     }
     for path in candidates {
         if path.is_file() {
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                    if val.is_object() {
-                        return Some(val);
-                    }
-                }
+            if let Ok((file, _)) = hyp_node::node_file::NodeFile::read(&path) {
+                return Some(file);
             }
         }
     }
@@ -8965,11 +8908,9 @@ fn maybe_spawn_transport_probe(
         return;
     }
 
-    let node_json = read_node_json_for_state_dir(&daemon.node.config().state_dir);
-    let node_t3 = node_json
-        .as_ref()
-        .map(NodeJsonT3Config::from_node_json)
-        .unwrap_or_default();
+    let mut node_file =
+        read_node_file_for_state_dir(&daemon.node.config().state_dir).unwrap_or_default();
+    let node_t3 = node_file.t3.take().unwrap_or_default();
 
     // Check whether we have any plausible transport signal worth probing:
     // - explicit Herdr terminal ID, T3 dir/url/harness, OpenClaw harness, or Codex harness/args
@@ -9107,15 +9048,16 @@ fn maybe_spawn_transport_probe(
                     .or(daemon_arc.config.t3_default_url.as_deref())
                     .or(node_t3.url.as_deref())
                     .unwrap_or(DEFAULT_T3_URL);
-                if let Ok(origin) =
-                    normalize_t3_server_url_with_remote(raw_url, node_t3.allow_remote)
-                {
+                if let Ok(origin) = normalize_t3_server_url_with_remote(
+                    raw_url,
+                    node_t3.allow_remote.unwrap_or(false),
+                ) {
                     let token =
                         read_t3_secret_for_node(&daemon_arc.node, node_t3.token_secret.as_deref());
                     let probe = probe_t3_server_with_remote(
                         &origin,
                         token.as_deref(),
-                        node_t3.allow_remote,
+                        node_t3.allow_remote.unwrap_or(false),
                         DEFAULT_PROBE_TIMEOUT,
                     )
                     .await;
@@ -9134,7 +9076,8 @@ fn maybe_spawn_transport_probe(
                         if daemon_arc.attach_transport_if_higher_priority(
                             &sid,
                             Arc::new(
-                                T3Transport::new(target).with_allow_remote(node_t3.allow_remote),
+                                T3Transport::new(target)
+                                    .with_allow_remote(node_t3.allow_remote.unwrap_or(false)),
                             ),
                             PRIORITY_T3,
                         ) {
@@ -9153,9 +9096,9 @@ fn maybe_spawn_transport_probe(
             && is_openclaw
             && daemon_arc.current_transport_priority(&sid) < PRIORITY_OPENCLAW
         {
-            let oc_cfg = node_json
-                .as_ref()
-                .map(OpenClawNodeConfig::from_node_json)
+            let oc_cfg = node_file
+                .openclaw
+                .map(OpenClawNodeConfig::from_node_file)
                 .unwrap_or_default();
             if oc_cfg.gateway_push_enabled() {
                 let mut target = oc_cfg.to_target();
