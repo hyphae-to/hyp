@@ -2276,3 +2276,142 @@ fn cli_drop_portal_url_override_and_fail_closed_validation() {
     assert_eq!(bad_node_json["ok"], false);
     assert_eq!(bad_node_json["error"]["code"], "CONFIG_ERROR");
 }
+
+// ============================================================================
+// 8. `hyp drop create --kind secret` non-authoritative `secretExists` hint
+// ============================================================================
+
+#[test]
+fn cli_drop_create_secret_exists_hint_absent_vs_present() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let state_dir = home.join("state");
+    let state_str = state_dir.to_str().unwrap();
+
+    // 1. Initialize node identity & human authority.
+    let init = isolated_cmd(home)
+        .args([
+            "auth",
+            "init",
+            "--human-id",
+            "operator",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run auth init");
+    assert_eq!(init.status.code(), Some(0));
+
+    let decode_frag = |url: &str| -> Value {
+        let raw_hash = url.split_once('#').expect("URL must carry #fragment").1;
+        let b64 = raw_hash.strip_prefix("drop=").unwrap_or(raw_hash);
+        let bytes = URL_SAFE_NO_PAD.decode(b64).expect("valid base64url");
+        serde_json::from_slice(&bytes).expect("valid JSON fragment")
+    };
+
+    // 2. Secret absent: `data.secretExists == false`, omitted from URL fragment.
+    let absent_out = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "secret",
+            "--secret-name",
+            "my-api-key",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run drop create secret absent");
+    assert_eq!(absent_out.status.code(), Some(0));
+    let absent_json = parse_json_stdout(&absent_out);
+    assert_eq!(absent_json["data"]["secretName"], "my-api-key");
+    assert_eq!(absent_json["data"]["secretExists"], false);
+    let absent_frag = decode_frag(absent_json["data"]["url"].as_str().unwrap());
+    assert_eq!(absent_frag["secretName"], "my-api-key");
+    assert!(
+        absent_frag.get("secretExists").is_none(),
+        "absent secret should omit secretExists from fragment: {absent_frag}"
+    );
+
+    // 3. Pre-seed `my-api-key` in isolated file SecretStore.
+    let canary_val = "sk_cli_secret_exists_canary_never_leak_999";
+    let secrets = hyp_crypto::SecretStore::file_only(&state_dir);
+    secrets.set("my-api-key", canary_val).unwrap();
+
+    // 4. Secret present: `data.secretExists == true` AND fragment carries `secretExists: true` (ZERO secret leak!).
+    let present_out = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "secret",
+            "--secret-name",
+            "my-api-key",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run drop create secret present");
+    assert_eq!(present_out.status.code(), Some(0));
+    let stdout_str = String::from_utf8_lossy(&present_out.stdout);
+    let stderr_str = String::from_utf8_lossy(&present_out.stderr);
+    assert!(
+        !stdout_str.contains(canary_val) && !stderr_str.contains(canary_val),
+        "ZERO-LEAK VIOLATION: secret value leaked into CLI output!"
+    );
+    let present_json = parse_json_stdout(&present_out);
+    assert_eq!(present_json["data"]["secretName"], "my-api-key");
+    assert_eq!(present_json["data"]["secretExists"], true);
+    let present_frag = decode_frag(present_json["data"]["url"].as_str().unwrap());
+    assert_eq!(present_frag["secretName"], "my-api-key");
+    assert_eq!(present_frag["secretExists"], true);
+
+    // 5. TTY (non-JSON) output prints an Overwrite note and never leaks secret bytes.
+    let tty_out = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "secret",
+            "--secret-name",
+            "my-api-key",
+            "--offline",
+            "--state-dir",
+            state_str,
+        ])
+        .output()
+        .expect("run drop create secret present TTY");
+    assert_eq!(tty_out.status.code(), Some(0));
+    let tty_stdout = String::from_utf8_lossy(&tty_out.stdout);
+    assert!(
+        tty_stdout.contains("already exists") && tty_stdout.contains("Overwrite"),
+        "expected Overwrite note in TTY output, got: {tty_stdout}"
+    );
+    assert!(!tty_stdout.contains(canary_val));
+
+    // 6. Directive drop: `secretExists` is false and omitted from fragment.
+    let dir_out = isolated_cmd(home)
+        .args([
+            "drop",
+            "create",
+            "--kind",
+            "directive",
+            "--offline",
+            "--state-dir",
+            state_str,
+            "--json",
+        ])
+        .output()
+        .expect("run drop create directive");
+    assert_eq!(dir_out.status.code(), Some(0));
+    let dir_json = parse_json_stdout(&dir_out);
+    assert_eq!(dir_json["data"]["secretExists"], false);
+    let dir_frag = decode_frag(dir_json["data"]["url"].as_str().unwrap());
+    assert!(dir_frag.get("secretExists").is_none());
+}

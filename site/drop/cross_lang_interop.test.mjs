@@ -835,4 +835,83 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
       `expected tampered humanClaimSig to fail closed at INVALID_HANDOFF, got: ${badJoinRes.stdout}`,
     );
   });
+
+  test("Non-authoritative `secretExists` hint interop: Rust `hyp drop create` <-> JS `parseFragmentString` & fail-closed UI markup", () => {
+    // 1. Secret absent -> `secretExists: false` in CLI JSON & parsed JS fragment.
+    const absentRes = runHyp(hypBin, isoEnv, [
+      "drop",
+      "create",
+      "--kind",
+      "secret",
+      "--secret-name",
+      "cross-lang-missing-secret",
+      "--offline",
+      "--state-dir",
+      stateDir,
+      "--config",
+      configPath,
+      "--json",
+    ]);
+    const absentJson = parseJsonStdout(absentRes, "hyp drop create (secret absent)");
+    assert.equal(absentJson.data.secretExists, false);
+    const absentParsed = parseFragmentString(
+      absentJson.data.url.slice(absentJson.data.url.indexOf("#")),
+    );
+    assert.equal(absentParsed.mode, "drop");
+    assert.equal(absentParsed.fragment.secretName, "cross-lang-missing-secret");
+    assert.equal(absentParsed.fragment.secretExists, false);
+
+    // 2. Secret already exists (`cross-lang-api-key` stored earlier) -> `secretExists: true`!
+    const presentRes = runHyp(hypBin, isoEnv, [
+      "drop",
+      "create",
+      "--kind",
+      "secret",
+      "--secret-name",
+      "cross-lang-api-key",
+      "--offline",
+      "--state-dir",
+      stateDir,
+      "--config",
+      configPath,
+      "--json",
+    ]);
+    const presentJson = parseJsonStdout(presentRes, "hyp drop create (secret present)");
+    assert.equal(presentJson.data.secretExists, true);
+    assert.ok(
+      !presentRes.stdout.includes("sk_live_cross_lang_interop_secret_987654321"),
+      "secretExists check must NEVER leak secret bytes",
+    );
+    const presentParsed = parseFragmentString(
+      presentJson.data.url.slice(presentJson.data.url.indexOf("#")),
+    );
+    assert.equal(presentParsed.mode, "drop");
+    assert.equal(presentParsed.fragment.secretName, "cross-lang-api-key");
+    assert.equal(presentParsed.fragment.secretExists, true);
+
+    // 3. Mutated nearby fragments: directive or non-boolean `secretExists` MUST parse as false!
+    const encodeFrag = (obj) => `#drop=${base64urlEncode(new TextEncoder().encode(JSON.stringify(obj)))}`;
+    const baseFrag = {
+      v: 1,
+      nodeId,
+      encJwk: nodeEncJwk,
+    };
+    const dirWithHint = parseFragmentString(
+      encodeFrag({ ...baseFrag, kind: "directive", secretExists: true }),
+    );
+    assert.equal(dirWithHint.fragment.secretExists, false);
+
+    const strBoolHint = parseFragmentString(
+      encodeFrag({ ...baseFrag, kind: "secret", secretName: "k", secretExists: "true" }),
+    );
+    assert.equal(strBoolHint.fragment.secretExists, false);
+
+    // 4. H15 markup invariant: `#chkOverwriteSecret` is never checked by default and `#secretExistsHint` exists.
+    const indexHtml = readFileSync(join(__dirname, "index.html"), "utf8");
+    assert.ok(indexHtml.includes('id="secretExistsHint"'), "index.html must include #secretExistsHint");
+    assert.ok(
+      /<input\s+id="chkOverwriteSecret"\s+type="checkbox"\s+disabled\s*\/>/.test(indexHtml),
+      "#chkOverwriteSecret must remain unchecked by default (H15)",
+    );
+  });
 });

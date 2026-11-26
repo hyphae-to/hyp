@@ -985,6 +985,22 @@ textarea:disabled {
   color: #fde4df;
 }
 
+.secret-exists-hint {
+  margin: 0;
+  padding: 8px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--gold-dim);
+  border: 1px solid var(--gold-border);
+  color: #f6e7c4;
+  font-size: 0.79rem;
+  line-height: 1.42;
+}
+
+.secret-exists-hint code {
+  color: var(--gold-bright);
+  background: rgba(226, 168, 66, 0.16);
+}
+
 /* ========================================================================= */
 /* Buttons & Loading Spinner                                                 */
 /* ========================================================================= */

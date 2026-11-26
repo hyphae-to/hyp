@@ -648,6 +648,10 @@ fn run_drop_create(
     };
     let node_id = resolve_effective_node_id(loaded.as_ref(), db.as_ref());
     let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
+    // Non-authoritative UI cue ONLY (H15): strictly boolean existence check; NEVER expose secret bytes.
+    let secret_exists = validated_secret_name
+        .as_deref()
+        .is_some_and(|sn| secrets.get(sn).is_ok());
     let identity = match secrets.load_or_create_node_keys(&node_id) {
         Ok(k) => k,
         Err(e) => {
@@ -869,6 +873,9 @@ fn run_drop_create(
     }
     if let Some(ref sn) = validated_secret_name {
         frag.insert("secretName".to_string(), json!(sn));
+        if secret_exists {
+            frag.insert("secretExists".to_string(), json!(true));
+        }
     }
     if let Some(ref cert) = node_cert_hcert1 {
         frag.insert("nodeCert".to_string(), json!(cert));
@@ -934,6 +941,7 @@ fn run_drop_create(
                 "handle": handle_arg,
                 "kind": kind.to_crypto_kind().as_str(),
                 "secretName": validated_secret_name,
+                "secretExists": secret_exists,
                 "dropId": drop_id,
                 "relay": relay_url,
                 "nodeCert": node_cert_hcert1,
@@ -958,6 +966,13 @@ fn run_drop_create(
         }
         if encrypted_draft.is_some() {
             println!("      Draft:   HPKE-encrypted (human.draft.v1; zero plaintext in URL)");
+        }
+        if secret_exists {
+            if let Some(ref sn) = validated_secret_name {
+                println!(
+                    "      Note:    Secret '{sn}' already exists — check Overwrite on the drop page to replace it."
+                );
+            }
         }
         print_next_steps(&next);
     }

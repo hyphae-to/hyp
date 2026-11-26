@@ -42,7 +42,7 @@ use hyp_node::delivery::{
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
 use hyp_node::engine::{
     ChannelMode, CreateDropRequest, CreateDropResponse, DROP_CAP_HEADER, DropSubscriberAuth,
-    KvWriteRequest, PeerReconcileReport, SubscribeRequest, UnifiedNode,
+    KvWriteRequest, NodeError, PeerReconcileReport, SubscribeRequest, UnifiedNode,
 };
 use hyp_node::gates::{
     GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
@@ -4186,6 +4186,10 @@ impl LocalDaemonInner {
         } else {
             None
         };
+        // Non-authoritative UI cue ONLY (H15): strictly boolean existence check; NEVER expose secret bytes.
+        let secret_exists = secret_name
+            .as_deref()
+            .is_some_and(|sname| self.node.secret_store().get(sname).is_ok());
 
         let handle: Option<String> = match args
             .get("handle")
@@ -4421,17 +4425,19 @@ impl LocalDaemonInner {
                         )
                         .map_err(|e| ("drop_relay_error".into(), e.to_string()))?;
 
-                    let task_node = Arc::clone(&self.node);
-                    let task_gate = Arc::clone(&self.gate);
+                    let task_daemon = Arc::clone(self);
                     let task_relay = Arc::clone(&local_relay);
                     let mut task_shutdown = self.shutdown_rx.clone();
+                    let requesting_session_id = session_id.to_string();
                     let drop_id_bg = created.drop_id.clone();
+                    let drop_secret_name = secret_name.clone();
                     let sub_cap_bg = created.sub_cap.clone();
                     let deadline_dur = Duration::from_secs(ttl_seconds.saturating_add(5));
 
                     tokio::spawn(async move {
                         let sleep = tokio::time::sleep(deadline_dur);
                         tokio::pin!(sleep);
+                        let mut notified_conflicts: HashSet<String> = HashSet::new();
                         loop {
                             let item_opt = tokio::select! {
                                 item = sub.recv() => item,
@@ -4447,24 +4453,44 @@ impl LocalDaemonInner {
                                 break;
                             };
                             if let Ok(env) = parse_drop_payload_bytes(item.payload.as_slice()) {
-                                let cur_gate = task_gate
-                                    .read()
-                                    .expect("gate lock poisoned")
-                                    .as_ref()
-                                    .map(Arc::clone);
-                                if task_node
+                                let cur_gate = task_daemon.current_gate();
+                                match task_daemon
+                                    .node
                                     .ingest_human_drop(&env, cur_gate.as_deref(), false)
                                     .await
-                                    .is_ok()
                                 {
-                                    let _ = task_relay.ack_drop(
-                                        &drop_id_bg,
-                                        DropSubscriberAuth::SubCap(&sub_cap_bg),
-                                        item.seq,
-                                        true,
-                                        now_ms(),
-                                    );
-                                    break;
+                                    Ok(_) => {
+                                        let _ = task_relay.ack_drop(
+                                            &drop_id_bg,
+                                            DropSubscriberAuth::SubCap(&sub_cap_bg),
+                                            item.seq,
+                                            true,
+                                            now_ms(),
+                                        );
+                                        task_daemon.bump_ui_rev();
+                                        break;
+                                    }
+                                    Err(NodeError::Conflict(_)) => {
+                                        // Post-auth secret overwrite conflict (`human.secret_exists`):
+                                        // notify requesting session (metadata-only, deduplicated by seq)
+                                        // while keeping watcher alive (H18) so human can resubmit with Overwrite.
+                                        let dedup_key = format!("seq:{}", item.seq);
+                                        if notified_conflicts.insert(dedup_key.clone()) {
+                                            notify_drop_secret_conflict(
+                                                &task_daemon,
+                                                &requesting_session_id,
+                                                &drop_id_bg,
+                                                drop_secret_name.as_deref(),
+                                                &dedup_key,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+                                    Err(_) => {
+                                        // H18: Silently ignore unverified/junk/spoofed envelopes.
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -4483,6 +4509,7 @@ impl LocalDaemonInner {
                         session_id.to_string(),
                         relay_url.clone(),
                         created.drop_id.clone(),
+                        secret_name.clone(),
                         created.sub_cap.clone(),
                         Duration::from_secs(ttl_seconds.saturating_add(5)),
                     );
@@ -4521,6 +4548,9 @@ impl LocalDaemonInner {
         }
         if let Some(ref sname) = secret_name {
             frag.insert("secretName".into(), json!(sname));
+            if secret_exists {
+                frag.insert("secretExists".into(), json!(true));
+            }
         }
         if let Some(ref cert) = node_cert_hcert1 {
             frag.insert("nodeCert".into(), json!(cert));
@@ -4565,6 +4595,7 @@ impl LocalDaemonInner {
         out.insert("kind".into(), json!(kind));
         if let Some(sname) = secret_name {
             out.insert("secretName".into(), json!(sname));
+            out.insert("secretExists".into(), json!(secret_exists));
         }
         if let Some(h) = handle {
             out.insert("handle".into(), json!(h));
@@ -8710,11 +8741,38 @@ fn format_human_verified_source(source: &str, human_id: Option<&str>, kid: Optio
     }
 }
 
+async fn notify_drop_secret_conflict(
+    daemon: &Arc<LocalDaemonInner>,
+    requesting_session_id: &str,
+    drop_id: &str,
+    secret_name: Option<&str>,
+    dedup_key: &str,
+) {
+    let safe_drop_id = sanitize_notice_label(drop_id);
+    let safe_dedup = sanitize_notice_label(dedup_key);
+    let item_id = format!("drop-conflict:{safe_drop_id}:{safe_dedup}");
+    let text = match secret_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => {
+            let safe_secret = sanitize_notice_label(name);
+            format!(
+                "[hyphae notice] Verified human secret drop '{safe_drop_id}' for '{safe_secret}' was blocked because the secret already exists and 'Overwrite existing secret' was unchecked. Ask the human to resubmit with Overwrite checked."
+            )
+        }
+        None => format!(
+            "[hyphae notice] Verified human secret drop '{safe_drop_id}' was blocked because the secret already exists and 'Overwrite existing secret' was unchecked. Ask the human to resubmit with Overwrite checked."
+        ),
+    };
+    daemon
+        .enqueue_system_notice(requesting_session_id, item_id, text)
+        .await;
+}
+
 fn spawn_external_drop_watcher(
     daemon: Arc<LocalDaemonInner>,
     requesting_session_id: String,
     relay_url: String,
     drop_id: String,
+    secret_name: Option<String>,
     sub_cap: String,
     deadline_dur: Duration,
 ) {
@@ -8729,6 +8787,8 @@ fn spawn_external_drop_watcher(
         };
         let mut last_event_id: Option<String> = None;
         let mut reconnect_attempt: usize = 0;
+        let mut notified_conflicts: HashSet<String> = HashSet::new();
+        let mut conflict_attempt: u64 = 0;
 
         loop {
             if *shutdown_rx.borrow() {
@@ -8863,6 +8923,36 @@ fn spawn_external_drop_watcher(
                                         }
                                         daemon.bump_ui_rev();
                                         return;
+                                    }
+                                    Err(NodeError::Conflict(_)) => {
+                                        // Post-auth secret overwrite conflict (`human.secret_exists`):
+                                        // notify requesting session (metadata-only, deduplicated per
+                                        // event seq or attempt) while keeping watcher alive (H18) so
+                                        // the human can resubmit with Overwrite checked.
+                                        let dedup_key = match ev
+                                            .id
+                                            .as_deref()
+                                            .map(str::trim)
+                                            .filter(|s| !s.is_empty())
+                                        {
+                                            Some(seq_id) => format!("seq:{seq_id}"),
+                                            None => {
+                                                conflict_attempt =
+                                                    conflict_attempt.saturating_add(1);
+                                                format!("attempt:{conflict_attempt}")
+                                            }
+                                        };
+                                        if notified_conflicts.insert(dedup_key.clone()) {
+                                            notify_drop_secret_conflict(
+                                                &daemon,
+                                                &requesting_session_id,
+                                                &drop_id,
+                                                secret_name.as_deref(),
+                                                &dedup_key,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
                                     }
                                     Err(err) => {
                                         // H18: Never kill the drop watcher on a single junk /

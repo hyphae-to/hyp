@@ -2166,3 +2166,520 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
     daemon.stop().await;
     node.shutdown();
 }
+
+// =========================================================================
+// Test 8: Secret Overwrite Conflict Notice (Local + External Watchers) & `secretExists` Hint
+// =========================================================================
+
+#[tokio::test]
+async fn test_drop_secret_exists_hint_and_conflict_notice_local_and_external_watchers() {
+    let dir = TempDir::new().unwrap();
+    let mut node_cfg = NodeConfig::router(NodeId::new("drop-conflict@box").unwrap(), dir.path());
+    node_cfg.secret_backend = Some(SecretBackend::File);
+    node_cfg.drop_relay = DropRelayConfig {
+        enabled: true,
+        ..DropRelayConfig::default()
+    };
+    let node = UnifiedNode::open(node_cfg).expect("open UnifiedNode");
+    let (http_addr, _server_handle) = Arc::clone(&node)
+        .serve("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .expect("bind local drop relay HTTP server");
+
+    // Enroll an active human admin authority + issue NodeCertV1 (`hcert1_`).
+    let human_admin = Ed25519KeyPair::generate().unwrap();
+    let attacker_kp = Ed25519KeyPair::generate().unwrap();
+    let human_id = "bogdan@phone";
+    {
+        let db = node.db();
+        db.human()
+            .upsert_authority(
+                &HumanAuthorityInput {
+                    human_id: human_id.to_string(),
+                    kid: human_admin.kid(),
+                    label: "iPhone Passkey".to_string(),
+                    role: HumanAuthorityRole::Admin,
+                    jwk_json: serde_json::to_string(&human_admin.to_jwk()).unwrap(),
+                    enc_jwk_json: None,
+                    prf_salt: Some("salt-conflict-01".to_string()),
+                    auth_epoch: 1,
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+    let _ = node
+        .issue_node_cert(&human_admin, &human_admin.kid(), 30)
+        .expect("issue NodeCertV1");
+
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        None,
+        LocalDaemonConfig {
+            drop_watcher_backoff_ms: vec![40, 80, 160],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start LocalDaemon");
+    let sock = daemon.socket_path().to_path_buf();
+
+    let mut client_opts = McpOptions::new(sock.clone());
+    client_opts.backend = Some(HarnessKind::Claude);
+    let mut client = TestMcpClient::spawn(client_opts);
+    client.initialize().await;
+
+    let (_, join_err) = client
+        .call_verified_claude(
+            &sock,
+            "conflict-s1",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "ops" }),
+        )
+        .await;
+    assert!(!join_err);
+    let sid = "claude:conflict-s1";
+
+    let decode_frag = |url: &str| -> Value {
+        let b64 = url
+            .strip_prefix("https://hyphae.to/drop#drop=")
+            .expect("URL must start with https://hyphae.to/drop#drop=");
+        let bytes = URL_SAFE_NO_PAD.decode(b64).expect("valid base64url");
+        serde_json::from_slice(&bytes).expect("valid fragment JSON")
+    };
+
+    // 1. Before secret exists: `secretExists` is false in JSON output and omitted from URL fragment.
+    let (absent_txt, absent_err) = client
+        .call_verified_claude(
+            &sock,
+            "conflict-s1",
+            "hyp_mesh",
+            json!({
+                "action": "drop_link",
+                "kind": "secret",
+                "secretName": "my-api-key"
+            }),
+        )
+        .await;
+    assert!(!absent_err, "drop_link failed: {absent_txt}");
+    let absent_val: Value = serde_json::from_str(&absent_txt).unwrap();
+    assert_eq!(absent_val["secretExists"], json!(false));
+    let absent_frag = decode_frag(absent_val["url"].as_str().unwrap());
+    assert!(
+        absent_frag.get("secretExists").is_none(),
+        "absent secret must omit secretExists from fragment: {absent_frag}"
+    );
+
+    // 2. Pre-seed `my-api-key` -> `secretExists: true` in both JSON output and URL fragment (zero secret leak!).
+    let orig_secret = "sk-orig-secret-canary-v1";
+    node.secret_store().set("my-api-key", orig_secret).unwrap();
+
+    let (present_txt, present_err) = client
+        .call_verified_claude(
+            &sock,
+            "conflict-s1",
+            "hyp_mesh",
+            json!({
+                "action": "drop_link",
+                "kind": "secret",
+                "secretName": "my-api-key"
+            }),
+        )
+        .await;
+    assert!(!present_err, "drop_link failed: {present_txt}");
+    assert!(
+        !present_txt.contains(orig_secret),
+        "ZERO-LEAK VIOLATION: existing secret bytes leaked into drop_link output!"
+    );
+    let present_val: Value = serde_json::from_str(&present_txt).unwrap();
+    assert_eq!(present_val["secretExists"], json!(true));
+    let present_frag = decode_frag(present_val["url"].as_str().unwrap());
+    assert_eq!(present_frag["secretName"], json!("my-api-key"));
+    assert_eq!(present_frag["secretExists"], json!(true));
+    assert_eq!(present_frag["relay"], format!("http://{http_addr}"));
+
+    let local_relay_url = present_frag["relay"].as_str().unwrap().to_string();
+    let local_drop_id = present_frag["dropId"].as_str().unwrap().to_string();
+    let local_post_cap = present_frag["postCap"].as_str().unwrap().to_string();
+
+    let build_secret_env =
+        |signer: &Ed25519KeyPair, drop_id: &str, name: &str, overwrite: bool, body: &str| {
+            let now = now_ms();
+            let claim = HumanClaimV1 {
+                v: 1,
+                kind: HumanDropKind::Secret,
+                claim_id: format!("clm-{}", uuid_v4()),
+                human_id: human_id.to_string(),
+                human_kid: signer.kid(),
+                auth_epoch: 1,
+                issued_at: format_rfc3339_millis(now),
+                expires_at: format_rfc3339_millis(now + 300_000),
+                drop_id: drop_id.to_string(),
+                audience: HumanAudience {
+                    node_id: "drop-conflict@box".to_string(),
+                    node_enc_kid: node.identity().encryption.kid(),
+                    handle: Some("ops".to_string()),
+                },
+                secret_spec: Some(SecretDropSpec {
+                    name: name.to_string(),
+                    overwrite,
+                }),
+                body: body.to_string(),
+            };
+            seal_human_drop(&claim, signer, &node.identity().encryption.public_key())
+                .expect("seal secret drop")
+        };
+
+    let http_client = HttpClient::new().unwrap();
+    let post_drop_env = |relay: &str, drop_id: &str, post_cap: &str, env_json: String| {
+        let client_ref = &http_client;
+        let uri = format!("{relay}/v1/drops/{drop_id}");
+        let cap = post_cap.to_string();
+        async move {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/json")
+                .header(DROP_CAP_HEADER, cap)
+                .body(full_body(env_json.into_bytes()))
+                .unwrap();
+            let (status, _, _) =
+                HttpClient::collect(client_ref.request(req).await.expect("POST drop"), 64 * 1024)
+                    .await
+                    .unwrap();
+            assert!(
+                status == StatusCode::OK
+                    || status == StatusCode::CREATED
+                    || status == StatusCode::ACCEPTED,
+                "unexpected POST /v1/drops status: {status}"
+            );
+        }
+    };
+
+    // 3a. Local watcher: unauthenticated forged envelope MUST NOT spam a conflict notice!
+    let forged_env = build_secret_env(
+        &attacker_kp,
+        &local_drop_id,
+        "my-api-key",
+        false,
+        "forged-junk-secret",
+    );
+    post_drop_env(
+        &local_relay_url,
+        &local_drop_id,
+        &local_post_cap,
+        to_canonical_json(&forged_env).unwrap(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        node.db().local().peek_inbox(sid, 10).unwrap().is_empty(),
+        "forged/unauthenticated envelope MUST NOT enqueue any notice"
+    );
+
+    // 3b. Local watcher: valid human-signed drop with overwrite=false triggers metadata-only conflict notice!
+    let blocked_secret = "sk-blocked-overwrite-false-canary-v2";
+    let conflict_env = build_secret_env(
+        &human_admin,
+        &local_drop_id,
+        "my-api-key",
+        false,
+        blocked_secret,
+    );
+    post_drop_env(
+        &local_relay_url,
+        &local_drop_id,
+        &local_post_cap,
+        to_canonical_json(&conflict_env).unwrap(),
+    )
+    .await;
+
+    let conflict_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let conflict_box = loop {
+        let items = node.db().local().peek_inbox(sid, 10).unwrap();
+        if !items.is_empty() {
+            break items;
+        }
+        assert!(
+            tokio::time::Instant::now() < conflict_deadline,
+            "timed out waiting for local watcher secret conflict notice"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(conflict_box.len(), 1);
+    assert!(conflict_box[0].text.contains("[hyphae notice]"));
+    assert!(conflict_box[0].text.contains(&local_drop_id));
+    assert!(conflict_box[0].text.contains("my-api-key"));
+    assert!(conflict_box[0].text.contains("Overwrite"));
+    assert!(!conflict_box[0].text.contains(orig_secret));
+    assert!(!conflict_box[0].text.contains(blocked_secret));
+    assert_eq!(
+        node.secret_store().get("my-api-key").unwrap().as_str(),
+        orig_secret,
+        "overwrite=false MUST NOT overwrite existing secret"
+    );
+    assert_zero_bytes_in_sqlite_files(dir.path(), blocked_secret);
+
+    // 3c. Local watcher MUST remain alive so resubmitting with overwrite=true succeeds on the same drop!
+    let updated_secret = "sk-updated-overwrite-true-canary-v3";
+    let overwrite_env = build_secret_env(
+        &human_admin,
+        &local_drop_id,
+        "my-api-key",
+        true,
+        updated_secret,
+    );
+    post_drop_env(
+        &local_relay_url,
+        &local_drop_id,
+        &local_post_cap,
+        to_canonical_json(&overwrite_env).unwrap(),
+    )
+    .await;
+
+    let overwrite_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let val_ok = node
+            .secret_store()
+            .get("my-api-key")
+            .ok()
+            .is_some_and(|v| v.as_str() == updated_secret);
+        let burned = node.drop_relay().health(now_ms()).buffered_bytes == 0;
+        let items = node.db().local().peek_inbox(sid, 10).unwrap();
+        if val_ok && burned && items.len() >= 2 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < overwrite_deadline,
+            "timed out waiting for local watcher overwrite resubmission (val_ok={val_ok}, burned={burned}, inbox_len={})",
+            items.len()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_zero_bytes_in_sqlite_files(dir.path(), updated_secret);
+    let local_items = node.db().local().peek_inbox(sid, 10).unwrap();
+    assert!(
+        local_items
+            .iter()
+            .any(|m| m.text.contains("stored in SecretStore") && m.text.contains("my-api-key")),
+        "expected stored confirmation in inbox, got: {local_items:?}"
+    );
+    assert!(
+        local_items
+            .iter()
+            .all(|m| !m.text.contains(updated_secret) && !m.text.contains(blocked_secret)),
+        "ZERO-LEAK VIOLATION in session inbox!"
+    );
+
+    // 4. External drop watcher: junk ignored, conflict notified once (deduped by seq),
+    //    watcher stays alive, overwrite=true resubmission succeeds and acks seq=3!
+    let ext_orig_secret = "sk-ext-orig-canary-v1";
+    let ext_blocked_secret = "sk-ext-blocked-canary-v2";
+    let ext_updated_secret = "sk-ext-updated-canary-v3";
+    node.secret_store()
+        .set("ext-api-key", ext_orig_secret)
+        .unwrap();
+
+    let (_, join2_err) = client
+        .call_verified_claude(
+            &sock,
+            "conflict-ext",
+            "hyp_mesh",
+            json!({ "action": "join", "handle": "ops-ext" }),
+        )
+        .await;
+    assert!(!join2_err);
+    let ext_sid = "claude:conflict-ext";
+
+    let ext_drop_id = "drop_ext_conflict_01";
+    let ext_forged = to_canonical_json(&build_secret_env(
+        &attacker_kp,
+        ext_drop_id,
+        "ext-api-key",
+        false,
+        "ext-forged-junk",
+    ))
+    .unwrap();
+    let ext_conflict = to_canonical_json(&build_secret_env(
+        &human_admin,
+        ext_drop_id,
+        "ext-api-key",
+        false,
+        ext_blocked_secret,
+    ))
+    .unwrap();
+    let ext_overwrite = to_canonical_json(&build_secret_env(
+        &human_admin,
+        ext_drop_id,
+        "ext-api-key",
+        true,
+        ext_updated_secret,
+    ))
+    .unwrap();
+
+    let send_overwrite_gate = Arc::new(Notify::new());
+    let acked_seqs: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ext_relay_url = format!("http://{}", listener.local_addr().unwrap());
+
+    let gate_srv = Arc::clone(&send_overwrite_gate);
+    let acks_srv = Arc::clone(&acked_seqs);
+    let srv_forged = ext_forged.clone();
+    let srv_conflict = ext_conflict.clone();
+    let srv_overwrite = ext_overwrite.clone();
+    let ext_srv_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let gate = Arc::clone(&gate_srv);
+            let acks = Arc::clone(&acks_srv);
+            let forged_s = srv_forged.clone();
+            let conflict_s = srv_conflict.clone();
+            let overwrite_s = srv_overwrite.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or_default();
+                if first_line.starts_with("POST /v1/drops ") {
+                    let body = serde_json::to_string(&json!({
+                        "dropId": ext_drop_id,
+                        "expiresAtMs": now_ms() + 300_000,
+                        "postCap": "hdcap1_ext_post",
+                        "subCap": "hdcap1_ext_sub",
+                        "maxPayloadBytes": 65536,
+                        "maxItems": 4,
+                    }))
+                    .unwrap();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                } else if first_line.starts_with(&format!("GET /v1/drops/{ext_drop_id}/stream ")) {
+                    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    // 1. Forged junk (id=1), 2. Valid conflict (id=2), 3. Duplicate conflict replay (id=2).
+                    let first_batch = format!(
+                        "id: 1\nevent: drop\ndata: {forged_s}\n\n\
+                         id: 2\nevent: drop\ndata: {conflict_s}\n\n\
+                         id: 2\nevent: drop\ndata: {conflict_s}\n\n"
+                    );
+                    let _ = stream.write_all(first_batch.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    // Wait for test to verify intermediate conflict state, then send overwrite=true (id=3).
+                    gate.notified().await;
+                    let second_batch = format!("id: 3\nevent: drop\ndata: {overwrite_s}\n\n");
+                    let _ = stream.write_all(second_batch.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                } else if first_line.starts_with(&format!("POST /v1/drops/{ext_drop_id}/ack ")) {
+                    if let Some((_, body_part)) = req.split_once("\r\n\r\n") {
+                        if let Ok(v) = serde_json::from_str::<Value>(body_part.trim()) {
+                            if let Some(seq) = v.get("seq").and_then(Value::as_u64) {
+                                acks.lock().unwrap().push(seq);
+                            }
+                        }
+                    }
+                    let body = serde_json::to_string(&json!({
+                        "ackedSeq": 3,
+                        "burnedItems": 3,
+                        "burnedBytes": 0,
+                        "remainingItems": 0,
+                        "slotClosed": true,
+                    }))
+                    .unwrap();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+        }
+    });
+
+    let (ext_link_txt, ext_link_err) = client
+        .call_verified_claude(
+            &sock,
+            "conflict-ext",
+            "hyp_mesh",
+            json!({
+                "action": "drop_link",
+                "kind": "secret",
+                "secretName": "ext-api-key",
+                "relay": ext_relay_url,
+            }),
+        )
+        .await;
+    assert!(!ext_link_err, "external drop_link failed: {ext_link_txt}");
+    let ext_link_val: Value = serde_json::from_str(&ext_link_txt).unwrap();
+    assert_eq!(ext_link_val["secretExists"], json!(true));
+    let ext_frag = decode_frag(ext_link_val["url"].as_str().unwrap());
+    assert_eq!(ext_frag["secretExists"], json!(true));
+
+    // Wait for the external watcher to deliver the conflict notice for `id: 2`.
+    let ext_conflict_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let items = node.db().local().peek_inbox(ext_sid, 10).unwrap();
+        if !items.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < ext_conflict_deadline,
+            "timed out waiting for external watcher secret conflict notice"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Give duplicate `id: 2` replay a brief moment to prove it was deduplicated.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let ext_conflict_items = node.db().local().peek_inbox(ext_sid, 10).unwrap();
+    assert_eq!(
+        ext_conflict_items.len(),
+        1,
+        "expected strictly 1 deduplicated conflict notice (junk ignored & duplicate seq deduped), got: {ext_conflict_items:?}"
+    );
+    assert!(ext_conflict_items[0].text.contains("[hyphae notice]"));
+    assert!(ext_conflict_items[0].text.contains(ext_drop_id));
+    assert!(ext_conflict_items[0].text.contains("ext-api-key"));
+    assert!(ext_conflict_items[0].text.contains("Overwrite"));
+    assert!(!ext_conflict_items[0].text.contains(ext_orig_secret));
+    assert!(!ext_conflict_items[0].text.contains(ext_blocked_secret));
+    assert_eq!(
+        node.secret_store().get("ext-api-key").unwrap().as_str(),
+        ext_orig_secret,
+        "external watcher conflict MUST NOT overwrite secret"
+    );
+    assert_zero_bytes_in_sqlite_files(dir.path(), ext_blocked_secret);
+
+    // Release `id: 3` (overwrite=true) on the SAME open SSE stream!
+    send_overwrite_gate.notify_one();
+
+    let ext_overwrite_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let val_ok = node
+            .secret_store()
+            .get("ext-api-key")
+            .ok()
+            .is_some_and(|v| v.as_str() == ext_updated_secret);
+        let ack_ok = acked_seqs.lock().unwrap().contains(&3);
+        if val_ok && ack_ok {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < ext_overwrite_deadline,
+            "timed out waiting for external watcher overwrite resubmission (val_ok={val_ok}, ack_ok={ack_ok})"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_zero_bytes_in_sqlite_files(dir.path(), ext_updated_secret);
+
+    ext_srv_task.abort();
+    client.close().await;
+    daemon.stop().await;
+    node.shutdown();
+}

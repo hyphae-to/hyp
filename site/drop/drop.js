@@ -164,6 +164,8 @@ export function parseFragmentString(rawHash) {
     nodeCert: raw.nodeCert ?? null,
     kind: raw.kind,
     secretName: typeof raw.secretName === "string" ? raw.secretName.trim() : "",
+    // Non-authoritative UI cue ONLY (H15): NEVER auto-checks overwrite!
+    secretExists: raw.kind === "secret" && raw.secretExists === true,
     expiresAt: typeof raw.expiresAt === "string" ? raw.expiresAt : "",
     expiresAtMs,
     humanId: typeof raw.humanId === "string" ? raw.humanId.trim() : "",
@@ -879,6 +881,31 @@ async function initDropMode(fragment) {
         `"${fragment.secretName}" targets an internal Hyphae system key and is permanently blocked.`
       );
     }
+
+    // H15: Always start with Overwrite unchecked (fail-closed human opt-in);
+    // display a non-authoritative amber cue only when fragment.secretExists === true.
+    $("chkOverwriteSecret").checked = false;
+    const hintEl = $("secretExistsHint");
+    if (hintEl) {
+      if (fragment.secretExists && !state.hardBlocked) {
+        const nameCode = document.createElement("code");
+        nameCode.textContent = fragment.secretName;
+        const nodeCode = document.createElement("code");
+        nodeCode.textContent = fragment.nodeId;
+        hintEl.textContent = "";
+        hintEl.append(
+          document.createTextNode("A secret named "),
+          nameCode,
+          document.createTextNode(" already exists on "),
+          nodeCode,
+          document.createTextNode(" — check Overwrite to replace it.")
+        );
+        hintEl.classList.remove("hidden");
+      } else {
+        hintEl.textContent = "";
+        hintEl.classList.add("hidden");
+      }
+    }
   }
 
   // --- Render Target X25519 SAS Fingerprint ---
@@ -1015,6 +1042,7 @@ async function initDropMode(fragment) {
     $("inputDirectiveValue").value = "";
     $("inputDirectiveValue").style.height = "";
     setSecretInputMasked(true);
+    $("chkOverwriteSecret").checked = false;
     $("draftApproveCheck").checked = false;
     $("chkManualSasConfirm").checked = false;
     $("draftWarningBanner").classList.add("hidden");
