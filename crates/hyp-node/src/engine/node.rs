@@ -128,6 +128,10 @@ use crate::gates::{
     VerifiedHumanClaim,
 };
 
+mod kv_inspect;
+
+pub use kv_inspect::{KvInspection, KvKeyInspection, KvNamespaceInspection, KvValuePreview};
+
 const MANIFEST_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const MANIFEST_WINDOW_REFRESH_MS: i64 = 60 * 60 * 1000;
 const HTTP_AUTH_SKEW_MS: i64 = 5 * 60 * 1000;

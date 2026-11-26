@@ -7696,7 +7696,8 @@ async fn handle_connection<R, W>(
                         break;
                     }
                     "sessions.summary" => {
-                        let resp = handle_sessions_summary(&daemon, &packet);
+                        let resp =
+                            handle_sessions_summary(&daemon, &packet, tcp_endpoint.is_none());
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
@@ -7704,6 +7705,7 @@ async fn handle_connection<R, W>(
                         run_inspect_watch(
                             &daemon,
                             &packet,
+                            tcp_endpoint.is_none(),
                             &mut reader,
                             &mut write_half,
                             &mut shutdown_rx,
@@ -7760,7 +7762,7 @@ async fn handle_connection<R, W>(
                     }
                     "kv.local" => {
                         let resp = if tcp_endpoint.is_none() {
-                            handle_local_kv(&daemon, packet.get("request"))
+                            handle_local_kv(&daemon, packet.get("request")).await
                         } else {
                             kv_auth_required()
                         };
@@ -9413,15 +9415,17 @@ where
         let response: Value = serde_json::from_str(&line).ok()?;
         let request = response.get("request")?;
         let client_proof = response.get("clientProof")?.as_str()?;
-        tcp_auth::verify(
+        if !tcp_auth::verify(
             &key,
             endpoint,
             client_nonce,
             &challenge.server_nonce,
             Some(request),
             client_proof,
-        )
-        .then(|| handle_local_kv(daemon, Some(request)))
+        ) {
+            return None;
+        }
+        Some(handle_local_kv(daemon, Some(request)).await)
     };
 
     tokio::time::timeout(Duration::from_secs(5), exchange)
@@ -9431,8 +9435,8 @@ where
         .unwrap_or_else(kv_auth_required)
 }
 
-fn handle_local_kv(daemon: &LocalDaemonInner, request: Option<&Value>) -> Value {
-    use crate::local_kv::{LocalKvError, LocalKvRequest, LocalKvResponse};
+async fn handle_local_kv(daemon: &LocalDaemonInner, request: Option<&Value>) -> Value {
+    use crate::local_kv::{LocalKvAction, LocalKvError, LocalKvRequest, LocalKvResponse};
 
     let Some(request) = request else {
         return json!({ "ok": false, "error": "Missing local KV request" });
@@ -9441,7 +9445,23 @@ fn handle_local_kv(daemon: &LocalDaemonInner, request: Option<&Value>) -> Value 
         Ok(request) => request,
         Err(err) => return json!({ "ok": false, "error": err.to_string() }),
     };
-    let result = request.execute(&daemon.node.db(), daemon.node.node_id().as_str());
+    let node = &daemon.node;
+    let local = request.host_node == "local" || request.host_node == node.node_id().as_str();
+    let result = match &request.action {
+        LocalKvAction::Inspect if local => node
+            .inspect_local_kv(daemon.current_time_ms())
+            .map(LocalKvResponse::Inspect)
+            .map_err(|err| LocalKvError::Other(err.to_string())),
+        LocalKvAction::Preview { key } if local => node
+            .preview_local_kv(&request.namespace, key)
+            .await
+            .map(LocalKvResponse::Preview)
+            .map_err(|err| LocalKvError::Other(err.to_string())),
+        LocalKvAction::Inspect | LocalKvAction::Preview { .. } => Err(LocalKvError::InvalidInput(
+            "KV inspection requires a local namespace.".into(),
+        )),
+        _ => request.execute(&node.db(), node.node_id().as_str()),
+    };
     if matches!(
         result,
         Ok(LocalKvResponse::Set(_) | LocalKvResponse::Delete { deleted: true, .. })
@@ -11483,14 +11503,11 @@ impl LocalDaemonInner {
         })
     }
 
-    fn build_all_sessions_summary_envelope(&self, detail: SummaryDetail) -> Value {
-        self.build_all_sessions_summary_envelope_with_online(detail, true)
-    }
-
     fn build_all_sessions_summary_envelope_with_online(
         &self,
         detail: SummaryDetail,
         online: bool,
+        include_kv: bool,
     ) -> Value {
         let rev = self.current_ui_rev();
         let updated_at = self.current_time_ms();
@@ -11524,14 +11541,18 @@ impl LocalDaemonInner {
             .map(|(tid, (_, sid))| (tid, sid))
             .collect();
 
-        json!({
+        let mut snapshot = json!({
             "schemaVersion": UI_STATE_SCHEMA_VERSION,
             "rev": rev,
             "updatedAt": updated_at,
             "daemon": daemon_block,
             "sessions": sessions_json,
             "byHerdrTerminal": by_herdr_terminal,
-        })
+        });
+        if include_kv && detail == SummaryDetail::Full {
+            snapshot["kv"] = json!(self.node.inspect_local_kv(updated_at).ok());
+        }
+        snapshot
     }
 
     fn write_ui_state_snapshot(&self) -> io::Result<()> {
@@ -11541,7 +11562,7 @@ impl LocalDaemonInner {
     fn write_ui_state_snapshot_with_online(&self, online: bool) -> io::Result<()> {
         let ui_dir = self.node.config().state_dir.join("ui");
         let snapshot =
-            self.build_all_sessions_summary_envelope_with_online(SummaryDetail::Full, online);
+            self.build_all_sessions_summary_envelope_with_online(SummaryDetail::Full, online, true);
         let rev = snapshot
             .get("rev")
             .and_then(Value::as_u64)
@@ -11844,12 +11865,16 @@ fn handle_session_summary(daemon: &LocalDaemonInner, packet: &Map<String, Value>
     json!({ "ok": true, "result": result })
 }
 
-fn handle_sessions_summary(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+fn handle_sessions_summary(
+    daemon: &LocalDaemonInner,
+    packet: &Map<String, Value>,
+    include_kv: bool,
+) -> Value {
     let detail = match SummaryDetail::from_packet(packet) {
         Ok(d) => d,
         Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
     };
-    let result = daemon.build_all_sessions_summary_envelope(detail);
+    let result = daemon.build_all_sessions_summary_envelope_with_online(detail, true, include_kv);
     json!({ "ok": true, "result": result })
 }
 
@@ -11857,11 +11882,12 @@ fn build_inspect_snapshot_packet(
     daemon: &LocalDaemonInner,
     sel: &SessionSelector,
     detail: SummaryDetail,
+    include_kv: bool,
 ) -> Value {
     let mut envelope = if sel.has_target() {
         daemon.build_single_session_summary_envelope(sel, detail)
     } else {
-        daemon.build_all_sessions_summary_envelope(detail)
+        daemon.build_all_sessions_summary_envelope_with_online(detail, true, include_kv)
     };
     if let Some(obj) = envelope.as_object_mut() {
         obj.insert("type".into(), json!("inspect.snapshot"));
@@ -11872,6 +11898,7 @@ fn build_inspect_snapshot_packet(
 async fn run_inspect_watch<R, W>(
     daemon: &Arc<LocalDaemonInner>,
     packet: &Map<String, Value>,
+    include_kv: bool,
     reader: &mut BufReader<R>,
     write_half: &mut W,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -11903,7 +11930,7 @@ async fn run_inspect_watch<R, W>(
     };
 
     let mut rev_rx = daemon.subscribe_ui_rev();
-    let initial = build_inspect_snapshot_packet(daemon, &sel, detail);
+    let initial = build_inspect_snapshot_packet(daemon, &sel, detail, include_kv);
     let mut last_sent_rev = initial
         .get("rev")
         .and_then(Value::as_u64)
@@ -11976,7 +12003,7 @@ async fn run_inspect_watch<R, W>(
                 if latest == last_sent_rev {
                     continue;
                 }
-                let snap = build_inspect_snapshot_packet(daemon, &sel, detail);
+                let snap = build_inspect_snapshot_packet(daemon, &sel, detail, include_kv);
                 last_sent_rev = snap.get("rev").and_then(Value::as_u64).unwrap_or(latest);
                 if write_ndjson_line_async(write_half, &snap).await.is_err() {
                     break;

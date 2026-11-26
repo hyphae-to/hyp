@@ -81,6 +81,19 @@ pub struct KvEntry {
     pub expires_at: Option<i64>,
 }
 
+/// Metadata selected without loading or parsing the stored value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvEntryMetadata {
+    pub key: String,
+    pub version: u64,
+    pub writer_id: String,
+    pub updated_at: i64,
+    pub expires_at: Option<i64>,
+    pub stored_size_bytes: u64,
+    pub content_type: String,
+    pub e2ee_epoch: Option<u64>,
+}
+
 /// Result of a KV `set` operation, including the atomically emitted `to.hyphae.kv.set` event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvSetResult {
@@ -516,6 +529,45 @@ impl<'a> KvStore<'a> {
             Some(p) if !p.is_empty() => rows.into_iter().filter(|e| e.key.starts_with(p)).collect(),
             _ => rows,
         })
+    }
+
+    /// Pages through live entry metadata in key order. The node authorizes each
+    /// namespace, key and epoch before returning metadata to a caller.
+    pub fn list_entry_metadata(
+        &self,
+        host_node: &str,
+        namespace: &str,
+        after: Option<&str>,
+        limit: u32,
+        now_ms: i64,
+    ) -> StoreResult<Vec<KvEntryMetadata>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT key, version, writer_id, updated_at, expires_at,
+                    length(CAST(value_json AS BLOB)), content_type, e2ee_epoch
+             FROM kv_entries
+             WHERE host_node = ?1 AND namespace = ?2 AND key > ?3
+               AND (expires_at IS NULL OR expires_at > ?4)
+             ORDER BY key ASC
+             LIMIT ?5",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![host_node, namespace, after.unwrap_or(""), now_ms, limit],
+                |row| {
+                    Ok(KvEntryMetadata {
+                        key: row.get(0)?,
+                        version: row.get(1)?,
+                        writer_id: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        expires_at: row.get(4)?,
+                        stored_size_bytes: row.get(5)?,
+                        content_type: row.get(6)?,
+                        e2ee_epoch: row.get(7)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Lists namespaces with at least one live KV entry on `host_node`.

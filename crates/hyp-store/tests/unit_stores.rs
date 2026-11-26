@@ -1006,6 +1006,34 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
         .unwrap();
     assert_eq!(cas_ok.entry.version, 2);
 
+    let first = db
+        .kv()
+        .list_entry_metadata("local", "pair", None, 1, t0 + 400)
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].key, "plan/lock");
+    assert_eq!(first[0].version, 2);
+    assert_eq!(first[0].writer_id, "bob");
+    assert_eq!(first[0].updated_at, t0 + 400);
+    assert_eq!(first[0].e2ee_epoch, Some(1));
+    assert_eq!(
+        first[0].stored_size_bytes,
+        serde_json::to_vec(&cas_ok.entry.value).unwrap().len() as u64
+    );
+    let next = db
+        .kv()
+        .list_entry_metadata("local", "pair", Some(&first[0].key), 1, t0 + 400)
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].key, "plan/v1");
+    assert_eq!(next[0].expires_at, Some(t0 + 10_000));
+    assert!(
+        db.kv()
+            .list_entry_metadata("local", "pair", Some(&first[0].key), 1, t0 + 10_000)
+            .unwrap()
+            .is_empty()
+    );
+
     // 3. Allowlist write model.
     db.kv()
         .set(
