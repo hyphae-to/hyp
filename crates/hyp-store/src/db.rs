@@ -24,7 +24,7 @@ use crate::types::now_ms;
 use crate::wakeups::{WakeupLimits, WakeupStore};
 
 /// Current unified schema version stored in `schema_version`.
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 /// Maximum number of pre-migration `node.sqlite.v*.bak` backups retained per database directory.
 pub const MAX_MIGRATION_BACKUPS: usize = 3;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -103,6 +103,12 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "0008_gate_lock_seal",
         disable_foreign_keys: false,
         kind: MigrationKind::Sql(include_str!("../migrations/0008_gate_lock_seal.sql")),
+    },
+    Migration {
+        version: 9,
+        name: "0009_mailbox_daemon_notice",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Sql(include_str!("../migrations/0009_mailbox_daemon_notice.sql")),
     },
 ];
 

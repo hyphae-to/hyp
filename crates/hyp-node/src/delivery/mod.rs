@@ -17,7 +17,7 @@ pub use burst::{BurstAssessment, BurstTracker};
 pub use inbox_query::{
     InboxFilter, InboxItemState, InboxItemView, InboxQuery, InboxQueryResult, InboxStateFilter,
     archive_muted_entry, load_session_policy, move_pending_to_muted, muted_count, query_inbox,
-    record_delivered_receipts, save_session_policy,
+    query_inbox_for_node, record_delivered_receipts, save_session_policy,
 };
 pub use packer::{PackableItem, PackedDeliveryBatch, pack_inbox_digest};
 pub use policy::{

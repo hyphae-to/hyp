@@ -4411,6 +4411,7 @@ mod tests {
             traceparent: None,
             payload_sha256: Some("0".repeat(64)),
             reviewed_at: None,
+            daemon_notice: None,
         };
         let summary = format_inbox_disposition_summary("approve", &entry, "guest", None).join("\n");
         assert!(summary.contains("rcpt-42"));
