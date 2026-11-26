@@ -7039,10 +7039,10 @@ pub fn render_openclaw_config_screen(
     lines.push(format!("{left_pad}{border_fg}╭{horiz}╮{reset}"));
     let delivery_summary = match state.delivery {
         OpenClawDeliveryMode::Gateway => {
-            "Delivery: Gateway webhook wakeups (/hooks/agent) + hyp_inbox"
+            "Delivery: Native plugin wake / /hooks/wake + hyp_inbox"
         }
         OpenClawDeliveryMode::Inbox => {
-            "Delivery: Turn-start / hyp_inbox only (no Gateway webhook)"
+            "Delivery: Turn-start / hyp_inbox only (no live wakeups)"
         }
     };
     for wrapped in wrap_words(delivery_summary, inner_card_w) {
@@ -7081,7 +7081,7 @@ pub fn render_openclaw_config_screen(
         OpenClawDeliveryMode::Inbox => "inbox",
     };
     let delivery_desc = match state.delivery {
-        OpenClawDeliveryMode::Gateway => "wakes idle OpenClaw via /hooks/agent",
+        OpenClawDeliveryMode::Gateway => "wakes exact OpenClaw session (plugin / /hooks/wake)",
         OpenClawDeliveryMode::Inbox => "turn-start / hyp_inbox only",
     };
     let pi_desc = if state.prompt_injection {

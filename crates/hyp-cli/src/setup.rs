@@ -279,10 +279,10 @@ const CLAUDE_SLASH_COMMANDS: [(&str, &str); 4] = [
 )]
 #[serde(rename_all = "lowercase")]
 pub enum OpenClawDeliveryMode {
-    /// OpenClaw Gateway webhook push wakeups (`/hooks/agent`) + turn-start / `hyp_inbox`.
+    /// OpenClaw native plugin wake service (`enqueueSessionEvent`) + `/hooks/wake` fallback + `hyp_inbox`.
     #[default]
     Gateway,
-    /// Turn-start / `hyp_inbox` only (disables Gateway webhook push wakeups).
+    /// Turn-start / `hyp_inbox` only (disables live OpenClaw wakeups).
     Inbox,
 }
 
@@ -296,8 +296,8 @@ impl OpenClawDeliveryMode {
 
     pub const fn display_label(self) -> &'static str {
         match self {
-            Self::Gateway => "Gateway webhook wakeups (/hooks/agent + hyp_inbox)",
-            Self::Inbox => "Turn-start / hyp_inbox only (no Gateway webhook)",
+            Self::Gateway => "Native plugin wake / /hooks/wake + hyp_inbox",
+            Self::Inbox => "Turn-start / hyp_inbox only (no live wakeups)",
         }
     }
 }
@@ -4025,7 +4025,7 @@ pub fn apply_openclaw_config(
         "hyphae".to_string(),
         json!({
             "command": bin,
-            "args": mcp_args(socket, &["--backend", "openclaw", "--ephemeral"])
+            "args": mcp_args(socket, &["--backend", "openclaw"])
         }),
     );
     mcp.insert("servers".to_string(), Value::Object(servers));
@@ -4135,7 +4135,7 @@ pub fn apply_openclaw_config(
     match delivery_mode {
         OpenClawDeliveryMode::Gateway => {
             notes.push(
-                "OpenClaw delivery mode: gateway (Gateway webhook wakeups + hyp_inbox). Store `openclaw-hooks-token` via `hyp secret set openclaw-hooks-token --web` (never plaintext) to enable automatic `/hooks/agent` wake nudges."
+                "OpenClaw delivery mode: gateway (native plugin service exact-session wake + optional /hooks/wake fallback + hyp_inbox). Optional webhook fallback: store `openclaw-hooks-token` via `hyp secret set openclaw-hooks-token --web` (never plaintext)."
                     .to_string(),
             );
         }

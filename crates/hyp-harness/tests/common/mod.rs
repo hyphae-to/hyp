@@ -418,20 +418,21 @@ impl TestMcpClient {
                     HarnessKind::Openclaw,
                     HookEvent::PreToolUse,
                     json!({
-                        "session_id": raw_session_id,
-                        "tool_name": format!("mcp__hyphae__{tool_name}"),
-                        "tool_use_id": call_id,
-                        "tool_input": arguments
+                        "sessionKey": raw_session_id,
+                        "toolName": format!("hyphae__{tool_name}"),
+                        "toolCallId": call_id,
+                        "params": arguments
                     }),
                 )
                 .await;
-                assert_eq!(pre, json!({}));
-                self.call_tool(
-                    tool_name,
-                    arguments,
-                    Some(json!({ "tool_use_id": call_id })),
-                )
-                .await
+                let tok = pre["callToken"]
+                    .as_str()
+                    .expect("OpenClaw before-tool-call must return callToken")
+                    .to_string();
+                let mut with_tok = arguments.as_object().cloned().unwrap_or_default();
+                with_tok.insert("_meshCall".into(), json!(tok));
+                self.call_tool(tool_name, Value::Object(with_tok), None)
+                    .await
             }
             HarnessKind::Herdr => {
                 let pre = run_hook(

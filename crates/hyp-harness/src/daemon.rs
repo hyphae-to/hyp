@@ -80,10 +80,13 @@ use crate::transport::herdr::{
     is_valid_terminal_id, probe_herdr_terminal, spawn_herdr_template,
 };
 use crate::transport::openclaw::{
-    DEFAULT_OPENCLAW_PROBE_TIMEOUT, OpenClawNodeConfig, OpenClawTransport,
-    REASON_OPENCLAW_AUTH_FAILED, REASON_OPENCLAW_GATEWAY_UNAVAILABLE,
-    REASON_OPENCLAW_HOOKS_DISABLED, REASON_OPENCLAW_INVALID_URL, REASON_OPENCLAW_RATE_LIMITED,
-    REASON_OPENCLAW_TOKEN_MISSING, probe_openclaw_gateway,
+    DEFAULT_OPENCLAW_AGENT_ID, DEFAULT_OPENCLAW_PROBE_TIMEOUT, OpenClawNodeConfig,
+    OpenClawTransport, REASON_OPENCLAW_AUTH_FAILED, REASON_OPENCLAW_GATEWAY_UNAVAILABLE,
+    REASON_OPENCLAW_HOOKS_DISABLED, REASON_OPENCLAW_INVALID_SESSION_KEY,
+    REASON_OPENCLAW_INVALID_URL, REASON_OPENCLAW_RATE_LIMITED, REASON_OPENCLAW_SESSION_MISSING,
+    REASON_OPENCLAW_TOKEN_MISSING, canonical_openclaw_session_id,
+    parse_openclaw_agent_id_from_session_key, probe_openclaw_gateway,
+    validate_openclaw_session_key,
 };
 use crate::transport::t3::{
     DEFAULT_PROBE_TIMEOUT, DEFAULT_T3_TOKEN_SECRET, DEFAULT_T3_URL, FALLBACK_T3_TOKEN_SECRET,
@@ -91,7 +94,7 @@ use crate::transport::t3::{
     normalize_t3_server_url_with_remote, probe_t3_server_with_remote,
     resolve_t3_thread_by_provider_session, t3_state_db_path, verify_t3_thread_exists,
 };
-use crate::transport::{PushMode, PushOutcome, PushTransport};
+use crate::transport::{PushMode, PushOutcome, PushTransport, format_push_wake_nudge};
 
 /// Reserved `SecretStore` key name holding the daemon's 32-byte deterministic HMAC-SHA256
 /// key used to derive per-session `sessionToken` values that survive daemon restarts & resume.
@@ -308,6 +311,9 @@ struct TransportHints {
     explicit_codex_queue: bool,
     t3_base_dir: Option<PathBuf>,
     t3_url: Option<String>,
+    openclaw_session_key: Option<String>,
+    openclaw_session_id: Option<String>,
+    openclaw_agent_id: Option<String>,
     cwd: Option<String>,
 }
 
@@ -343,6 +349,22 @@ impl TransportHints {
             explicit_thread.is_some() || codex_remote.is_some() || codex_resume;
         let t3_base_dir = non_empty_str("t3BaseDir").map(PathBuf::from);
         let t3_url = non_empty_str("t3Url");
+        let openclaw_session_key = non_empty_str("openclawSessionKey")
+            .or_else(|| non_empty_str("sessionKey"))
+            .and_then(|raw| {
+                let stripped = raw.strip_prefix("openclaw:").unwrap_or(&raw);
+                validate_openclaw_session_key(stripped).ok()
+            });
+        let openclaw_session_id = non_empty_str("openclawSessionId")
+            .filter(|s| s.len() <= 200 && !s.bytes().any(|b| b <= 0x20 || b == 0x7f));
+        let openclaw_agent_id = non_empty_str("openclawAgentId")
+            .or_else(|| non_empty_str("agentId"))
+            .filter(|s| s.len() <= 128 && !s.bytes().any(|b| b <= 0x20 || b == 0x7f))
+            .or_else(|| {
+                openclaw_session_key
+                    .as_deref()
+                    .and_then(parse_openclaw_agent_id_from_session_key)
+            });
         let cwd = non_empty_str("cwd")
             .filter(|s| s.len() <= 1024 && !s.chars().any(char::is_control));
 
@@ -357,6 +379,9 @@ impl TransportHints {
             explicit_codex_queue,
             t3_base_dir,
             t3_url,
+            openclaw_session_key,
+            openclaw_session_id,
+            openclaw_agent_id,
             cwd,
         }
     }
@@ -368,6 +393,7 @@ impl TransportHints {
             || self.harness == Some(HarnessKind::T3)
             || self.harness == Some(HarnessKind::Openclaw)
             || self.harness == Some(HarnessKind::Codex)
+            || self.openclaw_session_key.is_some()
             || self.codex_thread_id.is_some()
             || (self.explicit_codex_queue && self.codex_thread_id.is_some())
     }
@@ -385,6 +411,15 @@ impl TransportHints {
         }
         if let Some(ref codex_tid) = self.codex_thread_id {
             patch.insert("codexThreadId".into(), json!(codex_tid));
+        }
+        if let Some(ref sk) = self.openclaw_session_key {
+            patch.insert("openclawSessionKey".into(), json!(sk));
+        }
+        if let Some(ref oc_sid) = self.openclaw_session_id {
+            patch.insert("openclawSessionId".into(), json!(oc_sid));
+        }
+        if let Some(ref aid) = self.openclaw_agent_id {
+            patch.insert("openclawAgentId".into(), json!(aid));
         }
         if let Some(ref cwd) = self.cwd {
             patch.insert("cwd".into(), json!(cwd));
@@ -414,6 +449,27 @@ struct ChannelDeliverCommand {
     delivery_id: u64,
     text: String,
     ack_tx: oneshot::Sender<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenClawWakeAck {
+    ok: bool,
+    reason: Option<String>,
+}
+
+struct OpenClawWakeCommand {
+    delivery_id: u64,
+    session_id: String,
+    session_key: String,
+    agent_id: String,
+    batch_id: String,
+    text: String,
+    ack_tx: oneshot::Sender<OpenClawWakeAck>,
+}
+
+struct LiveOpenClawService {
+    conn_id: u64,
+    tx: mpsc::UnboundedSender<OpenClawWakeCommand>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +563,14 @@ struct LocalDaemonInner {
     socket_path: PathBuf,
     waiters: Mutex<HashMap<String, Vec<LiveWaiter>>>,
     channels: Mutex<HashMap<String, LiveChannel>>,
+    /// Connected native OpenClaw Gateway plugin wake service (`openclaw.service.ready`).
+    openclaw_service: Mutex<Option<LiveOpenClawService>>,
+    /// In-memory lock-free-of-DB index mapping `openclaw:*` `session_id -> (sessionKey, agentId)`,
+    /// hydrated from SQLite `sessions.backend_json` on startup and updated on every backend merge.
+    /// Ensures `active_transport_kind` / `daemon.status` / `ui/state.json` NEVER re-enter `node.db()`.
+    openclaw_targets: Mutex<HashMap<String, (String, String)>>,
+    /// OpenClaw sessions whose target was reported missing (`createIfMissing: false`) until new activity.
+    openclaw_missing_sessions: Mutex<HashSet<String>>,
     /// Attached native external push transports (`Herdr`, `T3`, `OpenClaw`, `CodexQueue`, or test doubles).
     session_transports: Mutex<HashMap<String, AttachedPushTransport>>,
     /// Deterministic 256-bit HMAC-SHA256 key loaded/persisted in `SecretStore` under
@@ -1476,6 +1540,7 @@ impl LocalDaemonInner {
     ) -> Self {
         let mut hydrated_herdr_index: HashMap<String, Vec<String>> = HashMap::new();
         let mut hydrated_env_exported: HashSet<String> = HashSet::new();
+        let mut hydrated_openclaw_targets: HashMap<String, (String, String)> = HashMap::new();
         {
             let db = node.db();
             if let Ok(sessions) = db.local().list_sessions() {
@@ -1487,6 +1552,10 @@ impl LocalDaemonInner {
                                 entry.push(s.id.clone());
                             }
                         }
+                    }
+                    if let Some(target) = extract_openclaw_target_from_parts(&s.id, &s.backend_json)
+                    {
+                        hydrated_openclaw_targets.insert(s.id.clone(), target);
                     }
                     if backend_json_flag_true(&s.backend_json, "envFileExported") {
                         hydrated_env_exported.insert(s.id);
@@ -1506,6 +1575,9 @@ impl LocalDaemonInner {
             socket_path,
             waiters: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
+            openclaw_service: Mutex::new(None),
+            openclaw_targets: Mutex::new(hydrated_openclaw_targets),
+            openclaw_missing_sessions: Mutex::new(HashSet::new()),
             session_transports: Mutex::new(HashMap::new()),
             session_token_key,
             env_file_exported_sessions: Mutex::new(hydrated_env_exported),
@@ -1643,6 +1715,12 @@ impl LocalDaemonInner {
         )?;
         if let Some(tid) = patch.get("herdrTerminalId").and_then(Value::as_str) {
             self.record_herdr_terminal(tid, session_id);
+        }
+        if let Some(target) = extract_openclaw_target_from_parts(session_id, &sess.backend_json) {
+            self.openclaw_targets
+                .lock()
+                .expect("openclaw_targets lock poisoned")
+                .insert(session_id.to_string(), target);
         }
         Ok(sess)
     }
@@ -2452,6 +2530,79 @@ impl LocalDaemonInner {
         }
     }
 
+    fn openclaw_gateway_push_enabled(&self) -> bool {
+        read_node_json_for_state_dir(&self.node.config().state_dir)
+            .as_ref()
+            .map(OpenClawNodeConfig::from_node_json)
+            .unwrap_or_default()
+            .gateway_push_enabled()
+    }
+
+    /// Resolves the exact `(sessionKey, agentId)` target for an `openclaw:*` session purely from
+    /// the in-memory `openclaw_targets` index (or canonical `openclaw:agent:<agentId>:...` ID),
+    /// NEVER locking `self.node.db()` so callers holding `db` (`daemon.status`, `sessions.summary`,
+    /// `ui/state.json`) can NEVER self-deadlock.
+    /// Fails closed (`None`) when no validated OpenClaw `sessionKey` exists for this session.
+    fn resolve_openclaw_session_target(&self, session_id: &str) -> Option<(String, String)> {
+        if !session_id.starts_with("openclaw:") {
+            return None;
+        }
+        if let Some(cached) = self
+            .openclaw_targets
+            .lock()
+            .expect("openclaw_targets lock poisoned")
+            .get(session_id)
+            .cloned()
+        {
+            return Some(cached);
+        }
+        let suffix = session_id.strip_prefix("openclaw:")?;
+        if !suffix.starts_with("agent:") {
+            return None;
+        }
+        let session_key = validate_openclaw_session_key(suffix).ok()?;
+        let agent_id = parse_openclaw_agent_id_from_session_key(&session_key)
+            .or_else(|| {
+                read_node_json_for_state_dir(&self.node.config().state_dir)
+                    .as_ref()
+                    .map(OpenClawNodeConfig::from_node_json)
+                    .and_then(|cfg| cfg.agent_id)
+            })
+            .unwrap_or_else(|| DEFAULT_OPENCLAW_AGENT_ID.to_string());
+        Some((session_key, agent_id))
+    }
+
+    fn openclaw_plugin_wake_available_for(&self, session_id: &str) -> bool {
+        if !session_id.starts_with("openclaw:") {
+            return false;
+        }
+        let has_service = self
+            .openclaw_service
+            .lock()
+            .expect("openclaw_service lock poisoned")
+            .is_some();
+        if !has_service {
+            return false;
+        }
+        if self
+            .openclaw_missing_sessions
+            .lock()
+            .expect("openclaw_missing_sessions lock poisoned")
+            .contains(session_id)
+        {
+            return false;
+        }
+        self.openclaw_gateway_push_enabled()
+            && self.resolve_openclaw_session_target(session_id).is_some()
+    }
+
+    fn clear_openclaw_session_missing(&self, session_id: &str) {
+        self.openclaw_missing_sessions
+            .lock()
+            .expect("openclaw_missing_sessions lock poisoned")
+            .remove(session_id);
+    }
+
     fn active_transport_kind(&self, session_id: &str) -> Option<&'static str> {
         if self
             .channels
@@ -2460,6 +2611,9 @@ impl LocalDaemonInner {
             .contains_key(session_id)
         {
             return Some("claude_channel");
+        }
+        if self.openclaw_plugin_wake_available_for(session_id) {
+            return Some("openclaw_plugin");
         }
         if let Some(attached) = self
             .session_transports
@@ -3509,6 +3663,118 @@ impl LocalDaemonInner {
                 }
             }
 
+            // Priority 1.5: Native OpenClaw Gateway plugin wake service (`openclaw.service.ready`).
+            // Targets the EXACT existing `(agentId, sessionKey)` with `createIfMissing: false` —
+            // zero webhook token required, zero isolated cron spawns, strictly metadata-only nudge!
+            if !batch.notify_only && self.openclaw_plugin_wake_available_for(session_id) {
+                let oc_service_entry = self
+                    .openclaw_service
+                    .lock()
+                    .expect("openclaw_service lock poisoned")
+                    .as_ref()
+                    .map(|s| (s.conn_id, s.tx.clone()));
+                if let (Some((service_conn_id, tx)), Some((session_key, agent_id))) =
+                    (oc_service_entry, self.resolve_openclaw_session_target(session_id))
+                {
+                    if !bypass_activity_grace {
+                        if let Some((act_harness, remaining)) = self.active_session_lease(session_id) {
+                            if batch.max_urgency == DeliveryUrgency::Interrupt {
+                                if Self::can_drain_mid_turn(act_harness)
+                                    && !self.config.interrupt_hook_grace.is_zero()
+                                {
+                                    let delay = self.config.interrupt_hook_grace.min(remaining);
+                                    self.schedule_activity_grace_flush(session_id, delay, true);
+                                    break;
+                                }
+                            } else if batch.max_urgency == DeliveryUrgency::Queue
+                                && Self::can_drain_turn_end(act_harness)
+                                && !self.config.queue_activity_lease.is_zero()
+                            {
+                                self.schedule_activity_grace_flush(session_id, remaining, false);
+                                break;
+                            }
+                        }
+                    }
+
+                    let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt {
+                        PushMode::Interrupt
+                    } else {
+                        PushMode::Queue
+                    };
+                    let msg_count = batch
+                        .inline_ids
+                        .len()
+                        .saturating_add(batch.spilled_ids.len())
+                        .saturating_add(batch.truncated_ids.len())
+                        .max(1);
+                    let handle = {
+                        let db = self.node.db();
+                        db.local()
+                            .get_session(session_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.handle)
+                    };
+                    let batch_id = compute_batch_idempotency_id(session_id, &batch);
+                    let nudge = format_push_wake_nudge(msg_count, handle.as_deref(), push_mode);
+                    let delivery_id = self.next_seq();
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    let sent = tx
+                        .send(OpenClawWakeCommand {
+                            delivery_id,
+                            session_id: session_id.to_string(),
+                            session_key,
+                            agent_id,
+                            batch_id,
+                            text: nudge,
+                            ack_tx,
+                        })
+                        .is_ok();
+                    if sent {
+                        let ack = tokio::time::timeout(
+                            crate::transport::openclaw::DEFAULT_OPENCLAW_DELIVER_TIMEOUT,
+                            ack_rx,
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(OpenClawWakeAck {
+                            ok: false,
+                            reason: Some(REASON_OPENCLAW_GATEWAY_UNAVAILABLE.to_string()),
+                        });
+                        if ack.ok {
+                            self.mark_batch_notified(session_id, &batch);
+                            self.cancel_activity_grace(session_id);
+                            delivered_any = true;
+                            continue;
+                        }
+                        if matches!(
+                            ack.reason.as_deref(),
+                            Some(REASON_OPENCLAW_SESSION_MISSING | REASON_OPENCLAW_INVALID_SESSION_KEY)
+                        ) {
+                            self.openclaw_missing_sessions
+                                .lock()
+                                .expect("openclaw_missing_sessions lock poisoned")
+                                .insert(session_id.to_string());
+                            terminal_error = ack.reason;
+                            self.cancel_hold_retry(session_id);
+                            self.bump_ui_rev();
+                            break;
+                        }
+                        let still_connected = self
+                            .openclaw_service
+                            .lock()
+                            .expect("openclaw_service lock poisoned")
+                            .as_ref()
+                            .is_some_and(|s| s.conn_id == service_conn_id);
+                        if still_connected {
+                            self.schedule_hold_retry(session_id);
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Priority 2: Attached native external PushTransport (Herdr > T3 Code > OpenClaw > Codex Queue)
             let mut deferred_transient_hold = false;
             let push_transport = self
@@ -3627,6 +3893,8 @@ impl LocalDaemonInner {
                                     | REASON_OPENCLAW_AUTH_FAILED
                                     | REASON_OPENCLAW_HOOKS_DISABLED
                                     | REASON_OPENCLAW_INVALID_URL
+                                    | REASON_OPENCLAW_INVALID_SESSION_KEY
+                                    | REASON_OPENCLAW_SESSION_MISSING
                                     | REASON_OPENCLAW_TOKEN_MISSING
                             ) {
                                 terminal_error = Some(reason.clone());
@@ -6048,10 +6316,13 @@ async fn handle_connection<R, W>(
     let mut reader = BufReader::new(read_half);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
     let (chan_tx, mut chan_rx) = mpsc::unbounded_channel::<ChannelDeliverCommand>();
+    let (oc_wake_tx, mut oc_wake_rx) = mpsc::unbounded_channel::<OpenClawWakeCommand>();
 
     let mut mcp_ctx: Option<McpSocketContext> = None;
     let mut attached_waiter: Option<(String, u64)> = None;
+    let mut is_openclaw_service = false;
     let mut pending_channel_acks: HashMap<u64, oneshot::Sender<bool>> = HashMap::new();
+    let mut pending_oc_wake_acks: HashMap<u64, oneshot::Sender<OpenClawWakeAck>> = HashMap::new();
 
     // Writer loop merged into select! so both request replies and async pushes serialize cleanly.
     loop {
@@ -6059,6 +6330,7 @@ async fn handle_connection<R, W>(
             Line(Result<Option<String>, crate::sock::SockError>),
             Push(Option<Value>),
             ChannelCmd(Option<ChannelDeliverCommand>),
+            OpenClawWakeCmd(Option<OpenClawWakeCommand>),
             Shutdown,
         }
 
@@ -6066,6 +6338,7 @@ async fn handle_connection<R, W>(
             res = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES) => Ev::Line(res),
             msg = out_rx.recv() => Ev::Push(msg),
             cmd = chan_rx.recv() => Ev::ChannelCmd(cmd),
+            oc_cmd = oc_wake_rx.recv() => Ev::OpenClawWakeCmd(oc_cmd),
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     Ev::Shutdown
@@ -6107,6 +6380,27 @@ async fn handle_connection<R, W>(
                 }
             }
             Ev::ChannelCmd(None) => break,
+            Ev::OpenClawWakeCmd(Some(cmd)) => {
+                let pkt = json!({
+                    "type": "openclaw.wake",
+                    "delivery": cmd.delivery_id,
+                    "sessionId": cmd.session_id,
+                    "sessionKey": cmd.session_key,
+                    "agentId": cmd.agent_id,
+                    "batchId": cmd.batch_id,
+                    "text": cmd.text,
+                });
+                if write_ndjson_line_async(&mut write_half, &pkt).await.is_ok() {
+                    pending_oc_wake_acks.insert(cmd.delivery_id, cmd.ack_tx);
+                } else {
+                    let _ = cmd.ack_tx.send(OpenClawWakeAck {
+                        ok: false,
+                        reason: Some(REASON_OPENCLAW_GATEWAY_UNAVAILABLE.to_string()),
+                    });
+                    break;
+                }
+            }
+            Ev::OpenClawWakeCmd(None) => break,
             Ev::Line(Ok(None)) | Ev::Line(Err(_)) => break,
             Ev::Line(Ok(Some(line))) => {
                 if line.trim().is_empty() {
@@ -6450,6 +6744,68 @@ async fn handle_connection<R, W>(
                         });
                     }
 
+                    // ---- Native OpenClaw Gateway plugin wake service ----
+                    "openclaw.service.ready" => {
+                        {
+                            let mut guard = daemon
+                                .openclaw_service
+                                .lock()
+                                .expect("openclaw_service lock poisoned");
+                            *guard = Some(LiveOpenClawService {
+                                conn_id,
+                                tx: oc_wake_tx.clone(),
+                            });
+                        }
+                        daemon
+                            .openclaw_missing_sessions
+                            .lock()
+                            .expect("openclaw_missing_sessions lock poisoned")
+                            .clear();
+                        is_openclaw_service = true;
+                        daemon.bump_ui_rev();
+                        if write_ndjson_line_async(
+                            &mut write_half,
+                            &json!({ "type": "openclaw.service.ack", "ok": true }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                        let flush_daemon = Arc::clone(&daemon);
+                        tokio::spawn(async move {
+                            let oc_sessions: Vec<String> = {
+                                let db = flush_daemon.node.db();
+                                db.local()
+                                    .list_sessions()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter(|s| s.id.starts_with("openclaw:"))
+                                    .map(|s| s.id)
+                                    .collect()
+                            };
+                            for sid in oc_sessions {
+                                if flush_daemon.openclaw_plugin_wake_available_for(&sid) {
+                                    let _ = flush_daemon.flush_session(&sid).await;
+                                }
+                            }
+                        });
+                    }
+                    "openclaw.wake.ack" => {
+                        if let Some(delivery_id) = packet.get("delivery").and_then(Value::as_u64) {
+                            let ok = packet.get("ok").and_then(Value::as_bool) == Some(true);
+                            let reason = packet
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToString::to_string);
+                            if let Some(tx) = pending_oc_wake_acks.remove(&delivery_id) {
+                                let _ = tx.send(OpenClawWakeAck { ok, reason });
+                            }
+                        }
+                    }
+
                     // ---- Persistent MCP shim protocol ----
                     "mcp.hello" => {
                         let backend = packet
@@ -6607,11 +6963,27 @@ async fn handle_connection<R, W>(
             }
         }
     }
+    if is_openclaw_service {
+        let mut guard = daemon
+            .openclaw_service
+            .lock()
+            .expect("openclaw_service lock poisoned");
+        if guard.as_ref().is_some_and(|s| s.conn_id == conn_id) {
+            *guard = None;
+            transport_changed = true;
+        }
+    }
     if transport_changed {
         daemon.bump_ui_rev();
     }
     for (_, tx) in pending_channel_acks.drain() {
         let _ = tx.send(false);
+    }
+    for (_, tx) in pending_oc_wake_acks.drain() {
+        let _ = tx.send(OpenClawWakeAck {
+            ok: false,
+            reason: Some(REASON_OPENCLAW_GATEWAY_UNAVAILABLE.to_string()),
+        });
     }
 }
 
@@ -6770,7 +7142,31 @@ fn harness_natively_uses_hooks(harness: HarnessKind) -> bool {
             | HarnessKind::Gemini
             | HarnessKind::Codex
             | HarnessKind::Opencode
+            | HarnessKind::Openclaw
     )
+}
+
+fn extract_openclaw_target_from_parts(session_id: &str, backend_json: &str) -> Option<(String, String)> {
+    if !session_id.starts_with("openclaw:") {
+        return None;
+    }
+    let session_key = extract_backend_str(backend_json, "openclawSessionKey")
+        .and_then(|raw| {
+            let stripped = raw.strip_prefix("openclaw:").unwrap_or(&raw);
+            validate_openclaw_session_key(stripped).ok()
+        })
+        .or_else(|| {
+            let suffix = session_id.strip_prefix("openclaw:")?;
+            suffix
+                .starts_with("agent:")
+                .then(|| validate_openclaw_session_key(suffix).ok())
+                .flatten()
+        })?;
+    let agent_id = extract_backend_str(backend_json, "openclawAgentId")
+        .filter(|s| !s.is_empty() && s.len() <= 128 && !s.bytes().any(|b| b <= 0x20 || b == 0x7f))
+        .or_else(|| parse_openclaw_agent_id_from_session_key(&session_key))
+        .unwrap_or_else(|| DEFAULT_OPENCLAW_AGENT_ID.to_string());
+    Some((session_key, agent_id))
 }
 
 fn backend_json_flag_true(backend_json: &str, key: &str) -> bool {
@@ -7300,8 +7696,9 @@ fn maybe_spawn_transport_probe(
         }
 
         // Priority 3: OpenClaw Gateway Webhook Push (`X2`: fail-closed on missing SecretStore token
-        // or unreachable `/hooks/*` endpoint; honors optional `node.json` `"openclaw"` block,
-        // including `enabled: false` / `deliveryMode: "inbox"` opt-out).
+        // or unreachable `/hooks/*` endpoint; defaults to `POST /hooks/wake` targeting this
+        // session's exact `(agentId, sessionKey)` and honors optional `node.json` `"openclaw"`
+        // block, including `enabled: false` / `deliveryMode: "inbox"` opt-out).
         if !attached && is_openclaw && daemon_arc.current_transport_priority(&sid) < PRIORITY_OPENCLAW
         {
             let oc_cfg = node_json
@@ -7312,14 +7709,48 @@ fn maybe_spawn_transport_probe(
                 let mut target = oc_cfg.to_target();
                 target.state_dir = Some(daemon_arc.node.config().state_dir.clone());
                 target.secret_backend = daemon_arc.node.config().secret_backend;
-                target.handle = daemon_arc
-                    .node
-                    .db()
-                    .local()
-                    .get_session(&sid)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.handle);
+                let sess_opt = daemon_arc.node.db().local().get_session(&sid).ok().flatten();
+                target.handle = sess_opt.as_ref().and_then(|s| s.handle.clone());
+
+                let session_key = hints
+                    .openclaw_session_key
+                    .clone()
+                    .or_else(|| {
+                        sess_opt
+                            .as_ref()
+                            .and_then(|s| extract_backend_str(&s.backend_json, "openclawSessionKey"))
+                            .and_then(|raw| {
+                                let stripped = raw.strip_prefix("openclaw:").unwrap_or(&raw);
+                                validate_openclaw_session_key(stripped).ok()
+                            })
+                    })
+                    .or_else(|| {
+                        let suffix = sid.strip_prefix("openclaw:")?;
+                        suffix
+                            .starts_with("agent:")
+                            .then(|| validate_openclaw_session_key(suffix).ok())
+                            .flatten()
+                    });
+                if let Some(ref sk) = session_key {
+                    target.session_key = Some(sk.clone());
+                }
+
+                let resolved_agent_id = hints
+                    .openclaw_agent_id
+                    .clone()
+                    .or_else(|| {
+                        sess_opt
+                            .as_ref()
+                            .and_then(|s| extract_backend_str(&s.backend_json, "openclawAgentId"))
+                    })
+                    .or_else(|| {
+                        session_key
+                            .as_deref()
+                            .and_then(parse_openclaw_agent_id_from_session_key)
+                    });
+                if let Some(aid) = resolved_agent_id {
+                    target.agent_id = aid;
+                }
 
                 let probe = probe_openclaw_gateway(&target, DEFAULT_OPENCLAW_PROBE_TIMEOUT).await;
                 if probe.ok
@@ -7435,6 +7866,7 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
     if let Err(e) = daemon.merge_session_backend_and_index(session_id, &patch, now_ms()) {
         return json!({ "ok": false, "error": e.to_string() });
     }
+    daemon.clear_openclaw_session_missing(session_id);
     daemon
         .hook_registered_sessions
         .lock()
@@ -7467,6 +7899,11 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
     }
 }
 
+/// Strict, fail-closed session resolver for OpenClaw hooks (`before_prompt_build`, `agent_end`).
+///
+/// NEVER falls back across sessions (not even when only 1 `openclaw:*` session exists!) so an
+/// unrelated OpenClaw thread, subagent, or cron run can NEVER drain or read another OpenClaw
+/// session's mailbox.
 fn resolve_openclaw_drain_session(
     daemon: &LocalDaemonInner,
     session_id: &str,
@@ -7485,75 +7922,58 @@ fn resolve_openclaw_drain_session(
         return None;
     }
 
-    let qualify_openclaw = |raw: &str| -> Option<String> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
+    let raw_sk = packet
+        .get("openclawSessionKey")
+        .or_else(|| packet.get("sessionKey"))
+        .and_then(Value::as_str)
+        .map(|s| s.strip_prefix("openclaw:").unwrap_or(s));
+    if let Some(raw) = raw_sk {
+        let Ok(sk) = validate_openclaw_session_key(raw) else {
             return None;
-        }
-        let qualified = if trimmed.starts_with("openclaw:") {
-            trimmed.to_string()
-        } else {
-            format!("openclaw:{trimmed}")
         };
-        is_valid_session_id(&qualified).then_some(qualified)
-    };
-
-    if let Some(sk) = packet
-        .get("sessionKey")
-        .and_then(Value::as_str)
-        .and_then(qualify_openclaw)
-    {
-        if db.local().get_session(&sk).ok().flatten().is_some() {
-            return Some(sk);
+        if let Ok(canonical_sid) = canonical_openclaw_session_id(&sk) {
+            if db.local().get_session(&canonical_sid).ok().flatten().is_some() {
+                return Some(canonical_sid);
+            }
         }
-    }
-
-    let agent_id_raw = packet
-        .get("agentId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    if let Some(aid_sid) = agent_id_raw.and_then(qualify_openclaw) {
-        if db.local().get_session(&aid_sid).ok().flatten().is_some() {
-            return Some(aid_sid);
-        }
-    }
-
-    // Deterministic fail-closed fallback strictly scoped to enrolled `openclaw:*` sessions
-    // (covers ephemeral OpenClaw MCP sessions created via `hyp mcp --backend openclaw --ephemeral`
-    // whose generated UUID differs from OpenClaw's hook `ctx.sessionId`). NEVER leaks or touches
-    // non-OpenClaw sessions, and fails closed (`None`) whenever multiple OpenClaw sessions are
-    // ambiguous!
-    let openclaw_sessions: Vec<_> = db
-        .local()
-        .list_sessions()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|s| s.id.starts_with("openclaw:"))
-        .collect();
-
-    if let Some(aid) = agent_id_raw {
-        let matching_agent: Vec<_> = openclaw_sessions
-            .iter()
+        let matching_sk: Vec<_> = db
+            .local()
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
             .filter(|s| {
-                s.handle.as_deref() == Some(aid)
-                    || serde_json::from_str::<Value>(&s.backend_json)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("openclawAgentId")
-                                .and_then(Value::as_str)
-                                .map(|a| a == aid)
-                        })
-                        .unwrap_or(false)
+                s.id.starts_with("openclaw:")
+                    && extract_backend_str(&s.backend_json, "openclawSessionKey").as_deref()
+                        == Some(sk.as_str())
             })
             .collect();
-        if matching_agent.len() == 1 {
-            return Some(matching_agent[0].id.clone());
+        if matching_sk.len() == 1 {
+            return Some(matching_sk[0].id.clone());
         }
+        // Fail closed: an explicit `sessionKey` that does not match any registered OpenClaw
+        // session MUST NEVER fall back to another session!
+        return None;
     }
 
-    if openclaw_sessions.len() == 1 {
-        return Some(openclaw_sessions[0].id.clone());
+    if let Some(oc_sid) = packet
+        .get("openclawSessionId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 200 && !s.bytes().any(|b| b <= 0x20 || b == 0x7f))
+    {
+        let matching_sid: Vec<_> = db
+            .local()
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| {
+                s.id.starts_with("openclaw:")
+                    && extract_backend_str(&s.backend_json, "openclawSessionId").as_deref()
+                        == Some(oc_sid)
+            })
+            .collect();
+        if matching_sid.len() == 1 {
+            return Some(matching_sid[0].id.clone());
+        }
     }
 
     None
@@ -7581,7 +8001,7 @@ async fn handle_session_idle(
     if let Err(err) = daemon.verify_optional_session_token(&target_session_id, packet) {
         return json!({ "ok": false, "error": err });
     }
-
+    daemon.clear_openclaw_session_missing(&target_session_id);
     daemon.mark_session_idle(&target_session_id);
     // Any Queue batch deferred while the session was Active can now flush immediately to L2!
     let flush_daemon = Arc::clone(daemon);
@@ -7615,6 +8035,7 @@ async fn handle_mailbox_drain(
     if let Err(err) = daemon.verify_optional_session_token(&target_session_id, packet) {
         return json!({ "ok": false, "error": err });
     }
+    daemon.clear_openclaw_session_missing(&target_session_id);
 
     let include_nudged = packet
         .get("includeNudged")

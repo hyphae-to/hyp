@@ -1,7 +1,7 @@
 {
   "id": "hyphae",
   "name": "Hyphae Mesh",
-  "description": "Hyphae E2EE agent mesh turn-start inbox delivery plugin for OpenClaw.",
+  "description": "Hyphae E2EE agent mesh exact-session caller binding, native wake service, and turn-start inbox delivery plugin for OpenClaw.",
   "version": "1.0.0",
   "activation": {
     "onStartup": true,

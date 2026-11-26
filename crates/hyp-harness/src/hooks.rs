@@ -11,6 +11,10 @@ use crate::protocol::{
     HarnessKind, UNTRUSTED_PROVENANCE, normalize_mesh_tool_name, resolve_v1_daemon_tool,
 };
 use crate::sock::{DEFAULT_HOOK_TIMEOUT, DaemonRpcResult, daemon_rpc_sync};
+use crate::transport::openclaw::{
+    canonical_openclaw_session_id, parse_openclaw_agent_id_from_session_key,
+    validate_openclaw_session_key,
+};
 use serde_json::{Map, Value, json};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,17 +48,18 @@ impl FromStr for HookEvent {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "pre-tool-use" | "PreToolUse" | "BeforeTool" | "beforeMCPExecution"
-            | "before-mcp-execution" => Ok(HookEvent::PreToolUse),
-            "post-tool-use" | "PostToolUse" | "AfterTool" => Ok(HookEvent::PostToolUse),
+            | "before-mcp-execution" | "before-tool-call" | "before_tool_call"
+            | "BeforeToolCall" => Ok(HookEvent::PreToolUse),
+            "post-tool-use" | "PostToolUse" | "AfterTool" | "after-tool-call"
+            | "after_tool_call" | "AfterToolCall" => Ok(HookEvent::PostToolUse),
             "pre-invocation" | "PreInvocation" | "before-prompt-build" | "before_prompt_build"
             | "BeforePromptBuild" | "user-prompt-submit" | "UserPromptSubmit"
             | "before-agent" | "BeforeAgent" | "before-submit-prompt" | "beforeSubmitPrompt" => {
                 Ok(HookEvent::PreInvocation)
             }
-            "stop" | "Stop" | "AfterAgent" | "agent-end" | "agent_end" | "AgentEnd" => {
-                Ok(HookEvent::Stop)
-            }
-            "session-start" | "SessionStart" => Ok(HookEvent::SessionStart),
+            "stop" | "Stop" | "AfterAgent" | "agent-end" | "agent_end" | "AgentEnd"
+            | "run-stopped" | "run_stopped" | "RunStopped" => Ok(HookEvent::Stop),
+            "session-start" | "session_start" | "SessionStart" => Ok(HookEvent::SessionStart),
             other => Err(format!("Unknown hook event '{other}'")),
         }
     }
@@ -138,17 +143,19 @@ pub fn extract_session_id(harness: HarnessKind, payload: &Map<String, Value>) ->
                 .or_else(|| payload.get("sessionId")),
         ),
         HarnessKind::Openclaw => {
+            // Prefer canonical OpenClaw `sessionKey` FIRST (exact stable routing key across
+            // turns, `/new`, `/reset`, and live wakeups), falling back to `sessionId`/`agentId`.
             for key in [
+                "sessionKey",
+                "session_key",
                 "session_id",
                 "sessionId",
-                "session_key",
-                "sessionKey",
-                "agent_id",
                 "agentId",
+                "agent_id",
             ] {
-                if let Some(qualified) = qualify_session_id(harness, payload.get(key)) {
-                    if is_valid_session_id(&qualified) {
-                        return Some(qualified);
+                if let Some(raw) = payload.get(key).and_then(Value::as_str) {
+                    if let Ok(canonical) = canonical_openclaw_session_id(raw) {
+                        return Some(canonical);
                     }
                 }
             }
@@ -227,12 +234,15 @@ fn extract_tool_info(harness: HarnessKind, payload: &Map<String, Value>) -> Tool
         .or_else(|| payload.get("call_id"))
         .or_else(|| payload.get("callId"))
         .or_else(|| payload.get("toolUseId"))
+        .or_else(|| payload.get("toolCallId"))
+        .or_else(|| payload.get("tool_call_id"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
     let tool_args = payload
         .get("tool_input")
         .or_else(|| payload.get("toolInput"))
+        .or_else(|| payload.get("params"))
         .or_else(|| payload.get("arguments"))
         .or_else(|| payload.get("args"))
         .and_then(Value::as_object)
@@ -334,28 +344,32 @@ fn insert_transport_hints(
     hints: &HookTransportHints,
 ) -> bool {
     let mut added = false;
-    let herdr_tid = hints
-        .herdr_terminal_id
-        .as_deref()
-        .or_else(|| {
-            payload
-                .get("herdr_terminal_id")
-                .or_else(|| payload.get("terminal_id"))
-                .or_else(|| payload.get("terminalId"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| crate::transport::herdr::is_valid_terminal_id(s))
-        });
-    if let Some(tid) = herdr_tid {
-        pkt.insert("herdrTerminalId".into(), json!(tid));
-        added = true;
-    }
-    if let Some(created_ms) = payload
-        .get("herdr_created_ms")
-        .or_else(|| payload.get("herdrCreatedMs"))
-        .and_then(Value::as_i64)
-    {
-        pkt.insert("herdrCreatedMs".into(), json!(created_ms));
+    if harness != HarnessKind::Openclaw {
+        let herdr_tid = hints
+            .herdr_terminal_id
+            .as_deref()
+            .or_else(|| {
+                payload
+                    .get("herdr_terminal_id")
+                    .or_else(|| payload.get("terminal_id"))
+                    .or_else(|| payload.get("terminalId"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| crate::transport::herdr::is_valid_terminal_id(s))
+            });
+        if let Some(tid) = herdr_tid {
+            pkt.insert("herdrTerminalId".into(), json!(tid));
+            added = true;
+        }
+        if let Some(created_ms) = payload
+            .get("herdr_created_ms")
+            .or_else(|| payload.get("herdrCreatedMs"))
+            .and_then(Value::as_i64)
+        {
+            pkt.insert("herdrCreatedMs".into(), json!(created_ms));
+            added = true;
+        }
+    } else if attach_openclaw_session_hints(pkt, payload) {
         added = true;
     }
     if let Some(cwd) = payload
@@ -432,35 +446,50 @@ fn attach_session_token(pkt: &mut Map<String, Value>, session_token: Option<&str
     }
 }
 
-fn attach_openclaw_session_hints(pkt: &mut Map<String, Value>, payload: &Map<String, Value>) {
-    if let Some(sk) = payload
-        .get("session_key")
-        .or_else(|| payload.get("sessionKey"))
+fn attach_openclaw_session_hints(pkt: &mut Map<String, Value>, payload: &Map<String, Value>) -> bool {
+    let mut added = false;
+    let mut validated_sk: Option<String> = None;
+    if let Some(raw_sk) = payload
+        .get("sessionKey")
+        .or_else(|| payload.get("session_key"))
+        .or_else(|| payload.get("openclawSessionKey"))
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && s.len() <= 200)
     {
-        let qualified = if sk.starts_with("openclaw:") {
-            sk.to_string()
-        } else {
-            format!("openclaw:{sk}")
-        };
-        if is_valid_session_id(&qualified) {
-            pkt.insert("sessionKey".into(), json!(sk));
+        let trimmed = raw_sk.strip_prefix("openclaw:").unwrap_or(raw_sk);
+        if let Ok(valid_sk) = validate_openclaw_session_key(trimmed) {
+            pkt.insert("sessionKey".into(), json!(valid_sk));
+            pkt.insert("openclawSessionKey".into(), json!(valid_sk));
+            validated_sk = Some(valid_sk);
+            added = true;
         }
     }
-    if let Some(aid) = payload
-        .get("agent_id")
-        .or_else(|| payload.get("agentId"))
+    if let Some(raw_sid) = payload
+        .get("sessionId")
+        .or_else(|| payload.get("openclawSessionId"))
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .filter(|s| !s.is_empty() && s.len() <= 200 && !s.bytes().any(|b| b <= 0x20 || b == 0x7f))
     {
-        let qualified = format!("openclaw:{aid}");
-        if is_valid_session_id(&qualified) {
-            pkt.insert("agentId".into(), json!(aid));
-        }
+        pkt.insert("openclawSessionId".into(), json!(raw_sid));
+        added = true;
     }
+    let explicit_aid = payload
+        .get("agentId")
+        .or_else(|| payload.get("agent_id"))
+        .or_else(|| payload.get("openclawAgentId"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty() && s.len() <= 128 && !s.bytes().any(|b| b <= 0x20 || b == 0x7f))
+        .map(ToString::to_string);
+    let resolved_aid = explicit_aid.or_else(|| {
+        validated_sk
+            .as_deref()
+            .and_then(parse_openclaw_agent_id_from_session_key)
+    });
+    if let Some(aid) = resolved_aid {
+        pkt.insert("agentId".into(), json!(aid));
+        pkt.insert("openclawAgentId".into(), json!(aid));
+        added = true;
+    }
+    added
 }
 
 /// Validates `session_id` strictly against [`is_valid_session_id`] (ASCII `[A-Za-z0-9:._-]`
@@ -666,7 +695,7 @@ where
                         }
                     }
                 },
-                HarnessKind::Opencode => match token {
+                HarnessKind::Opencode | HarnessKind::Openclaw => match token {
                     Some(tok) => json!({ "callToken": tok, "sessionId": session_id }),
                     None => json!({}),
                 },
@@ -700,7 +729,10 @@ where
                     &json!({ "type": "call.end", "callId": call_id }),
                 );
             }
-            if options.harness == HarnessKind::Antigravity {
+            if matches!(
+                options.harness,
+                HarnessKind::Antigravity | HarnessKind::Openclaw
+            ) {
                 return json!({});
             }
             let mut drain_pkt = Map::new();
@@ -1197,6 +1229,10 @@ mod tests {
                     assert_eq!(pre_res["callToken"], "tok_abc");
                     assert_eq!(pre_res["sessionId"], "opencode:id-1");
                 }
+                HarnessKind::Openclaw => {
+                    assert_eq!(pre_res["callToken"], "tok_abc");
+                    assert_eq!(pre_res["sessionId"], "openclaw:id-1");
+                }
                 HarnessKind::Gemini => {
                     assert_eq!(pre_res["decision"], "allow");
                     assert_eq!(
@@ -1231,7 +1267,7 @@ mod tests {
             );
 
             match harness {
-                HarnessKind::Antigravity => assert_eq!(post_res, json!({})),
+                HarnessKind::Antigravity | HarnessKind::Openclaw => assert_eq!(post_res, json!({})),
                 HarnessKind::Opencode => assert!(
                     post_res["additionalContext"]
                         .as_str()
@@ -1484,8 +1520,17 @@ mod tests {
                 "expected {raw} to parse as PreInvocation"
             );
         }
+        for raw in ["before-tool-call", "before_tool_call", "BeforeToolCall"] {
+            assert_eq!(raw.parse::<HookEvent>().unwrap(), HookEvent::PreToolUse);
+        }
+        for raw in ["after-tool-call", "after_tool_call", "AfterToolCall"] {
+            assert_eq!(raw.parse::<HookEvent>().unwrap(), HookEvent::PostToolUse);
+        }
+        for raw in ["agent-end", "agent_end", "AgentEnd", "run-stopped", "run_stopped"] {
+            assert_eq!(raw.parse::<HookEvent>().unwrap(), HookEvent::Stop);
+        }
 
-        // Session ID extraction order & strict validation
+        // Session ID extraction prefers canonical `sessionKey` FIRST, then `sessionId`, then `agentId`.
         assert_eq!(
             extract_session_id(
                 HarnessKind::Openclaw,
@@ -1494,7 +1539,7 @@ mod tests {
                     .unwrap()
             )
             .as_deref(),
-            Some("openclaw:abc-123")
+            Some("openclaw:agent:main:explicit:abc-123")
         );
         assert_eq!(
             extract_session_id(
@@ -1505,6 +1550,16 @@ mod tests {
             )
             .as_deref(),
             Some("openclaw:agent:main:explicit:xyz")
+        );
+        assert_eq!(
+            extract_session_id(
+                HarnessKind::Openclaw,
+                json!({"sessionId": "ephemeral-uuid-only", "agentId": "main"})
+                    .as_object()
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("openclaw:ephemeral-uuid-only")
         );
         assert_eq!(
             extract_session_id(
@@ -1532,6 +1587,67 @@ mod tests {
             ),
             None
         );
+
+        // OpenClaw PreToolUse (`before-tool-call`) registers exact `sessionKey` + returns `callToken`
+        let pre_pkts = RefCell::new(Vec::<Value>::new());
+        let pre_res = handle_hook_payload_with(
+            json!({
+                "sessionKey": "agent:ops:explicit:thread-9",
+                "sessionId": "ephemeral-9",
+                "toolName": "hyphae__hyp_mesh",
+                "toolCallId": "tool_call:1:hyphae__hyp_mesh:1",
+                "params": { "action": "join", "handle": "ops-claw" }
+            })
+            .as_object()
+            .unwrap(),
+            &opts(HarnessKind::Openclaw, HookEvent::PreToolUse),
+            |_sock, pkt| {
+                pre_pkts.borrow_mut().push(pkt.clone());
+                DaemonRpcResult::ok(
+                    json!({ "callToken": "ct_openclaw_1", "sessionId": pkt["sessionId"] })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+            },
+        );
+        assert_eq!(pre_res["callToken"], "ct_openclaw_1");
+        assert_eq!(pre_res["sessionId"], "openclaw:agent:ops:explicit:thread-9");
+        {
+            let pkts = pre_pkts.borrow();
+            assert_eq!(pkts.len(), 1);
+            assert_eq!(pkts[0]["type"], "call.start");
+            assert_eq!(pkts[0]["harness"], "openclaw");
+            assert_eq!(pkts[0]["sessionId"], "openclaw:agent:ops:explicit:thread-9");
+            assert_eq!(pkts[0]["openclawSessionKey"], "agent:ops:explicit:thread-9");
+            assert_eq!(pkts[0]["openclawAgentId"], "ops");
+            assert_eq!(pkts[0]["tool"], "hyp_session");
+            assert_eq!(pkts[0]["callId"], "tool_call:1:hyphae__hyp_mesh:1");
+        }
+
+        // OpenClaw PostToolUse (`after-tool-call`) sends ONLY `call.end` and NEVER drains mailbox!
+        let post_pkts = RefCell::new(Vec::<Value>::new());
+        let post_res = handle_hook_payload_with(
+            json!({
+                "sessionKey": "agent:ops:explicit:thread-9",
+                "toolName": "hyphae__hyp_mesh",
+                "toolCallId": "tool_call:1:hyphae__hyp_mesh:1"
+            })
+            .as_object()
+            .unwrap(),
+            &opts(HarnessKind::Openclaw, HookEvent::PostToolUse),
+            |_sock, pkt| {
+                post_pkts.borrow_mut().push(pkt.clone());
+                DaemonRpcResult::ok(json!({}).as_object().unwrap().clone())
+            },
+        );
+        assert_eq!(post_res, json!({}));
+        {
+            let pkts = post_pkts.borrow();
+            assert_eq!(pkts.len(), 1);
+            assert_eq!(pkts[0]["type"], "call.end");
+            assert_eq!(pkts[0]["callId"], "tool_call:1:hyphae__hyp_mesh:1");
+        }
 
         let recorded = RefCell::new(Vec::<Value>::new());
         let res = handle_hook_payload_with(
@@ -1561,11 +1677,13 @@ mod tests {
         let pkts = recorded.borrow();
         assert_eq!(pkts.len(), 1);
         assert_eq!(pkts[0]["type"], "mailbox.drain");
-        assert_eq!(pkts[0]["sessionId"], "openclaw:oc-sess-1");
+        assert_eq!(pkts[0]["sessionId"], "openclaw:agent:main:explicit:oc-sess-1");
         assert_eq!(pkts[0]["harness"], "openclaw");
         assert_eq!(pkts[0]["includeNudged"], true);
         assert_eq!(pkts[0]["sessionKey"], "agent:main:explicit:oc-sess-1");
+        assert_eq!(pkts[0]["openclawSessionKey"], "agent:main:explicit:oc-sess-1");
         assert_eq!(pkts[0]["agentId"], "main");
+        assert_eq!(pkts[0]["openclawAgentId"], "main");
 
         let ctx = res["prependContext"]
             .as_str()
@@ -1585,11 +1703,9 @@ mod tests {
         assert_eq!(empty, json!({}));
 
         // OpenClaw observational TurnEnd (`agent-end`) sends `session.idle` and returns `{}`
-        assert_eq!("agent-end".parse::<HookEvent>().unwrap(), HookEvent::Stop);
-        assert_eq!("agent_end".parse::<HookEvent>().unwrap(), HookEvent::Stop);
         let idle_pkts = RefCell::new(Vec::<Value>::new());
         let idle_res = handle_hook_payload_with(
-            json!({"session_id": "oc-sess-1", "agentId": "main"}).as_object().unwrap(),
+            json!({"sessionKey": "agent:main:explicit:oc-sess-1", "agentId": "main"}).as_object().unwrap(),
             &opts(HarnessKind::Openclaw, HookEvent::Stop),
             |_sock, pkt| {
                 idle_pkts.borrow_mut().push(pkt.clone());
@@ -1601,7 +1717,7 @@ mod tests {
         assert_eq!(idle_pkts.len(), 1);
         assert_eq!(idle_pkts[0]["type"], "session.idle");
         assert_eq!(idle_pkts[0]["harness"], "openclaw");
-        assert_eq!(idle_pkts[0]["sessionId"], "openclaw:oc-sess-1");
+        assert_eq!(idle_pkts[0]["sessionId"], "openclaw:agent:main:explicit:oc-sess-1");
     }
 
     #[test]

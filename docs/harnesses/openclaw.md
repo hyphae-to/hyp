@@ -1,4 +1,4 @@
-# OpenClaw *(Experimental)*
+# OpenClaw
 
 OpenClaw acts as a human-facing orchestrator while Hyphae links it to coding agent sessions on the same machine or across paired nodes.
 
@@ -9,12 +9,18 @@ hyp setup --harness openclaw
 ```
 
 What this configures:
-- Managed MCP server entry in `~/.openclaw/openclaw.json` (`hyp mcp --backend openclaw --ephemeral`).
+- Official zero-dependency OpenClaw plugin in `~/.openclaw/extensions/hyphae/` (`openclaw.plugin.json` + `index.js`) providing:
+  - Scoped `before_tool_call` / `after_tool_call` hooks that bind every Hyphae MCP call to the exact OpenClaw `(agentId, sessionKey)` via single-use `_meshCall` tokens (no `--ephemeral` split-brain).
+  - Native `hyphae-wake` Gateway service (`api.registerService`) delivering metadata-only wakeups directly into the exact existing `(agentId, sessionKey)` session via `enqueueSessionEvent` (strictly without `createIfMissing`, never spawning isolated cron jobs).
+  - Optional `before_prompt_build` turn-start context injection (`--openclaw-prompt-injection`) and observational `agent_end` / `run_stopped` Queue flushing.
+- Managed MCP server entry in `~/.openclaw/openclaw.json` (`hyp mcp --backend openclaw`).
 - Orchestrator-aware skill in `~/.openclaw/skills/hyphae/SKILL.md` (intentionally avoids duplicating OpenClaw's native `cron`, `HEARTBEAT.md`, or `sessions_send`).
 
-### Optional: Enable OpenClaw Gateway Push Wakeups
+### Optional Fallback: OpenClaw Gateway `/hooks/wake` Webhook
 
-To let Hyphae push metadata wakeups directly into OpenClaw Gateway webhooks (instead of relying only on `hyp_inbox` at turn start), store the Gateway hooks token out-of-band and add the `"openclaw"` block in `~/.config/hyphae/node.json`:
+With the `hyphae` plugin active in OpenClaw Gateway, live exact-session wakeups work automatically over local `connector.sock` with **no webhook token required**.
+
+If you also want standalone `/hooks/wake` webhook fallback when the plugin service is not connected, store the Gateway hooks token out-of-band and configure `"openclaw"` in `~/.config/hyphae/node.json`:
 
 ```sh
 hyp secret set openclaw-hooks-token --web
@@ -25,21 +31,19 @@ hyp secret set openclaw-hooks-token --web
   "openclaw": {
     "url": "http://127.0.0.1:18789",
     "hooksPath": "/hooks",
+    "mode": "wake",
     "agentId": "main",
     "tokenSecret": "openclaw-hooks-token"
   }
 }
 ```
 
-Restart the Hyphae service (`hyp service restart`).
+Restart the Hyphae service (`hyp service restart`). Note: if routing non-main sessions over `/hooks/wake`, enable `hooks.allowRequestSessionKey: true` in `~/.openclaw/openclaw.json` so OpenClaw accepts per-session `sessionKey` targeting.
 
-## Current Limitations
+## Multi-Session Isolation
 
-- OpenClaw runs with `--ephemeral` MCP identity fallback (no per-tool-call hook injection).
-- When `openclaw-hooks-token` is absent, OpenClaw checks `hyp_inbox` once at the start of each gateway turn (never poll in a loop).
+- Each OpenClaw session (`agent:main:main`, `agent:main:explicit:thread-2`, `agent:ops:main`, etc.) maps deterministically to its own Hyphae session ID (`openclaw:<sessionKey>`).
+- Concurrent OpenClaw sessions enroll independent handles, maintain separate mailboxes, and never drain or impersonate each other's messages.
+- If a target OpenClaw session is closed or deleted before wakeup, Hyphae fails cleanly without creating a ghost session and preserves unread messages durably in SQLite.
 
-## What You Should See
-
-- With `openclaw-hooks-token` configured, inbound DMs/events push wakeups directly to OpenClaw's `/hooks` endpoint; without it, `hyp_inbox` surfaces unread items cleanly on the next turn.
-
-See [Troubleshooting](../operations/troubleshooting.md) if Gateway push fails to attach.
+See [Troubleshooting](../operations/troubleshooting.md) if Gateway wakeups fail to attach.
