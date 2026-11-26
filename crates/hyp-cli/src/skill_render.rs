@@ -608,15 +608,13 @@ fn render_capabilities_layer(caps: SkillCapabilities) -> Option<String> {
 
 /// Canonical runtime `hyp-mesh/SKILL.md` path(s) `(primary, extras)` for a harness under `home`.
 ///
-/// When `codex_present` is `true`, `T3` leaves `~/.agents/skills/hyp-mesh/SKILL.md` to Codex's
-/// dual-push skill (avoiding conflicting overwrites during `hyp setup --harness all`).
+/// Codex and T3 share one user skill in `~/.agents/skills`.
 ///
 /// For `HarnessKind::Claude`, resolves all active `claude_profiles` (`$CLAUDE_CONFIG_DIR` and/or
 /// `~/.claude`) and deduplicates symlinked `skills/` directories by canonical target path.
 pub fn runtime_skill_paths(
     kind: HarnessKind,
     home: &Path,
-    codex_present: bool,
     claude_profiles: &[ClaudeConfigProfile],
 ) -> (PathBuf, Vec<PathBuf>) {
     match kind {
@@ -652,18 +650,9 @@ pub fn runtime_skill_paths(
                 (primary, paths)
             }
         }
-        HarnessKind::Codex => (
-            home.join(".codex")
-                .join("skills")
-                .join("hyp-mesh")
-                .join("SKILL.md"),
-            vec![
-                home.join(".agents")
-                    .join("skills")
-                    .join("hyp-mesh")
-                    .join("SKILL.md"),
-            ],
-        ),
+        HarnessKind::Codex | HarnessKind::T3 => {
+            (home.join(".agents/skills/hyp-mesh/SKILL.md"), Vec::new())
+        }
         HarnessKind::Cursor => (
             home.join(".cursor")
                 .join("skills")
@@ -701,24 +690,6 @@ pub fn runtime_skill_paths(
                 .join("SKILL.md"),
             Vec::new(),
         ),
-        HarnessKind::T3 => {
-            let primary = home
-                .join(".t3")
-                .join("skills")
-                .join("hyp-mesh")
-                .join("SKILL.md");
-            let extras = if codex_present {
-                Vec::new()
-            } else {
-                vec![
-                    home.join(".agents")
-                        .join("skills")
-                        .join("hyp-mesh")
-                        .join("SKILL.md"),
-                ]
-            };
-            (primary, extras)
-        }
     }
 }
 
@@ -1205,7 +1176,7 @@ mod tests {
                 is_default_home: true,
             },
         ];
-        let (primary, extras) = runtime_skill_paths(HarnessKind::Claude, &home, false, &profiles);
+        let (primary, extras) = runtime_skill_paths(HarnessKind::Claude, &home, &profiles);
         assert_eq!(
             primary,
             work.join("skills").join("hyp-mesh").join("SKILL.md")

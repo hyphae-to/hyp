@@ -2317,9 +2317,12 @@ pub fn detect_harness_statuses(
                     }
                 }
                 HarnessKind::T3 => {
-                    let skill_root = home.join(".t3").join("skills");
-                    let t3_skill = skill_root.join("hyp-mesh/SKILL.md");
-                    let legacy_skill = skill_root.join("hyphae/SKILL.md");
+                    let t3_skill = home.join(".agents/skills/hyp-mesh/SKILL.md");
+                    let legacy_skill = home.join(".t3/skills/hyphae/SKILL.md");
+                    let t3_profile_installed = fs::read_to_string(&t3_skill).is_ok_and(|text| {
+                        text.lines()
+                            .any(|line| line.starts_with("<!-- hyphae:managed profile=t3 "))
+                    });
                     let legacy = home.join(".t3").join("hyphae.json");
                     let in_node_cfg = config_path
                         .and_then(|path| NodeFile::read_document(path).ok())
@@ -2328,7 +2331,7 @@ pub fn detect_harness_statuses(
                         config_path
                             .map(|cp| cp.display().to_string())
                             .unwrap_or_else(|| t3_skill.display().to_string())
-                    } else if t3_skill.exists() {
+                    } else if t3_profile_installed {
                         t3_skill.display().to_string()
                     } else if legacy_skill.exists() {
                         legacy_skill.display().to_string()
@@ -2337,7 +2340,7 @@ pub fn detect_harness_statuses(
                     };
                     (
                         in_node_cfg
-                            || t3_skill.exists()
+                            || t3_profile_installed
                             || legacy_skill.exists()
                             || legacy.exists(),
                         loc,
@@ -2673,22 +2676,34 @@ fn install_harness_runtime_skills(
     files: &mut Vec<String>,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
-    let target = SkillTargetHarness::from_harness_kind(kind);
+    let target = if kind == HarnessKind::T3 && ctx.codex_present {
+        // The shared Codex profile covers both standalone and T3-managed Codex sessions.
+        SkillTargetHarness::Codex
+    } else {
+        SkillTargetHarness::from_harness_kind(kind)
+    };
     let transport = resolve_transport_for_harness(target, &ctx.orchestrators);
     let profile = SkillProfile::new(target, transport, ctx.capabilities);
     let rendered = render_runtime_skill(&profile);
-    let (primary, extras) = runtime_skill_paths(kind, home, ctx.codex_present, claude_profiles);
+    let (primary, extras) = runtime_skill_paths(kind, home, claude_profiles);
     for path in std::iter::once(primary).chain(extras) {
         match apply_managed_skill(&path, &rendered, ctx.force_skills, dry_run)? {
             SkillWriteOutcome::Written | SkillWriteOutcome::Unchanged => {
                 if !dry_run {
-                    retire_legacy_skill(&path, "hyphae", |text| {
+                    let managed_legacy = |text: &str| {
                         text.starts_with("---\nname: hyphae\n")
                             && text
                                 .lines()
                                 .any(|line| line.starts_with(MANAGED_MARKER_PREFIX))
                             && !text.contains(UNMANAGED_MARKER)
-                    })?;
+                    };
+                    retire_legacy_skill(&path, "hyphae", managed_legacy)?;
+                    if matches!(kind, HarnessKind::Codex | HarnessKind::T3) {
+                        for root in [".codex", ".t3"] {
+                            let old_install = home.join(root).join("skills/hyp-mesh/SKILL.md");
+                            retire_legacy_skill(&old_install, "hyphae", managed_legacy)?;
+                        }
+                    }
                 }
                 files.push(path.display().to_string());
             }

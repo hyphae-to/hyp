@@ -894,7 +894,7 @@ fast_mode = true
         assert!(!h.join(".config/herdr/hyphae.json").exists());
         assert!(!h.join(".t3/hyphae.json").exists());
         assert!(h.join(".config/herdr/skills/hyp-mesh/SKILL.md").exists());
-        assert!(h.join(".t3/skills/hyp-mesh/SKILL.md").exists());
+        assert!(h.join(".agents/skills/hyp-mesh/SKILL.md").exists());
 
         // Now run `scripts/uninstall.sh --yes`!
         let script = repo_root().join("scripts/uninstall.sh");

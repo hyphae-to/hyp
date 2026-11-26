@@ -75,7 +75,12 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
     let legacy_cursor = home.join(".cursor/skills/hyphae/SKILL.md");
     let legacy =
         "---\nname: hyphae\ndescription: Mesh\n---\n<!-- hyphae:managed profile=claude -->\n";
-    for path in [&legacy_claude, &legacy_cursor] {
+    let legacy_shared_copies =
+        [".codex", ".agents", ".t3"].map(|root| home.join(root).join("skills/hyphae/SKILL.md"));
+    for path in [&legacy_claude, &legacy_cursor]
+        .into_iter()
+        .chain(&legacy_shared_copies)
+    {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, legacy).unwrap();
     }
@@ -109,14 +114,12 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
     for rel in [
         ".gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md",
         ".claude/skills/hyp-mesh/SKILL.md",
-        ".codex/skills/hyp-mesh/SKILL.md",
         ".agents/skills/hyp-mesh/SKILL.md",
         ".cursor/skills/hyp-mesh/SKILL.md",
         ".config/opencode/skills/hyp-mesh/SKILL.md",
         ".gemini/skills/hyp-mesh/SKILL.md",
         ".openclaw/skills/hyp-mesh/SKILL.md",
         ".config/herdr/skills/hyp-mesh/SKILL.md",
-        ".t3/skills/hyp-mesh/SKILL.md",
     ] {
         assert!(
             !home.join(rel).exists(),
@@ -150,6 +153,11 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
     assert_eq!(run1_json["ok"], true);
     assert_eq!(run1_json["data"]["configuredCount"], 9);
     assert!(!legacy_claude.exists(), "retired the managed runtime skill");
+    for old in &legacy_shared_copies {
+        assert!(!old.exists(), "unretired managed skill: {}", old.display());
+    }
+    assert!(!home.join(".codex/skills/hyp-mesh/SKILL.md").exists());
+    assert!(!home.join(".t3/skills/hyp-mesh/SKILL.md").exists());
     assert!(
         fs::read_to_string(legacy_cursor)
             .unwrap()
@@ -162,14 +170,12 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
             "antigravity",
         ),
         (".claude/skills/hyp-mesh/SKILL.md", "claude"),
-        (".codex/skills/hyp-mesh/SKILL.md", "codex"),
         (".agents/skills/hyp-mesh/SKILL.md", "codex"),
         (".cursor/skills/hyp-mesh/SKILL.md", "cursor"),
         (".config/opencode/skills/hyp-mesh/SKILL.md", "opencode"),
         (".gemini/skills/hyp-mesh/SKILL.md", "gemini"),
         (".openclaw/skills/hyp-mesh/SKILL.md", "openclaw"),
         (".config/herdr/skills/hyp-mesh/SKILL.md", "herdr"),
-        (".t3/skills/hyp-mesh/SKILL.md", "t3"),
     ];
 
     let mut first_snapshots: Vec<(PathBuf, String)> = Vec::new();
@@ -234,7 +240,7 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
     assert!(claude_txt.contains("HC_TERMINAL_ID"));
     assert!(claude_txt.contains("Monitor"));
 
-    let codex_txt = read_lf(&home.join(".codex/skills/hyp-mesh/SKILL.md"));
+    let codex_txt = read_lf(&home.join(".agents/skills/hyp-mesh/SKILL.md"));
     assert!(codex_txt.contains("transport=codex-or-push"));
     assert!(codex_txt.contains("codex queue"));
     assert!(!codex_txt.contains("Monitor"));
@@ -309,7 +315,7 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
     );
     assert!(claude_solo.contains("Monitor"));
 
-    let codex_solo = read_lf(&home.join(".codex/skills/hyp-mesh/SKILL.md"));
+    let codex_solo = read_lf(&home.join(".agents/skills/hyp-mesh/SKILL.md"));
     assert!(
         codex_solo.contains("transport=background-wait"),
         "expected background-wait when Herdr/T3 absent:\n{codex_solo}"
@@ -362,7 +368,7 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
     assert!(!claude_dual.contains("hyp_wakeup"));
     assert!(estimated_tokens(&claude_dual) <= MAX_TOKENS);
 
-    let codex_dual = read_lf(&home.join(".codex/skills/hyp-mesh/SKILL.md"));
+    let codex_dual = read_lf(&home.join(".agents/skills/hyp-mesh/SKILL.md"));
     assert!(codex_dual.contains("transport=codex-or-push"));
     assert!(codex_dual.contains("caps=bridge,kv"));
     assert!(codex_dual.contains("`hyp_bridge`"));

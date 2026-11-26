@@ -153,33 +153,40 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
     fs::create_dir_all(home.join(".config").join("opencode")).unwrap();
     fs::create_dir_all(home.join(".cursor")).unwrap();
 
-    let legacy_stock = home.join(".claude/skills/hyphae-setup/SKILL.md");
-    let legacy_custom = home.join(".codex/skills/hyphae-setup/SKILL.md");
-    let stock = fs::read_to_string(repo_setup_skill_path()).unwrap();
-    fs::create_dir_all(legacy_stock.parent().unwrap()).unwrap();
+    let legacy_paths = [
+        ".claude/skills/hyphae-setup/SKILL.md",
+        ".codex/skills/hyphae-setup/SKILL.md",
+        ".agents/skills/hyphae-setup/SKILL.md",
+    ]
+    .map(|relative| home.join(relative));
+    let stock = fs::read_to_string(repo_setup_skill_path())
+        .unwrap()
+        .replace("hyp-setup", "hyphae-setup")
+        .replace("skills/hyp-mesh/", "skills/hyphae/")
+        .replace("skills/hyp-schedule/", "skills/hyphae-schedule/")
+        .replace("/skills/hyp-panel/", "/skills/hyphae-panel/");
+    for path in &legacy_paths {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, &stock).unwrap();
+    }
+    let legacy_custom = home.join(".cursor/skills/hyphae-setup/SKILL.md");
     fs::create_dir_all(legacy_custom.parent().unwrap()).unwrap();
-    fs::write(
-        &legacy_stock,
-        stock
-            .replace("hyp-setup", "hyphae-setup")
-            .replace("skills/hyp-mesh/", "skills/hyphae/")
-            .replace("skills/hyp-schedule/", "skills/hyphae-schedule/")
-            .replace("/skills/hyp-panel/", "/skills/hyphae-panel/"),
-    )
-    .unwrap();
     fs::write(&legacy_custom, "# Custom setup").unwrap();
 
-    let out = isolated_cmd(home)
-        .args([
-            "onboard",
-            "--install-skill",
-            "--home",
-            home.to_str().unwrap(),
-            "--json",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .expect("run onboard --install-skill");
+    let install = || {
+        isolated_cmd(home)
+            .args([
+                "onboard",
+                "--install-skill",
+                "--home",
+                home.to_str().unwrap(),
+                "--json",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run onboard --install-skill")
+    };
+    let out = install();
 
     assert_eq!(
         out.status.code(),
@@ -205,7 +212,6 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
 
     let expected_paths = [
         home.join(".claude/skills/hyp-setup/SKILL.md"),
-        home.join(".codex/skills/hyp-setup/SKILL.md"),
         home.join(".agents/skills/hyp-setup/SKILL.md"),
         home.join(".gemini/config/skills/hyp-setup/SKILL.md"),
         home.join(".gemini/skills/hyp-setup/SKILL.md"),
@@ -213,7 +219,14 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
         home.join(".cursor/skills/hyp-setup/SKILL.md"),
     ];
 
-    assert!(!legacy_stock.exists());
+    let shared = home.join(".agents/skills/hyp-setup/SKILL.md");
+    let before = fs::metadata(&shared).unwrap().modified().unwrap();
+    assert!(install().status.success());
+    assert_eq!(fs::metadata(&shared).unwrap().modified().unwrap(), before);
+    for old in legacy_paths {
+        assert!(!old.exists(), "unretired managed skill: {}", old.display());
+    }
+    assert!(!home.join(".codex/skills/hyp-setup/SKILL.md").exists());
     assert_eq!(fs::read_to_string(legacy_custom).unwrap(), "# Custom setup");
     for path in &expected_paths {
         assert!(
@@ -262,7 +275,7 @@ fn install_skill_handles_bare_gemini_directory_for_antigravity() {
     let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
     for rel in [
         ".claude/skills/hyp-setup/SKILL.md",
-        ".codex/skills/hyp-setup/SKILL.md",
+        ".agents/skills/hyp-setup/SKILL.md",
         ".gemini/config/skills/hyp-setup/SKILL.md",
         ".config/opencode/skills/hyp-setup/SKILL.md",
         ".cursor/skills/hyp-setup/SKILL.md",
@@ -318,7 +331,7 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
         (
             "codex",
             "codex",
-            ".codex/skills/hyp-setup/SKILL.md",
+            ".agents/skills/hyp-setup/SKILL.md",
             None,
             0,
         ),
@@ -865,14 +878,9 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
         assert!(stdout.contains("t9m"), "stdout={stdout}");
         assert!(stdout.contains("hc attach t9m"), "stdout={stdout}");
 
-        for rel in [
-            ".codex/skills/hyp-setup/SKILL.md",
-            ".agents/skills/hyp-setup/SKILL.md",
-        ] {
-            let p = home.join(rel);
-            assert!(p.is_file(), "missing {}", p.display());
-            assert_eq!(fs::read_to_string(&p).unwrap(), canonical);
-        }
+        let skill_path = home.join(".agents/skills/hyp-setup/SKILL.md");
+        assert_eq!(fs::read_to_string(skill_path).unwrap(), canonical);
+        assert!(!home.join(".codex/skills/hyp-setup/SKILL.md").exists());
     }
 
     // 3. Failing `hc run` emits structured `HERDR_LAUNCH_FAILED` including stderr snippet.
@@ -1020,7 +1028,6 @@ fn assist_openclaw_and_t3_install_skill_and_emit_structured_manual_guide() {
     for rel in [
         ".agents/skills/hyp-setup/SKILL.md",
         ".claude/skills/hyp-setup/SKILL.md",
-        ".codex/skills/hyp-setup/SKILL.md",
     ] {
         let path = home_t3.join(rel);
         assert!(path.is_file(), "expected T3 skill at {}", path.display());
@@ -1072,7 +1079,7 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
     assert!(cd_skill.is_file());
     assert_eq!(fs::read_to_string(&cd_skill).unwrap(), canonical);
 
-    // 2. Codex Desktop (`--assist codex-desktop --json`): installs ~/.codex/skills + ~/.agents/skills.
+    // 2. Codex Desktop (`--assist codex-desktop --json`): installs to ~/.agents/skills.
     let tmp_cx = TempDir::new().expect("tempdir");
     let home_cx = tmp_cx.path();
     let cx_out = isolated_cmd(home_cx)
@@ -1097,14 +1104,9 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
         cx_json["data"]["prompt"],
         "Set up Hyphae on this machine using the hyp-setup skill"
     );
-    for rel in [
-        ".codex/skills/hyp-setup/SKILL.md",
-        ".agents/skills/hyp-setup/SKILL.md",
-    ] {
-        let p = home_cx.join(rel);
-        assert!(p.is_file(), "missing {}", p.display());
-        assert_eq!(fs::read_to_string(&p).unwrap(), canonical);
-    }
+    let skill_path = home_cx.join(".agents/skills/hyp-setup/SKILL.md");
+    assert_eq!(fs::read_to_string(skill_path).unwrap(), canonical);
+    assert!(!home_cx.join(".codex/skills/hyp-setup/SKILL.md").exists());
 
     // 3. Cursor IDE fallback when `cursor-agent` CLI is NOT on PATH (`--assist cursor --json`).
     let tmp_cu = TempDir::new().expect("tempdir");

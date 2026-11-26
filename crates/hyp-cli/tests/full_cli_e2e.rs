@@ -290,7 +290,7 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
         home.join(".config/herdr/skills/hyp-mesh/SKILL.md")
             .is_file()
     );
-    assert!(home.join(".t3/skills/hyp-mesh/SKILL.md").is_file());
+    assert!(home.join(".agents/skills/hyp-mesh/SKILL.md").is_file());
     let mut snapshots: Vec<(PathBuf, String)> = Vec::new();
     for path in &expected_json_files {
         let content = fs::read_to_string(path)

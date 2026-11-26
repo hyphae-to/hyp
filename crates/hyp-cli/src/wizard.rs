@@ -179,11 +179,7 @@ impl LaunchableHarness {
                         .join("hyp-setup")
                         .join("SKILL.md")
                 }),
-            Self::Codex => home
-                .join(".codex")
-                .join("skills")
-                .join("hyp-setup")
-                .join("SKILL.md"),
+            Self::Codex => shared_setup_skill_path(home),
             Self::Antigravity => home
                 .join(".gemini")
                 .join("config")
@@ -235,12 +231,6 @@ impl LaunchableHarness {
                 }
                 extras
             }
-            Self::Codex => vec![
-                home.join(".agents")
-                    .join("skills")
-                    .join("hyp-setup")
-                    .join("SKILL.md"),
-            ],
             _ => Vec::new(),
         }
     }
@@ -350,11 +340,7 @@ impl ManualGuideHarness {
                 .join("skills")
                 .join("hyp-setup")
                 .join("SKILL.md"),
-            Self::T3 => home
-                .join(".agents")
-                .join("skills")
-                .join("hyp-setup")
-                .join("SKILL.md"),
+            Self::T3 => shared_setup_skill_path(home),
             Self::ConfigOnlyCli(lh) => {
                 lh.primary_skill_path_for(home, explicit_home, claude_config_dir)
             }
@@ -379,16 +365,10 @@ impl ManualGuideHarness {
                 claude_config_dir,
             ),
             Self::CodexDesktop => LaunchableHarness::Codex.extra_skill_paths(home),
-            Self::OpenCodeDesktop => vec![
-                home.join(".agents")
-                    .join("skills")
-                    .join("hyp-setup")
-                    .join("SKILL.md"),
-            ],
+            Self::OpenCodeDesktop => vec![shared_setup_skill_path(home)],
             Self::CursorIde => Vec::new(),
             Self::Openclaw => Vec::new(),
-            // T3 Code spawns Claude and Codex sessions; install into all active Claude profile
-            // skill directories plus Codex.
+            // Claude children discover the skill through their active Claude profiles.
             Self::T3 => {
                 let mut seen = BTreeSet::new();
                 let mut out = Vec::new();
@@ -398,12 +378,6 @@ impl ManualGuideHarness {
                         out.push(path);
                     }
                 }
-                out.push(
-                    home.join(".codex")
-                        .join("skills")
-                        .join("hyp-setup")
-                        .join("SKILL.md"),
-                );
                 out
             }
             Self::ConfigOnlyCli(lh) => {
@@ -4110,12 +4084,12 @@ pub fn install_setup_skill_for_harnesses_with_claude(
             continue;
         };
         if written_paths.insert(canonical_dedup_key(&primary)) {
-            write_setup_skill(&primary)?;
+            write_setup_skill(home, &primary)?;
         }
         let mut written_extras = Vec::new();
         for extra in extras {
             if written_paths.insert(canonical_dedup_key(&extra)) {
-                write_setup_skill(&extra)?;
+                write_setup_skill(home, &extra)?;
             }
             written_extras.push(extra.display().to_string());
         }
@@ -4128,13 +4102,9 @@ pub fn install_setup_skill_for_harnesses_with_claude(
 
     // If `<home>/.agents` already exists and wasn't populated yet (e.g., Codex/T3 not detected),
     // also populate `<home>/.agents/skills/hyp-setup/SKILL.md` for cross-tool discovery.
-    let agents_skill = home
-        .join(".agents")
-        .join("skills")
-        .join("hyp-setup")
-        .join("SKILL.md");
+    let agents_skill = shared_setup_skill_path(home);
     if home.join(".agents").is_dir() && written_paths.insert(canonical_dedup_key(&agents_skill)) {
-        write_setup_skill(&agents_skill)?;
+        write_setup_skill(home, &agents_skill)?;
         entries.push(InstalledSkillEntry {
             harness: "agents".to_string(),
             path: agents_skill.display().to_string(),
@@ -4145,7 +4115,11 @@ pub fn install_setup_skill_for_harnesses_with_claude(
     Ok(entries)
 }
 
-fn write_setup_skill(path: &Path) -> Result<(), String> {
+fn shared_setup_skill_path(home: &Path) -> PathBuf {
+    home.join(".agents/skills/hyp-setup/SKILL.md")
+}
+
+fn write_setup_skill(home: &Path, path: &Path) -> Result<(), String> {
     // The stock setup skill predates the managed runtime marker.
     const LEGACY_DIGESTS: &[&str] = &[
         "4a336e5b76253e513b4f57edae22cc9fbb2640080294c5cf0622912c1fb02186",
@@ -4153,11 +4127,21 @@ fn write_setup_skill(path: &Path) -> Result<(), String> {
         "d34e2926a7f1d801b875efe526cc9e6044cd59201aad3b9bb3b3c4ff20ca7d48",
         "934bc876321ad2abf31c8bb918bc21d44e1257b70699a478a51cf80b659632d7",
         "d78d6f7cd123e39442fbe13158d0a15827e8d076a9d1b6e3fc54b872d6928e23",
+        "e4ea5f1fff56c729f448c35d687e7c422d98cf3405d28ac9f5eaba11a4ce2351",
+        "86e8bd12f2489abb4eca3be6c7d474d6cdb944d0db29cde6d8e5c50358c1e1bc",
+        "e1b75a2e02e7b7835459460034c75839f9fd137b6ab4c93be1ba014f8d4b228e",
+        "7945d93e4909b8e422ee18e18beca0555497a5c945634f9938acf7ab2aefe767",
+        "ad2850fc1eff8fe439e8772156539b090ca2b81f3edcd2ffb31863b088d22959",
     ];
-    write_atomic_file(path, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
-    crate::skill_render::retire_legacy_skill(path, "hyphae-setup", |text| {
-        LEGACY_DIGESTS.contains(&hyp_store::sha256_hex(text.as_bytes()).as_str())
-    })
+    crate::skill_render::write_managed_skill(path, HYPHAE_SETUP_SKILL_MD, true)?;
+    let stock =
+        |text: &str| LEGACY_DIGESTS.contains(&hyp_store::sha256_hex(text.as_bytes()).as_str());
+    crate::skill_render::retire_legacy_skill(path, "hyphae-setup", stock)?;
+    if path == shared_setup_skill_path(home) {
+        let old_codex = home.join(".codex/skills/hyp-setup/SKILL.md");
+        crate::skill_render::retire_legacy_skill(&old_codex, "hyphae-setup", stock)?;
+    }
+    Ok(())
 }
 
 /// Entrypoint for `hyp onboard --install-skill`.
@@ -4852,12 +4836,8 @@ fn install_and_handoff_herdr(
     } else {
         // Fallback cross-tool location when template name doesn't name a known harness and no
         // harness dirs exist under `home` yet.
-        let fallback = home
-            .join(".agents")
-            .join("skills")
-            .join("hyp-setup")
-            .join("SKILL.md");
-        if let Err(e) = write_setup_skill(&fallback) {
+        let fallback = shared_setup_skill_path(home);
+        if let Err(e) = write_setup_skill(home, &fallback) {
             return emit_error(
                 "onboard",
                 as_json,
@@ -4921,7 +4901,7 @@ fn install_manual_guide_skills(
     for extra in harness.extra_skill_paths_for(home, explicit_home, claude_config_dir) {
         if already_recorded.insert(canonical_dedup_key(&extra)) {
             let extra_str = extra.display().to_string();
-            write_setup_skill(&extra)?;
+            write_setup_skill(home, &extra)?;
             if let Some(first) = installed.first_mut() {
                 first.extra_paths.push(extra_str);
             } else {
@@ -6548,10 +6528,7 @@ impl SetupToggleState {
                 HarnessKind::Codex => {
                     preview.push("codex: ~/.codex/{config.toml,hooks.json}".to_string());
                     if sel.install_skills {
-                        preview.push(
-                            "  + skill: ~/.codex/skills/hyp-mesh/SKILL.md (+ ~/.agents/skills/hyp-mesh/SKILL.md)"
-                                .to_string(),
-                        );
+                        preview.push("  + skill: ~/.agents/skills/hyp-mesh/SKILL.md".to_string());
                     }
                 }
                 HarnessKind::Cursor => {
@@ -6611,10 +6588,7 @@ impl SetupToggleState {
                 HarnessKind::T3 => {
                     preview.push("t3: ~/.config/hyphae/node.json (\"t3\" block)".to_string());
                     if sel.install_skills {
-                        preview.push(
-                            "  + skill: ~/.t3/skills/hyp-mesh/SKILL.md (+ ~/.agents/skills/hyp-mesh/SKILL.md)"
-                                .to_string(),
-                        );
+                        preview.push("  + skill: ~/.agents/skills/hyp-mesh/SKILL.md".to_string());
                     }
                 }
             }

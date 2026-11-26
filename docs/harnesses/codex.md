@@ -9,7 +9,7 @@ hyp setup --harness codex
 What this configures:
 - MCP entry in `~/.codex/config.toml` (`hyp mcp --backend codex`).
 - Hooks (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`) in `~/.codex/hooks.json`.
-- Tailored skill in `~/.codex/skills/hyp-mesh/SKILL.md` and `~/.agents/skills/hyp-mesh/SKILL.md`.
+- Tailored skill in `~/.agents/skills/hyp-mesh/SKILL.md`.
 
 For Codex Desktop, run `hyp onboard --assist codex-desktop` to preview and merge `~/.codex/config.toml`, then **restart Codex Desktop**. Both setup paths use the same MCP entry and keep any socket set by `hyp setup --harness codex --socket <path>`.
 
