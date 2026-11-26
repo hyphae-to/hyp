@@ -16,12 +16,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{
-    TestMcpClient, run_hook, run_hook_with_hints, session_status, wait_for_live_transport,
-};
+use common::{TestMcpClient, run_hook, session_status};
 use hyp_crypto::SecretBackend;
-use hyp_harness::daemon::{DeliveryRetryConfig, InboundItem, LocalDaemon, LocalDaemonConfig};
-use hyp_harness::hooks::{HookEvent, HookTransportHints};
+use hyp_harness::daemon::{InboundItem, LocalDaemon, LocalDaemonConfig};
+use hyp_harness::hooks::HookEvent;
 use hyp_harness::mcp::McpOptions;
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::daemon_rpc_async;
@@ -572,6 +570,9 @@ async fn issue32_focus_vip_bypass_isolates_buffered_notify_and_flushes_on_focus_
 
 #[cfg(unix)]
 mod unix_e2e {
+    use crate::common::{run_hook_with_hints, wait_for_live_transport};
+    use hyp_harness::daemon::DeliveryRetryConfig;
+    use hyp_harness::hooks::HookTransportHints;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;

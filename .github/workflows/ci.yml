@@ -35,13 +35,12 @@ env:
 jobs:
   detect-changes:
     name: Change Detection
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       run_rust: ${{ steps.changes.outputs.run_rust }}
       run_js: ${{ steps.changes.outputs.run_js }}
-      os_matrix: ${{ steps.changes.outputs.os_matrix }}
-      skip_release_build: ${{ steps.changes.outputs.skip_release_build }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,52 +51,18 @@ jobs:
         id: changes
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
-          GITHUB_SHA: ${{ github.sha }}
-          INPUT_OS: ${{ inputs.os }}
-          INPUT_SKIP_RELEASE_BUILD: ${{ inputs.skip_release_build }}
         run: |
           set -euo pipefail
-          ALL_OS='["ubuntu-latest","macos-latest","windows-latest"]'
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            case "${INPUT_OS:-all}" in
-              ubuntu-latest|macos-latest|windows-latest)
-                OS_MATRIX="[\"${INPUT_OS}\"]"
-                ;;
-              *)
-                OS_MATRIX="$ALL_OS"
-                ;;
-            esac
-            SKIP_REL="${INPUT_SKIP_RELEASE_BUILD:-false}"
-            echo "workflow_dispatch: running full CI (os_matrix=${OS_MATRIX}, skip_release_build=${SKIP_REL})."
-            echo "run_rust=true" >> "$GITHUB_OUTPUT"
-            echo "run_js=true" >> "$GITHUB_OUTPUT"
-            echo "os_matrix=${OS_MATRIX}" >> "$GITHUB_OUTPUT"
-            echo "skip_release_build=${SKIP_REL}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "os_matrix=${ALL_OS}" >> "$GITHUB_OUTPUT"
-          echo "skip_release_build=false" >> "$GITHUB_OUTPUT"
-
           CHANGED=""
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
-              CHANGED="$(git -c core.quotepath=false diff --name-only HEAD^1 HEAD || true)"
-            elif [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
-              CHANGED="$(git -c core.quotepath=false diff --name-only "${PR_BASE_SHA}" HEAD || true)"
-            fi
-          elif [ "$EVENT_NAME" = "push" ]; then
-            if [ -n "${PUSH_BEFORE_SHA:-}" ] \
-              && [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
-              && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
-              CHANGED="$(git -c core.quotepath=false diff --name-only "${PUSH_BEFORE_SHA}" "${GITHUB_SHA}" || true)"
-            fi
+          if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+            CHANGED="$(git -c core.quotepath=false diff --name-only HEAD^1 HEAD || true)"
+          elif [ -n "${PR_BASE_SHA:-}" ] && git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
+            CHANGED="$(git -c core.quotepath=false diff --name-only "${PR_BASE_SHA}" HEAD || true)"
           fi
 
           if [ -z "$CHANGED" ]; then
-            echo "Unable to narrow changed files (initial/force push or empty diff); running Rust and JS CI (fail-safe)."
+            echo "Unable to determine changed PR files; running Rust and JS CI."
             echo "run_rust=true" >> "$GITHUB_OUTPUT"
             echo "run_js=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -136,7 +101,7 @@ jobs:
   js-lint-and-tests:
     name: JavaScript / TypeScript (Node 24)
     needs: detect-changes
-    if: needs.detect-changes.outputs.run_js == 'true'
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.detect-changes.result == 'success' && needs.detect-changes.outputs.run_js == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -206,13 +171,13 @@ jobs:
   rust-workspace:
     name: Rust (${{ matrix.os }})
     needs: detect-changes
-    if: needs.detect-changes.outputs.run_rust == 'true'
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.detect-changes.result == 'success' && needs.detect-changes.outputs.run_rust == 'true')) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJson(needs.detect-changes.outputs.os_matrix) }}
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.os != 'all' && format('["{0}"]', inputs.os) || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -239,7 +204,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (zero warnings across workspace & all targets)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --keep-going --locked -- -D warnings
 
       - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
         run: cargo test --workspace --locked
@@ -268,11 +233,11 @@ jobs:
           node --test site/drop/cross_lang_interop.test.mjs
 
       - name: Build release binary (hyp)
-        if: needs.detect-changes.outputs.skip_release_build != 'true'
+        if: github.event_name != 'workflow_dispatch' || !inputs.skip_release_build
         run: cargo build --release --locked -p hyp-cli
 
       - name: Smoke-test compiled binary (Unix)
-        if: runner.os != 'Windows' && needs.detect-changes.outputs.skip_release_build != 'true'
+        if: runner.os != 'Windows' && (github.event_name != 'workflow_dispatch' || !inputs.skip_release_build)
         shell: bash
         run: |
           set -euo pipefail
@@ -281,14 +246,14 @@ jobs:
           python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
 
       - name: Run installer E2E verification suite (Unix, reusing built binary)
-        if: runner.os != 'Windows' && needs.detect-changes.outputs.skip_release_build != 'true'
+        if: runner.os != 'Windows' && (github.event_name != 'workflow_dispatch' || !inputs.skip_release_build)
         shell: bash
         env:
           HYPHAE_PREBUILT_BIN: ./target/release/hyp
         run: bash scripts/test-installer.sh
 
       - name: Smoke-test compiled binary (Windows)
-        if: runner.os == 'Windows' && needs.detect-changes.outputs.skip_release_build != 'true'
+        if: runner.os == 'Windows' && (github.event_name != 'workflow_dispatch' || !inputs.skip_release_build)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -300,7 +265,7 @@ jobs:
           }
 
       - name: Verify Windows PowerShell installer & uninstaller (AST, parity & dry-run)
-        if: runner.os == 'Windows' && needs.detect-changes.outputs.skip_release_build != 'true'
+        if: runner.os == 'Windows' && (github.event_name != 'workflow_dispatch' || !inputs.skip_release_build)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
