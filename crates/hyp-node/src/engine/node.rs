@@ -339,8 +339,18 @@ impl UnifiedNode {
 
         db.local()
             .ensure_metadata("node_id", config.node_id.as_str())?;
-        if db.local().get_metadata("manifest_version")?.is_none() {
-            db.local().set_metadata("manifest_version", "1")?;
+        match db.local().get_metadata("manifest_version")? {
+            None => {
+                db.local().set_metadata("manifest_version", "1")?;
+            }
+            Some(raw) => {
+                // Bump manifest_version monotonically across restarts so a newly signed
+                // `issued_at`/`expires_at` window or reloaded config never triggers same-version
+                // equivocation (`ManifestRollback`) on reconnecting peers.
+                let next = raw.parse::<u64>().unwrap_or(1).max(1).saturating_add(1);
+                db.local()
+                    .set_metadata("manifest_version", &next.to_string())?;
+            }
         }
 
         // Seed declarative channel policies from NodeConfig without clobbering existing persisted ones.
@@ -1225,21 +1235,41 @@ impl UnifiedNode {
         &self,
         caller: Option<&AuthenticatedPeer>,
     ) -> Result<(SignedNodeManifest, NodeManifestPayload, String), NodeError> {
-        let manifest_version = self.current_manifest_version()?;
-        let issued_at_ms = {
-            let mut win = self
-                .manifest_window
-                .lock()
-                .expect("manifest_window lock poisoned");
+        let (manifest_version, issued_at_ms) = {
+            let ver = self.current_manifest_version()?;
             let now = now_ms();
-            if win.version != manifest_version
-                || win.issued_at_ms == 0
-                || now - win.issued_at_ms >= MANIFEST_WINDOW_REFRESH_MS
-            {
-                win.version = manifest_version;
+            let need_refresh = {
+                let mut win = self
+                    .manifest_window
+                    .lock()
+                    .expect("manifest_window lock poisoned");
+                if win.issued_at_ms == 0 || win.version != ver {
+                    win.version = ver;
+                    win.issued_at_ms = now;
+                    false
+                } else {
+                    now - win.issued_at_ms >= MANIFEST_WINDOW_REFRESH_MS
+                }
+            };
+            if need_refresh {
+                // Rolling to a fresh `issued_at`/`expires_at` window changes the signed manifest
+                // JSON; bump `manifest_version` monotonically so peers never mistake a legitimate
+                // TTL rollover for same-version equivocation.
+                let next_ver = self.bump_manifest_version()?;
+                let mut win = self
+                    .manifest_window
+                    .lock()
+                    .expect("manifest_window lock poisoned");
+                win.version = next_ver;
                 win.issued_at_ms = now;
+                (next_ver, win.issued_at_ms)
+            } else {
+                let win = self
+                    .manifest_window
+                    .lock()
+                    .expect("manifest_window lock poisoned");
+                (win.version, win.issued_at_ms)
             }
-            win.issued_at_ms
         };
         let expires_at_ms = issued_at_ms + MANIFEST_TTL_MS;
 

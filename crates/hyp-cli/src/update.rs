@@ -1556,51 +1556,129 @@ async fn fetch_signed_manifest(url: &str) -> Result<SignedReleaseManifest, (&'st
     })
 }
 
-async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'static str, String)> {
-    validate_endpoint_origin(url)
-        .map_err(|e| ("UNSAFE_URL", format!("Refusing unsafe URL '{url}': {e}")))?;
-    let uri: http::Uri = url
-        .parse()
-        .map_err(|e| ("INVALID_URL", format!("Invalid URL '{url}': {e}")))?;
-    let client =
-        build_http_client::<Empty<Bytes>>().map_err(|e| ("HTTP_INIT_ERROR", e))?;
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(&uri)
-        .header(
-            header::USER_AGENT,
-            format!("hyp/{}", env!("CARGO_PKG_VERSION")),
-        )
-        .body(Empty::new())
-        .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
+const MAX_REDIRECTS: usize = 5;
 
-    let resp = tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
-        .await
-        .map_err(|_| ("HTTP_TIMEOUT", format!("GET {url} timed out after {HTTP_TIMEOUT_SECS}s")))?
-        .map_err(|e| ("HTTP_ERROR", format!("GET {url} failed: {e}")))?;
-
-    if !resp.status().is_success() {
+fn resolve_redirect_url(
+    current_uri: &http::Uri,
+    location: &str,
+) -> Result<http::Uri, (&'static str, String)> {
+    let trimmed = location.trim();
+    let next_url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else if trimmed.starts_with('/') {
+        let scheme = current_uri.scheme_str().unwrap_or("https");
+        let authority = current_uri
+            .authority()
+            .map(|a| a.as_str())
+            .unwrap_or_default();
+        format!("{scheme}://{authority}{trimmed}")
+    } else {
         return Err((
-            "HTTP_STATUS",
-            format!("GET {url} returned HTTP {}", resp.status().as_u16()),
+            "UNSAFE_REDIRECT",
+            format!("Refusing unsupported redirect Location '{trimmed}'"),
+        ));
+    };
+
+    validate_endpoint_origin(&next_url)
+        .map_err(|e| ("UNSAFE_REDIRECT", format!("Refusing unsafe redirect '{next_url}': {e}")))?;
+    let next_uri: http::Uri = next_url
+        .parse()
+        .map_err(|e| ("UNSAFE_REDIRECT", format!("Invalid redirect URL '{next_url}': {e}")))?;
+    if current_uri.scheme_str() == Some("https") && next_uri.scheme_str() != Some("https") {
+        return Err((
+            "UNSAFE_REDIRECT",
+            format!("Refusing HTTPS-to-HTTP downgrade redirect to '{next_url}'"),
         ));
     }
+    Ok(next_uri)
+}
 
-    let mut body = resp.into_body();
-    let mut out = Vec::new();
-    while let Some(frame_res) = body.frame().await {
-        let frame = frame_res.map_err(|e| ("HTTP_ERROR", format!("body read error: {e}")))?;
-        if let Some(chunk) = frame.data_ref() {
-            if out.len().saturating_add(chunk.len()) > max_bytes {
+async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'static str, String)> {
+    let mut current_url = url.trim().to_string();
+    validate_endpoint_origin(&current_url)
+        .map_err(|e| ("UNSAFE_URL", format!("Refusing unsafe URL '{current_url}': {e}")))?;
+    let mut current_uri: http::Uri = current_url
+        .parse()
+        .map_err(|e| ("INVALID_URL", format!("Invalid URL '{current_url}': {e}")))?;
+    let client =
+        build_http_client::<Empty<Bytes>>().map_err(|e| ("HTTP_INIT_ERROR", e))?;
+
+    for redirect_count in 0..=MAX_REDIRECTS {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&current_uri)
+            .header(
+                header::USER_AGENT,
+                format!("hyp/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .body(Empty::new())
+            .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
+            .await
+            .map_err(|_| {
+                (
+                    "HTTP_TIMEOUT",
+                    format!("GET {current_url} timed out after {HTTP_TIMEOUT_SECS}s"),
+                )
+            })?
+            .map_err(|e| ("HTTP_ERROR", format!("GET {current_url} failed: {e}")))?;
+
+        let status = resp.status();
+        if status.is_redirection() {
+            if redirect_count >= MAX_REDIRECTS {
                 return Err((
-                    "RESPONSE_TOO_LARGE",
-                    format!("Download from {url} exceeds {max_bytes} byte limit"),
+                    "TOO_MANY_REDIRECTS",
+                    format!("GET {current_url} exceeded {MAX_REDIRECTS} redirects"),
                 ));
             }
-            out.extend_from_slice(chunk);
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    (
+                        "HTTP_ERROR",
+                        format!(
+                            "GET {current_url} returned redirect HTTP {} without Location header",
+                            status.as_u16()
+                        ),
+                    )
+                })?;
+            let next_uri = resolve_redirect_url(&current_uri, location)?;
+            current_url = next_uri.to_string();
+            current_uri = next_uri;
+            continue;
         }
+
+        if !status.is_success() {
+            return Err((
+                "HTTP_STATUS",
+                format!("GET {current_url} returned HTTP {}", status.as_u16()),
+            ));
+        }
+
+        let mut body = resp.into_body();
+        let mut out = Vec::new();
+        while let Some(frame_res) = body.frame().await {
+            let frame = frame_res.map_err(|e| ("HTTP_ERROR", format!("body read error: {e}")))?;
+            if let Some(chunk) = frame.data_ref() {
+                if out.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err((
+                        "RESPONSE_TOO_LARGE",
+                        format!("Download from {current_url} exceeds {max_bytes} byte limit"),
+                    ));
+                }
+                out.extend_from_slice(chunk);
+            }
+        }
+        return Ok(out);
     }
-    Ok(out)
+
+    Err((
+        "TOO_MANY_REDIRECTS",
+        format!("GET {current_url} exceeded {MAX_REDIRECTS} redirects"),
+    ))
 }
 
 struct SwapSuccess {
@@ -2102,5 +2180,45 @@ mod tests {
         assert_eq!(sync["skipped"], true);
         assert!(warnings.is_empty());
         assert!(next.iter().any(|s| s == "hyp plugin update --all"));
+    }
+
+    #[test]
+    fn resolve_redirect_url_allows_https_assets_and_blocks_downgrade_or_unsafe_targets() {
+        let gh: http::Uri =
+            "https://github.com/hyphae-to/hyp/releases/download/nightly/release-manifest.json"
+                .parse()
+                .unwrap();
+
+        let ok_abs = resolve_redirect_url(
+            &gh,
+            "https://release-assets.githubusercontent.com/github-production-release-asset/123/manifest.json",
+        )
+        .expect("https -> https redirect allowed");
+        assert_eq!(ok_abs.scheme_str(), Some("https"));
+
+        let ok_rel = resolve_redirect_url(&gh, "/other/path/manifest.json")
+            .expect("root-relative https redirect allowed");
+        assert_eq!(
+            ok_rel.to_string(),
+            "https://github.com/other/path/manifest.json"
+        );
+
+        assert_eq!(
+            resolve_redirect_url(&gh, "http://127.0.0.1:8080/manifest.json")
+                .unwrap_err()
+                .0,
+            "UNSAFE_REDIRECT",
+            "HTTPS -> HTTP downgrade must fail closed even to loopback"
+        );
+        assert_eq!(
+            resolve_redirect_url(&gh, "http://evil.example.com/manifest.json")
+                .unwrap_err()
+                .0,
+            "UNSAFE_REDIRECT"
+        );
+        assert_eq!(
+            resolve_redirect_url(&gh, "file:///etc/passwd").unwrap_err().0,
+            "UNSAFE_REDIRECT"
+        );
     }
 }

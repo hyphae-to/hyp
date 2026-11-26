@@ -1301,3 +1301,92 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
     alice.shutdown();
     hub.shutdown();
 }
+
+// ============================================================================
+// 5. Hub Restart Monotonic Manifest Version + Reconnect Regression Test
+// ============================================================================
+
+#[tokio::test]
+async fn hub_restart_bumps_manifest_version_and_paired_client_reconnects_cleanly() {
+    let hub_dir = TempDir::new().unwrap();
+    let alice_dir = TempDir::new().unwrap();
+
+    let admin_ca = Ed25519KeyPair::generate().unwrap();
+    let admin_proto_jwk = OkpJwk::new(OkpCurve::Ed25519, &admin_ca.public_key_bytes());
+
+    let build_hub_cfg = |dir: &std::path::Path| {
+        let mut cfg = NodeConfig::router(NodeId::new("restart-hub").unwrap(), dir);
+        cfg.secret_backend = Some(SecretBackend::File);
+        cfg.admin_jwk = Some(admin_proto_jwk.clone());
+        cfg
+    };
+
+    // 1. Start hub #1 (`manifest_version == 1`) and pair Alice.
+    let hub1 = UnifiedNode::open(build_hub_cfg(hub_dir.path())).unwrap();
+    assert_eq!(hub1.current_manifest_version().unwrap(), 1);
+    let (hub_addr, hub1_srv) = Arc::clone(&hub1).serve(loopback_zero()).await.unwrap();
+
+    let mut alice_cfg = NodeConfig::local(NodeId::new("alice@macbook").unwrap(), alice_dir.path());
+    alice_cfg.secret_backend = Some(SecretBackend::File);
+    let alice1 = UnifiedNode::open(alice_cfg.clone()).unwrap();
+
+    let scopes = ["dm:send=*", "dm:receive", "kv:read=shared/*", "kv:write=shared/*"];
+    let (inv, _) = hub1
+        .create_admin_invite(&admin_ca, "alice@macbook", &scopes, TrustTier::Org, 300_000)
+        .unwrap();
+    let paired = alice1.accept_am2_invite(&inv).await.unwrap();
+    assert_eq!(paired.negotiated.updated_manifest_version, Some(1));
+
+    // Save v1 signed manifest to verify anti-rollback still rejects v1 after v2 is observed.
+    let alice_auth = hyp_node::engine::AuthenticatedPeer {
+        peer_id: "alice@macbook".to_string(),
+        scopes: hyp_proto::scopes::ScopeSet::from_strings(&scopes),
+        trust_tier: TrustTier::Org,
+    };
+    let (v1_manifest, _, _) = hub1.build_signed_manifest(Some(&alice_auth)).unwrap();
+
+    // 2. Shut down BOTH hub and Alice, then restart hub on the SAME address & state dir!
+    alice1.shutdown();
+    hub1.shutdown();
+    hub1_srv.abort();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let hub2 = UnifiedNode::open(build_hub_cfg(hub_dir.path())).unwrap();
+    assert_eq!(
+        hub2.current_manifest_version().unwrap(),
+        2,
+        "restarted hub MUST monotonically bump manifest_version to avoid equivocation"
+    );
+    let (_hub2_addr, _hub2_srv) = Arc::clone(&hub2).serve(hub_addr).await.unwrap();
+
+    // 3. Restart Alice and reconnect to restarted hub: MUST succeed cleanly (no ManifestRollback)!
+    let alice2 = UnifiedNode::open(alice_cfg).unwrap();
+    let link = alice2
+        .connect_peer("restart-hub", &format!("http://{hub_addr}"))
+        .await
+        .expect("paired client MUST reconnect cleanly after hub restart");
+    assert_eq!(link.peer_id(), "restart-hub");
+    let rec = alice2
+        .db()
+        .peers()
+        .get_peer("restart-hub")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.manifest_version, 2);
+
+    // 4. Anti-rollback still fails closed if an attacker replays the stale v1 manifest!
+    let replay_err = alice2
+        .verify_and_cache_peer_manifest("restart-hub", &v1_manifest, None, false)
+        .unwrap_err();
+    assert!(
+        matches!(
+            replay_err,
+            NodeError::Negotiation(NegotiationError::ManifestRollbackDetected { .. })
+                | NodeError::Store(hyp_store::StoreError::ManifestRollback { .. })
+        ),
+        "stale v1 manifest replay after v2 must still fail closed, got {replay_err:?}"
+    );
+
+    alice2.shutdown();
+    hub2.shutdown();
+}
