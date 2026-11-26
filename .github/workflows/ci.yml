@@ -202,6 +202,23 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      - name: Check CLI renderer boundaries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          result=0
+          git grep -nE '(^|[^[:alnum:]_])(emit_error|print_command_error)[[:space:]]*\(|(^|[^[:alnum:]_])JsonEnvelope[[:space:]]*\{' -- \
+            'crates/hyp-cli/src/*.rs' \
+            ':(exclude)crates/hyp-cli/src/main.rs' \
+            ':(exclude)crates/hyp-cli/src/ui.rs' || result=$?
+          if [[ "$result" -eq 0 ]]; then
+            echo "Return CliError to the dispatcher and use a JsonEnvelope builder."
+            exit 1
+          fi
+          if [[ "$result" -gt 1 ]]; then
+            exit "$result"
+          fi
+
       - name: Clippy (zero warnings across workspace & all targets)
         run: cargo clippy --workspace --all-targets --keep-going --locked -- -D warnings
 

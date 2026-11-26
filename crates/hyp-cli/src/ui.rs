@@ -218,21 +218,6 @@ pub fn print_json<T: Serialize>(envelope: &JsonEnvelope<T>) {
     }
 }
 
-pub fn emit_error(
-    command: &str,
-    as_json: bool,
-    exit_code: u8,
-    code: &str,
-    message: impl Into<String>,
-    fix: Option<String>,
-) -> ExitCode {
-    print_command_error(
-        command,
-        as_json,
-        CliError::new(exit_code, code, message).with_optional_fix(fix),
-    )
-}
-
 pub fn print_command_error(command: &str, as_json: bool, mut error: CliError) -> ExitCode {
     let exit = error.exit;
     if as_json {

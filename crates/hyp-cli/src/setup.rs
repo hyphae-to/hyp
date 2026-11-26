@@ -26,8 +26,8 @@ use crate::skill_render::{
     retire_legacy_skill, runtime_skill_paths,
 };
 use crate::ui::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
-    print_warnings,
+    CliError, CommandResult, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, print_json,
+    print_next_steps, print_warnings,
 };
 use crate::wizard;
 use clap::Args;
@@ -536,115 +536,77 @@ pub struct StatusLineDiagnostic {
     pub detail: String,
 }
 
-pub fn run_setup(mut args: SetupArgs) -> ExitCode {
+pub fn run_setup(args: SetupArgs) -> CommandResult {
+    CommandResult::new("setup", args.json, setup(args))
+}
+
+fn setup(mut args: SetupArgs) -> Result<ExitCode, CliError> {
     let cmd = "setup";
     let as_json = args.json;
     if args.statusline && args.restore_statusline {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "`--statusline` and `--restore-statusline` are mutually exclusive",
-            Some(
-                "Pass either `--statusline` to enable or `--restore-statusline` to restore."
-                    .to_string(),
-            ),
-        );
+        )
+        .with_fix(
+            "Pass either `--statusline` to enable or `--restore-statusline` to restore."
+                .to_string(),
+        ));
     }
     if args.no_skills && args.refresh_skills {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "`--no-skills` and `--refresh-skills` are mutually exclusive",
-            Some(
-                "Pass either `--no-skills` to skip skills or `--refresh-skills` to update them."
-                    .to_string(),
-            ),
-        );
+        )
+        .with_fix(
+            "Pass either `--no-skills` to skip skills or `--refresh-skills` to update them."
+                .to_string(),
+        ));
     }
     if args.plugins_dir.is_some() && args.plugins_archive.is_some() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "`--plugins-dir` and `--plugins-archive` are mutually exclusive",
-            Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
-        );
+        )
+        .with_fix("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()));
     }
     if args.openclaw_prompt_injection && args.no_openclaw_prompt_injection {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "CONFLICTING_FLAGS",
-            "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive",
-            Some(
+        return Err(CliError::usage("CONFLICTING_FLAGS", "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive").with_fix(
                 "Pass either `--openclaw-prompt-injection` (enable) or `--no-openclaw-prompt-injection` (disable)."
                     .to_string(),
-            ),
-        );
+            ));
     }
     if args.interactive {
         if as_json {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INTERACTIVE_WITH_JSON",
-                "`--interactive` cannot be combined with `--json`",
-                Some(
+            return Err(CliError::usage("INTERACTIVE_WITH_JSON", "`--interactive` cannot be combined with `--json`").with_fix(
                     "Use explicit flags for machine-readable output: `hyp setup --harness <list> [--statusline] [--mod] [--no-skills] [--no-commands] --json`."
                         .to_string(),
-                ),
-            );
+                ));
         }
         if args.restore_statusline || args.refresh_skills {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "CONFLICTING_FLAGS",
-                "`--interactive` cannot be combined with `--restore-statusline` or `--refresh-skills`",
-                Some(
+            return Err(CliError::usage("CONFLICTING_FLAGS", "`--interactive` cannot be combined with `--restore-statusline` or `--refresh-skills`").with_fix(
                     "Run `hyp setup --interactive` to pick harnesses and components interactively."
                         .to_string(),
-                ),
-            );
+                ));
         }
         if !io::stdout().is_terminal() {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INTERACTIVE_REQUIRES_TTY",
-                "`--interactive` requires an interactive terminal (TTY)",
-                Some(
+            return Err(CliError::usage("INTERACTIVE_REQUIRES_TTY", "`--interactive` requires an interactive terminal (TTY)").with_fix(
                     "Run in a TTY or pass explicit flags: `hyp setup --harness <list> [--statusline] [--mod] [--no-skills] [--no-commands]`."
                         .to_string(),
-                ),
-            );
+                ));
         }
     }
 
     let Some(home) = resolve_home_dir(args.home.as_deref()) else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "MISSING_HOME",
             "Could not determine home directory (set HOME or pass --home <dir>)",
-            Some("Pass --home <dir>.".to_string()),
-        );
+        )
+        .with_fix("Pass --home <dir>.".to_string()));
     };
 
-    let bin_path = match resolve_binary_path(args.bin.as_deref()) {
-        Ok(p) => p,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "BIN_PATH_ERROR", e, None),
-    };
+    let bin_path = resolve_binary_path(args.bin.as_deref())
+        .map_err(|e| CliError::error("BIN_PATH_ERROR", e))?;
 
     let claude_profiles = resolve_claude_profiles(
         &home,
@@ -655,17 +617,10 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
     let mut targets = match parse_harness_selection(&args.harness, &home, &claude_profiles) {
         Ok(t) => t,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_HARNESS",
-                e,
-                Some(
+            return Err(CliError::usage("INVALID_HARNESS", e).with_fix(
                     "Use --harness all or one of: antigravity, claude, codex, cursor, opencode, gemini, openclaw, herdr, t3."
                         .to_string(),
-                ),
-            );
+                ));
         }
     };
 
@@ -719,10 +674,10 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
             }
             Ok(None) => {
                 println!("Cancelled — no files were written.");
-                return ExitCode::from(EXIT_OK);
+                return Ok(ExitCode::from(EXIT_OK));
             }
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "INTERACTIVE_ERROR", e, None);
+                return Err(CliError::error("INTERACTIVE_ERROR", e));
             }
         }
     }
@@ -833,28 +788,20 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
                             extra_next.push("hyp plugin install herdr-mod".to_string());
                         }
                         Err(err) => {
-                            return emit_error(
-                                cmd,
-                                as_json,
-                                EXIT_ERROR,
+                            return Err(CliError::error(
                                 "HERDR_MOD_FAILED",
                                 format!("Failed to install Herdr mod: {}", err.message),
-                                None,
-                            );
+                            ));
                         }
                     }
                 }
                 results.push(outcome);
             }
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "SETUP_FAILED",
                     format!("Failed to configure {}: {e}", kind.as_str()),
-                    None,
-                );
+                ));
             }
         }
     }
@@ -895,15 +842,9 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         if let Some(ref hm) = herdr_mod_outcome {
             data_map.insert("herdrMod".to_string(), json!(hm));
         }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(Value::Object(data_map)),
-            warnings,
-            next,
-            error: None,
-        };
+        let envelope = JsonEnvelope::ok(cmd.to_string(), summary, Value::Object(data_map))
+            .warnings(warnings)
+            .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -921,50 +862,39 @@ pub fn run_setup(mut args: SetupArgs) -> ExitCode {
         print_next_steps(&next);
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
-pub fn run_onboard(args: OnboardArgs) -> ExitCode {
+pub fn run_onboard(args: OnboardArgs) -> CommandResult {
+    CommandResult::new("onboard", args.json, onboard(args))
+}
+
+fn onboard(args: OnboardArgs) -> Result<ExitCode, CliError> {
     if args.preview_anim {
-        return wizard::run_preview_animation(args.no_anim);
+        return Ok(wizard::run_preview_animation(args.no_anim));
     }
 
-    let cmd = "onboard";
     let as_json = args.json;
 
     if args.plugins_dir.is_some() && args.plugins_archive.is_some() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "`--plugins-dir` and `--plugins-archive` are mutually exclusive",
-            Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
-        );
+        )
+        .with_fix("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()));
     }
     if args.openclaw_prompt_injection && args.no_openclaw_prompt_injection {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "CONFLICTING_FLAGS",
-            "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive",
-            Some(
+        return Err(CliError::usage("CONFLICTING_FLAGS", "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive").with_fix(
                 "Pass either `--openclaw-prompt-injection` (enable) or `--no-openclaw-prompt-injection` (disable)."
                     .to_string(),
-            ),
-        );
+            ));
     }
 
     let Some(home) = resolve_home_dir(args.home.as_deref()) else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "MISSING_HOME",
             "Could not determine home directory (set HOME or pass --home <dir>)",
-            None,
-        );
+        ));
     };
 
     if args.install_skill {
@@ -1003,47 +933,30 @@ fn run_onboard_deterministic(
     args: OnboardArgs,
     home: PathBuf,
     selection_override: Option<wizard::SetupSelection>,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "onboard";
     let as_json = args.json;
 
     if args.plugins_dir.is_some() && args.plugins_archive.is_some() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "`--plugins-dir` and `--plugins-archive` are mutually exclusive",
-            Some("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()),
-        );
+        )
+        .with_fix("Specify at most one of `--plugins-dir` or `--plugins-archive`.".to_string()));
     }
     if args.openclaw_prompt_injection && args.no_openclaw_prompt_injection {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "CONFLICTING_FLAGS",
-            "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive",
-            Some(
+        return Err(CliError::usage("CONFLICTING_FLAGS", "`--openclaw-prompt-injection` and `--no-openclaw-prompt-injection` are mutually exclusive").with_fix(
                 "Pass either `--openclaw-prompt-injection` (enable) or `--no-openclaw-prompt-injection` (disable)."
                     .to_string(),
-            ),
-        );
+            ));
     }
 
     let profile = args.profile.to_node_profile();
     let node_id = args.node_id.unwrap_or_else(default_node_id);
     if node_id == LOCAL_NODE_ID || !is_valid_node_id(&node_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "INVALID_NODE_ID",
-            format!(
+        return Err(CliError::usage("INVALID_NODE_ID", format!(
                 "Invalid --node-id '{node_id}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and not be 'local'"
-            ),
-            Some("Example: --node-id alice@macbook".to_string()),
-        );
+            )).with_fix("Example: --node-id alice@macbook".to_string()));
     }
 
     let state_dir = resolve_state_dir(args.state_dir.as_deref(), None, Some(&home));
@@ -1052,19 +965,15 @@ fn run_onboard_deterministic(
     let previous_config_path =
         resolve_config_path_for_read(None, args.state_dir.as_deref(), Some(&home));
     let existing_config = previous_config_path.exists();
-    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
-        Ok(m) => m,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
-    };
+    let mut cfg_map = NodeFile::read_document_or_empty(&config_path)
+        .map_err(|e| CliError::error("CONFIG_ERROR", e))?;
     let kv_choice = if args.kv {
         Some(true)
     } else if args.no_kv {
         Some(false)
     } else {
-        let previous_kv = match kv_tool_override(cfg_map.get("kv")) {
-            Ok(value) => value,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
-        };
+        let previous_kv =
+            kv_tool_override(cfg_map.get("kv")).map_err(|e| CliError::error("CONFIG_ERROR", e))?;
         if selection_override.is_some() {
             let question = "Enable the shared key-value tool for agents?";
             let prompt = if existing_config {
@@ -1085,16 +994,9 @@ fn run_onboard_deterministic(
                         "" => break (!existing_config).then_some(false),
                         _ => println!("Please enter yes or no."),
                     },
-                    Ok(None) => return ExitCode::from(EXIT_OK),
+                    Ok(None) => return Ok(ExitCode::from(EXIT_OK)),
                     Err(e) => {
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
-                            "TTY_READ_ERROR",
-                            e.to_string(),
-                            None,
-                        );
+                        return Err(CliError::error("TTY_READ_ERROR", e.to_string()));
                     }
                 }
             }
@@ -1110,9 +1012,7 @@ fn run_onboard_deterministic(
         }
     }
 
-    if let Err(e) = ensure_dir(&state_dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
 
     // 1. Optional join token inspection & staging (stdin or file ONLY — never raw token in argv!).
     let mut warnings = Vec::new();
@@ -1120,7 +1020,7 @@ fn run_onboard_deterministic(
         match read_and_stage_join_token(join_source, &mut warnings) {
             Ok(info) => Some(info),
             Err((exit_code, err_code, msg, fix)) => {
-                return emit_error(cmd, as_json, exit_code, err_code, msg, fix);
+                return Err(CliError::new(exit_code, err_code, msg).with_optional_fix(fix));
             }
         }
     } else {
@@ -1133,14 +1033,10 @@ fn run_onboard_deterministic(
     let keys = match secrets.load_or_create_node_keys(&node_id) {
         Ok(k) => k,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "KEYSTORE_ERROR",
                 format!("Failed to initialize node identity keys: {e}"),
-                None,
-            );
+            ));
         }
     };
     let kid = keys.kid();
@@ -1152,19 +1048,15 @@ fn run_onboard_deterministic(
     let db = match NodeDb::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "DB_ERROR",
                 format!("Failed to open {}: {e}", db_path.display()),
-                None,
-            );
+            ));
         }
     };
-    if let Err(e) = db.local().set_metadata("node_id", &node_id) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None);
-    }
+    db.local()
+        .set_metadata("node_id", &node_id)
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
     let _ = db
         .local()
         .set_metadata("node_profile", profile_as_str(profile));
@@ -1197,9 +1089,7 @@ fn run_onboard_deterministic(
         );
     }
 
-    if let Err(e) = NodeFile::write_document(&config_path, cfg_map) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    NodeFile::write_document(&config_path, cfg_map).map_err(|e| CliError::error("IO_ERROR", e))?;
 
     let using_default_paths = args.state_dir.is_none() && args.home.is_none();
     let state_flag_suffix = if using_default_paths {
@@ -1241,17 +1131,10 @@ fn run_onboard_deterministic(
                 live_join_outcome = Some(outcome);
             }
             Some(Err(LiveHandshakeError::Rejected { code, message })) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    code,
-                    message,
-                    Some(
-                        "Verify the pairing invite is valid, unexpired, and not already claimed."
-                            .to_string(),
-                    ),
-                );
+                return Err(CliError::error(code, message).with_fix(
+                    "Verify the pairing invite is valid, unexpired, and not already claimed."
+                        .to_string(),
+                ));
             }
             Some(Err(LiveHandshakeError::Unreachable(reason))) => {
                 let target_ep = staged.endpoint.as_deref().unwrap_or(&staged.raw_token);
@@ -1261,16 +1144,14 @@ fn run_onboard_deterministic(
                 ));
                 if staged.format != "url" {
                     // Preserve SecretStore staging for offline test compatibility, never plaintext.
-                    if let Err(e) = secrets.set("staged-join-token", &staged.raw_token) {
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
-                            "KEYSTORE_ERROR",
-                            format!("Failed to stage join token in SecretStore: {e}"),
-                            None,
-                        );
-                    }
+                    secrets
+                        .set("staged-join-token", &staged.raw_token)
+                        .map_err(|e| {
+                            CliError::error(
+                                "KEYSTORE_ERROR",
+                                format!("Failed to stage join token in SecretStore: {e}"),
+                            )
+                        })?;
                     if let Some(ref peer_id) = staged.peer_node_id {
                         if is_valid_node_id(peer_id) && peer_id != LOCAL_NODE_ID {
                             let _ = db.peers().upsert_peer(
@@ -1306,16 +1187,14 @@ fn run_onboard_deterministic(
             }
             None => {
                 // Legacy v1 `t3mp1_` token without router URL: stage in SecretStore and guide user to v2 pairing.
-                if let Err(e) = secrets.set("staged-join-token", &staged.raw_token) {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "KEYSTORE_ERROR",
-                        format!("Failed to stage join token in SecretStore: {e}"),
-                        None,
-                    );
-                }
+                secrets
+                    .set("staged-join-token", &staged.raw_token)
+                    .map_err(|e| {
+                        CliError::error(
+                            "KEYSTORE_ERROR",
+                            format!("Failed to stage join token in SecretStore: {e}"),
+                        )
+                    })?;
                 deferred_join_cmd = Some(if let Some(ref path) = staged.source_file {
                     format!("hyp pair accept --token-file {path}{state_flag_suffix}")
                 } else {
@@ -1326,10 +1205,8 @@ fn run_onboard_deterministic(
     }
 
     // 5. Run harness setup for detected (or requested/interactively selected) harnesses under --home.
-    let bin_path = match resolve_binary_path(args.bin.as_deref()) {
-        Ok(p) => p,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "BIN_PATH_ERROR", e, None),
-    };
+    let bin_path = resolve_binary_path(args.bin.as_deref())
+        .map_err(|e| CliError::error("BIN_PATH_ERROR", e))?;
     let claude_profiles = resolve_claude_profiles(
         &home,
         args.home.is_some(),
@@ -1355,10 +1232,8 @@ fn run_onboard_deterministic(
         )
     } else {
         let harness_spec = args.harness.as_deref().unwrap_or("auto");
-        let targets = match parse_harness_selection(harness_spec, &home, &claude_profiles) {
-            Ok(t) => t,
-            Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HARNESS", e, None),
-        };
+        let targets = parse_harness_selection(harness_spec, &home, &claude_profiles)
+            .map_err(|e| CliError::usage("INVALID_HARNESS", e))?;
         let pi_override = if args.openclaw_prompt_injection {
             Some(true)
         } else if args.no_openclaw_prompt_injection {
@@ -1576,20 +1451,18 @@ fn run_onboard_deterministic(
         if let Some(ref hm) = herdr_mod_outcome {
             data_map.insert("herdrMod".to_string(), json!(hm));
         }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Onboarded Hyphae v2 Node '{}' ({}, kid {})",
                 node_id,
                 profile_as_str(profile),
                 kid
-            )),
-            data: Some(Value::Object(data_map)),
-            warnings,
-            next,
-            error: None,
-        };
+            ),
+            Value::Object(data_map),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -1647,7 +1520,7 @@ fn run_onboard_deterministic(
         print_next_steps(&next);
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 /// Resolves a clean default `user@host` nodeId, falling back to `hostname -s` and (on macOS)

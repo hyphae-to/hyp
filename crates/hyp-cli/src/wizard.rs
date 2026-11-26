@@ -20,8 +20,7 @@ use crate::setup::{
     read_openclaw_hyphae_preferences, resolve_claude_profiles,
 };
 use crate::ui::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
-    print_warnings,
+    CliError, EXIT_ERROR, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
 use hyp_harness::protocol::HarnessKind;
 use serde::{Deserialize, Serialize};
@@ -879,7 +878,7 @@ pub struct LaunchSpec {
 
 /// Outcome returned by the interactive wizard so `setup::run_onboard` can fall through to local setup.
 pub enum WizardOutcome {
-    Finished(ExitCode),
+    Finished(Result<ExitCode, CliError>),
     #[allow(dead_code)]
     RunLocalCliSetup,
     RunLocalCliSetupWithSelection(SetupSelection),
@@ -4122,7 +4121,7 @@ pub fn run_install_skill(
     claude_config_dir: Option<&Path>,
     harness_spec: Option<&str>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "onboard";
     let include_path_scan = !explicit_home;
     let targets = match parse_skill_harness_selection(
@@ -4134,17 +4133,10 @@ pub fn run_install_skill(
     ) {
         Ok(t) => t,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_HARNESS",
-                e,
-                Some(
+            return Err(CliError::usage("INVALID_HARNESS", e).with_fix(
                     "Use --harness all, auto, or one of: claude, codex, antigravity (agy), opencode, cursor, gemini, openclaw, t3."
                         .to_string(),
-                ),
-            );
+                ));
         }
     };
 
@@ -4156,7 +4148,7 @@ pub fn run_install_skill(
     ) {
         Ok(v) => v,
         Err(e) => {
-            return emit_error(cmd, as_json, EXIT_ERROR, "SKILL_INSTALL_FAILED", e, None);
+            return Err(CliError::error("SKILL_INSTALL_FAILED", e));
         }
     };
 
@@ -4185,21 +4177,19 @@ pub fn run_install_skill(
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            summary,
+            json!({
                 "mode": "install-skill",
                 "skill": "hyp-setup",
                 "home": home.display().to_string(),
                 "installedCount": installed.len(),
                 "installed": installed,
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!("OK    {summary}");
@@ -4213,7 +4203,7 @@ pub fn run_install_skill(
         print_next_steps(&next);
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 // ============================================================================
@@ -4488,8 +4478,7 @@ fn spawn_interactive_harness(
     harness: LaunchableHarness,
     exe_path: &Path,
     prompt: &str,
-    as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let spec = harness.build_launch_spec(prompt);
     let mut cmd = Command::new(exe_path);
     cmd.args(&spec.args);
@@ -4497,21 +4486,18 @@ fn spawn_interactive_harness(
 
     match status_retrying_busy(&mut cmd) {
         Ok(status) => match status.code() {
-            Some(code) => ExitCode::from((code.clamp(0, 255)) as u8),
-            None => ExitCode::from(EXIT_ERROR),
+            Some(code) => Ok(ExitCode::from((code.clamp(0, 255)) as u8)),
+            None => Ok(ExitCode::from(EXIT_ERROR)),
         },
-        Err(e) => emit_error(
-            "onboard",
-            as_json,
-            EXIT_ERROR,
+        Err(e) => Err(CliError::error(
             "LAUNCH_FAILED",
             format!(
                 "Failed to launch {} ({}): {e}",
                 harness.display_name(),
                 exe_path.display()
             ),
-            Some("Run `hyp onboard --yes` for quick local CLI setup.".to_string()),
-        ),
+        )
+        .with_fix("Run `hyp onboard --yes` for quick local CLI setup.".to_string())),
     }
 }
 
@@ -4520,27 +4506,24 @@ fn spawn_herdr_template(
     template_name: &str,
     prompt: &str,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let mut cmd = build_herdr_template_launch_command(hc_bin, template_name, prompt);
     cmd.stdin(Stdio::null());
 
     let output = match output_retrying_busy(&mut cmd) {
         Ok(out) => out,
         Err(e) => {
-            return emit_error(
-                "onboard",
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "HERDR_LAUNCH_FAILED",
                 format!(
                     "Failed to launch Herdr template '{template_name}' via {}: {e}",
                     hc_bin.display()
                 ),
-                Some(
-                    "Run `hc templates` to verify Herdr, or `hyp onboard --yes` for local CLI setup."
-                        .to_string(),
-                ),
-            );
+            )
+            .with_fix(
+                "Run `hc templates` to verify Herdr, or `hyp onboard --yes` for local CLI setup."
+                    .to_string(),
+            ));
         }
     };
 
@@ -4565,32 +4548,18 @@ fn spawn_herdr_template(
         } else {
             format!("Herdr failed launching template '{template_name}': {stderr_snippet}")
         };
-        return emit_error(
-            "onboard",
-            as_json,
-            EXIT_ERROR,
-            "HERDR_LAUNCH_FAILED",
-            detail,
-            Some(
-                "Run `hc templates` to verify Herdr, or `hyp onboard --yes` for local CLI setup."
-                    .to_string(),
-            ),
-        );
+        return Err(CliError::error("HERDR_LAUNCH_FAILED", detail).with_fix(
+            "Run `hc templates` to verify Herdr, or `hyp onboard --yes` for local CLI setup."
+                .to_string(),
+        ));
     }
 
     let stdout_raw = String::from_utf8_lossy(&output.stdout);
     let Some(address) = parse_herdr_run_address_json(&stdout_raw) else {
         let snippet = truncate_chars(stdout_raw.trim(), 200);
-        return emit_error(
-            "onboard",
-            as_json,
-            EXIT_ERROR,
-            "HERDR_LAUNCH_FAILED",
-            format!(
+        return Err(CliError::error("HERDR_LAUNCH_FAILED", format!(
                 "Herdr launched template '{template_name}' but returned no valid terminal address (stdout: {snippet})"
-            ),
-            Some("Run `hc list` to inspect running Herdr terminals.".to_string()),
-        );
+            )).with_fix("Run `hc list` to inspect running Herdr terminals.".to_string()));
     };
 
     let raise_window = !as_json && io::stdout().is_terminal();
@@ -4607,22 +4576,19 @@ fn spawn_herdr_template(
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: "onboard".to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            "onboard".to_string(),
+            summary,
+            json!({
                 "mode": "herdr_launch",
                 "template": template_name,
                 "terminal": address,
                 "openedInHerdrApp": opened_in_herdr_app,
-            })),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        };
+            }),
+        )
+        .next(next);
         print_json(&envelope);
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     if opened_in_herdr_app || !io::stdout().is_terminal() {
@@ -4633,27 +4599,24 @@ fn spawn_herdr_template(
             println!("      Window:   Herdr app (focused tab)");
         }
         print_next_steps(&next);
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     println!("Launched Herdr terminal {address} — attaching (Ctrl+\\ to detach)...");
     let mut attach_cmd = build_herdr_attach_command(hc_bin, &address);
     match status_retrying_busy(&mut attach_cmd) {
         Ok(status) => match status.code() {
-            Some(code) => ExitCode::from((code.clamp(0, 255)) as u8),
-            None => ExitCode::from(EXIT_ERROR),
+            Some(code) => Ok(ExitCode::from((code.clamp(0, 255)) as u8)),
+            None => Ok(ExitCode::from(EXIT_ERROR)),
         },
-        Err(e) => emit_error(
-            "onboard",
-            false,
-            EXIT_ERROR,
+        Err(e) => Err(CliError::error(
             "HERDR_LAUNCH_FAILED",
             format!(
                 "Launched Herdr terminal '{address}', but failed to attach via {}: {e}",
                 hc_bin.display()
             ),
-            Some(format!("Attach manually with: hc attach {address}")),
-        ),
+        )
+        .with_fix(format!("Attach manually with: hc attach {address}"))),
     }
 }
 
@@ -4704,7 +4667,7 @@ fn install_and_handoff_cli(
     existing_node: Option<&ExistingNodeInfo>,
     cli_bin: &str,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     // If the CLI binary is not on PATH, seamlessly fall back to Path B (install skill + guide)
     // instead of failing with a broken exec error.
     let Some(exe_path) = find_executable_in_path(chosen.binary_name()) else {
@@ -4738,14 +4701,7 @@ fn install_and_handoff_cli(
     ) {
         Ok(v) => v,
         Err(e) => {
-            return emit_error(
-                "onboard",
-                as_json,
-                EXIT_ERROR,
-                "SKILL_INSTALL_FAILED",
-                e,
-                None,
-            );
+            return Err(CliError::error("SKILL_INSTALL_FAILED", e));
         }
     };
 
@@ -4761,7 +4717,7 @@ fn install_and_handoff_cli(
     }
 
     let prompt = build_onboarding_prompt(&primary_skill, existing_node.map(|n| n.node_id.as_str()));
-    spawn_interactive_harness(chosen, &exe_path, &prompt, as_json)
+    spawn_interactive_harness(chosen, &exe_path, &prompt)
 }
 
 fn install_and_handoff_herdr(
@@ -4772,7 +4728,7 @@ fn install_and_handoff_herdr(
     claude_config_dir: Option<&Path>,
     existing_node: Option<&ExistingNodeInfo>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let inferred = infer_harness_from_herdr_template(&template.name, &template.command);
     let targets = collect_skill_targets_with_primary(
         inferred.map(LaunchableHarness::kind),
@@ -4789,14 +4745,7 @@ fn install_and_handoff_herdr(
     ) {
         Ok(v) => v,
         Err(e) => {
-            return emit_error(
-                "onboard",
-                as_json,
-                EXIT_ERROR,
-                "SKILL_INSTALL_FAILED",
-                e,
-                None,
-            );
+            return Err(CliError::error("SKILL_INSTALL_FAILED", e));
         }
     };
 
@@ -4808,16 +4757,8 @@ fn install_and_handoff_herdr(
         // Fallback cross-tool location when template name doesn't name a known harness and no
         // harness dirs exist under `home` yet.
         let fallback = shared_setup_skill_path(home);
-        if let Err(e) = write_setup_skill(home, &fallback) {
-            return emit_error(
-                "onboard",
-                as_json,
-                EXIT_ERROR,
-                "SKILL_INSTALL_FAILED",
-                e,
-                None,
-            );
-        }
+        write_setup_skill(home, &fallback)
+            .map_err(|e| CliError::error("SKILL_INSTALL_FAILED", e))?;
         installed.push(InstalledSkillEntry {
             harness: "agents".to_string(),
             path: fallback.display().to_string(),
@@ -4961,19 +4902,12 @@ fn install_and_emit_manual_guide(
     existing_node: Option<&ExistingNodeInfo>,
     cli_bin: &str,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let (primary_skill, installed) =
         match install_manual_guide_skills(harness, home, explicit_home, claude_config_dir) {
             Ok(res) => res,
             Err(e) => {
-                return emit_error(
-                    "onboard",
-                    as_json,
-                    EXIT_ERROR,
-                    "SKILL_INSTALL_FAILED",
-                    e,
-                    None,
-                );
+                return Err(CliError::error("SKILL_INSTALL_FAILED", e));
             }
         };
 
@@ -5030,20 +4964,17 @@ fn install_and_emit_manual_guide(
                 obj.insert("deeplink".to_string(), json!(url));
             }
         }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: "onboard".to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            "onboard".to_string(),
+            format!(
                 "Installed 'hyp-setup' skill for {} (manual handoff guide)",
                 harness.display_name()
-            )),
-            data: Some(data),
-            warnings: Vec::new(),
-            next: steps,
-            error: None,
-        };
+            ),
+            data,
+        )
+        .next(steps);
         print_json(&envelope);
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     print_manual_guide_plain(
@@ -5056,7 +4987,7 @@ fn install_and_emit_manual_guide(
         &mcp_status,
         deeplink.as_deref(),
     );
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 // ============================================================================
@@ -8496,7 +8427,7 @@ impl<'a> WizardDispatch<'a> {
             json,
         } = self;
         match action {
-            WizardAction::Cancel => WizardOutcome::Finished(ExitCode::from(EXIT_OK)),
+            WizardAction::Cancel => WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK))),
             WizardAction::RunLocalCliSetupWithSelection(selection) => {
                 WizardOutcome::RunLocalCliSetupWithSelection(selection)
             }
@@ -8554,17 +8485,13 @@ impl<'a> WizardDispatch<'a> {
                     &mcp_status,
                     deeplink.as_deref(),
                 );
-                WizardOutcome::Finished(ExitCode::from(EXIT_OK))
+                WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK)))
             }
             #[cfg(unix)]
-            WizardAction::Error(msg) => WizardOutcome::Finished(emit_error(
-                "onboard",
-                false,
-                EXIT_ERROR,
-                "WIZARD_ERROR",
-                msg,
-                Some("Re-run with `hyp onboard --yes` for local CLI setup.".to_string()),
-            )),
+            WizardAction::Error(msg) => {
+                WizardOutcome::Finished(Err(CliError::error("WIZARD_ERROR", msg)
+                    .with_fix("Re-run with `hyp onboard --yes` for local CLI setup.".to_string())))
+            }
         }
     }
 }
@@ -8620,7 +8547,7 @@ fn run_numbered_herdr_fallback(
     loop {
         let reply = match read_tty_line("Choose template [1]: ") {
             Ok(Some(line)) => line.trim().to_ascii_lowercase(),
-            Ok(None) => return Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK))),
+            Ok(None) => return Some(WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK)))),
             Err(_) => return None,
         };
         if reply.is_empty() {
@@ -8633,7 +8560,7 @@ fn run_numbered_herdr_fallback(
             return None;
         }
         if matches!(reply.as_str(), "q" | "quit") {
-            return Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)));
+            return Some(WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK))));
         }
         if let Some(n) = reply
             .parse::<usize>()
@@ -8736,14 +8663,10 @@ fn run_plain_tty_manual_guide(
         match install_manual_guide_skills(harness, home, explicit_home, claude_config_dir) {
             Ok(res) => res,
             Err(e) => {
-                return Some(WizardOutcome::Finished(emit_error(
-                    "onboard",
-                    false,
-                    EXIT_ERROR,
+                return Some(WizardOutcome::Finished(Err(CliError::error(
                     "SKILL_INSTALL_FAILED",
                     e,
-                    None,
-                )));
+                ))));
             }
         };
 
@@ -8770,7 +8693,7 @@ fn run_plain_tty_manual_guide(
             },
             Ok(OpenClawConfigAction::Back) => return None,
             Ok(OpenClawConfigAction::Cancel | OpenClawConfigAction::Continue) => {
-                return Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)));
+                return Some(WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK))));
             }
             Err(_) => DesktopMcpStatus::Skipped,
         }
@@ -8779,7 +8702,7 @@ fn run_plain_tty_manual_guide(
             PlainMcpConfirmOutcome::Status(st) => st,
             PlainMcpConfirmOutcome::Back => return None,
             PlainMcpConfirmOutcome::Quit => {
-                return Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)));
+                return Some(WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK))));
             }
         }
     };
@@ -8821,7 +8744,7 @@ fn run_plain_tty_manual_guide(
             return None;
         }
     }
-    Some(WizardOutcome::Finished(ExitCode::from(EXIT_OK)))
+    Some(WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK))))
 }
 
 fn run_numbered_fallback_wizard(
@@ -8881,16 +8804,15 @@ fn run_numbered_fallback_wizard(
 
         let reply = match read_tty_line("Selection [1]: ") {
             Ok(Some(line)) => line.trim().to_ascii_lowercase(),
-            Ok(None) => return WizardOutcome::Finished(ExitCode::from(EXIT_OK)),
+            Ok(None) => return WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK))),
             Err(e) => {
-                return WizardOutcome::Finished(emit_error(
-                    "onboard",
-                    false,
-                    EXIT_ERROR,
+                return WizardOutcome::Finished(Err(CliError::error(
                     "TTY_READ_ERROR",
                     format!("Failed reading interactive selection: {e}"),
-                    Some("Re-run with `hyp onboard --yes` for non-interactive setup.".to_string()),
-                ));
+                )
+                .with_fix(
+                    "Re-run with `hyp onboard --yes` for non-interactive setup.".to_string(),
+                )));
             }
         };
 
@@ -8984,17 +8906,10 @@ fn run_numbered_fallback_wizard(
                                         return dispatch.dispatch(WizardAction::Cancel);
                                     }
                                     Err(e) => {
-                                        return WizardOutcome::Finished(emit_error(
-                                            "onboard",
-                                            false,
-                                            EXIT_ERROR,
-                                            "TTY_READ_ERROR",
-                                            e,
-                                            Some(
+                                        return WizardOutcome::Finished(Err(CliError::error("TTY_READ_ERROR", e).with_fix(
                                                 "Re-run with `hyp onboard --yes` for non-interactive setup."
                                                     .to_string(),
-                                            ),
-                                        ));
+                                            )));
                                     }
                                 }
                             }
@@ -9007,17 +8922,14 @@ fn run_numbered_fallback_wizard(
                             return dispatch.dispatch(WizardAction::Cancel);
                         }
                         Err(e) => {
-                            return WizardOutcome::Finished(emit_error(
-                                "onboard",
-                                false,
-                                EXIT_ERROR,
+                            return WizardOutcome::Finished(Err(CliError::error(
                                 "TTY_READ_ERROR",
                                 e,
-                                Some(
-                                    "Re-run with `hyp onboard --yes` for non-interactive setup."
-                                        .to_string(),
-                                ),
-                            ));
+                            )
+                            .with_fix(
+                                "Re-run with `hyp onboard --yes` for non-interactive setup."
+                                    .to_string(),
+                            )));
                         }
                     }
                 }
@@ -9147,34 +9059,23 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                     .dispatch(WizardAction::ManualGuide(guide));
             }
         }
-        return WizardOutcome::Finished(emit_error(
-            "onboard",
-            args.json,
-            EXIT_ERROR,
-            "NO_LAUNCHABLE_HARNESS",
-            "No interactive agent CLI (claude, codex, agy, opencode, cursor-agent, gemini) found on PATH",
-            Some(
+        return WizardOutcome::Finished(Err(CliError::error("NO_LAUNCHABLE_HARNESS", "No interactive agent CLI (claude, codex, agy, opencode, cursor-agent, gemini) found on PATH").with_fix(
                 "Run `hyp onboard --yes` for local CLI onboarding, or install an agent CLI."
                     .to_string(),
-            ),
-        ));
+            )));
     }
 
     // 1. Direct Herdr template handoff: `--assist herdr:<template>` or interactive `--assist herdr`.
     let lower = trimmed.to_ascii_lowercase();
     if lower == "herdr" || lower.starts_with("herdr:") {
         let Some(hc_bin) = find_executable_in_path("hc") else {
-            return WizardOutcome::Finished(emit_error(
-                "onboard",
-                args.json,
-                EXIT_ERROR,
+            return WizardOutcome::Finished(Err(CliError::error(
                 "HERDR_CLI_NOT_FOUND",
                 "Could not find 'hc' on PATH for Herdr launch templates",
-                Some(
-                    "Install Herdr (`hc`) or run `hyp onboard --yes` for local CLI setup."
-                        .to_string(),
-                ),
-            ));
+            )
+            .with_fix(
+                "Install Herdr (`hc`) or run `hyp onboard --yes` for local CLI setup.".to_string(),
+            )));
         };
 
         let existing_node = detect_existing_node(args, home);
@@ -9182,14 +9083,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
 
         if lower == "herdr" {
             if discovered.is_empty() {
-                return WizardOutcome::Finished(emit_error(
-                    "onboard",
-                    args.json,
-                    EXIT_ERROR,
-                    "HERDR_NO_TEMPLATES",
-                    "Herdr (`hc templates --json`) returned no launch templates",
-                    Some("Create a template under ~/.config/herdr-core/templates or pass `--assist <harness>`.".to_string()),
-                ));
+                return WizardOutcome::Finished(Err(CliError::error("HERDR_NO_TEMPLATES", "Herdr (`hc templates --json`) returned no launch templates").with_fix("Create a template under ~/.config/herdr-core/templates or pass `--assist <harness>`.".to_string())));
             }
             #[cfg(unix)]
             if io::stdout().is_terminal() && !args.json {
@@ -9224,29 +9118,19 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                 ) {
                     return outcome;
                 }
-                return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+                return WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK)));
             }
             let names: Vec<&str> = discovered.iter().map(|t| t.name.as_str()).collect();
-            return WizardOutcome::Finished(emit_error(
-                "onboard",
-                args.json,
-                EXIT_USAGE,
-                "HERDR_TEMPLATE_REQUIRED",
-                "Specify a Herdr launch template in non-interactive mode: `--assist herdr:<template>`",
-                Some(format!("Available templates: {}", names.join(", "))),
-            ));
+            return WizardOutcome::Finished(Err(CliError::usage("HERDR_TEMPLATE_REQUIRED", "Specify a Herdr launch template in non-interactive mode: `--assist herdr:<template>`").with_fix(format!("Available templates: {}", names.join(", ")))));
         }
 
         let tmpl_name = trimmed[6..].trim();
         if tmpl_name.is_empty() {
-            return WizardOutcome::Finished(emit_error(
-                "onboard",
-                args.json,
-                EXIT_USAGE,
+            return WizardOutcome::Finished(Err(CliError::usage(
                 "INVALID_ASSIST_HARNESS",
                 "Empty Herdr template name in `--assist herdr:`",
-                Some("Example: hyp onboard --assist herdr:claude-gateway".to_string()),
-            ));
+            )
+            .with_fix("Example: hyp onboard --assist herdr:claude-gateway".to_string())));
         }
 
         let template = discovered
@@ -9308,14 +9192,10 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
                     }
                 }
                 Err(e) => {
-                    return WizardOutcome::Finished(emit_error(
-                        "onboard",
-                        false,
-                        EXIT_ERROR,
+                    return WizardOutcome::Finished(Err(CliError::error(
                         "SKILL_INSTALL_FAILED",
                         e,
-                        None,
-                    ));
+                    )));
                 }
             }
         }
@@ -9332,7 +9212,7 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
             ) {
                 return outcome;
             }
-            return WizardOutcome::Finished(ExitCode::from(EXIT_OK));
+            return WizardOutcome::Finished(Ok(ExitCode::from(EXIT_OK)));
         }
 
         return WizardDispatch::new(args, home, existing_node.as_ref(), &cli_bin)
@@ -9341,16 +9221,9 @@ pub fn run_assist(args: &OnboardArgs, home: &Path, assist_target: &str) -> Wizar
 
     // 3. Verified interactive CLI harnesses.
     let Some(chosen) = LaunchableHarness::parse_alias(trimmed) else {
-        return WizardOutcome::Finished(emit_error(
-            "onboard",
-            args.json,
-            EXIT_USAGE,
-            "INVALID_ASSIST_HARNESS",
-            format!(
+        return WizardOutcome::Finished(Err(CliError::usage("INVALID_ASSIST_HARNESS", format!(
                 "Unsupported --assist harness '{trimmed}' (expected auto, herdr:<template>, claude, claude-desktop, codex, codex-desktop, opencode-desktop, agy/antigravity, opencode, cursor/cursor-agent, gemini, openclaw, or t3)"
-            ),
-            Some("Example: hyp onboard --assist claude".to_string()),
-        ));
+            )).with_fix("Example: hyp onboard --assist claude".to_string())));
     };
 
     if !args.json {
@@ -10341,7 +10214,10 @@ command = "other"
                 else {
                     panic!("expected setup command");
                 };
-                assert_eq!(crate::setup::run_setup(args), ExitCode::SUCCESS);
+                assert_eq!(
+                    crate::finish_command(crate::setup::run_setup(args)),
+                    ExitCode::SUCCESS
+                );
             };
 
             if !cli_first {
