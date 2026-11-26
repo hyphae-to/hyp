@@ -915,10 +915,13 @@ input.secret-masked {
   border-radius: 50%;
   background: rgba(134, 211, 154, 0.2);
   color: var(--sage);
-  display: grid;
-  place-items: center;
-  font-weight: 700;
-  font-size: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+.done-icon svg {
+  display: block;
 }
 .done-banner strong {
   display: block;
@@ -926,7 +929,7 @@ input.secret-masked {
   font-size: 0.88rem;
   margin-bottom: 3px;
 }
-.done-banner span {
+.done-banner > div span {
   display: block;
   color: var(--text);
   font-size: 0.86rem;
@@ -1045,6 +1048,8 @@ fn render_web_capture_form_html(
     )
 }
 
+const HYPHAE_CHECK_SVG: &str = r#"<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>"#;
+
 fn render_web_capture_saved_html(safe_name: &str, backend_raw: &str) -> String {
     let backend_pretty = friendly_backend_label(backend_raw);
     format!(
@@ -1071,7 +1076,7 @@ fn render_web_capture_saved_html(safe_name: &str, backend_raw: &str) -> String {
       <h1>Return to your setup now</h1>
       <p class="lead">Your secret was saved securely and the one-shot local listener has shut down. You can close this tab.</p>
       <div class="done-banner">
-        <span class="done-icon" aria-hidden="true">✓</span>
+        <span class="done-icon" aria-hidden="true">{HYPHAE_CHECK_SVG}</span>
         <div>
           <strong>Stored in {backend_pretty}</strong>
           <span>Saved under <code>{safe_name}</code> without echoing any secret bytes.</span>
