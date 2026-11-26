@@ -2051,6 +2051,7 @@ fn inspect_hp2p1(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitC
     if as_json {
         let error = if expired {
             Some(CliError {
+                exit: EXIT_ERROR,
                 code: "TOKEN_EXPIRED".to_string(),
                 message: format!(
                     "P2P pairing offer '{}' expired at {}",
@@ -2268,6 +2269,7 @@ fn inspect_am2(token: &str, mut warnings: Vec<String>, as_json: bool) -> ExitCod
     if as_json {
         let error = if expired {
             Some(CliError {
+                exit: EXIT_ERROR,
                 code: "TOKEN_EXPIRED".to_string(),
                 message: "Org Admin-CA invite bundle has expired".to_string(),
                 fix: next.first().cloned(),

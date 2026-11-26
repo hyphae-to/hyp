@@ -3142,6 +3142,7 @@ fn run_check(url: Option<String>, config: Option<PathBuf>, as_json: bool) -> Exi
             None
         } else {
             Some(CliError {
+                exit: EXIT_ERROR,
                 code: "DEPLOY_CHECK_FAILED".to_string(),
                 message: summary.clone(),
                 fix: next.first().cloned(),

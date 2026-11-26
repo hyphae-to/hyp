@@ -1216,6 +1216,7 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                     warnings,
                     next: Vec::new(),
                     error: Some(CliError {
+                        exit: EXIT_ERROR,
                         code: swap_err.code.to_string(),
                         message: swap_err.message,
                         fix: Some("Original binary remains intact; inspect the release artifact before retrying.".to_string()),
@@ -1317,6 +1318,7 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                 None
             } else {
                 Some(CliError {
+                    exit: EXIT_ERROR,
                     code: "FLEET_PARTIAL_FAILURE".to_string(),
                     message: "Local node updated, but one or more remote peers failed to update"
                         .to_string(),

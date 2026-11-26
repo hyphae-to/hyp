@@ -25,7 +25,7 @@ use crate::drop_cmd::{
     wait_for_relay_drop,
 };
 use crate::gate_cmd::sanitize_tty_display;
-use crate::ui::{EXIT_ERROR, EXIT_USAGE, emit_error};
+use crate::ui::{EXIT_ERROR, EXIT_USAGE};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
@@ -155,15 +155,13 @@ impl CeremonyError {
         self
     }
 
+    pub fn into_cli_error(self) -> crate::ui::CliError {
+        crate::ui::CliError::new(self.exit_code, self.code, self.message)
+            .with_optional_fix(self.next)
+    }
+
     pub fn emit(self, cmd: &str, as_json: bool) -> ExitCode {
-        emit_error(
-            cmd,
-            as_json,
-            self.exit_code,
-            self.code,
-            self.message,
-            self.next,
-        )
+        crate::ui::print_command_error(cmd, as_json, self.into_cli_error())
     }
 }
 

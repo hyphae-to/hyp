@@ -84,6 +84,52 @@ pub struct CliError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    #[serde(skip)]
+    pub exit: u8,
+}
+
+impl CliError {
+    pub fn new(exit: u8, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            fix: None,
+            exit,
+        }
+    }
+
+    pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(EXIT_ERROR, code, message)
+    }
+
+    pub fn usage(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(EXIT_USAGE, code, message)
+    }
+
+    pub fn with_fix(self, fix: impl Into<String>) -> Self {
+        self.with_optional_fix(Some(fix.into()))
+    }
+
+    pub fn with_optional_fix(mut self, fix: Option<String>) -> Self {
+        self.fix = fix;
+        self
+    }
+}
+
+pub struct CommandResult {
+    pub command: &'static str,
+    pub as_json: bool,
+    pub result: Result<ExitCode, CliError>,
+}
+
+impl CommandResult {
+    pub fn new(command: &'static str, as_json: bool, result: Result<ExitCode, CliError>) -> Self {
+        Self {
+            command,
+            as_json,
+            result,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +149,30 @@ pub struct JsonEnvelope<T: Serialize> {
     pub error: Option<CliError>,
 }
 
+impl<T: Serialize> JsonEnvelope<T> {
+    pub fn ok(command: impl Into<String>, summary: impl Into<String>, data: T) -> Self {
+        Self {
+            ok: true,
+            command: command.into(),
+            summary: Some(summary.into()),
+            data: Some(data),
+            warnings: Vec::new(),
+            next: Vec::new(),
+            error: None,
+        }
+    }
+
+    pub fn warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
+    }
+
+    pub fn next(mut self, next: Vec<String>) -> Self {
+        self.next = next;
+        self
+    }
+}
+
 pub fn print_json<T: Serialize>(envelope: &JsonEnvelope<T>) {
     match serde_json::to_string_pretty(envelope) {
         Ok(s) => println!("{s}"),
@@ -120,29 +190,33 @@ pub fn emit_error(
     message: impl Into<String>,
     fix: Option<String>,
 ) -> ExitCode {
-    let message = message.into();
+    print_command_error(
+        command,
+        as_json,
+        CliError::new(exit_code, code, message).with_optional_fix(fix),
+    )
+}
+
+pub fn print_command_error(command: &str, as_json: bool, error: CliError) -> ExitCode {
+    let exit = error.exit;
     if as_json {
         let envelope: JsonEnvelope<Value> = JsonEnvelope {
             ok: false,
             command: command.to_string(),
-            summary: Some(message.clone()),
+            summary: Some(error.message.clone()),
             data: None,
             warnings: Vec::new(),
-            next: fix.iter().cloned().collect(),
-            error: Some(CliError {
-                code: code.to_string(),
-                message,
-                fix,
-            }),
+            next: error.fix.iter().cloned().collect(),
+            error: Some(error),
         };
         print_json(&envelope);
     } else {
-        eprintln!("FAIL [{code}] {message}");
-        if let Some(f) = fix {
-            eprintln!("Fix:  {f}");
+        eprintln!("FAIL [{}] {}", error.code, error.message);
+        if let Some(fix) = error.fix {
+            eprintln!("Fix:  {fix}");
         }
     }
-    ExitCode::from(exit_code)
+    ExitCode::from(exit)
 }
 
 pub fn print_checks(checks: &[CliCheck]) {

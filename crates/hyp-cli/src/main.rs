@@ -322,6 +322,13 @@ fn build_current_thread_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| format!("Failed to start async runtime: {e}"))
 }
 
+fn finish_command(outcome: ui::CommandResult) -> ExitCode {
+    match outcome.result {
+        Ok(exit) => exit,
+        Err(error) => ui::print_command_error(outcome.command, outcome.as_json, error),
+    }
+}
+
 fn main() -> ExitCode {
     if let Some(code) = try_hook_fast_path() {
         return code;
@@ -503,7 +510,7 @@ fn main() -> ExitCode {
         Commands::Inbox { command } => gate_cmd::run_inbox(command),
         Commands::Kv { command } => kv_cmd::run_kv(command),
         Commands::Emit(args) => emit_cmd::run_emit(args),
-        Commands::Auth { command } => auth_cmd::run_auth(command),
+        Commands::Auth { command } => finish_command(auth_cmd::run_auth(command)),
         Commands::Join(args) => join_cmd::run_join(args),
         Commands::Drop { command } => drop_cmd::run_drop(command),
         Commands::Relay { command } => drop_cmd::run_relay(command),
