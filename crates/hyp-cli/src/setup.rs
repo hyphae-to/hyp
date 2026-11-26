@@ -1346,10 +1346,11 @@ fn run_onboard_deterministic(
     }
 
     // 6. Auto-install & start background daemon OS service on real default workstation onboarding
-    //    (never touches live LaunchAgents/systemd when --no-start, --home, --state-dir, CI, or HYPHAE_NO_SERVICE=1).
+    //    (never touches live LaunchAgents/systemd when --no-start, --home, --state-dir, CI,
+    //     HYPHAE_NO_SERVICE=1, or an ephemeral temporary HOME).
     let ci_active = std::env::var("CI").ok().is_some_and(|v| !v.is_empty());
-    let no_service_env = std::env::var("HYPHAE_NO_SERVICE").ok().as_deref() == Some("1");
-    let daemon_auto = if !args.no_start && using_default_paths && !ci_active && !no_service_env {
+    let service_disabled = service::service_control_disabled(&home).is_some();
+    let daemon_auto = if !args.no_start && using_default_paths && !ci_active && !service_disabled {
         let res = service::install_and_start_default(Path::new(&bin_path), &home, &state_dir);
         if let Some(ref w) = res.warning {
             warnings.push(w.clone());

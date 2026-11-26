@@ -29,18 +29,17 @@ pub fn repo_plugins_dir() -> PathBuf {
         .join("plugins")
 }
 
-/// Constructs a `Command` for the compiled `hyp` binary with complete environment
-/// isolation so live user config, sockets, Keychain, and ambient `HYPHAE_*` variables
-/// can never leak into tests. Sets `HYPHAE_PLUGINS_DIR` to the local repo `plugins/`
-/// directory so `hyp setup` / `hyp plugin` exercise real compile-time SHA-256 verification
-/// completely offline (tests wanting offline-failure or tarball behavior can remove/override it).
-pub fn isolated_cmd(home: &Path) -> Command {
-    let mut cmd = Command::new(hyp_bin());
+/// Applies complete hermetic environment isolation to `cmd` so live user config, sockets,
+/// Keychain, host OS service managers (`HYPHAE_NO_SERVICE=1`, `HYPHAE_NO_SERVICE_RESTART=1`),
+/// ambient `HYPHAE_*` variables, and parent live-harness identity variables can NEVER leak into tests.
+fn apply_isolated_env(cmd: &mut Command, home: &Path) {
     cmd.env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("HYPHAE_SECRET_BACKEND", "file")
         .env("HYPHAE_NO_OPEN", "1")
+        .env("HYPHAE_NO_SERVICE", "1")
+        .env("HYPHAE_NO_SERVICE_RESTART", "1")
         .env("HYPHAE_PLUGINS_DIR", repo_plugins_dir())
         .env("HYPHAE_TAILSCALE_BIN", "none")
         .env_remove("HYPHAE_TAILSCALE_STATUS_JSON")
@@ -55,7 +54,33 @@ pub fn isolated_cmd(home: &Path) -> Command {
         .env_remove("AGENTS_MESH_SOCKET")
         .env_remove("HYPHAE_RELEASE_PUBKEY")
         .env_remove("HYPHAE_DISABLE_AUTO_UPDATE")
-        .env_remove("HYPHAE_DROP_PORTAL_URL");
+        .env_remove("HYPHAE_DROP_PORTAL_URL")
+        // Scrub ambient live-harness env vars so running `cargo test` inside Claude Code / Herdr /
+        // Codex / OpenClaw / OpenCode / T3 never leaks parent harness identity into tests (B5).
+        .env_remove("HC_TERMINAL_ID")
+        .env_remove("HC_TERMINAL_SOCKET")
+        .env_remove("HYPHAE_SESSION_ID")
+        .env_remove("HYPHAE_SESSION_TOKEN")
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_ENV_FILE")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("OPENCLAW_STATE_DIR")
+        .env_remove("OPENCLAW_CONFIG_PATH")
+        .env_remove("OPENCLAW_HOME")
+        .env_remove("OPENCODE_CONFIG")
+        .env_remove("T3CODE_HOME");
+}
+
+/// Constructs a `Command` for the compiled `hyp` binary with complete environment
+/// isolation so live user config, sockets, Keychain, host OS service managers, and ambient
+/// harness/Hyphae variables can never leak into tests. Sets `HYPHAE_PLUGINS_DIR` to the local
+/// repo `plugins/` directory so `hyp setup` / `hyp plugin` exercise real compile-time SHA-256
+/// verification completely offline (tests wanting offline-failure or tarball behavior can
+/// remove/override it).
+pub fn isolated_cmd(home: &Path) -> Command {
+    let mut cmd = Command::new(hyp_bin());
+    apply_isolated_env(&mut cmd, home);
     cmd
 }
 
@@ -713,28 +738,9 @@ sys.stdout.write(json.dumps({
     .to_string();
 
     let mut py = Command::new("python3");
-    py.args(["-c", PY_PTY_DRIVER])
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("HYPHAE_SECRET_BACKEND", "file")
-        .env("HYPHAE_NO_OPEN", "1")
-        .env("HYPHAE_PLUGINS_DIR", repo_plugins_dir())
-        .env("HYPHAE_TAILSCALE_BIN", "none")
-        .env_remove("HYPHAE_TAILSCALE_STATUS_JSON")
-        .env_remove("HYPHAE_TAILSCALE_SERVE_STATUS_JSON")
-        .env_remove("HYPHAE_SSH_BIN")
-        .env_remove("HYPHAE_PLUGINS_ARCHIVE")
-        .env_remove("HYPHAE_PLUGINS_URL")
-        .env_remove("HYPHAE_CONFIG")
-        .env_remove("HYPHAE_STATE_DIR")
-        .env_remove("HYPHAE_CONFIG_DIR")
-        .env_remove("HYPHAE_SOCKET")
-        .env_remove("AGENTS_MESH_SOCKET")
-        .env_remove("HYPHAE_RELEASE_PUBKEY")
-        .env_remove("HYPHAE_DISABLE_AUTO_UPDATE")
-        .env_remove("HYPHAE_DROP_PORTAL_URL")
-        .stdin(Stdio::piped())
+    py.args(["-c", PY_PTY_DRIVER]);
+    apply_isolated_env(&mut py, home);
+    py.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

@@ -641,7 +641,34 @@ fn service_status_json_reports_cleanly_in_isolated_home() {
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["command"], "service status");
     assert_eq!(payload["data"]["installed"], false);
+    assert_eq!(payload["data"]["loaded"], false);
     assert_eq!(payload["data"]["daemon"]["alive"], false);
+
+    // Mutating `hyp service` verbs MUST fail closed in isolated temp homes (even if HYPHAE_NO_SERVICE
+    // is explicitly unset!) so tests can NEVER bootout/mutate the host OS LaunchAgent/systemd unit.
+    for verb in ["install", "uninstall", "start", "stop", "restart"] {
+        let mut cmd = isolated_cmd(home);
+        cmd.env_remove("HYPHAE_NO_SERVICE");
+        let mut_out = cmd
+            .args(["service", verb, "--home", home.to_str().unwrap(), "--json"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("run hyp service {verb}: {e}"));
+        assert_eq!(
+            mut_out.status.code(),
+            Some(1),
+            "hyp service {verb} on temp home must fail closed: stdout={} stderr={}",
+            String::from_utf8_lossy(&mut_out.stdout),
+            String::from_utf8_lossy(&mut_out.stderr)
+        );
+        let err_json = parse_json_stdout(&mut_out);
+        assert_eq!(err_json["ok"], false, "verb={verb} json={err_json}");
+        let msg = err_json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("Refusing to run `hyp service"),
+            "verb={verb} expected fail-closed refusal message: {err_json}"
+        );
+    }
 }
 
 #[cfg(unix)]

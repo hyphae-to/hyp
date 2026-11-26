@@ -34,6 +34,394 @@ const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DAEMON_RPC_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Pure fail-closed check for environment variable boolean flags (`1`, `true`, `yes`).
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+/// Canonicalizes the longest existing ancestor of `path` and re-joins any non-existent tail
+/// components, so symlinked temp paths like `/var/folders/...` <-> `/private/var/folders/...`
+/// and `/tmp/...` <-> `/private/tmp/...` normalize consistently even before directories are created.
+fn best_effort_canonicalize(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut tail = Vec::new();
+    let mut cur = path;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if parent.exists() {
+            if let Ok(mut base) = std::fs::canonicalize(parent) {
+                for comp in tail.into_iter().rev() {
+                    base.push(comp);
+                }
+                return base;
+            }
+            break;
+        }
+        cur = parent;
+    }
+    path.to_path_buf()
+}
+
+/// Returns `true` if `home` points inside an ephemeral/temporary directory (e.g. `TempDir`,
+/// `/tmp`, `/private/tmp`, `/var/folders`, `/private/var/folders`, or Windows `%TEMP%`/`Temp`).
+///
+/// Used as a fail-closed guard so isolated tests and ephemeral temp homes NEVER mutate the
+/// live host OS service manager (`launchctl`, `systemctl --user`, or `schtasks`).
+pub(crate) fn is_ephemeral_temp_home(home: &Path) -> bool {
+    let raw_home = home;
+    let canon_home = best_effort_canonicalize(home);
+
+    let matches_prefix = |prefix: &Path| -> bool {
+        // Guard against pathological root-only prefixes (e.g. TMPDIR=/).
+        if prefix.as_os_str().is_empty() || prefix.components().count() <= 1 {
+            return false;
+        }
+        raw_home.starts_with(prefix) || canon_home.starts_with(prefix)
+    };
+
+    let sys_tmp = std::env::temp_dir();
+    if matches_prefix(&sys_tmp) || matches_prefix(&best_effort_canonicalize(&sys_tmp)) {
+        return true;
+    }
+
+    for static_prefix in [
+        Path::new("/tmp"),
+        Path::new("/private/tmp"),
+        Path::new("/var/folders"),
+        Path::new("/private/var/folders"),
+    ] {
+        if matches_prefix(static_prefix) {
+            return true;
+        }
+    }
+
+    for var in ["TMPDIR", "TEMP", "TMP"] {
+        if let Some(val) = std::env::var_os(var) {
+            let p = PathBuf::from(val);
+            if matches_prefix(&p) || matches_prefix(&best_effort_canonicalize(&p)) {
+                return true;
+            }
+        }
+    }
+
+    // Cross-platform Windows temp path pattern (`\AppData\Local\Temp` or `\Windows\Temp`).
+    let normalized = raw_home
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    if normalized.contains("/appdata/local/temp/")
+        || normalized.ends_with("/appdata/local/temp")
+        || normalized.contains("/windows/temp/")
+        || normalized.ends_with("/windows/temp")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Returns `Some(reason)` when host OS service control (`launchctl` / `systemctl --user` /
+/// `schtasks`) MUST be disabled to protect the live host (either `HYPHAE_NO_SERVICE=1` is set
+/// or `home` resolves to an ephemeral temporary directory).
+pub(crate) fn service_control_disabled(home: &Path) -> Option<&'static str> {
+    if env_flag_enabled("HYPHAE_NO_SERVICE") {
+        return Some("HYPHAE_NO_SERVICE is set");
+    }
+    if is_ephemeral_temp_home(home) {
+        return Some("ephemeral temporary home directory");
+    }
+    None
+}
+
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
+    allow(dead_code)
+)]
+fn ensure_service_control_allowed(home: &Path, action: &str) -> Result<(), String> {
+    if let Some(reason) = service_control_disabled(home) {
+        return Err(format!(
+            "Refusing to run `hyp service {action}` against the host OS service manager ({reason}; home={}). \
+             Run `hyp daemon` directly in isolated/test environments, or unset HYPHAE_NO_SERVICE with a persistent HOME.",
+            home.display()
+        ));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Pure Cross-Platform macOS `launchd` State Machine (Testable on Every OS)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) struct LaunchctlOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+impl LaunchctlOutput {
+    pub(crate) fn success(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+
+    pub(crate) fn detail(&self) -> String {
+        let stderr = self.stderr.trim();
+        let stdout = self.stdout.trim();
+        if !stderr.is_empty() {
+            stderr.to_string()
+        } else if !stdout.is_empty() {
+            stdout.to_string()
+        } else {
+            match self.exit_code {
+                Some(code) => format!("exit status {code}"),
+                None => "unknown error".to_string(),
+            }
+        }
+    }
+
+    fn combined_lower(&self) -> String {
+        format!("{}\n{}", self.stderr, self.stdout).to_ascii_lowercase()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) struct LaunchdRetryPolicy {
+    /// Max polls waiting for `launchctl bootout` to finish tearing down (`40 × 50ms = 2.0s`).
+    pub bootout_poll_attempts: usize,
+    pub bootout_poll_interval: Duration,
+    /// Max retries for `launchctl bootstrap` on transient unload-race errors (`10 × 150ms = 1.5s`).
+    pub bootstrap_max_attempts: usize,
+    pub bootstrap_retry_delay: Duration,
+}
+
+impl Default for LaunchdRetryPolicy {
+    fn default() -> Self {
+        Self {
+            bootout_poll_attempts: 40,
+            bootout_poll_interval: Duration::from_millis(50),
+            bootstrap_max_attempts: 10,
+            bootstrap_retry_delay: Duration::from_millis(150),
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn is_launchd_service_already_loaded(out: &LaunchctlOutput) -> bool {
+    let lower = out.combined_lower();
+    out.exit_code == Some(37)
+        || lower.contains("service already loaded")
+        || lower.contains("already loaded")
+        || lower.contains("already bootstrapped")
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn is_launchd_transient_bootstrap_race(out: &LaunchctlOutput) -> bool {
+    let lower = out.combined_lower();
+    out.exit_code == Some(5)
+        || out.exit_code == Some(35)
+        || out.exit_code == Some(36)
+        || lower.contains("input/output error")
+        || lower.contains("could not find service")
+        || lower.contains("service is disabled")
+        || lower.contains("operation now in progress")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("try again")
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn launchd_is_loaded_via<F>(target: &str, run: &mut F) -> bool
+where
+    F: FnMut(&[&str]) -> Result<LaunchctlOutput, String>,
+{
+    run(&["print", target])
+        .map(|o| o.success())
+        .unwrap_or(false)
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn launchd_bootout_and_wait_via<F, S>(
+    target: &str,
+    policy: LaunchdRetryPolicy,
+    run: &mut F,
+    sleep: &mut S,
+) where
+    F: FnMut(&[&str]) -> Result<LaunchctlOutput, String>,
+    S: FnMut(Duration),
+{
+    let _ = run(&["bootout", target]);
+    let polls = policy.bootout_poll_attempts.max(1);
+    for attempt in 0..polls {
+        if !launchd_is_loaded_via(target, run) {
+            return;
+        }
+        if attempt + 1 < polls {
+            sleep(policy.bootout_poll_interval);
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn launchd_bootstrap_with_retry_via<F, S>(
+    domain: &str,
+    target: &str,
+    plist_str: &str,
+    force_kill_if_loaded: bool,
+    policy: LaunchdRetryPolicy,
+    run: &mut F,
+    sleep: &mut S,
+) -> Result<(), String>
+where
+    F: FnMut(&[&str]) -> Result<LaunchctlOutput, String>,
+    S: FnMut(Duration),
+{
+    let _ = run(&["enable", target]);
+    let max_attempts = policy.bootstrap_max_attempts.max(1);
+    let mut last_err = String::from("unknown error");
+
+    for attempt in 0..max_attempts {
+        let boot = run(&["bootstrap", domain, plist_str])?;
+        if boot.success() {
+            return Ok(());
+        }
+
+        if is_launchd_service_already_loaded(&boot) {
+            let kick = if force_kill_if_loaded {
+                run(&["kickstart", "-k", target])?
+            } else {
+                run(&["kickstart", target])?
+            };
+            if kick.success() {
+                return Ok(());
+            }
+            last_err = kick.detail();
+            if attempt + 1 < max_attempts {
+                if launchd_is_loaded_via(target, run) {
+                    launchd_bootout_and_wait_via(target, policy, run, sleep);
+                } else {
+                    sleep(policy.bootstrap_retry_delay);
+                }
+                let _ = run(&["enable", target]);
+                continue;
+            }
+            return Err(format!(
+                "launchctl bootstrap failed after {max_attempts} attempts: {last_err}"
+            ));
+        }
+
+        last_err = boot.detail();
+        if is_launchd_transient_bootstrap_race(&boot) {
+            if attempt + 1 < max_attempts {
+                let _ = run(&["enable", target]);
+                sleep(policy.bootstrap_retry_delay);
+                continue;
+            }
+            return Err(format!(
+                "launchctl bootstrap failed after {max_attempts} attempts: {last_err}"
+            ));
+        }
+
+        return Err(format!("launchctl bootstrap failed: {last_err}"));
+    }
+
+    Err(format!(
+        "launchctl bootstrap failed after {max_attempts} attempts: {last_err}"
+    ))
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn launchd_install_via<F, S>(
+    domain: &str,
+    target: &str,
+    plist_str: &str,
+    policy: LaunchdRetryPolicy,
+    run: &mut F,
+    sleep: &mut S,
+) -> Result<(), String>
+where
+    F: FnMut(&[&str]) -> Result<LaunchctlOutput, String>,
+    S: FnMut(Duration),
+{
+    launchd_bootout_and_wait_via(target, policy, run, sleep);
+    launchd_bootstrap_with_retry_via(domain, target, plist_str, false, policy, run, sleep)
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn launchd_start_via<F, S>(
+    domain: &str,
+    target: &str,
+    plist_str: &str,
+    policy: LaunchdRetryPolicy,
+    run: &mut F,
+    sleep: &mut S,
+) -> Result<(), String>
+where
+    F: FnMut(&[&str]) -> Result<LaunchctlOutput, String>,
+    S: FnMut(Duration),
+{
+    let _ = run(&["enable", target]);
+    if launchd_is_loaded_via(target, run) {
+        let kick = run(&["kickstart", target])?;
+        if kick.success() {
+            return Ok(());
+        }
+        // Recover cleanly from stale `is_loaded` race (e.g. `Could not find service` right after
+        // `bootout`) or a wedged loaded job by falling through to retryable `bootstrap`.
+        if launchd_is_loaded_via(target, run) {
+            launchd_bootout_and_wait_via(target, policy, run, sleep);
+        }
+    }
+    launchd_bootstrap_with_retry_via(domain, target, plist_str, false, policy, run, sleep)
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn launchd_stop_via<F, S>(
+    target: &str,
+    policy: LaunchdRetryPolicy,
+    run: &mut F,
+    sleep: &mut S,
+) where
+    F: FnMut(&[&str]) -> Result<LaunchctlOutput, String>,
+    S: FnMut(Duration),
+{
+    launchd_bootout_and_wait_via(target, policy, run, sleep);
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn launchd_restart_via<F, S>(
+    domain: &str,
+    target: &str,
+    plist_str: &str,
+    policy: LaunchdRetryPolicy,
+    run: &mut F,
+    sleep: &mut S,
+) -> Result<(), String>
+where
+    F: FnMut(&[&str]) -> Result<LaunchctlOutput, String>,
+    S: FnMut(Duration),
+{
+    let _ = run(&["enable", target]);
+    let kick = run(&["kickstart", "-k", target])?;
+    if kick.success() {
+        return Ok(());
+    }
+    if launchd_is_loaded_via(target, run) {
+        launchd_bootout_and_wait_via(target, policy, run, sleep);
+    }
+    launchd_bootstrap_with_retry_via(domain, target, plist_str, true, policy, run, sleep)
+}
+
 #[derive(Subcommand)]
 pub enum ServiceCommand {
     /// Install and start the Hyphae background daemon OS service (LaunchAgent / systemd --user / Windows Task Scheduler)
@@ -977,18 +1365,21 @@ mod platform {
         format!("gui/{uid}/{MACOS_LAUNCHAGENT_LABEL}")
     }
 
-    fn run_launchctl(args: &[&str]) -> Result<std::process::Output, String> {
-        Command::new("launchctl")
+    fn run_launchctl(args: &[&str]) -> Result<LaunchctlOutput, String> {
+        let out = Command::new("launchctl")
             .args(args)
             .output()
-            .map_err(|e| format!("failed to execute launchctl: {e}"))
+            .map_err(|e| format!("failed to execute launchctl: {e}"))?;
+        Ok(LaunchctlOutput {
+            exit_code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        })
     }
 
     fn is_loaded(uid: &str) -> bool {
         let target = service_target(uid);
-        run_launchctl(&["print", &target])
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        launchd_is_loaded_via(&target, &mut run_launchctl)
     }
 
     pub fn install(
@@ -997,6 +1388,7 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "install")?;
         ensure_dir(&spec.state_dir, true)?;
         ensure_dir(&spec.logs_dir, true)?;
 
@@ -1009,22 +1401,14 @@ mod platform {
         let target = service_target(&uid);
         let plist_str = plist_path.display().to_string();
 
-        // Bootout any existing registration (ignore errors when not currently loaded).
-        let _ = run_launchctl(&["bootout", &target]);
-
-        let boot = run_launchctl(&["bootstrap", &domain, &plist_str])?;
-        if !boot.status.success() {
-            let stderr = String::from_utf8_lossy(&boot.stderr).trim().to_string();
-            return Err(format!(
-                "launchctl bootstrap failed ({}): {}",
-                boot.status,
-                if stderr.is_empty() {
-                    "unknown error"
-                } else {
-                    &stderr
-                }
-            ));
-        }
+        launchd_install_via(
+            &domain,
+            &target,
+            &plist_str,
+            LaunchdRetryPolicy::default(),
+            &mut run_launchctl,
+            &mut thread::sleep,
+        )?;
 
         let probe = wait_for_daemon_alive(socket, DAEMON_READY_TIMEOUT);
         let detail = if probe.alive {
@@ -1056,9 +1440,15 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "uninstall")?;
         let uid = current_uid()?;
         let target = service_target(&uid);
-        let _ = run_launchctl(&["bootout", &target]);
+        launchd_stop_via(
+            &target,
+            LaunchdRetryPolicy::default(),
+            &mut run_launchctl,
+            &mut thread::sleep,
+        );
 
         let plist_path = macos_plist_path(home);
         if plist_path.exists() {
@@ -1086,6 +1476,7 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "start")?;
         let plist_path = macos_plist_path(home);
         if !plist_path.exists() {
             return Err(format!(
@@ -1098,19 +1489,14 @@ mod platform {
         let target = service_target(&uid);
         let plist_str = plist_path.display().to_string();
 
-        if is_loaded(&uid) {
-            let kick = run_launchctl(&["kickstart", &target])?;
-            if !kick.status.success() {
-                let stderr = String::from_utf8_lossy(&kick.stderr).trim().to_string();
-                return Err(format!("launchctl kickstart failed: {stderr}"));
-            }
-        } else {
-            let boot = run_launchctl(&["bootstrap", &domain, &plist_str])?;
-            if !boot.status.success() {
-                let stderr = String::from_utf8_lossy(&boot.stderr).trim().to_string();
-                return Err(format!("launchctl bootstrap failed: {stderr}"));
-            }
-        }
+        launchd_start_via(
+            &domain,
+            &target,
+            &plist_str,
+            LaunchdRetryPolicy::default(),
+            &mut run_launchctl,
+            &mut thread::sleep,
+        )?;
 
         let probe = wait_for_daemon_alive(socket, DAEMON_READY_TIMEOUT);
         let detail = if probe.alive {
@@ -1137,9 +1523,15 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "stop")?;
         let uid = current_uid()?;
         let target = service_target(&uid);
-        let _ = run_launchctl(&["bootout", &target]);
+        launchd_stop_via(
+            &target,
+            LaunchdRetryPolicy::default(),
+            &mut run_launchctl,
+            &mut thread::sleep,
+        );
 
         let plist_path = macos_plist_path(home);
         let probe = probe_daemon_once(socket);
@@ -1162,6 +1554,7 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "restart")?;
         let plist_path = macos_plist_path(home);
         if !plist_path.exists() {
             return Err(format!(
@@ -1174,15 +1567,15 @@ mod platform {
         let target = service_target(&uid);
         let plist_str = plist_path.display().to_string();
 
-        let kick = run_launchctl(&["kickstart", "-k", &target])?;
-        if !kick.status.success() {
-            let _ = run_launchctl(&["bootout", &target]);
-            let boot = run_launchctl(&["bootstrap", &domain, &plist_str])?;
-            if !boot.status.success() {
-                let stderr = String::from_utf8_lossy(&boot.stderr).trim().to_string();
-                return Err(format!("launchctl restart failed: {stderr}"));
-            }
-        }
+        launchd_restart_via(
+            &domain,
+            &target,
+            &plist_str,
+            LaunchdRetryPolicy::default(),
+            &mut run_launchctl,
+            &mut thread::sleep,
+        )
+        .map_err(|e| format!("launchctl restart failed: {e}"))?;
 
         let probe = wait_for_daemon_alive(socket, DAEMON_READY_TIMEOUT);
         let detail = if probe.alive {
@@ -1211,7 +1604,11 @@ mod platform {
     ) -> Result<ServiceActionReport, String> {
         let plist_path = macos_plist_path(home);
         let installed = plist_path.exists();
-        let loaded = current_uid().map(|u| is_loaded(&u)).unwrap_or(false);
+        let loaded = if service_control_disabled(home).is_some() {
+            false
+        } else {
+            current_uid().map(|u| is_loaded(&u)).unwrap_or(false)
+        };
         let probe = probe_daemon_once(socket);
         let detail = if probe.alive && installed {
             format!("Running (LaunchAgent {MACOS_LAUNCHAGENT_LABEL})")
@@ -1357,6 +1754,7 @@ mod platform {
         socket: &Path,
         explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "install")?;
         ensure_dir(&spec.state_dir, true)?;
         ensure_dir(&spec.logs_dir, true)?;
 
@@ -1366,8 +1764,11 @@ mod platform {
 
         let reload = run_systemctl(&["daemon-reload"])?;
         check_systemctl_ok(&reload, "daemon-reload")?;
-        let enable = run_systemctl(&["enable", "--now", LINUX_SYSTEMD_UNIT])?;
-        check_systemctl_ok(&enable, "enable --now")?;
+        let _ = run_systemctl(&["reset-failed", LINUX_SYSTEMD_UNIT]);
+        let enable = run_systemctl(&["enable", LINUX_SYSTEMD_UNIT])?;
+        check_systemctl_ok(&enable, "enable")?;
+        let restart = run_systemctl(&["restart", LINUX_SYSTEMD_UNIT])?;
+        check_systemctl_ok(&restart, "restart")?;
 
         let mut warnings = Vec::new();
         let mut next = vec!["hyp service status".to_string(), "hyp doctor".to_string()];
@@ -1405,6 +1806,7 @@ mod platform {
         socket: &Path,
         explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "uninstall")?;
         let _ = run_systemctl(&["disable", "--now", LINUX_SYSTEMD_UNIT]);
         let unit_path = unit_path_for(home, explicit_home);
         if unit_path.exists() {
@@ -1432,6 +1834,7 @@ mod platform {
         socket: &Path,
         explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "start")?;
         let unit_path = unit_path_for(home, explicit_home);
         if !unit_path.exists() {
             return Err(format!(
@@ -1439,6 +1842,8 @@ mod platform {
                 unit_path.display()
             ));
         }
+        let _ = run_systemctl(&["daemon-reload"]);
+        let _ = run_systemctl(&["reset-failed", LINUX_SYSTEMD_UNIT]);
         let out = run_systemctl(&["start", LINUX_SYSTEMD_UNIT])?;
         check_systemctl_ok(&out, "start")?;
         let probe = wait_for_daemon_alive(socket, DAEMON_READY_TIMEOUT);
@@ -1461,6 +1866,7 @@ mod platform {
         socket: &Path,
         explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "stop")?;
         let unit_path = unit_path_for(home, explicit_home);
         let _ = run_systemctl(&["stop", LINUX_SYSTEMD_UNIT]);
         let probe = probe_daemon_once(socket);
@@ -1483,6 +1889,7 @@ mod platform {
         socket: &Path,
         explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "restart")?;
         let unit_path = unit_path_for(home, explicit_home);
         if !unit_path.exists() {
             return Err(format!(
@@ -1490,6 +1897,8 @@ mod platform {
                 unit_path.display()
             ));
         }
+        let _ = run_systemctl(&["daemon-reload"]);
+        let _ = run_systemctl(&["reset-failed", LINUX_SYSTEMD_UNIT]);
         let out = run_systemctl(&["restart", LINUX_SYSTEMD_UNIT])?;
         check_systemctl_ok(&out, "restart")?;
         let probe = wait_for_daemon_alive(socket, DAEMON_READY_TIMEOUT);
@@ -1514,9 +1923,13 @@ mod platform {
     ) -> Result<ServiceActionReport, String> {
         let unit_path = unit_path_for(home, explicit_home);
         let installed = unit_path.exists();
-        let loaded = run_systemctl(&["is-active", "--quiet", LINUX_SYSTEMD_UNIT])
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let loaded = if service_control_disabled(home).is_some() {
+            false
+        } else {
+            run_systemctl(&["is-active", "--quiet", LINUX_SYSTEMD_UNIT])
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
         let probe = probe_daemon_once(socket);
         let detail = if probe.alive && installed {
             format!("Running (systemd user {LINUX_SYSTEMD_UNIT})")
@@ -1595,12 +2008,26 @@ mod platform {
         }
     }
 
+    fn end_task_and_wait(task_name: &str) {
+        let _ = run_schtasks(&build_schtasks_end_args(task_name));
+        for attempt in 0..20 {
+            let (_installed, running) = query_task(task_name);
+            if !running {
+                return;
+            }
+            if attempt + 1 < 20 {
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
     pub fn install(
         spec: &ServiceSpec,
-        _home: &Path,
+        home: &Path,
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "install")?;
         ensure_dir(&spec.state_dir, true)?;
         ensure_dir(&spec.logs_dir, true)?;
 
@@ -1608,6 +2035,8 @@ mod platform {
         let xml_content = windows_task_xml(spec);
         let xml_bytes = encode_utf16le_bom(&xml_content);
         write_atomic_file(&xml_path, &xml_bytes, true)?;
+
+        end_task_and_wait(WINDOWS_TASK_NAME);
 
         let create_args = build_schtasks_create_args(WINDOWS_TASK_NAME, &xml_path);
         let create_out = run_schtasks(&create_args)?;
@@ -1646,7 +2075,8 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
-        let _ = run_schtasks(&build_schtasks_end_args(WINDOWS_TASK_NAME));
+        ensure_service_control_allowed(home, "uninstall")?;
+        end_task_and_wait(WINDOWS_TASK_NAME);
         let _ = run_schtasks(&build_schtasks_delete_args(WINDOWS_TASK_NAME));
 
         let state_dir = resolve_state_dir(None, None, Some(home));
@@ -1676,6 +2106,7 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "start")?;
         let state_dir = resolve_state_dir(None, None, Some(home));
         let xml_path = windows_task_xml_path(&state_dir);
         let (installed, _running) = query_task(WINDOWS_TASK_NAME);
@@ -1716,9 +2147,10 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "stop")?;
         let state_dir = resolve_state_dir(None, None, Some(home));
         let xml_path = windows_task_xml_path(&state_dir);
-        let _ = run_schtasks(&build_schtasks_end_args(WINDOWS_TASK_NAME));
+        end_task_and_wait(WINDOWS_TASK_NAME);
         let (installed, _running) = query_task(WINDOWS_TASK_NAME);
         let probe = probe_daemon_once(socket);
 
@@ -1741,6 +2173,7 @@ mod platform {
         socket: &Path,
         _explicit_home: bool,
     ) -> Result<ServiceActionReport, String> {
+        ensure_service_control_allowed(home, "restart")?;
         let state_dir = resolve_state_dir(None, None, Some(home));
         let xml_path = windows_task_xml_path(&state_dir);
         let (installed, _running) = query_task(WINDOWS_TASK_NAME);
@@ -1750,8 +2183,7 @@ mod platform {
             ));
         }
 
-        let _ = run_schtasks(&build_schtasks_end_args(WINDOWS_TASK_NAME));
-        thread::sleep(Duration::from_millis(250));
+        end_task_and_wait(WINDOWS_TASK_NAME);
         let run_out = run_schtasks(&build_schtasks_run_args(WINDOWS_TASK_NAME))?;
         check_schtasks_ok(&run_out, "/Run")?;
 
@@ -1786,7 +2218,9 @@ mod platform {
         let state_dir = resolve_state_dir(None, None, Some(home));
         let xml_path = windows_task_xml_path(&state_dir);
         let xml_exists = xml_path.exists();
-        let (installed, loaded) = if explicit_home && !xml_exists {
+        let (installed, loaded) = if service_control_disabled(home).is_some() {
+            (xml_exists, false)
+        } else if explicit_home && !xml_exists {
             (false, false)
         } else {
             query_task(WINDOWS_TASK_NAME)
@@ -1994,6 +2428,29 @@ pub fn restart_if_installed(
             detail: "Could not resolve home directory to inspect background service.".to_string(),
         };
     };
+    if let Some(reason) = service_control_disabled(&resolved_home) {
+        return ServiceRestartOutcome {
+            attempted: false,
+            installed: false,
+            restarted: false,
+            skipped: true,
+            skip_reason: Some("service_control_disabled".to_string()),
+            error: None,
+            detail: format!("Skipped background service restart ({reason})."),
+        };
+    }
+    if env_flag_enabled("HYPHAE_NO_SERVICE_RESTART") {
+        return ServiceRestartOutcome {
+            attempted: false,
+            installed: false,
+            restarted: false,
+            skipped: true,
+            skip_reason: Some("env_disabled".to_string()),
+            error: None,
+            detail: "Skipped background service restart (HYPHAE_NO_SERVICE_RESTART is set)."
+                .to_string(),
+        };
+    }
     let explicit_home = home_override.is_some();
     let probe_sock = resolve_probe_socket(None, state_dir_override, &resolved_home, explicit_home);
 
@@ -2064,6 +2521,16 @@ pub fn install_and_start_default(
     home: &Path,
     state_dir: &Path,
 ) -> AutoStartResult {
+    if let Some(reason) = service_control_disabled(home) {
+        return AutoStartResult {
+            started: false,
+            installed: false,
+            manager: platform::MANAGER_NAME,
+            service: None,
+            detail: format!("Skipped background service install ({reason})"),
+            warning: None,
+        };
+    }
     let explicit_state = state_dir != default_config_dir(Some(home));
     let spec = match build_spec(
         Some(bin_path),
@@ -2685,5 +3152,351 @@ mod tests {
         assert_eq!(parse_loginctl_linger("Linger=yes\n"), Some(true));
         assert_eq!(parse_loginctl_linger("Linger=no\n"), Some(false));
         assert_eq!(parse_loginctl_linger("Other=1\n"), None);
+    }
+
+    fn zero_sleep_policy() -> LaunchdRetryPolicy {
+        LaunchdRetryPolicy {
+            bootout_poll_attempts: 10,
+            bootout_poll_interval: Duration::ZERO,
+            bootstrap_max_attempts: 6,
+            bootstrap_retry_delay: Duration::ZERO,
+        }
+    }
+
+    fn ok_out() -> LaunchctlOutput {
+        LaunchctlOutput {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn err_out(code: i32, stderr: &str) -> LaunchctlOutput {
+        LaunchctlOutput {
+            exit_code: Some(code),
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    #[test]
+    fn launchd_stop_then_start_normal_flow() {
+        use std::cell::{Cell, RefCell};
+
+        let loaded = Cell::new(true);
+        let print_remaining_before_unload = Cell::new(2usize);
+        let calls: RefCell<Vec<Vec<String>>> = RefCell::new(Vec::new());
+        let sleeps = Cell::new(0usize);
+
+        let mut run = |args: &[&str]| -> Result<LaunchctlOutput, String> {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            match args[0] {
+                "bootout" => Ok(ok_out()),
+                "print" => {
+                    if loaded.get() && print_remaining_before_unload.get() > 0 {
+                        print_remaining_before_unload.set(print_remaining_before_unload.get() - 1);
+                        Ok(ok_out())
+                    } else {
+                        loaded.set(false);
+                        Ok(err_out(113, "Could not find service \"to.hyphae.daemon\""))
+                    }
+                }
+                "enable" => Ok(ok_out()),
+                "bootstrap" => {
+                    assert!(!loaded.get(), "bootstrap must run after service unloaded");
+                    loaded.set(true);
+                    Ok(ok_out())
+                }
+                other => panic!("unexpected launchctl subcommand: {other}"),
+            }
+        };
+        let mut sleep = |_d: Duration| {
+            sleeps.set(sleeps.get() + 1);
+        };
+
+        let target = "gui/501/to.hyphae.daemon";
+        let plist = "/Users/alice/Library/LaunchAgents/to.hyphae.daemon.plist";
+
+        launchd_stop_via(target, zero_sleep_policy(), &mut run, &mut sleep);
+        assert!(
+            !loaded.get(),
+            "stop must poll until launchd finishes bootout"
+        );
+        assert_eq!(sleeps.get(), 2);
+
+        launchd_start_via(
+            "gui/501",
+            target,
+            plist,
+            zero_sleep_policy(),
+            &mut run,
+            &mut sleep,
+        )
+        .expect("start after stop must succeed");
+        assert!(loaded.get());
+        let recorded = calls.borrow();
+        assert!(recorded.iter().any(|c| c == &["enable", target]));
+        assert!(
+            recorded
+                .iter()
+                .any(|c| c == &["bootstrap", "gui/501", plist])
+        );
+    }
+
+    #[test]
+    fn launchd_start_recovers_from_stale_is_loaded_kickstart_could_not_find_service_race() {
+        // Exact Issue #21 race: `print` briefly returns 0 (stale during bootout teardown),
+        // then `kickstart` fails with exit 113 `Could not find service`, and `start` automatically
+        // falls back to `bootstrap` and succeeds!
+        let mut print_calls = 0usize;
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut run = |args: &[&str]| -> Result<LaunchctlOutput, String> {
+            calls.push(args.iter().map(|s| s.to_string()).collect());
+            match args[0] {
+                "enable" => Ok(ok_out()),
+                "print" => {
+                    print_calls += 1;
+                    if print_calls == 1 {
+                        Ok(ok_out()) // stale: still unloading
+                    } else {
+                        Ok(err_out(113, "Could not find service \"to.hyphae.daemon\""))
+                    }
+                }
+                "kickstart" => Ok(err_out(
+                    113,
+                    "Could not find service \"to.hyphae.daemon\" in domain for user gui: 501",
+                )),
+                "bootstrap" => Ok(ok_out()),
+                other => panic!("unexpected launchctl subcommand: {other}"),
+            }
+        };
+        let mut sleep = |_d: Duration| {};
+
+        launchd_start_via(
+            "gui/501",
+            "gui/501/to.hyphae.daemon",
+            "/Users/alice/Library/LaunchAgents/to.hyphae.daemon.plist",
+            zero_sleep_policy(),
+            &mut run,
+            &mut sleep,
+        )
+        .expect("start must recover via bootstrap after kickstart race");
+
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["kickstart", "gui/501/to.hyphae.daemon"])
+        );
+        assert!(calls.iter().any(|c| c[0] == "bootstrap"));
+    }
+
+    #[test]
+    fn launchd_bootstrap_retries_transient_eio_and_succeeds_on_attempt_three() {
+        let mut bootstrap_attempts = 0usize;
+        let mut sleeps = 0usize;
+        let mut run = |args: &[&str]| -> Result<LaunchctlOutput, String> {
+            match args[0] {
+                "enable" => Ok(ok_out()),
+                "bootstrap" => {
+                    bootstrap_attempts += 1;
+                    if bootstrap_attempts < 3 {
+                        Ok(err_out(5, "Bootstrap failed: 5: Input/output error"))
+                    } else {
+                        Ok(ok_out())
+                    }
+                }
+                other => panic!("unexpected launchctl subcommand: {other}"),
+            }
+        };
+        let mut sleep = |_d: Duration| {
+            sleeps += 1;
+        };
+
+        launchd_bootstrap_with_retry_via(
+            "gui/501",
+            "gui/501/to.hyphae.daemon",
+            "/Users/alice/Library/LaunchAgents/to.hyphae.daemon.plist",
+            false,
+            zero_sleep_policy(),
+            &mut run,
+            &mut sleep,
+        )
+        .expect("transient EIO must retry and succeed on attempt 3");
+
+        assert_eq!(bootstrap_attempts, 3);
+        assert_eq!(sleeps, 2);
+    }
+
+    #[test]
+    fn launchd_bootstrap_already_loaded_recovers_via_kickstart() {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut run = |args: &[&str]| -> Result<LaunchctlOutput, String> {
+            calls.push(args.iter().map(|s| s.to_string()).collect());
+            match args[0] {
+                "enable" => Ok(ok_out()),
+                "bootstrap" => Ok(err_out(
+                    37,
+                    "Bootstrap failed: 37: Operation already in progress (service already loaded)",
+                )),
+                "kickstart" => Ok(ok_out()),
+                other => panic!("unexpected launchctl subcommand: {other}"),
+            }
+        };
+        let mut sleep = |_d: Duration| {};
+
+        launchd_bootstrap_with_retry_via(
+            "gui/501",
+            "gui/501/to.hyphae.daemon",
+            "/Users/alice/Library/LaunchAgents/to.hyphae.daemon.plist",
+            false,
+            zero_sleep_policy(),
+            &mut run,
+            &mut sleep,
+        )
+        .expect("already loaded must recover via kickstart");
+
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["kickstart", "gui/501/to.hyphae.daemon"])
+        );
+    }
+
+    #[test]
+    fn launchd_restart_when_already_stopped_recovers_via_bootstrap() {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut run = |args: &[&str]| -> Result<LaunchctlOutput, String> {
+            calls.push(args.iter().map(|s| s.to_string()).collect());
+            match args[0] {
+                "enable" => Ok(ok_out()),
+                "kickstart" => Ok(err_out(
+                    113,
+                    "Could not find service \"to.hyphae.daemon\" in domain for user gui: 501",
+                )),
+                "print" => Ok(err_out(113, "Could not find service \"to.hyphae.daemon\"")),
+                "bootstrap" => Ok(ok_out()),
+                other => panic!("unexpected launchctl subcommand: {other}"),
+            }
+        };
+        let mut sleep = |_d: Duration| {};
+
+        launchd_restart_via(
+            "gui/501",
+            "gui/501/to.hyphae.daemon",
+            "/Users/alice/Library/LaunchAgents/to.hyphae.daemon.plist",
+            zero_sleep_policy(),
+            &mut run,
+            &mut sleep,
+        )
+        .expect("restart on stopped service must recover via bootstrap");
+
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == &["kickstart", "-k", "gui/501/to.hyphae.daemon"])
+        );
+        assert!(calls.iter().any(|c| c[0] == "bootstrap"));
+        assert!(
+            !calls.iter().any(|c| c[0] == "bootout"),
+            "already-unloaded restart need not run bootout: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn launchd_bootstrap_fails_fast_on_non_transient_error() {
+        let mut attempts = 0usize;
+        let mut run = |args: &[&str]| -> Result<LaunchctlOutput, String> {
+            match args[0] {
+                "enable" => Ok(ok_out()),
+                "bootstrap" => {
+                    attempts += 1;
+                    Ok(err_out(1, "Path had bad ownership/permissions"))
+                }
+                other => panic!("unexpected launchctl subcommand: {other}"),
+            }
+        };
+        let mut sleep = |_d: Duration| {};
+
+        let err = launchd_bootstrap_with_retry_via(
+            "gui/501",
+            "gui/501/to.hyphae.daemon",
+            "/bad/plist",
+            false,
+            zero_sleep_policy(),
+            &mut run,
+            &mut sleep,
+        )
+        .expect_err("non-transient error must fail fast");
+
+        assert_eq!(attempts, 1, "must not retry fatal bootstrap errors");
+        assert!(err.contains("ownership/permissions"), "err={err}");
+    }
+
+    #[test]
+    fn ephemeral_temp_home_and_service_control_disabled_guard_refuses_live_mutations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested_nonexistent = tmp.path().join("isolated-home").join("nested");
+
+        assert!(is_ephemeral_temp_home(tmp.path()));
+        assert!(is_ephemeral_temp_home(&nested_nonexistent));
+        assert!(is_ephemeral_temp_home(Path::new("/tmp/hyphae-test-home")));
+        assert!(is_ephemeral_temp_home(Path::new(
+            "/private/tmp/hyphae-test-home"
+        )));
+        assert!(is_ephemeral_temp_home(Path::new(
+            "/var/folders/xx/abc/T/hyphae-test"
+        )));
+        assert!(is_ephemeral_temp_home(Path::new(
+            "/private/var/folders/xx/abc/T/hyphae-test"
+        )));
+        assert!(is_ephemeral_temp_home(Path::new(
+            r"C:\Users\alice\AppData\Local\Temp\hyphae-test"
+        )));
+        assert!(!is_ephemeral_temp_home(Path::new("/Users/alice")));
+        assert!(!is_ephemeral_temp_home(Path::new("/home/alice")));
+
+        assert!(service_control_disabled(tmp.path()).is_some());
+        assert!(service_control_disabled(&nested_nonexistent).is_some());
+
+        // `install_and_start_default` and `restart_if_installed` MUST refuse to touch live OS services
+        // on temp homes even without `HYPHAE_NO_SERVICE=1`.
+        let auto_res = install_and_start_default(
+            Path::new("/usr/local/bin/hyp"),
+            tmp.path(),
+            &tmp.path().join(".config/hyphae"),
+        );
+        assert!(!auto_res.started);
+        assert!(!auto_res.installed);
+
+        let restart_res = restart_if_installed(Some(tmp.path()), None);
+        assert!(!restart_res.attempted);
+        assert!(restart_res.skipped);
+        assert_eq!(
+            restart_res.skip_reason.as_deref(),
+            Some("service_control_disabled")
+        );
+
+        // Mutating platform entrypoints MUST fail closed on temp homes without calling launchctl/systemctl/schtasks.
+        let sock = tmp.path().join("connector.sock");
+        let mut spec = sample_spec();
+        spec.state_dir = tmp.path().join(".config/hyphae");
+        spec.logs_dir = spec.state_dir.join("logs");
+
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            assert!(platform::install(&spec, tmp.path(), &sock, true).is_err());
+            assert!(platform::uninstall(tmp.path(), &sock, true).is_err());
+            assert!(platform::start(tmp.path(), &sock, true).is_err());
+            assert!(platform::stop(tmp.path(), &sock, true).is_err());
+            assert!(platform::restart(tmp.path(), &sock, true).is_err());
+        }
+
+        // Read-only `status` STILL succeeds cleanly on temp homes without mutating or leaking host state.
+        let st = platform::status(tmp.path(), &sock, true).expect("status must succeed");
+        assert!(!st.installed);
+        assert!(!st.loaded);
+        assert!(!st.daemon.alive);
     }
 }
