@@ -156,8 +156,6 @@ struct MockGitHubState {
     polls: Mutex<Vec<RecordedPoll>>,
     poll_counter: AtomicU64,
     quota_remaining: AtomicU64,
-    /// When true, the next poll on `anthropics/claude-code` returns a fresh PullRequestEvent.
-    emit_resumed_event: Mutex<bool>,
 }
 
 struct MockGitHubServer {
@@ -284,46 +282,6 @@ async fn handle_mock_github(
         let repo = rest.to_ascii_lowercase();
         let n = state.poll_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Check if test requested a post-App-fallback event.
-        let mut emit_resumed = state.emit_resumed_event.lock().await;
-        if *emit_resumed {
-            *emit_resumed = false;
-            drop(emit_resumed);
-            let rem = state.quota_remaining.fetch_sub(1, Ordering::SeqCst) - 1;
-            state.polls.lock().await.push(RecordedPoll {
-                repo: repo.clone(),
-                if_none_match,
-                status: 200,
-            });
-            let payload = json!([{
-                "id": "evt-resumed-99",
-                "type": "IssuesEvent",
-                "repo": { "name": "anthropics/claude-code" },
-                "actor": { "login": "carol", "type": "User" },
-                "created_at": "2026-11-24T12:10:00Z",
-                "payload": {
-                    "action": "opened",
-                    "issue": {
-                        "number": 99,
-                        "title": "Polling resumed after App uninstall",
-                        "html_url": "https://github.com/anthropics/claude-code/issues/99",
-                        "state": "open",
-                        "body": "ETag fallback works cleanly",
-                        "labels": [{ "name": "ops" }],
-                        "assignees": []
-                    }
-                }
-            }]);
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ETAG, "\"etag-v3\"")
-                .header("x-ratelimit-remaining", rem.to_string())
-                .body(Full::new(Bytes::from(payload.to_string())))
-                .unwrap());
-        }
-        drop(emit_resumed);
-
         // Deterministic ETag sequence:
         // Poll 1: 200 OK empty baseline with ETag "etag-v1" (consumes 1 quota: 60 -> 59)
         // Poll 2 (with If-None-Match: "etag-v1"): 304 Not Modified (0 quota consumed: stays 59!)
@@ -425,14 +383,13 @@ async fn handle_mock_github(
 
 // ============================================================================
 // 1. `public.hyphae.to` End-to-End Test (50 Subscribers -> 1 Poller, ETag 304,
-//    Private/404 Fail-Closed Lint, GitHub App <1s Upgrade & Fallback, Teardown)
+//    Private/404 Fail-Closed Lint, Teardown)
 // ============================================================================
 
 #[tokio::test]
-async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown() {
+async fn public_hyphae_github_public_e2e_etag_50_subs_and_teardown() {
     let mock = MockGitHubServer::start().await;
     let host = RecordingHost::new();
-    let app_secret = "hyphae-public-app-webhook-secret";
 
     let cfg = GitHubPublicConfig {
         id: "github-public".to_string(),
@@ -445,7 +402,6 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
         base_poll_interval: Duration::from_millis(25),
         min_poll_interval: Duration::from_millis(10),
         teardown_grace: Duration::from_millis(100),
-        app_webhook_secret: Some(Zeroizing::new(app_secret.to_string())),
         http_timeout: Duration::from_secs(5),
         ..GitHubPublicConfig::default()
     };
@@ -646,130 +602,6 @@ async fn public_hyphae_github_public_e2e_etag_50_subs_app_upgrade_and_teardown()
         !matches_filters(&[exact_repo_filter("other/repo")], ev),
         "unrelated repo subscriber must not match"
     );
-
-    // --- Seamless <1s GitHub App Push Upgrade & Fallback ---
-    adapter
-        .register_app_installation("anthropics/claude-code")
-        .await
-        .expect("register app installation");
-    assert_eq!(
-        adapter.stats().await.active_pollers,
-        0,
-        "ETag polling must pause immediately when App is installed"
-    );
-
-    // Allow any in-flight poll to settle, then snapshot poll count and verify polling is paused.
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let polls_while_paused_before = mock.state.polls.lock().await.len();
-    tokio::time::sleep(Duration::from_millis(90)).await;
-    let polls_while_paused_after = mock.state.polls.lock().await.len();
-    assert_eq!(
-        polls_while_paused_before, polls_while_paused_after,
-        "no ETag HTTP polls should fire while GitHub App is installed"
-    );
-
-    // Build an App webhook delivery payload.
-    let app_body = serde_json::to_vec(&json!({
-        "action": "synchronize",
-        "repository": { "full_name": "anthropics/claude-code" },
-        "sender": { "login": "bob", "type": "User" },
-        "pull_request": {
-            "number": 42,
-            "title": "Add Rust v2 unified adapters",
-            "html_url": "https://github.com/anthropics/claude-code/pull/42",
-            "state": "open",
-            "draft": false,
-            "labels": [],
-            "assignees": [],
-            "head": { "ref": "feat/adapters", "sha": "cafebabe5678" },
-            "base": { "ref": "main" }
-        }
-    }))
-    .unwrap();
-    let valid_sig = compute_hmac_sha256_header(app_secret.as_bytes(), &app_body);
-
-    // Invalid HMAC (single-byte flip) MUST fail closed!
-    let mut flipped_sig = valid_sig.clone().into_bytes();
-    let last_idx = flipped_sig.len() - 1;
-    flipped_sig[last_idx] = if flipped_sig[last_idx] == b'0' {
-        b'1'
-    } else {
-        b'0'
-    };
-    let flipped_sig_str = String::from_utf8(flipped_sig).unwrap();
-
-    let mut bad_headers = HeaderMap::new();
-    bad_headers.insert(
-        "x-hub-signature-256",
-        HeaderValue::from_str(&flipped_sig_str).unwrap(),
-    );
-    bad_headers.insert("x-github-event", HeaderValue::from_static("pull_request"));
-    bad_headers.insert("x-github-delivery", HeaderValue::from_static("app-deliv-1"));
-    assert!(
-        matches!(
-            adapter.ingest_app_webhook(&bad_headers, &app_body).await,
-            Err(AdapterError::Unauthorized(_))
-        ),
-        "flipped HMAC on GitHub App webhook must fail closed"
-    );
-
-    // Valid HMAC App webhook delivers immediately onto the exact same `github` topic!
-    let mut good_headers = HeaderMap::new();
-    good_headers.insert(
-        "x-hub-signature-256",
-        HeaderValue::from_str(&valid_sig).unwrap(),
-    );
-    good_headers.insert("x-github-event", HeaderValue::from_static("pull_request"));
-    good_headers.insert("x-github-delivery", HeaderValue::from_static("app-deliv-1"));
-    let app_outcome = adapter
-        .ingest_app_webhook(&good_headers, &app_body)
-        .await
-        .expect("valid App webhook must succeed");
-    assert!(matches!(
-        app_outcome,
-        WebhookIngestOutcome::Published {
-            ref event_id,
-            outcome: PublishOutcome {
-                status: PublishStatus::Stored,
-                matched: 50,
-            }
-        } if event_id == "app-deliv-1"
-    ));
-
-    // Duplicate delivery ID is deduplicated cleanly.
-    let dup_outcome = adapter
-        .ingest_app_webhook(&good_headers, &app_body)
-        .await
-        .expect("duplicate delivery should return Ignored");
-    assert!(matches!(
-        dup_outcome,
-        WebhookIngestOutcome::Ignored { ref reason } if reason == "duplicate_event_id"
-    ));
-
-    // Uninstalling the GitHub App transparently resumes ETag polling!
-    *mock.state.emit_resumed_event.lock().await = true;
-    adapter
-        .unregister_app_installation("anthropics/claude-code")
-        .await
-        .expect("unregister app installation");
-    assert_eq!(adapter.stats().await.active_pollers, 1);
-
-    let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        if host
-            .events()
-            .await
-            .iter()
-            .any(|(_, e)| e.id == "evt-resumed-99")
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < resume_deadline,
-            "timed out waiting for ETag poller to resume after App uninstall"
-        );
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
 
     // --- Unsubscribe all 50 subscribers -> poller tears down cleanly after grace window ---
     subs.clear();

@@ -1140,7 +1140,7 @@ pub fn diagnose_subscription(
                 code: DiagnosticCode::UnmonitoredRepo,
                 message: format!(
                     "Repository/org '{repo_ref}' is NOT in the configured '{topic}' stream scope ({covered_summary}). \
-                     This subscription will NEVER receive notifications until the GitHub App or webhook is installed on '{repo_ref}'."
+                     This subscription will NEVER receive notifications until a repository webhook is configured for '{repo_ref}'."
                 ),
                 remediation: Some(
                     info.metadata
@@ -1148,7 +1148,7 @@ pub fn diagnose_subscription(
                         .and_then(|m| m.setup_guide.clone())
                         .unwrap_or_else(|| {
                             format!(
-                                "Install the GitHub App or webhook on '{repo_ref}' and add '{repo_ref}' to GITHUB_REPOS / GITHUB_ORGS."
+                                "Configure a repository webhook for '{repo_ref}' and add '{repo_ref}' to GITHUB_REPOS / GITHUB_ORGS."
                             )
                         }),
                 ),
@@ -1173,7 +1173,7 @@ pub fn diagnose_subscription(
                     "No webhook deliveries from '{repo_ref}' have been observed on topic '{topic}' yet (observed repos: {obs_str})."
                 ),
                 remediation: Some(format!(
-                    "Confirm the GitHub App or webhook is installed on '{repo_ref}' and send a ping delivery."
+                    "Confirm a repository webhook is configured for '{repo_ref}' and verify a recent delivery for a selected event."
                 )),
                 suggested_filter: None,
             });

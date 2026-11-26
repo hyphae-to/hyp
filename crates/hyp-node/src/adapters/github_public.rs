@@ -12,10 +12,6 @@
 //!   honors `X-Poll-Interval` and `X-RateLimit-Remaining`, backs off adaptively on idle `304`s
 //!   (`base -> 2x -> 5x`), snaps back immediately to `base` on `200` new events, and tears down
 //!   cleanly after a grace window once refcount drops to `0`.
-//! - Seamless `<1s` GitHub App Push Upgrade: `register_app_installation(repo)` pauses ETag polling
-//!   for that repo and routes HMAC-SHA256-verified App webhooks onto the exact same `github`
-//!   CloudEvents v1.0 topic with shared event-ID deduplication; `unregister_app_installation(repo)`
-//!   transparently resumes ETag polling.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,10 +39,7 @@ use crate::adapters::trait_def::{
     AdapterError, AdapterHealth, AdapterKind, BoxFuture, CompiledSubscription, NodeAdapter,
     NodeAdapterHost,
 };
-use crate::adapters::webhooks::{
-    GitHubNormalizeOutcome, WebhookIngestOutcome, normalize_github_webhook,
-    verify_hmac_sha256_header,
-};
+use crate::adapters::webhooks::{GitHubNormalizeOutcome, normalize_github_webhook};
 
 const DEFAULT_API_BASE_URL: &str = "https://api.github.com";
 const DEFAULT_USER_AGENT: &str = "hyphae-github-public/2.0";
@@ -85,8 +78,6 @@ pub struct GitHubPublicConfig {
     pub teardown_grace: Duration,
     /// Maximum concurrent active ETag pollers allowed (default `100`).
     pub max_active_pollers: usize,
-    /// Optional HMAC-SHA256 secret for "Hyphae Public" GitHub App webhook upgrade.
-    pub app_webhook_secret: Option<Zeroizing<String>>,
     /// Per-request HTTP timeout.
     pub http_timeout: Duration,
 }
@@ -106,7 +97,6 @@ impl Default for GitHubPublicConfig {
             min_poll_interval: Duration::from_secs(60),
             teardown_grace: Duration::from_secs(300),
             max_active_pollers: DEFAULT_MAX_ACTIVE_POLLERS,
-            app_webhook_secret: None,
             http_timeout: Duration::from_secs(15),
         }
     }
@@ -181,11 +171,9 @@ impl GitHubPublicConfig {
 pub struct GitHubPublicStats {
     pub active_pollers: usize,
     pub refcounts: BTreeMap<String, usize>,
-    pub app_installed_repos: BTreeSet<String>,
     pub polls_total: u64,
     pub polls_200: u64,
     pub polls_304: u64,
-    pub app_webhooks_published: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -225,7 +213,6 @@ impl RepoDedupSet {
 
 struct RepoDemandEntry {
     refcount: usize,
-    paused_for_app: bool,
     poller_cancel: Option<watch::Sender<bool>>,
     poller_task: Option<JoinHandle<()>>,
     teardown_task: Option<JoinHandle<()>>,
@@ -235,7 +222,6 @@ struct TelemetryCounters {
     polls_total: AtomicU64,
     polls_200: AtomicU64,
     polls_304: AtomicU64,
-    app_webhooks_published: AtomicU64,
 }
 
 impl TelemetryCounters {
@@ -244,7 +230,6 @@ impl TelemetryCounters {
             polls_total: AtomicU64::new(0),
             polls_200: AtomicU64::new(0),
             polls_304: AtomicU64::new(0),
-            app_webhooks_published: AtomicU64::new(0),
         }
     }
 }
@@ -256,12 +241,11 @@ struct Inner {
     host: RwLock<Option<Arc<dyn NodeAdapterHost>>>,
     repo_cache: RwLock<HashMap<String, CachedRepoCheck>>,
     demand: Mutex<HashMap<String, RepoDemandEntry>>,
-    app_installed: Mutex<BTreeSet<String>>,
     dedup: Mutex<HashMap<String, RepoDedupSet>>,
     counters: TelemetryCounters,
 }
 
-/// Demand-driven `github-public` adapter (ETag poller pool + optional GitHub App `<1s` push).
+/// Demand-driven `github-public` adapter (ETag poller pool).
 #[derive(Clone)]
 pub struct GitHubPublicAdapter {
     inner: Arc<Inner>,
@@ -284,7 +268,6 @@ impl GitHubPublicAdapter {
                 host: RwLock::new(None),
                 repo_cache: RwLock::new(HashMap::new()),
                 demand: Mutex::new(HashMap::new()),
-                app_installed: Mutex::new(BTreeSet::new()),
                 dedup: Mutex::new(HashMap::new()),
                 counters: TelemetryCounters::new(),
             }),
@@ -296,11 +279,6 @@ impl GitHubPublicAdapter {
         &self.inner.config.topic
     }
 
-    /// Returns `true` if a GitHub App HMAC-SHA256 webhook secret is configured.
-    pub fn has_app_webhook_secret(&self) -> bool {
-        self.inner.config.app_webhook_secret.is_some()
-    }
-
     /// Returns the sorted list of configured token scope patterns (NEVER raw tokens).
     pub fn configured_token_scopes(&self) -> Vec<String> {
         self.inner.config.configured_token_scopes()
@@ -309,183 +287,20 @@ impl GitHubPublicAdapter {
     /// Returns a point-in-time telemetry snapshot of active pollers, refcounts, and HTTP outcomes.
     pub async fn stats(&self) -> GitHubPublicStats {
         let demand = self.inner.demand.lock().await;
-        let active_pollers = demand
-            .values()
-            .filter(|e| e.poller_task.is_some() && !e.paused_for_app)
-            .count();
+        let active_pollers = demand.values().filter(|e| e.poller_task.is_some()).count();
         let refcounts = demand
             .iter()
             .map(|(repo, e)| (repo.clone(), e.refcount))
             .collect();
         drop(demand);
 
-        let app_installed_repos = self.inner.app_installed.lock().await.clone();
-
         GitHubPublicStats {
             active_pollers,
             refcounts,
-            app_installed_repos,
             polls_total: self.inner.counters.polls_total.load(Ordering::Relaxed),
             polls_200: self.inner.counters.polls_200.load(Ordering::Relaxed),
             polls_304: self.inner.counters.polls_304.load(Ordering::Relaxed),
-            app_webhooks_published: self
-                .inner
-                .counters
-                .app_webhooks_published
-                .load(Ordering::Relaxed),
         }
-    }
-
-    /// Registers a "Hyphae Public" GitHub App installation for `repo`, pausing ETag polling
-    /// immediately while keeping the subscriber demand entry intact.
-    pub async fn register_app_installation(&self, repo: &str) -> Result<(), AdapterError> {
-        let canonical = canonicalize_repo(repo).ok_or_else(|| {
-            AdapterError::InvalidInput(format!("invalid GitHub repository '{repo}'"))
-        })?;
-
-        self.inner
-            .app_installed
-            .lock()
-            .await
-            .insert(canonical.clone());
-
-        let mut demand = self.inner.demand.lock().await;
-        if let Some(entry) = demand.get_mut(&canonical) {
-            entry.paused_for_app = true;
-            stop_poller_entry(entry);
-        }
-        Ok(())
-    }
-
-    /// Unregisters a GitHub App installation for `repo` and transparently resumes ETag polling
-    /// if active subscribers remain.
-    pub async fn unregister_app_installation(&self, repo: &str) -> Result<(), AdapterError> {
-        let canonical = canonicalize_repo(repo).ok_or_else(|| {
-            AdapterError::InvalidInput(format!("invalid GitHub repository '{repo}'"))
-        })?;
-
-        self.inner.app_installed.lock().await.remove(&canonical);
-
-        let host = self.inner.host.read().expect("host lock").clone();
-        let mut demand = self.inner.demand.lock().await;
-        let active_now = count_active_pollers(&demand);
-        let cap = self.inner.config.max_active_pollers;
-        if let Some(entry) = demand.get_mut(&canonical) {
-            entry.paused_for_app = false;
-            if entry.refcount > 0 && entry.poller_task.is_none() && active_now < cap {
-                if let Some(h) = host {
-                    spawn_poller_into_entry(Arc::clone(&self.inner), h, &canonical, entry);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Alias for [`Self::ingest_app_webhook`] used by HTTP webhook routes.
-    pub async fn handle_app_webhook(
-        &self,
-        headers: &HeaderMap,
-        body: &[u8],
-    ) -> Result<WebhookIngestOutcome, AdapterError> {
-        self.ingest_app_webhook(headers, body).await
-    }
-
-    /// Ingests an HMAC-SHA256-verified "Hyphae Public" GitHub App webhook delivery directly onto
-    /// the same `github` CloudEvents v1.0 topic with shared event-ID deduplication.
-    pub async fn ingest_app_webhook(
-        &self,
-        headers: &HeaderMap,
-        body: &[u8],
-    ) -> Result<WebhookIngestOutcome, AdapterError> {
-        let Some(ref secret) = self.inner.config.app_webhook_secret else {
-            return Err(AdapterError::Unauthorized(
-                "GitHub App webhook secret is not configured".to_string(),
-            ));
-        };
-
-        let sig = headers
-            .get("x-hub-signature-256")
-            .and_then(|v| v.to_str().ok());
-        if !verify_hmac_sha256_header(secret.as_bytes(), body, sig, true) {
-            return Err(AdapterError::Unauthorized(
-                "invalid or missing X-Hub-Signature-256 on GitHub App webhook".to_string(),
-            ));
-        }
-
-        let event_name = headers
-            .get("x-github-event")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| AdapterError::InvalidInput("missing X-GitHub-Event header".into()))?;
-        let delivery_id = headers
-            .get("x-github-delivery")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| AdapterError::InvalidInput("missing X-GitHub-Delivery header".into()))?;
-
-        let payload: Value = serde_json::from_slice(body)
-            .map_err(|e| AdapterError::InvalidInput(format!("invalid JSON body: {e}")))?;
-
-        let ce = match normalize_github_webhook(
-            event_name,
-            delivery_id,
-            &payload,
-            &now_rfc3339_seconds(),
-        ) {
-            GitHubNormalizeOutcome::Publish(ev) => *ev,
-            GitHubNormalizeOutcome::Ignore(reason) => {
-                return Ok(WebhookIngestOutcome::Ignored { reason });
-            }
-        };
-
-        let repo = ce
-            .extensions
-            .get("repo")
-            .and_then(Value::as_str)
-            .and_then(canonicalize_repo)
-            .ok_or_else(|| {
-                AdapterError::InvalidInput(
-                    "App webhook payload missing repository.full_name".into(),
-                )
-            })?;
-
-        if !self.inner.app_installed.lock().await.contains(&repo) {
-            return Ok(WebhookIngestOutcome::Ignored {
-                reason: format!("github_app_not_installed:{repo}"),
-            });
-        }
-
-        let ce_val = serde_json::to_value(&ce)
-            .map_err(|e| AdapterError::Internal(format!("CloudEvent serialization failed: {e}")))?;
-        let (validated, _) =
-            check_cloudevent_v2(&ce_val).map_err(|e| AdapterError::InvalidInput(e.to_string()))?;
-
-        // Shared deduplication across ETag polling and App webhook push.
-        {
-            let mut dedup = self.inner.dedup.lock().await;
-            let set = dedup.entry(repo).or_insert_with(RepoDedupSet::new);
-            if !set.insert(validated.id.clone()) {
-                return Ok(WebhookIngestOutcome::Ignored {
-                    reason: "duplicate_event_id".to_string(),
-                });
-            }
-        }
-
-        let host = self
-            .inner
-            .host
-            .read()
-            .expect("host lock")
-            .clone()
-            .ok_or_else(|| AdapterError::NotRunning(self.inner.config.id.clone()))?;
-
-        let event_id = validated.id.clone();
-        let outcome = host
-            .publish_event(&self.inner.config.topic, validated)
-            .await?;
-        self.inner
-            .counters
-            .app_webhooks_published
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(WebhookIngestOutcome::Published { event_id, outcome })
     }
 
     async fn check_repo_visibility(&self, repo: &str) -> (bool, Option<String>) {
@@ -632,7 +447,7 @@ impl NodeAdapter for GitHubPublicAdapter {
                     break;
                 }
                 if let Some(entry) = demand.get_mut(&repo) {
-                    if entry.refcount > 0 && !entry.paused_for_app && entry.poller_task.is_none() {
+                    if entry.refcount > 0 && entry.poller_task.is_none() {
                         spawn_poller_into_entry(
                             Arc::clone(&self.inner),
                             Arc::clone(&host),
@@ -697,7 +512,6 @@ impl NodeAdapter for GitHubPublicAdapter {
             }
 
             let host = self.inner.host.read().expect("host lock").clone();
-            let app_installed = self.inner.app_installed.lock().await.clone();
             let mut demand = self.inner.demand.lock().await;
 
             // Schedule grace-window teardown (or immediate teardown when grace == 0) FIRST so
@@ -745,8 +559,7 @@ impl NodeAdapter for GitHubPublicAdapter {
                     if let Some(teardown) = entry.teardown_task.take() {
                         teardown.abort();
                     }
-                    entry.paused_for_app = app_installed.contains(repo);
-                    if !entry.paused_for_app && entry.poller_task.is_none() && active_now < cap {
+                    if entry.poller_task.is_none() && active_now < cap {
                         if let Some(ref h) = host {
                             spawn_poller_into_entry(
                                 Arc::clone(&self.inner),
@@ -758,15 +571,13 @@ impl NodeAdapter for GitHubPublicAdapter {
                         }
                     }
                 } else {
-                    let paused_for_app = app_installed.contains(repo);
                     let mut entry = RepoDemandEntry {
                         refcount: *count,
-                        paused_for_app,
                         poller_cancel: None,
                         poller_task: None,
                         teardown_task: None,
                     };
-                    if !paused_for_app && active_now < cap {
+                    if active_now < cap {
                         if let Some(ref h) = host {
                             spawn_poller_into_entry(
                                 Arc::clone(&self.inner),
@@ -811,12 +622,11 @@ impl NodeAdapter for GitHubPublicAdapter {
                 let active = count_active_pollers(&demand);
                 let tracked: BTreeSet<String> = demand
                     .iter()
-                    .filter(|(_, e)| e.poller_task.is_some() || e.paused_for_app)
+                    .filter(|(_, e)| e.poller_task.is_some())
                     .map(|(k, _)| k.clone())
                     .collect();
                 (active, tracked)
             };
-            let app_installed = self.inner.app_installed.lock().await.clone();
             let cap = self.inner.config.max_active_pollers;
             let mut new_pollers_needed = 0usize;
 
@@ -843,7 +653,7 @@ impl NodeAdapter for GitHubPublicAdapter {
                     continue;
                 }
 
-                if !already_tracked.contains(&canonical) && !app_installed.contains(&canonical) {
+                if !already_tracked.contains(&canonical) {
                     if active_pollers.saturating_add(new_pollers_needed) >= cap {
                         diagnostics.push(SubscriptionDiagnostic {
                             severity: DiagnosticSeverity::Error,
@@ -966,10 +776,7 @@ async fn github_get(
 }
 
 fn count_active_pollers(demand: &HashMap<String, RepoDemandEntry>) -> usize {
-    demand
-        .values()
-        .filter(|e| e.poller_task.is_some() && !e.paused_for_app)
-        .count()
+    demand.values().filter(|e| e.poller_task.is_some()).count()
 }
 
 fn stop_poller_entry(entry: &mut RepoDemandEntry) {

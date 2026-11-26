@@ -12,7 +12,7 @@
 //! 4. `chaos_kv_cas_thundering_herd_linearizability`
 //! 5. `chaos_mid_session_grant_revocation_and_tampered_gate_policy`
 //! 6. `chaos_oversized_and_malformed_wire_mutation_fuzz`
-//! 7. `chaos_public_github_scale_and_app_failover`
+//! 7. `chaos_public_github_scale_and_etag_refresh`
 //! 8. `chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e`
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -51,7 +51,7 @@ use hyp_node::adapters::{
     AdapterError, AdapterHealth, BoxFuture, CompiledSubscription, GitHubPublicAdapter,
     GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, NodeAdapter, NodeAdapterHost,
     PrometheusWebhookAdapter, PrometheusWebhookConfig, PublishErrorCode, PublishOutcome,
-    PublishStatus, WebhookIngestOutcome, compute_hmac_sha256_header,
+    PublishStatus, compute_hmac_sha256_header,
 };
 use hyp_node::delivery::DeliveryUrgency;
 use hyp_node::engine::http_util::{HttpClient, empty_body, full_body};
@@ -2555,11 +2555,11 @@ async fn chaos_oversized_and_malformed_wire_mutation_fuzz() {
 
 // ============================================================================
 // SCENARIO 7: Chaos — Public GitHub Scale (30 Subs across 5 Public + 3 Private/404)
-//             & Partial GitHub App Install / Uninstall Failover with Zero Dups
+//             & ETag Refresh with Zero Dups
 // ============================================================================
 
 #[tokio::test]
-async fn chaos_public_github_scale_and_app_failover() {
+async fn chaos_public_github_scale_and_etag_refresh() {
     let pub_dir = TempDir::new().unwrap();
     let mut pub_cfg = NodeConfig::router(NodeId::new("public.hyphae.to").unwrap(), pub_dir.path());
     pub_cfg.secret_backend = Some(SecretBackend::File);
@@ -2570,7 +2570,7 @@ async fn chaos_public_github_scale_and_app_failover() {
     struct ScaleGhState {
         poll_counts: StdMutex<HashMap<String, usize>>,
         poll_304_counts: StdMutex<HashMap<String, usize>>,
-        resume_mode: StdMutex<BTreeSet<String>>,
+        refresh_repos: StdMutex<BTreeSet<String>>,
     }
 
     let state = Arc::new(ScaleGhState::default());
@@ -2636,31 +2636,31 @@ async fn chaos_public_github_scale_and_app_failover() {
                                 *e
                             };
                             let slug = repo.replace('/', "-");
-                            let resumed = st.resume_mode.lock().unwrap().remove(&repo);
+                            let refreshed = st.refresh_repos.lock().unwrap().remove(&repo);
 
-                            if resumed {
-                                // Emit BOTH an already-delivered App webhook ID AND a brand-new resumed ID!
+                            if refreshed {
+                                // Repeat the initial event alongside a new event.
                                 let payload = json!([
                                     {
-                                        "id": format!("app-deliv-{slug}"),
+                                        "id": format!("init-ev-{slug}"),
                                         "type": "IssuesEvent",
                                         "repo": { "name": repo },
                                         "actor": { "login": "bot", "type": "User" },
                                         "created_at": "2026-11-24T12:05:00Z",
                                         "payload": {
                                             "action": "opened",
-                                            "issue": { "number": 50, "title": "dup-from-app", "state": "open", "labels": [], "assignees": [] }
+                                            "issue": { "number": 50, "title": "initial", "state": "open", "labels": [], "assignees": [] }
                                         }
                                     },
                                     {
-                                        "id": format!("resumed-new-{slug}"),
+                                        "id": format!("refreshed-{slug}"),
                                         "type": "IssuesEvent",
                                         "repo": { "name": repo },
                                         "actor": { "login": "carol", "type": "User" },
                                         "created_at": "2026-11-24T12:06:00Z",
                                         "payload": {
                                             "action": "opened",
-                                            "issue": { "number": 51, "title": "fresh-after-uninstall", "state": "open", "labels": [], "assignees": [] }
+                                            "issue": { "number": 51, "title": "fresh-after-refresh", "state": "open", "labels": [], "assignees": [] }
                                         }
                                     }
                                 ]);
@@ -2720,7 +2720,6 @@ async fn chaos_public_github_scale_and_app_failover() {
         }
     });
 
-    let app_secret = "scale-test-github-app-secret";
     let adapter = GitHubPublicAdapter::new(GitHubPublicConfig {
         id: "github-public".to_string(),
         topic: "github".to_string(),
@@ -2728,7 +2727,6 @@ async fn chaos_public_github_scale_and_app_failover() {
         base_poll_interval: Duration::from_millis(20),
         min_poll_interval: Duration::from_millis(10),
         teardown_grace: Duration::from_millis(80),
-        app_webhook_secret: Some(Zeroizing::new(app_secret.to_string())),
         http_timeout: Duration::from_secs(5),
         ..GitHubPublicConfig::default()
     })
@@ -2807,124 +2805,25 @@ async fn chaos_public_github_scale_and_app_failover() {
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
 
-    // 3. Install GitHub App on 2 repos (`org/repo-0`, `org/repo-1`) -> ONLY those 2 pause; 3 keep polling!
-    adapter
-        .register_app_installation("org/repo-0")
-        .await
-        .unwrap();
-    adapter
-        .register_app_installation("org/repo-1")
-        .await
-        .unwrap();
-    assert_eq!(adapter.stats().await.active_pollers, 3);
-
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let paused_r0_before = *state.poll_counts.lock().unwrap().get("org/repo-0").unwrap();
-    let paused_r1_before = *state.poll_counts.lock().unwrap().get("org/repo-1").unwrap();
-    let active_r2_304_before = *state
-        .poll_304_counts
-        .lock()
-        .unwrap()
-        .get("org/repo-2")
-        .unwrap();
-    let active_r3_304_before = *state
-        .poll_304_counts
-        .lock()
-        .unwrap()
-        .get("org/repo-3")
-        .unwrap();
-    let active_r4_304_before = *state
-        .poll_304_counts
-        .lock()
-        .unwrap()
-        .get("org/repo-4")
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(110)).await;
-    assert_eq!(
-        *state.poll_counts.lock().unwrap().get("org/repo-0").unwrap(),
-        paused_r0_before,
-        "org/repo-0 poller must stay paused while App installed"
-    );
-    assert_eq!(
-        *state.poll_counts.lock().unwrap().get("org/repo-1").unwrap(),
-        paused_r1_before,
-        "org/repo-1 poller must stay paused while App installed"
-    );
-    assert!(
-        *state
-            .poll_304_counts
-            .lock()
-            .unwrap()
-            .get("org/repo-2")
-            .unwrap()
-            > active_r2_304_before
-            && *state
-                .poll_304_counts
-                .lock()
-                .unwrap()
-                .get("org/repo-3")
-                .unwrap()
-                > active_r3_304_before
-            && *state
-                .poll_304_counts
-                .lock()
-                .unwrap()
-                .get("org/repo-4")
-                .unwrap()
-                > active_r4_304_before,
-        "remaining 3 repos must continue ETag 304 polling while repo-0 & repo-1 use App push"
-    );
-
-    // Deliver App webhooks on `org/repo-0` & `org/repo-1`!
-    for repo in ["org/repo-0", "org/repo-1"] {
-        let slug = repo.replace('/', "-");
-        let body = serde_json::to_vec(&json!({
-            "action": "opened",
-            "repository": { "full_name": repo },
-            "sender": { "login": "bot", "type": "User" },
-            "issue": { "number": 50, "title": "via-app", "state": "open", "labels": [], "assignees": [] }
-        }))
-        .unwrap();
-        let sig = compute_hmac_sha256_header(app_secret.as_bytes(), &body);
-        let mut hdrs = HeaderMap::new();
-        hdrs.insert("x-hub-signature-256", HeaderValue::from_str(&sig).unwrap());
-        hdrs.insert("x-github-event", HeaderValue::from_static("issues"));
-        hdrs.insert(
-            "x-github-delivery",
-            HeaderValue::from_str(&format!("app-deliv-{slug}")).unwrap(),
-        );
-        let outcome = adapter.ingest_app_webhook(&hdrs, &body).await.unwrap();
-        assert!(matches!(outcome, WebhookIngestOutcome::Published { .. }));
-    }
-
-    // 4. Uninstall App on both repos -> polling cleanly resumes with ZERO duplicate event IDs!
+    // Return a changed page for two active repos, with one replayed ID on each.
     {
-        let mut resume = state.resume_mode.lock().unwrap();
-        resume.insert("org/repo-0".to_string());
-        resume.insert("org/repo-1".to_string());
+        let mut refresh = state.refresh_repos.lock().unwrap();
+        refresh.insert("org/repo-0".to_string());
+        refresh.insert("org/repo-1".to_string());
     }
-    adapter
-        .unregister_app_installation("org/repo-0")
-        .await
-        .unwrap();
-    adapter
-        .unregister_app_installation("org/repo-1")
-        .await
-        .unwrap();
     assert_eq!(adapter.stats().await.active_pollers, 5);
 
     let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let ids = host.published_ids().await;
-        if ids.iter().any(|(_, id)| id == "resumed-new-org-repo-0")
-            && ids.iter().any(|(_, id)| id == "resumed-new-org-repo-1")
+        if ids.iter().any(|(_, id)| id == "refreshed-org-repo-0")
+            && ids.iter().any(|(_, id)| id == "refreshed-org-repo-1")
         {
             break;
         }
         assert!(
             tokio::time::Instant::now() < resume_deadline,
-            "timed out waiting for resumed pollers on repo-0 & repo-1; ids={ids:?}"
+            "timed out waiting for refreshed events on repo-0 & repo-1; ids={ids:?}"
         );
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
@@ -2935,12 +2834,12 @@ async fn chaos_public_github_scale_and_app_failover() {
     assert_eq!(
         unique_ids.len(),
         all_published.len(),
-        "duplicate event IDs published across App install/uninstall failover: {all_published:?}"
+        "duplicate event IDs published after ETag refresh: {all_published:?}"
     );
     assert_eq!(
         unique_ids.len(),
-        5 + 2 + 2, // 5 initial + 2 app webhooks + 2 resumed-new (the 2 duplicate app-deliv-* were deduped!)
-        "expected exact 9 unique events, got {unique_ids:?}"
+        5 + 2, // 5 initial plus one new event per refreshed repository
+        "expected exact 7 unique events, got {unique_ids:?}"
     );
 
     adapter.stop().await.unwrap();
