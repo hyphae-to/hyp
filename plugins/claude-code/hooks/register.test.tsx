@@ -7,6 +7,7 @@ import {
   qualifyChannelTarget,
   resolveUiStateCandidates,
   sanitizeUiText,
+  shouldSuppressPromptStrip,
 } from './state';
 
 const PANE_PROPS = {
@@ -388,7 +389,7 @@ describe('hyphae pure state & security helpers', () => {
 });
 
 describe('hyphae native Claude Code side-panel mod', () => {
-  test('registers /hyphae-panel on session.start, enables live status by default, and opens/closes panel', async ($, on) => {
+  test('registers /hyphae-panel on session.start, never emits loud ui.status text, and opens/closes panel', async ($, on) => {
     const registered: { name: string; immediate?: boolean }[] = [];
     const opened: { id: string; title?: string; focus?: boolean; closeOnEscape?: boolean }[] = [];
     const closed: string[] = [];
@@ -429,18 +430,33 @@ describe('hyphae native Claude Code side-panel mod', () => {
 
     await $.session.start({ cwd: '/workspace', surface: 'terminal', isInteractive: true });
     expect(registered).toEqual([{ name: 'hyphae-panel', immediate: true }]);
-    expect(statusUpdates[statusUpdates.length - 1]).toBe(
-      'hyphae @alice · telegram:personal · 1 sub · 2 queued · FOCUS · 1 muted · /hyphae-panel',
-    );
+    // Never emits non-empty `$.ui.status(...)` (Claude Code styles it as a bright yellow ⚠ warning).
+    expect(statusUpdates.every((t) => t === undefined)).toBe(true);
 
-    // Users can silence and re-enable the native status line via `/hyphae-panel status off|on`.
+    // Compact prompt indicator renders quietly in AbovePrompt outside Herdr (no repeated "hyphae" or "/hyphae-panel").
+    const stripMount = await $.ui.mount({
+      plugin: 'hyphae',
+      surface: 'terminal',
+      component: 'AbovePrompt',
+      requestId: 'hyphae-above-prompt',
+      props: ABOVE_PROMPT_PROPS,
+      viewport: VIEWPORT,
+    });
+    expect(await stripMount.keepsBeneath()).toBe(false);
+    const stripText = collectStrings(await stripMount.drawn()).join('\n');
+    expect(stripText).toContain('@alice · telegram:personal · 1 sub · 2 queued · focus · 1 muted');
+    expect(stripText).not.toContain('/hyphae-panel');
+    expect(stripText).not.toContain('hyphae @alice');
+
+    // Users can silence and re-enable the quiet prompt strip via `/hyphae-panel status off|on`.
     await $.command.run({
       command: 'hyphae-panel',
       args: 'status off',
       origin: { kind: 'composer' },
       presentation: { isFullscreen: false, columns: 120 },
     });
-    expect(statusUpdates[statusUpdates.length - 1]).toBeUndefined();
+    await stripMount.redraw(ABOVE_PROMPT_PROPS);
+    expect(await stripMount.keepsBeneath()).toBe(true);
 
     await $.command.run({
       command: 'hyphae-panel',
@@ -448,7 +464,9 @@ describe('hyphae native Claude Code side-panel mod', () => {
       origin: { kind: 'composer' },
       presentation: { isFullscreen: false, columns: 120 },
     });
-    expect(statusUpdates[statusUpdates.length - 1]).toContain('hyphae @alice · telegram:personal');
+    await stripMount.redraw(ABOVE_PROMPT_PROPS);
+    expect(await stripMount.keepsBeneath()).toBe(false);
+    await stripMount.unmount();
 
     await $.command.run({
       command: 'hyphae-panel',
@@ -459,7 +477,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     expect(opened).toEqual([
       {
         id: 'hyphae-panel',
-        title: 'Hyphae Mesh',
+        title: 'Hyphae',
         focus: true,
         closeOnEscape: true,
       },
@@ -538,9 +556,11 @@ describe('hyphae native Claude Code side-panel mod', () => {
     };
 
     // Tab 1: Bridges + Streams (default)
-    const subsText = checkInvariants(await mounted.drawn());
+    const subsDrawn = await mounted.drawn();
+    const subsText = checkInvariants(subsDrawn);
     expect(subsText).toContain('@alice');
-    expect(subsText).toContain('● online · laptop');
+    expect(subsText).toContain('● online');
+    expect(subsText).toContain('laptop · 3 peers');
     expect(subsText).toContain('FOCUS');
     expect(subsText).toContain('⚠ 2 quarantined items');
     expect(subsText).toContain('hyp gate review');
@@ -552,6 +572,10 @@ describe('hyphae native Claude Code side-panel mod', () => {
     expect(subsText).toContain('ci.builds');
     expect(subsText).toContain('branch=main');
     expect(subsText).not.toContain('BRIDGE_TOKEN_LEAK');
+    // No duplicate close button (Claude Code's native Pane chrome provides ×) and no double "(f)"/"(r)" hotkey labels.
+    expect(collectButtonKeys(subsDrawn)).not.toContain('hyphae-close');
+    expect(subsText).not.toContain('(f)');
+    expect(subsText).not.toContain('(r)');
 
     // Tab 2: Queue (metadata only)
     await mounted.press({ key: 'hyphae-tab-queue' });
@@ -622,9 +646,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     await mounted.redraw(PANE_PROPS);
     const malformedText = collectStrings(await mounted.drawn()).join('\n');
     expect(malformedText).toContain('offline');
-
-    await mounted.press({ key: 'hyphae-close' });
-    expect(closed).toEqual(['hyphae-panel']);
+    expect(collectButtonKeys(await mounted.drawn())).not.toContain('hyphae-close');
 
     await mounted.unmount();
   });
@@ -813,13 +835,13 @@ describe('hyphae native Claude Code side-panel mod', () => {
     await mounted.unmount();
   });
 
-  test('AbovePrompt stays strictly hidden unless quarantined > 0, and formatPersistentStatusLine hides unenrolled', async ($, on) => {
+  test('AbovePrompt auto-hides inside Herdr when herdr-mod is active, stays quiet outside Herdr, and alerts on quarantine', async ($, on) => {
     let quarantinedCount = 0;
     const opened: string[] = [];
 
     let invalidatedCount = 0;
     const clock = mock.clock(on, { now: 1_700_000_000_000 });
-    mock.env(on, { HOME: '/fake-home' });
+    mock.env(on, { HOME: '/fake-home', HC_TERMINAL_ID: 't42' });
     on('session.id', () => ({ value: 'sess-42' }));
     on('ui.invalidate', () => {
       invalidatedCount += 1;
@@ -840,14 +862,36 @@ describe('hyphae native Claude Code side-panel mod', () => {
           }),
         };
       }
+      if (e.path === '/fake-home/.config/herdr-app/shared.json') {
+        return {
+          value: JSON.stringify({
+            layout: 'personal',
+            'hyphae.modActive': { pane: true, panel: true, updatedAt: 1_700_000_000_000 },
+          }),
+        };
+      }
       return { deny: 'ENOENT' };
     });
 
     // Pure status-line helper stays hidden when unenrolled and has zero alerts
     expect(formatPersistentStatusLine(null, null, 0)).toBeUndefined();
-    expect(formatPersistentStatusLine(null, null, 2)).toContain('⚠ hyphae: 2 held');
+    expect(formatPersistentStatusLine(null, null, 2)).toContain('⚠ 2 held');
 
-    // Zero clutter in AbovePrompt whenever quarantined === 0
+    // Pure Herdr suppression detector verifies env + shared.json advertisement
+    expect(
+      await shouldSuppressPromptStrip(
+        { homeDir: '/fake-home', hcTerminalId: 't42' },
+        async (p) =>
+          p === '/fake-home/.config/herdr-app/shared.json'
+            ? JSON.stringify({ 'hyphae.modActive': { pane: true } })
+            : null,
+      ),
+    ).toBe(true);
+    expect(
+      await shouldSuppressPromptStrip({ homeDir: '/fake-home' }, async () => null),
+    ).toBe(false);
+
+    // Zero clutter in AbovePrompt inside Herdr when Herdr mod is active and quarantined === 0
     const cleanMount = await $.ui.mount({
       plugin: 'hyphae',
       surface: 'terminal',
@@ -859,7 +903,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     expect(await cleanMount.keepsBeneath()).toBe(true);
     await cleanMount.unmount();
 
-    // When quarantined > 0, renders 1-line red emergency warning + plain panel opener
+    // When quarantined > 0, renders 1-line red emergency warning + plain panel opener even inside Herdr
     quarantinedCount = 3;
     const alertMount = await $.ui.mount({
       plugin: 'hyphae',

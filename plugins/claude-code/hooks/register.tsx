@@ -12,6 +12,7 @@ import {
   resolveActiveSession,
   resolveUiStateCandidates,
   sanitizeUiText,
+  shouldSuppressPromptStrip,
   type HyphaeSnapshot,
   type PanelTab,
   type SessionControlAction,
@@ -24,11 +25,13 @@ const REFRESH_INTERVAL_MS = 5_000;
 const CONTROL_TIMEOUT_MS = 10_000;
 const MAX_VISIBLE_ROWS = 12;
 
+type StatusStripMode = 'auto' | 'on' | 'off';
+
 interface PanelUiState {
   tab: PanelTab;
   selectedSessionId: string | null;
-  statusEnabled: boolean;
-  lastStatusText: string | undefined;
+  statusMode: StatusStripMode;
+  lastStripKey: string;
   notice: { ok: boolean; text: string } | null;
   paneRefreshTimer: { cancel(): void } | null;
   statusRefreshTimer: { cancel(): void } | null;
@@ -38,8 +41,8 @@ function createInitialState(): PanelUiState {
   return {
     tab: 'subs',
     selectedSessionId: null,
-    statusEnabled: true,
-    lastStatusText: undefined,
+    statusMode: 'auto',
+    lastStripKey: '',
     notice: null,
     paneRefreshTimer: null,
     statusRefreshTimer: null,
@@ -77,34 +80,26 @@ async function loadHyphaeSnapshot(
   return { snapshot: null, stateFile: files[0] ?? null };
 }
 
-function applyStatusText(
-  $: { ui: { status(text: string | undefined): void } },
-  uiState: PanelUiState,
-  nextText: string | undefined,
-): void {
-  if (nextText === uiState.lastStatusText) return;
-  uiState.lastStatusText = nextText;
+function clearHostStatusBanner($: { ui: { status(text: string | undefined): void } }): void {
   try {
-    $.ui.status(nextText);
+    $.ui.status(undefined);
   } catch {
-    // Ignore if host surface does not support status line updates.
+    // Ignore if host surface does not support status updates.
   }
 }
 
-async function syncPersistentStatus(
+async function computePromptStripState(
   $: {
     fs: { read(path: string, opts: { as: 'text' }): Promise<unknown> };
     env: { get(name: string): Promise<string | undefined> };
     session: { id(): Promise<string> };
-    ui: { status(text: string | undefined): void };
   },
   uiState: PanelUiState,
-): Promise<void> {
-  if (!uiState.statusEnabled) {
-    applyStatusText($, uiState, undefined);
-    return;
-  }
-
+): Promise<{
+  quarantined: number;
+  stripText: string | undefined;
+  suppressedByHerdr: boolean;
+}> {
   const safeReadText = async (path: string): Promise<string | null> => {
     try {
       const res = await $.fs.read(path, { as: 'text' });
@@ -114,11 +109,26 @@ async function syncPersistentStatus(
     }
   };
 
-  const [homeDir, envStateDir, envSessionId, claudeSessionId] = await Promise.all([
+  const [
+    homeDir,
+    envStateDir,
+    envSessionId,
+    claudeSessionId,
+    herdrAppHome,
+    hcTerminalId,
+    hcTerminalSocket,
+    cfBundleId,
+    panelStatusEnv,
+  ] = await Promise.all([
     $.env.get('HOME').then((v) => v ?? '').catch(() => ''),
     $.env.get('HYPHAE_STATE_DIR').catch(() => undefined),
     $.env.get('HYPHAE_SESSION_ID').catch(() => undefined),
     $.session.id().catch(() => ''),
+    $.env.get('HERDR_APP_HOME').catch(() => undefined),
+    $.env.get('HC_TERMINAL_ID').catch(() => undefined),
+    $.env.get('HC_TERMINAL_SOCKET').catch(() => undefined),
+    $.env.get('__CFBundleIdentifier').catch(() => undefined),
+    $.env.get('HYPHAE_PANEL_STATUS').catch(() => undefined),
   ]);
 
   const { snapshot } = await loadHyphaeSnapshot(homeDir, envStateDir, safeReadText);
@@ -129,8 +139,58 @@ async function syncPersistentStatus(
     uiState.selectedSessionId,
   );
   const quarantined = getQuarantinedCount(snapshot, resolved.active);
-  const line = formatPersistentStatusLine(snapshot, resolved.active, quarantined);
-  applyStatusText($, uiState, line);
+  if (quarantined > 0) {
+    return {
+      quarantined,
+      stripText: formatPersistentStatusLine(snapshot, resolved.active, quarantined),
+      suppressedByHerdr: false,
+    };
+  }
+
+  if (uiState.statusMode === 'off') {
+    return { quarantined: 0, stripText: undefined, suppressedByHerdr: false };
+  }
+
+  const suppressedByHerdr =
+    uiState.statusMode === 'auto'
+      ? await shouldSuppressPromptStrip(
+          {
+            homeDir,
+            herdrAppHome,
+            hcTerminalId,
+            hcTerminalSocket,
+            cfBundleId,
+            panelStatusEnv,
+          },
+          safeReadText,
+        )
+      : false;
+
+  if (suppressedByHerdr) {
+    return { quarantined: 0, stripText: undefined, suppressedByHerdr: true };
+  }
+
+  const line = formatPersistentStatusLine(snapshot, resolved.active, 0);
+  return { quarantined: 0, stripText: line, suppressedByHerdr: false };
+}
+
+async function syncPromptStripInvalidation(
+  $: {
+    fs: { read(path: string, opts: { as: 'text' }): Promise<unknown> };
+    env: { get(name: string): Promise<string | undefined> };
+    session: { id(): Promise<string> };
+    ui: { status(text: string | undefined): void; invalidate(event: string): void };
+  },
+  uiState: PanelUiState,
+): Promise<void> {
+  // Never emit `$.ui.status(text)` for normal status (Claude Code renders it as a loud yellow ⚠ warning).
+  clearHostStatusBanner($);
+  const state = await computePromptStripState($, uiState);
+  const key = `${state.quarantined}|${state.stripText ?? ''}`;
+  if (key !== uiState.lastStripKey) {
+    uiState.lastStripKey = key;
+    $.ui.invalidate('ui.render');
+  }
 }
 
 export const register: Register = (on) => {
@@ -159,15 +219,15 @@ export const register: Register = (on) => {
     await $.command.register({
       name: COMMAND_NAME,
       description:
-        'Open the native Hyphae Mesh side panel (metadata-only inspector, bridges & controls)',
+        'Open the Hyphae side panel (metadata-only inspector, bridges & controls)',
       argumentHint: '[subs|queue|rules|mesh|status on|off|close]',
       immediate: true,
     });
 
-    await syncPersistentStatus($, uiState).catch(() => {});
+    await syncPromptStripInvalidation($, uiState).catch(() => {});
     stopStatusRefreshTimer();
     uiState.statusRefreshTimer = $.clock.every(REFRESH_INTERVAL_MS, () => {
-      void syncPersistentStatus($, uiState).catch(() => {});
+      void syncPromptStripInvalidation($, uiState).catch(() => {});
     });
 
     return next(e);
@@ -179,15 +239,16 @@ export const register: Register = (on) => {
     if (parsed.action === 'close') {
       stopPaneRefreshTimer();
       await $.ui.close({ id: PANE_ID });
-      return { text: 'Closed Hyphae Mesh side panel.', isTextDisplayOnly: true };
+      return { text: 'Closed Hyphae side panel.', isTextDisplayOnly: true };
     }
 
     if (parsed.action === 'status') {
-      uiState.statusEnabled = parsed.enabled;
-      await syncPersistentStatus($, uiState).catch(() => {});
+      uiState.statusMode = parsed.enabled ? 'on' : 'off';
+      uiState.lastStripKey = '';
+      clearHostStatusBanner($);
       $.ui.invalidate('ui.render');
       return {
-        text: `Hyphae status indicator ${parsed.enabled ? 'enabled' : 'disabled'}.`,
+        text: `Prompt status indicator ${parsed.enabled ? 'enabled' : 'disabled'}.`,
         isTextDisplayOnly: true,
       };
     }
@@ -199,19 +260,19 @@ export const register: Register = (on) => {
 
     await $.ui.open({
       id: PANE_ID,
-      title: 'Hyphae Mesh',
+      title: 'Hyphae',
       focus: true,
       closeOnEscape: true,
     });
 
-    await syncPersistentStatus($, uiState).catch(() => {});
+    clearHostStatusBanner($);
     stopPaneRefreshTimer();
     uiState.paneRefreshTimer = $.clock.every(REFRESH_INTERVAL_MS, () => {
       $.ui.invalidate('ui.render');
     });
     $.ui.invalidate('ui.render');
 
-    return { text: 'Opened Hyphae Mesh side panel.', isTextDisplayOnly: true };
+    return { text: 'Opened Hyphae side panel.', isTextDisplayOnly: true };
   });
 
   on('ui.close', { id: PANE_ID }, async (_$, e, next) => {
@@ -222,7 +283,7 @@ export const register: Register = (on) => {
   on('session.end', async ($, e, next) => {
     stopPaneRefreshTimer();
     stopStatusRefreshTimer();
-    applyStatusText($, uiState, undefined);
+    clearHostStatusBanner($);
     return next(e);
   });
 
@@ -260,11 +321,8 @@ export const register: Register = (on) => {
     const active: SessionSummary | null = resolved.active;
     const quarantined = getQuarantinedCount(snapshot, active);
 
-    // Keep the persistent bottom status line in sync whenever the panel redraws.
-    const statusText = uiState.statusEnabled
-      ? formatPersistentStatusLine(snapshot, active, quarantined)
-      : undefined;
-    applyStatusText($, uiState, statusText);
+    // Keep host warning status clear; quiet prompt indicator lives in AbovePrompt.
+    clearHostStatusBanner($);
 
     const runSessionControl = async (
       action: SessionControlAction,
@@ -286,33 +344,15 @@ export const register: Register = (on) => {
       $.ui.invalidate('ui.render');
     };
 
-    const closePanel = async (): Promise<void> => {
-      stopPaneRefreshTimer();
-      await $.ui.close({ id: PANE_ID });
-    };
-
     // Offline / missing ui/state.json graceful degradation
+    // (Claude Code's native Pane chrome already provides the top-right × close button.)
     if (!snapshot) {
       return (
         <Box flexDirection="column" paddingX={1} paddingY={1} gap={1}>
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexDirection="row" gap={1}>
-              <Text bold color="cyan">
-                hyphae
-              </Text>
-              <Text color="yellow">○ offline</Text>
-            </Box>
-            <Box key="hover-hyphae-close-offline">
-              <Button
-                key="hyphae-close"
-                plain
-                role="dismiss"
-                hover={{ color: 'white' }}
-                onPress={closePanel}
-              >
-                <Text dimColor>× close</Text>
-              </Button>
-            </Box>
+            <Text bold color="yellow">
+              ○ offline
+            </Text>
           </Box>
           <Box
             flexDirection="column"
@@ -322,9 +362,9 @@ export const register: Register = (on) => {
             paddingY={0}
             gap={0}
           >
-            <Text color="yellow">Hyphae daemon offline or ui/state.json not found.</Text>
+            <Text color="yellow">Daemon offline or ui/state.json not found.</Text>
             {stateFile ? <Text dimColor>{`Checked: ${sanitizeUiText(stateFile, 96)}`}</Text> : null}
-            <Text dimColor>Start your local node with `hyp node start` or check `hyp doctor`.</Text>
+            <Text dimColor>Run `hyp node start` or `hyp doctor`.</Text>
           </Box>
           {uiState.notice ? (
             <Text color={uiState.notice.ok ? 'green' : 'red'}>{uiState.notice.text}</Text>
@@ -337,15 +377,15 @@ export const register: Register = (on) => {
                 hotkey="r"
                 hover={{ color: 'cyan' }}
                 onPress={() => {
-                  uiState.notice = { ok: true, text: 'Refreshed Hyphae state.' };
+                  uiState.notice = { ok: true, text: 'Refreshed state.' };
                   $.ui.invalidate('ui.render');
                 }}
               >
-                <Text dimColor>↻ refresh (r)</Text>
+                <Text dimColor>↻ refresh</Text>
               </Button>
             </Box>
           </Box>
-          <Text dimColor>metadata only · untrusted external data · Esc to close</Text>
+          <Text dimColor>metadata only · untrusted external data</Text>
         </Box>
       );
     }
@@ -699,35 +739,22 @@ export const register: Register = (on) => {
 
     return (
       <Box flexDirection="column" paddingX={1} paddingY={1} gap={1}>
-        {/* Header */}
+        {/* Header — compact 2-row layout that scales cleanly in narrow side panes */}
         <Box flexDirection="column" gap={0}>
           <Box flexDirection="row" justifyContent="space-between" gap={1}>
-            <Box flexDirection="row" gap={1}>
-              <Text bold color="cyan">
-                hyphae
+            <Box flexShrink={1}>
+              <Text bold wrap="truncate-end">
+                {handleLabel}
               </Text>
-              <Text dimColor>·</Text>
-              <Text bold>{handleLabel}</Text>
             </Box>
-            <Box flexDirection="row" gap={1}>
+            <Box flexShrink={0}>
               <Text color={daemonOnline ? 'green' : 'yellow'}>
-                {daemonOnline ? `● online · ${nodeId}` : `○ offline · ${nodeId}`}
+                {daemonOnline ? '● online' : '○ offline'}
               </Text>
-              <Box key="hover-hyphae-close">
-                <Button
-                  key="hyphae-close"
-                  plain
-                  role="dismiss"
-                  hover={{ color: 'white' }}
-                  onPress={closePanel}
-                >
-                  <Text dimColor> ×</Text>
-                </Button>
-              </Box>
             </Box>
           </Box>
           <Box flexDirection="row" gap={1} flexWrap="wrap">
-            <Text dimColor>{`${peersOnline} peers`}</Text>
+            <Text dimColor>{`${nodeId} · ${peersOnline} peers`}</Text>
             {active?.transportKind ? <Text dimColor>{`· ${active.transportKind}`}</Text> : null}
             {headerBridgeText ? <Text color="cyan">{`· ${headerBridgeText}`}</Text> : null}
             {active?.focusMode ? (
@@ -758,7 +785,7 @@ export const register: Register = (on) => {
           </Box>
         ) : null}
 
-        {/* Sleek Borderless Controls (zero [ ... ] brackets) */}
+        {/* Compact Controls (Claude renders hotkey prefix `f:` / `r:` automatically) */}
         <Box flexDirection="row" gap={2} flexWrap="wrap">
           {active ? (
             <Box key="hover-hyphae-focus">
@@ -780,7 +807,7 @@ export const register: Register = (on) => {
                   color={active.focusMode ? 'yellow' : undefined}
                   dimColor={!active.focusMode}
                 >
-                  {active.focusMode ? '● focus on (f)' : '○ focus (f)'}
+                  {active.focusMode ? '● focus on' : '○ focus'}
                 </Text>
               </Button>
             </Box>
@@ -792,11 +819,11 @@ export const register: Register = (on) => {
               hotkey="r"
               hover={{ color: 'cyan' }}
               onPress={() => {
-                uiState.notice = { ok: true, text: 'Refreshed Hyphae metadata.' };
+                uiState.notice = { ok: true, text: 'Refreshed metadata.' };
                 $.ui.invalidate('ui.render');
               }}
             >
-              <Text dimColor>↻ refresh (r)</Text>
+              <Text dimColor>↻ refresh</Text>
             </Button>
           </Box>
           <Box key="hover-hyphae-status">
@@ -805,23 +832,21 @@ export const register: Register = (on) => {
               plain
               hover={{ color: 'cyan' }}
               onPress={() => {
-                uiState.statusEnabled = !uiState.statusEnabled;
-                applyStatusText(
-                  $,
-                  uiState,
-                  uiState.statusEnabled
-                    ? formatPersistentStatusLine(snapshot, active, quarantined)
-                    : undefined,
-                );
+                uiState.statusMode = uiState.statusMode === 'off' ? 'on' : 'off';
+                uiState.lastStripKey = '';
+                clearHostStatusBanner($);
                 uiState.notice = {
                   ok: true,
-                  text: `Status indicator ${uiState.statusEnabled ? 'ON' : 'OFF'}.`,
+                  text: `Prompt strip ${uiState.statusMode === 'off' ? 'OFF' : 'ON'}.`,
                 };
                 $.ui.invalidate('ui.render');
               }}
             >
-              <Text color={uiState.statusEnabled ? 'green' : undefined} dimColor={!uiState.statusEnabled}>
-                {uiState.statusEnabled ? '● status' : '○ status'}
+              <Text
+                color={uiState.statusMode !== 'off' ? 'green' : undefined}
+                dimColor={uiState.statusMode === 'off'}
+              >
+                {uiState.statusMode === 'off' ? '○ strip' : '● strip'}
               </Text>
             </Button>
           </Box>
@@ -890,68 +915,67 @@ export const register: Register = (on) => {
           {renderTabBody()}
         </Box>
 
-        <Text dimColor>metadata only · untrusted external data · Esc to close</Text>
+        <Text dimColor>metadata only · untrusted external data</Text>
       </Box>
     );
   });
 
-  // Emergency-only AbovePrompt banner: 100% hidden unless Security Gate has quarantined items.
+  // Quiet AbovePrompt indicator:
+  // - Emergency red quarantine alert whenever quarantined > 0
+  // - Subtle dim single-line indicator when enrolled outside Herdr (auto-hidden inside Herdr when the native Herdr mod is active)
+  // - 100% hidden when unenrolled or silenced (`/hyphae-panel status off`)
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const safeReadText = async (path: string): Promise<string | null> => {
-      try {
-        const res = await $.fs.read(path, { as: 'text' });
-        return typeof res === 'string' ? res : null;
-      } catch {
-        return null;
-      }
+    const state = await computePromptStripState($, uiState);
+    const { Box, Text, Button } = $.ui.resolve(e);
+
+    const openFromStrip = async (): Promise<void> => {
+      await $.ui.open({
+        id: PANE_ID,
+        title: 'Hyphae',
+        focus: true,
+        closeOnEscape: true,
+      });
+      stopPaneRefreshTimer();
+      uiState.paneRefreshTimer = $.clock.every(REFRESH_INTERVAL_MS, () => {
+        $.ui.invalidate('ui.render');
+      });
+      $.ui.invalidate('ui.render');
     };
 
-    const [homeDir, envStateDir, envSessionId, claudeSessionId] = await Promise.all([
-      $.env.get('HOME').then((v) => v ?? '').catch(() => ''),
-      $.env.get('HYPHAE_STATE_DIR').catch(() => undefined),
-      $.env.get('HYPHAE_SESSION_ID').catch(() => undefined),
-      $.session.id().catch(() => ''),
-    ]);
+    if (state.quarantined > 0) {
+      return (
+        <Box flexDirection="row" gap={1} paddingX={1}>
+          <Text bold color="red">
+            {`⚠ ${state.quarantined} quarantined — run \`hyp gate review\` in terminal`}
+          </Text>
+          <Box key="hover-hyphae-strip-open">
+            <Button
+              key="hyphae-strip-open"
+              plain
+              hover={{ color: 'white' }}
+              onPress={openFromStrip}
+            >
+              <Text color="cyan">open →</Text>
+            </Button>
+          </Box>
+        </Box>
+      );
+    }
 
-    const { snapshot } = await loadHyphaeSnapshot(homeDir, envStateDir, safeReadText);
-    const resolved = resolveActiveSession(
-      snapshot,
-      claudeSessionId,
-      envSessionId,
-      uiState.selectedSessionId,
-    );
-    const quarantined = getQuarantinedCount(snapshot, resolved.active);
-
-    if (quarantined === 0) {
+    if (!state.stripText) {
       return next(e);
     }
 
-    const { Box, Text, Button } = $.ui.resolve(e);
     return (
-      <Box flexDirection="row" gap={1} paddingX={1}>
-        <Text bold color="red">
-          {`⚠ hyphae: ${quarantined} quarantined — run \`hyp gate review\` in terminal`}
-        </Text>
-        <Box key="hover-hyphae-strip-open">
+      <Box flexDirection="row" paddingX={1}>
+        <Box key="hover-hyphae-strip-quiet">
           <Button
             key="hyphae-strip-open"
             plain
             hover={{ color: 'white' }}
-            onPress={async () => {
-              await $.ui.open({
-                id: PANE_ID,
-                title: 'Hyphae Mesh',
-                focus: true,
-                closeOnEscape: true,
-              });
-              stopPaneRefreshTimer();
-              uiState.paneRefreshTimer = $.clock.every(REFRESH_INTERVAL_MS, () => {
-                $.ui.invalidate('ui.render');
-              });
-              $.ui.invalidate('ui.render');
-            }}
+            onPress={openFromStrip}
           >
-            <Text color="cyan">open panel →</Text>
+            <Text dimColor>{state.stripText}</Text>
           </Button>
         </Box>
       </Box>

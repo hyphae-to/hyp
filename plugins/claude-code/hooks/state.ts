@@ -786,8 +786,89 @@ export function parseControlCommandResult(
   };
 }
 
+export interface HerdrModDetectionEnv {
+  homeDir?: string;
+  herdrAppHome?: string;
+  hcTerminalId?: string;
+  hcTerminalSocket?: string;
+  cfBundleId?: string;
+  panelStatusEnv?: string;
+}
+
 /**
- * Formats the single persistent native status line (`$.ui.status`) beneath the Claude Code prompt.
+ * Determines whether the inline prompt status strip should be auto-suppressed because
+ * the session is running inside Herdr with the native Hyphae Herdr mod active
+ * (or because `HYPHAE_PANEL_STATUS=off` was explicitly set).
+ */
+export async function shouldSuppressPromptStrip(
+  env: HerdrModDetectionEnv,
+  readText: (path: string) => Promise<string | null>,
+): Promise<boolean> {
+  const override = (env.panelStatusEnv ?? '').trim().toLowerCase();
+  if (override === 'off' || override === '0' || override === 'false') {
+    return true;
+  }
+  if (override === 'on' || override === '1' || override === 'true') {
+    return false;
+  }
+
+  const inHerdr = Boolean(
+    (env.hcTerminalId && env.hcTerminalId.trim()) ||
+      (env.hcTerminalSocket && env.hcTerminalSocket.trim()) ||
+      (env.cfBundleId && env.cfBundleId.trim() === 'dev.herdr.app'),
+  );
+  if (!inHerdr) {
+    return false;
+  }
+
+  const baseHerdr = (env.herdrAppHome ?? '').trim().replace(/[\\/]+$/, '') ||
+    (env.homeDir ? `${env.homeDir.replace(/[\\/]+$/, '')}/.config/herdr-app` : '');
+  if (!baseHerdr) {
+    return false;
+  }
+
+  // 1. Live mod advertisement in Herdr's persisted `shared.json` (`hyphae.modActive` or `workspace.panels`).
+  const sharedRaw = await readText(`${baseHerdr}/shared.json`);
+  let activeLayout: string | null = null;
+  if (sharedRaw) {
+    try {
+      const parsed = asRecord(JSON.parse(sharedRaw));
+      if (parsed) {
+        const modActive = asRecord(parsed['hyphae.modActive']);
+        if (modActive && (modActive.pane === true || modActive.panel === true)) {
+          return true;
+        }
+        const panels = parsed['workspace.panels'];
+        if (Array.isArray(panels) && panels.some((p) => p === 'hyphae')) {
+          return true;
+        }
+        activeLayout = asStr(parsed.layout) || null;
+      }
+    } catch {
+      // Malformed shared.json: fall through to installed mod manifest check.
+    }
+  }
+
+  // 2. Installed native Herdr mod files (`mods/hyphae-pane/mod.json` or `mods/hyphae-panel/mod.json`).
+  const [paneMod, panelMod] = await Promise.all([
+    readText(`${baseHerdr}/mods/hyphae-pane/mod.json`),
+    readText(`${baseHerdr}/mods/hyphae-panel/mod.json`),
+  ]);
+  if (!paneMod && !panelMod) {
+    return false;
+  }
+
+  if (activeLayout && !/[\\/]|^\.\.?$/.test(activeLayout)) {
+    const layoutRaw = await readText(`${baseHerdr}/layouts/${activeLayout}.json`);
+    if (layoutRaw !== null) {
+      return layoutRaw.includes('hyphae-pane') || layoutRaw.includes('hyphae-panel');
+    }
+  }
+  return true;
+}
+
+/**
+ * Formats the quiet, compact status indicator rendered in `AbovePrompt` outside Herdr.
  * Returns `undefined` when the current session is unenrolled and has no alerts (zero clutter).
  */
 export function formatPersistentStatusLine(
@@ -796,7 +877,7 @@ export function formatPersistentStatusLine(
   quarantined: number,
 ): string | undefined {
   if (quarantined > 0) {
-    return `⚠ hyphae: ${quarantined} held · run \`hyp gate review\``;
+    return `⚠ ${quarantined} held · hyp gate review`;
   }
   if (!snapshot || !active) {
     return undefined;
@@ -810,7 +891,10 @@ export function formatPersistentStatusLine(
     return undefined;
   }
 
-  const parts: string[] = [active.handle ? `hyphae @${active.handle}` : 'hyphae'];
+  const parts: string[] = [];
+  if (active.handle) {
+    parts.push(`@${active.handle}`);
+  }
 
   const firstBridge = active.bridges[0];
   if (firstBridge && active.bridges.length === 1) {
@@ -830,7 +914,7 @@ export function formatPersistentStatusLine(
     parts.push(`${active.counts.queued} queued`);
   }
   if (active.focusMode) {
-    parts.push('FOCUS');
+    parts.push('focus');
   }
   if (active.mutedAll) {
     parts.push('muted');
@@ -838,7 +922,9 @@ export function formatPersistentStatusLine(
     parts.push(`${active.counts.mutedRules} muted`);
   }
 
-  parts.push('/hyphae-panel');
+  if (parts.length === 0) {
+    return undefined;
+  }
   return parts.join(' · ');
 }
 

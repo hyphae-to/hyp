@@ -115,6 +115,13 @@ export default class HyphaePanel extends View {
 
     if (checking()) return;
 
+    // Advertise active Herdr mod via persisted shared state so in-pane CLI plugins
+    // (e.g. Claude Code's hyphae-panel) can auto-hide redundant prompt chrome.
+    const prevMod = shared("hyphae.modActive") ?? {};
+    if (!prevMod.panel) {
+      setShared("hyphae.modActive", { ...prevMod, panel: true, updatedAt: Date.now() });
+    }
+
     this.ensureDockPanelRegistered();
     this.client.ensureLocal(cx);
 
