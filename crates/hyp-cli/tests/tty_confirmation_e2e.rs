@@ -1843,6 +1843,7 @@ fn issue6_gate_review_full_and_gate_show_enforce_tty_sanitization_and_zero_json_
         &hostile_full_body,
         "prompt_injection",
     );
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let receipt2 = seed_quarantined_item(
         &state_dir,
         "issue6-full-2",

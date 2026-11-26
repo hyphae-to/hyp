@@ -794,7 +794,7 @@ sys.path.insert(0, os.environ["SDK_PY_DIR"])
 from client import MeshPluginClient
 
 client = MeshPluginClient()
-port = int(os.environ["TRIGGER_PORT"])
+port_file = os.environ["TRIGGER_PORT_FILE"]
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -830,10 +830,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 srv.daemon_threads = True
 t = threading.Thread(target=srv.serve_forever, daemon=True)
 t.start()
+tmp_port_file = port_file + ".tmp"
+with open(tmp_port_file, "w", encoding="utf-8") as fh:
+    fh.write(str(srv.server_address[1]))
+os.replace(tmp_port_file, port_file)
 client._dead.wait()
 srv.shutdown()
 "#;
@@ -868,8 +872,8 @@ srv.shutdown()
             l.local_addr().unwrap().port()
         };
         let peer_http_port = alloc_port();
-        let trigger_port_phase1 = alloc_port();
-        let trigger_port_phase2 = alloc_port();
+        let trigger_port_file_phase1 = tmp.path().join("trigger_port_phase1.txt");
+        let trigger_port_file_phase2 = tmp.path().join("trigger_port_phase2.txt");
 
         // Pre-seed three paired remote peers covering ALL wildcard-stream presets (`member`,
         // `observer`, `full` — every one grants `stream:subscribe=*`) plus a same-node local
@@ -948,49 +952,50 @@ srv.shutdown()
             node.shutdown();
         }
 
-        let write_node_cfg = |cfg_path: &Path, trigger_port: u16, expose_topic: Option<bool>| {
-            let mut plugin_entry = json!({
-                "id": "mailfeed",
-                "kind": "source",
-                "command": python_bin,
-                "args": ["-u", plugin_script.to_str().unwrap()],
-                "targets": ["personal-mail"],
-                "env": {
-                    "SDK_PY_DIR": sdk_py_dir.to_str().unwrap(),
-                    "TRIGGER_PORT": trigger_port.to_string(),
+        let write_node_cfg =
+            |cfg_path: &Path, trigger_port_file: &Path, expose_topic: Option<bool>| {
+                let mut plugin_entry = json!({
+                    "id": "mailfeed",
+                    "kind": "source",
+                    "command": python_bin,
+                    "args": ["-u", plugin_script.to_str().unwrap()],
+                    "targets": ["personal-mail"],
+                    "env": {
+                        "SDK_PY_DIR": sdk_py_dir.to_str().unwrap(),
+                        "TRIGGER_PORT_FILE": trigger_port_file.to_str().unwrap(),
+                    }
+                });
+                if let Some(exp) = expose_topic {
+                    plugin_entry["exposeTopic"] = json!(exp);
                 }
-            });
-            if let Some(exp) = expose_topic {
-                plugin_entry["exposeTopic"] = json!(exp);
-            }
-            let mut gate_cfg = hyp_node::gates::SecurityGateConfig::default();
-            gate_cfg
-                .stage1
-                .inbound_regex_denylist
-                .push("FORBIDDEN_SOURCE_CANARY".to_string());
-            gate_cfg.stage1.regex_deny_action = hyp_node::gates::Stage1DenyAction::Quarantine;
-            fs::write(
-                cfg_path,
-                serde_json::to_string_pretty(&json!({
-                    "v": 2,
-                    "nodeId": "alice@laptop",
-                    "profile": "p2p",
-                    "bind": format!("127.0.0.1:{peer_http_port}"),
-                    "stateDir": state_dir.to_str().unwrap(),
-                    "gate": serde_json::to_value(&gate_cfg).unwrap(),
-                    "plugins": [plugin_entry]
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        };
+                let mut gate_cfg = hyp_node::gates::SecurityGateConfig::default();
+                gate_cfg
+                    .stage1
+                    .inbound_regex_denylist
+                    .push("FORBIDDEN_SOURCE_CANARY".to_string());
+                gate_cfg.stage1.regex_deny_action = hyp_node::gates::Stage1DenyAction::Quarantine;
+                fs::write(
+                    cfg_path,
+                    serde_json::to_string_pretty(&json!({
+                        "v": 2,
+                        "nodeId": "alice@laptop",
+                        "profile": "p2p",
+                        "bind": format!("127.0.0.1:{peer_http_port}"),
+                        "stateDir": state_dir.to_str().unwrap(),
+                        "gate": serde_json::to_value(&gate_cfg).unwrap(),
+                        "plugins": [plugin_entry]
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            };
 
         let cfg_path = state_dir.join("node.json");
 
         // =====================================================================
         // PHASE 1: Default `exposeTopic` (omitted -> `false`, strictly local-only)
         // =====================================================================
-        write_node_cfg(&cfg_path, trigger_port_phase1, None);
+        write_node_cfg(&cfg_path, &trigger_port_file_phase1, None);
         let mut cmd1 = isolated_cmd(&home);
         cmd1.args(["daemon", "--config", cfg_path.to_str().unwrap(), "--json"]);
         let mut daemon1 = ManagedDaemon::spawn(&mut cmd1);
@@ -1006,29 +1011,43 @@ srv.shutdown()
             .build()
             .unwrap();
 
-        let wait_plugin_ready = |port: u16| {
+        let wait_plugin_ready = |port_file: &Path| -> u16 {
             rt.block_on(async {
                 let client: Client<_, Full<Bytes>> =
                     Client::builder(TokioExecutor::new()).build_http();
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut last_port: Option<u16> = None;
                 loop {
-                    let req = Request::builder()
-                        .method(Method::GET)
-                        .uri(format!("http://127.0.0.1:{port}/health"))
-                        .body(Full::new(Bytes::new()))
-                        .unwrap();
-                    if let Ok(resp) = client.request(req).await {
-                        if resp.status() == StatusCode::OK {
-                            return;
+                    if let Ok(raw) = fs::read_to_string(port_file) {
+                        if let Ok(port) = raw.trim().parse::<u16>() {
+                            last_port = Some(port);
+                            let req = Request::builder()
+                                .method(Method::GET)
+                                .uri(format!("http://127.0.0.1:{port}/health"))
+                                .body(Full::new(Bytes::new()))
+                                .unwrap();
+                            if let Ok(resp) = client.request(req).await {
+                                if resp.status() == StatusCode::OK {
+                                    return port;
+                                }
+                            }
                         }
                     }
-                    assert!(
-                        Instant::now() < deadline,
-                        "timed out waiting for source plugin health on port {port}"
-                    );
+                    if Instant::now() >= deadline {
+                        let plugin_log = fs::read_to_string(
+                            state_dir.join("logs").join("plugin-mailfeed.log"),
+                        )
+                        .unwrap_or_else(|_| "<no plugin-mailfeed.log>".to_string());
+                        let node_status = fs::read_to_string(state_dir.join("node.status.json"))
+                            .unwrap_or_else(|_| "<no node.status.json>".to_string());
+                        panic!(
+                            "timed out waiting for source plugin health (port={last_port:?}, file={})\nplugin-mailfeed.log:\n{plugin_log}\nnode.status.json:\n{node_status}",
+                            port_file.display()
+                        );
+                    }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-            });
+            })
         };
 
         let emit_source_event = |port: u16, event: Value| -> Value {
@@ -1056,7 +1075,7 @@ srv.shutdown()
             })
         };
 
-        wait_plugin_ready(trigger_port_phase1);
+        let trigger_port_phase1 = wait_plugin_ready(&trigger_port_file_phase1);
 
         // 1A. Issue #25 (B6): ALL three wildcard-stream presets (`member`, `observer`, `full`)
         //     MUST NOT see `personal-mail` in `/v1/manifest` AND MUST get `403 topic_local_only`
@@ -1373,7 +1392,7 @@ srv.shutdown()
         // =====================================================================
         // PHASE 2: Flip `"exposeTopic": true` -> authorized remote peer gets 200 & events!
         // =====================================================================
-        write_node_cfg(&cfg_path, trigger_port_phase2, Some(true));
+        write_node_cfg(&cfg_path, &trigger_port_file_phase2, Some(true));
         let mut cmd2 = isolated_cmd(&home);
         cmd2.args(["daemon", "--config", cfg_path.to_str().unwrap(), "--json"]);
         let mut daemon2 = ManagedDaemon::spawn(&mut cmd2);
@@ -1384,7 +1403,7 @@ srv.shutdown()
         );
         let _sock_path2 = PathBuf::from(startup2["data"]["socketPath"].as_str().unwrap());
 
-        wait_plugin_ready(trigger_port_phase2);
+        let trigger_port_phase2 = wait_plugin_ready(&trigger_port_file_phase2);
 
         // 2A. Observer's `/v1/manifest` NOW advertises `personal-mail`, and `PUT /v1/subscriptions`
         //     succeeds with `200 OK`!

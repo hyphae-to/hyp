@@ -340,7 +340,7 @@ where
     ))
 }
 
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn launchd_install_via<F, S>(
     domain: &str,
     target: &str,
