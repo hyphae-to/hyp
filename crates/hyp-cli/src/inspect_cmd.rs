@@ -9,7 +9,7 @@
 
 use crate::statusline_cmd::sanitize_terminal_text;
 use crate::ui::{
-    EXIT_ERROR, EXIT_OK, JsonEnvelope, emit_error, print_json, print_next_steps, print_warnings,
+    CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
 use clap::Args;
 use hyp_harness::sock::{
@@ -675,21 +675,17 @@ fn run_inspect_watch_mode(
     socket_path: &Path,
     target: &ResolvedInspectTarget,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
-            return emit_error(
-                "inspect",
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RUNTIME_ERROR",
                 format!("Failed to start async runtime: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -700,30 +696,14 @@ fn run_inspect_watch_mode(
         let (read_half, mut write_half) = match connect_daemon_async(socket_path).await {
             Ok(pair) => pair,
             Err(e) => {
-                return emit_error(
-                    "inspect",
-                    as_json,
-                    EXIT_ERROR,
-                    "DAEMON_OFFLINE",
-                    format!(
+                return Err(CliError::error("DAEMON_OFFLINE", format!(
                         "Could not connect to local Hyphae daemon at {}: {e}",
                         socket_path.display()
-                    ),
-                    Some("Run `hyp daemon` or `hyp service start`".to_string()),
-                );
+                    )).with_fix("Run `hyp daemon` or `hyp service start`".to_string()));
             }
         };
 
-        if let Err(e) = write_ndjson_line_async(&mut write_half, &packet).await {
-            return emit_error(
-                "inspect",
-                as_json,
-                EXIT_ERROR,
-                "WATCH_WRITE_FAILED",
-                format!("Failed sending inspect.watch request: {e}"),
-                None,
-            );
-        }
+        write_ndjson_line_async(&mut write_half, &packet).await.map_err(|e| CliError::error("WATCH_WRITE_FAILED", format!("Failed sending inspect.watch request: {e}")))?;
 
         let mut reader = tokio::io::BufReader::new(read_half);
         let is_tty = io::stdout().is_terminal();
@@ -732,33 +712,19 @@ fn run_inspect_watch_mode(
         loop {
             let line_opt = tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    return ExitCode::from(EXIT_OK);
+                    return Ok(ExitCode::from(EXIT_OK));
                 }
                 res = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES) => {
                     match res {
                         Ok(Some(line)) => Some(line),
                         Ok(None) => {
-                            return emit_error(
-                                "inspect",
-                                as_json,
-                                EXIT_ERROR,
-                                "WATCH_DISCONNECTED",
-                                "Local Hyphae daemon closed the inspect.watch stream unexpectedly",
-                                Some(
+                            return Err(CliError::error("WATCH_DISCONNECTED", "Local Hyphae daemon closed the inspect.watch stream unexpectedly").with_fix(
                                     "Check daemon status with `hyp status` or restart with `hyp service restart`."
                                         .to_string(),
-                                ),
-                            );
+                                ));
                         }
                         Err(e) => {
-                            return emit_error(
-                                "inspect",
-                                as_json,
-                                EXIT_ERROR,
-                                "WATCH_READ_FAILED",
-                                format!("inspect.watch stream error: {e}"),
-                                None,
-                            );
+                            return Err(CliError::error("WATCH_READ_FAILED", format!("inspect.watch stream error: {e}")));
                         }
                     }
                 }
@@ -780,13 +746,13 @@ fn run_inspect_watch_mode(
                     .get("error")
                     .and_then(Value::as_str)
                     .unwrap_or("inspect.watch failed");
-                return emit_error("inspect", as_json, EXIT_ERROR, code, msg, None);
+                return Err(CliError::error(code, msg));
             }
 
             if as_json {
                 let mut out = io::stdout().lock();
                 if writeln!(out, "{line}").is_err() || out.flush().is_err() {
-                    return ExitCode::from(EXIT_OK);
+                    return Ok(ExitCode::from(EXIT_OK));
                 }
             } else {
                 let rendered = render_inspect_text(&parsed, is_all);
@@ -800,17 +766,21 @@ fn run_inspect_watch_mode(
                     let _ = write!(out, "{rendered}");
                 }
                 if out.flush().is_err() {
-                    return ExitCode::from(EXIT_OK);
+                    return Ok(ExitCode::from(EXIT_OK));
                 }
             }
             frame_idx += 1;
         }
 
-        ExitCode::from(EXIT_OK)
+        Ok(ExitCode::from(EXIT_OK))
     })
 }
 
-pub fn run_inspect(args: &InspectArgs) -> ExitCode {
+pub fn run_inspect(args: &InspectArgs) -> CommandResult {
+    CommandResult::new("inspect", args.json, inspect(args))
+}
+
+fn inspect(args: &InspectArgs) -> Result<ExitCode, CliError> {
     let socket_path = args.socket.clone().unwrap_or_else(default_socket_path);
     let target = ResolvedInspectTarget::from_args(args);
 
@@ -827,14 +797,8 @@ pub fn run_inspect(args: &InspectArgs) -> ExitCode {
                 socket_path.display()
             )
         });
-        return emit_error(
-            "inspect",
-            args.json,
-            EXIT_ERROR,
-            "DAEMON_UNAVAILABLE",
-            err_msg,
-            Some("Run `hyp daemon` or `hyp service start`".to_string()),
-        );
+        return Err(CliError::error("DAEMON_UNAVAILABLE", err_msg)
+            .with_fix("Run `hyp daemon` or `hyp service start`".to_string()));
     }
 
     let mut payload = Value::Object(res.result.unwrap_or_default());
@@ -846,28 +810,27 @@ pub fn run_inspect(args: &InspectArgs) -> ExitCode {
     let (warnings, next) = collect_warnings_and_next(&payload);
 
     if args.json {
-        let env = JsonEnvelope {
-            ok: true,
-            command: "inspect".to_string(),
-            summary: Some(summarize_payload(&payload, target.all)),
-            data: Some(payload),
-            warnings,
-            next,
-            error: None,
-        };
+        let env = JsonEnvelope::ok(
+            "inspect".to_string(),
+            summarize_payload(&payload, target.all),
+            payload,
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&env);
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     print!("{}", render_inspect_text(&payload, target.all));
     print_warnings(&warnings);
     print_next_steps(&next);
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::EXIT_ERROR;
 
     #[test]
     fn renders_sanitized_tables_without_bodies_or_escape_sequences() {
@@ -1000,7 +963,7 @@ mod tests {
             socket: Some(addr_file),
             json: true,
         };
-        let code = run_inspect(&args);
+        let code = crate::finish_command(run_inspect(&args));
         srv.join().unwrap();
         assert_eq!(
             code,

@@ -186,6 +186,12 @@ impl<T: Serialize> JsonEnvelope<T> {
         }
     }
 
+    pub fn error(mut self, error: Option<CliError>) -> Self {
+        self.ok = error.is_none();
+        self.error = error;
+        self
+    }
+
     pub fn warnings(mut self, warnings: Vec<String>) -> Self {
         self.warnings = warnings;
         self

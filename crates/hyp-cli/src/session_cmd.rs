@@ -4,7 +4,7 @@
 //! and adheres strictly to the agent-first `crates/hyp-cli/src/ui.rs` JSON envelope contract.
 
 use crate::statusline_cmd::sanitize_terminal_text;
-use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
+use crate::ui::{CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_harness::sock::{daemon_rpc_sync, default_socket_path};
 use hyp_harness::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
@@ -200,8 +200,7 @@ fn insert_session_selector(
     Ok(())
 }
 
-pub fn run_session(args: &SessionArgs) -> ExitCode {
-    let socket_path = args.socket.clone().unwrap_or_else(default_socket_path);
+pub fn run_session(args: &SessionArgs) -> CommandResult {
     let mut pkt = Map::new();
 
     let (cmd_name, require_session) = match &args.command {
@@ -253,16 +252,24 @@ pub fn run_session(args: &SessionArgs) -> ExitCode {
         }
     };
 
-    if let Err(msg) = insert_session_selector(args, &mut pkt, require_session) {
-        return emit_error(
-            cmd_name,
-            args.json,
-            EXIT_USAGE,
-            "SESSION_REQUIRED",
-            msg,
-            Some("Pass --session <id>, --herdr-terminal <tid>, or --handle <name>".to_string()),
-        );
-    }
+    CommandResult::new(
+        cmd_name,
+        args.json,
+        session(args, cmd_name, require_session, pkt),
+    )
+}
+
+fn session(
+    args: &SessionArgs,
+    cmd_name: &str,
+    require_session: bool,
+    mut pkt: Map<String, Value>,
+) -> Result<ExitCode, CliError> {
+    let socket_path = args.socket.clone().unwrap_or_else(default_socket_path);
+    insert_session_selector(args, &mut pkt, require_session).map_err(|msg| {
+        CliError::usage("SESSION_REQUIRED", msg)
+            .with_fix("Pass --session <id>, --herdr-terminal <tid>, or --handle <name>".to_string())
+    })?;
 
     let res = daemon_rpc_sync(&socket_path, &Value::Object(pkt), SESSION_RPC_TIMEOUT);
     if !res.ok {
@@ -272,35 +279,20 @@ pub fn run_session(args: &SessionArgs) -> ExitCode {
                 socket_path.display()
             )
         });
-        return emit_error(
-            cmd_name,
-            args.json,
-            EXIT_ERROR,
-            "SESSION_RPC_FAILED",
-            msg,
-            Some("Verify the daemon is running (`hyp status`) and session ID is active (`hyp inspect --all`)".to_string()),
-        );
+        return Err(CliError::error("SESSION_RPC_FAILED", msg).with_fix("Verify the daemon is running (`hyp status`) and session ID is active (`hyp inspect --all`)".to_string()));
     }
 
     let result_map = res.result.unwrap_or_default();
     let summary = build_human_summary(&args.command, &result_map);
 
     if args.json {
-        let env = JsonEnvelope {
-            ok: true,
-            command: cmd_name.to_string(),
-            summary: Some(summary),
-            data: Some(Value::Object(result_map)),
-            warnings: Vec::new(),
-            next: Vec::new(),
-            error: None,
-        };
+        let env = JsonEnvelope::ok(cmd_name.to_string(), summary, Value::Object(result_map));
         print_json(&env);
     } else {
         println!("OK  {summary}");
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn build_human_summary(sub: &SessionSubcommand, result: &Map<String, Value>) -> String {
