@@ -1019,6 +1019,20 @@ impl<'a> LocalStateStore<'a> {
         Ok(n.max(0) as usize)
     }
 
+    /// Returns distinct `session_id`s that currently have at least one `gate_state = 'pending'`
+    /// mailbox row, ordered deterministically.
+    pub fn list_pending_session_ids(&self) -> StoreResult<Vec<String>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT DISTINCT session_id FROM mailbox
+             WHERE gate_state = 'pending'
+             ORDER BY session_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Count of `pending` AND gate-cleared mailbox entries for `session_id`
     /// (`reviewed_at IS NOT NULL OR human_auth_json IS NOT NULL`).
     pub fn pending_count_gate_cleared(&self, session_id: &str) -> StoreResult<usize> {

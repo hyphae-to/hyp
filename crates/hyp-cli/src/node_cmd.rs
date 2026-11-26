@@ -1062,6 +1062,16 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         startup_warnings.extend(initial_reconcile.warnings);
         let connected_peers = initial_reconcile.connected_peers;
 
+        // Wake the node scheduler and run a non-blocking post-bootstrap mailbox/topic flush
+        // now that plugins and peer links are online (strictly at-most-once, never blocks startup).
+        node.wake_scheduler();
+        if let Some(ref daemon) = local_daemon {
+            let flush_daemon = Arc::clone(daemon);
+            tokio::spawn(async move {
+                flush_daemon.flush_pending_sessions().await;
+            });
+        }
+
         let pid = std::process::id();
         let pid_path = state_dir.join("node.pid");
         let status_path = state_dir.join("node.status.json");

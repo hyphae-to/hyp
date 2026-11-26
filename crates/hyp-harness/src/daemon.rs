@@ -386,6 +386,20 @@ impl TransportHints {
         }
     }
 
+    fn from_session_backend(session_id: &str, backend_json: &str) -> Self {
+        let map = serde_json::from_str::<Value>(backend_json)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        let persisted_harness = map
+            .get("kind")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<HarnessKind>().ok());
+        let inferred_harness =
+            LocalDaemonInner::infer_session_harness(session_id, persisted_harness);
+        Self::from_packet(&map, inferred_harness)
+    }
+
     fn has_any_hint(&self) -> bool {
         self.herdr_terminal_id.is_some()
             || self.t3_base_dir.is_some()
@@ -638,6 +652,7 @@ pub struct LocalDaemon {
     stopped: AtomicBool,
     accept_task: Mutex<Option<JoinHandle<()>>>,
     inbox_task: Mutex<Option<JoinHandle<()>>>,
+    startup_flush_task: Mutex<Option<JoinHandle<()>>>,
     projector_task: Mutex<Option<JoinHandle<()>>>,
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -718,6 +733,17 @@ impl LocalDaemon {
         let _ = inner.prune_stale_sessions_now();
         sweep_approved_local_ingest_on_startup(&inner).await;
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
+        let startup_pending = inner.collect_pending_sessions_for_flush();
+        let startup_flush_task = if startup_pending.is_empty() {
+            None
+        } else {
+            let flush_inner = Arc::clone(&inner);
+            Some(tokio::spawn(async move {
+                flush_inner
+                    .flush_pending_session_list(startup_pending)
+                    .await;
+            }))
+        };
         let _ = inner.write_ui_state_snapshot();
         let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
         let maintenance_task = spawn_maintenance_task(Arc::clone(&inner), shutdown_tx.subscribe());
@@ -729,6 +755,7 @@ impl LocalDaemon {
             stopped: AtomicBool::new(false),
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
+            startup_flush_task: Mutex::new(startup_flush_task),
             projector_task: Mutex::new(Some(projector_task)),
             maintenance_task: Mutex::new(Some(maintenance_task)),
         })
@@ -810,6 +837,17 @@ impl LocalDaemon {
         let _ = inner.prune_stale_sessions_now();
         sweep_approved_local_ingest_on_startup(&inner).await;
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
+        let startup_pending = inner.collect_pending_sessions_for_flush();
+        let startup_flush_task = if startup_pending.is_empty() {
+            None
+        } else {
+            let flush_inner = Arc::clone(&inner);
+            Some(tokio::spawn(async move {
+                flush_inner
+                    .flush_pending_session_list(startup_pending)
+                    .await;
+            }))
+        };
         let _ = inner.write_ui_state_snapshot();
         let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
         let maintenance_task = spawn_maintenance_task(Arc::clone(&inner), shutdown_tx.subscribe());
@@ -821,6 +859,7 @@ impl LocalDaemon {
             stopped: AtomicBool::new(false),
             accept_task: Mutex::new(Some(accept_task)),
             inbox_task: Mutex::new(Some(inbox_task)),
+            startup_flush_task: Mutex::new(startup_flush_task),
             projector_task: Mutex::new(Some(projector_task)),
             maintenance_task: Mutex::new(Some(maintenance_task)),
         })
@@ -1097,6 +1136,13 @@ impl LocalDaemon {
         Ok(delivered)
     }
 
+    /// Sweeps pending local topic batches and reconciles/flushes every local session with
+    /// pending unread items (enforcing Security Gates, mutes, Focus Mode, and strictly
+    /// at-most-once delivery). Safe to invoke repeatedly or concurrently with live traffic.
+    pub async fn flush_pending_sessions(&self) {
+        self.inner.flush_all_pending_sessions().await;
+    }
+
     /// Gracefully stops the daemon listener, background watcher, and removes the local socket/addr file.
     pub async fn stop(self) {
         self.stop_sync();
@@ -1131,6 +1177,14 @@ impl LocalDaemon {
             .inbox_task
             .lock()
             .expect("inbox_task lock poisoned")
+            .take()
+        {
+            h.abort();
+        }
+        if let Some(h) = self
+            .startup_flush_task
+            .lock()
+            .expect("startup_flush_task lock poisoned")
             .take()
         {
             h.abort();
@@ -3572,6 +3626,170 @@ impl LocalDaemonInner {
             }
             Some(_) => Err("session_token_invalid"),
         }
+    }
+
+    /// Materializes any due local topic batches into local mailboxes and snapshots all sessions
+    /// currently holding pending mailbox rows (excluding internal `local-ingest:` staging rows).
+    ///
+    /// Runs synchronously against local SQLite so `LocalDaemon::start` captures the exact
+    /// pre-existing backlog before returning — never racing against fresh items ingested after
+    /// startup!
+    fn collect_pending_sessions_for_flush(&self) -> Vec<(String, String)> {
+        if *self.shutdown_rx.borrow() {
+            return Vec::new();
+        }
+        // 1. Materialize any queued/due local topic batches into `mailbox` BEFORE scanning sessions.
+        let _ = self.node.flush_pending_local_topic_batches();
+
+        // 2. Collect sessions that currently have pending mailbox entries (excluding internal
+        //    `local-ingest:` staging rows, which are handled by `sweep_approved_local_ingest_on_startup`).
+        let db = self.node.db();
+        let mut backend_by_id: HashMap<String, String> = HashMap::new();
+        for s in db.local().list_sessions().unwrap_or_default() {
+            backend_by_id.insert(s.id, s.backend_json);
+        }
+        let pending_ids = db.local().list_pending_session_ids().unwrap_or_default();
+        let mut out = Vec::new();
+        for sid in pending_ids {
+            if sid.starts_with("local-ingest:") {
+                continue;
+            }
+            let backend_json = backend_by_id
+                .remove(&sid)
+                .unwrap_or_else(|| "{}".to_string());
+            out.push((sid, backend_json));
+        }
+        out
+    }
+
+    /// Sweeps pending local topic batches into local mailboxes, reconciles every session with
+    /// pending unread/unscreened entries (strictly enforcing Security Gates, mutes, and Focus
+    /// Mode), hydrates native push transports from persisted `sessions.backend_json` when
+    /// `auto_detect_transports` is enabled, and flushes deliverable batches at-most-once.
+    async fn flush_all_pending_sessions(self: &Arc<Self>) {
+        let pending_sessions = self.collect_pending_sessions_for_flush();
+        self.flush_pending_session_list(pending_sessions).await;
+    }
+
+    async fn flush_pending_session_list(self: &Arc<Self>, pending_sessions: Vec<(String, String)>) {
+        if pending_sessions.is_empty() || *self.shutdown_rx.borrow() {
+            return;
+        }
+
+        // 3. Reconcile, optionally hydrate persisted push transports, and flush each session
+        //    concurrently so one slow external transport probe never stalls other sessions.
+        let mut join_set = tokio::task::JoinSet::new();
+        for (sid, backend_json) in pending_sessions {
+            let daemon = Arc::clone(self);
+            join_set.spawn(async move {
+                if *daemon.shutdown_rx.borrow() {
+                    return;
+                }
+
+                // Respect any active Tier 3 Hold backoff or active-turn hook grace timer rather
+                // than firing an unsolicited extra push attempt ahead of schedule.
+                let retry_or_grace_active = daemon
+                    .hold_retries
+                    .lock()
+                    .expect("hold_retries lock poisoned")
+                    .contains_key(&sid)
+                    || daemon
+                        .activity_grace_timers
+                        .lock()
+                        .expect("activity_grace_timers lock poisoned")
+                        .contains_key(&sid);
+                if retry_or_grace_active {
+                    return;
+                }
+
+                // Always enforce Security Gates, mutes, Focus Mode, and urgency classification first.
+                let wake_needed = daemon.reconcile_session_inbox(&sid).await;
+                if !wake_needed {
+                    return;
+                }
+
+                let has_unnotified = {
+                    let db = daemon.node.db();
+                    db.local().unnotified_count(&sid).unwrap_or(0) > 0
+                };
+                if !has_unnotified {
+                    return;
+                }
+
+                // Hydrate persisted push transport (Herdr / T3 / OpenClaw / Codex Queue) if enabled
+                // and no push transport is attached yet.
+                if daemon.config.auto_detect_transports
+                    && daemon.current_transport_priority(&sid) == 0
+                {
+                    let hints = TransportHints::from_session_backend(&sid, &backend_json);
+                    maybe_spawn_transport_probe(&daemon, &sid, hints);
+
+                    let probe_rx = daemon
+                        .pending_probes
+                        .lock()
+                        .expect("pending_probes lock poisoned")
+                        .get(&sid)
+                        .cloned();
+                    if let Some(mut rx) = probe_rx {
+                        let mut shutdown_rx = daemon.shutdown_rx.clone();
+                        let wait_probe = async {
+                            while !*rx.borrow() {
+                                if rx.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        };
+                        tokio::select! {
+                            _ = tokio::time::timeout(Duration::from_secs(5), wait_probe) => {}
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if *daemon.shutdown_rx.borrow() {
+                    return;
+                }
+
+                // Re-check backoff guard before flushing in case a live send just entered Hold.
+                let retry_active = daemon
+                    .hold_retries
+                    .lock()
+                    .expect("hold_retries lock poisoned")
+                    .contains_key(&sid);
+                if retry_active {
+                    return;
+                }
+
+                // Strictly at-most-once flush: respects per-session `flushing` lock, `notified`,
+                // `nudge_pending`, `delivered_at`, Security Gates, mutes, and Focus Mode.
+                let _ = daemon.flush_session(&sid).await;
+            });
+        }
+
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        loop {
+            tokio::select! {
+                res = join_set.join_next() => {
+                    if res.is_none() {
+                        break;
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        join_set.abort_all();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 4. Refresh UI projection revision so `ui/state.json` and `inspect.watch` reflect
+        //    post-flush mailbox state immediately.
+        self.bump_ui_rev();
     }
 
     /// Flushes eligible batches to live transports (`claude-channel` > `PushTransport` > `watch` stream > `wait` once).

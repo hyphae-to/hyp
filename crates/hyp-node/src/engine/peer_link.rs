@@ -1129,6 +1129,9 @@ pub fn spawn_sse_worker(
                 Ok(resp) if resp.status() == StatusCode::OK => {
                     backoff_ms = SSE_INITIAL_BACKOFF_MS;
                     auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
+                    // Promptly wake local peer inbox & scheduler on link connect/reconnect.
+                    node.notify_peer_inbox(link.peer_id());
+                    node.notify_scheduler();
                     let mut body = resp.into_body();
                     let mut parser = SseParser::new();
 
