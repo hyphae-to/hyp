@@ -9519,6 +9519,21 @@ impl UnifiedNode {
                     })
                 }
             }
+            HumanDropKind::Approval => {
+                self.record_human_drop_rejected_audit(
+                    Some(format!("human:{}:{}", auth_rec.human_id, auth_rec.kid)),
+                    None,
+                    Some(TYPE_HUMAN_DROP_V1),
+                    Some("human.approval_wrong_entrypoint"),
+                    "approval drops must be verified by the target ceremony command (not `hyp drop ingest`)",
+                    claim.claim_id.as_bytes(),
+                    now,
+                );
+                Err(NodeError::BadRequest(
+                    "approval drops cannot be ingested via `hyp drop ingest`; submit via the target ceremony command (e.g. `hyp gate lock --approval-file <path>`)"
+                        .to_string(),
+                ))
+            }
         }
     }
 

@@ -33,10 +33,11 @@ import {
   toCanonicalJson,
   utf8Bytes,
   utf8String,
+  validateApprovalAction,
   validateSecretName,
   verifyNodeCert,
   zeroize,
-} from "./crypto.js?v=2";
+} from "./crypto.js?v=4";
 
 const HINT_STORAGE_PREFIX = "hyphae.drop.hint.v1:";
 const MAX_DROP_TTL_MS = 10 * 60 * 1000;
@@ -121,12 +122,12 @@ export function parseFragmentString(rawHash) {
   if (!raw || typeof raw !== "object") {
     throw new Error("Drop invite fragment must be a JSON object");
   }
-  // Deliberately whitelist fields — HARD-IGNORE plaintext `proposedText`, `draft`, or `body`!
-  // Accept HPKE `encDraft` ONLY on `kind === "directive"` (HARD-IGNORE on `kind === "secret"`).
+  // Deliberately whitelist fields — HARD-IGNORE plaintext `proposedText`, `draft`, `summary`, `action`, or `body`!
+  // Accept HPKE `encDraft` ONLY on `kind === "directive"` and `approval` ONLY on `kind === "approval"`.
   if (raw.v !== 1) {
     throw new Error(`Unsupported drop invite version: ${raw.v}`);
   }
-  if (raw.kind !== "directive" && raw.kind !== "secret") {
+  if (raw.kind !== "directive" && raw.kind !== "secret" && raw.kind !== "approval") {
     throw new Error(`Unsupported drop kind: ${raw.kind}`);
   }
   if (typeof raw.nodeId !== "string" || raw.nodeId.trim().length === 0) {
@@ -152,6 +153,15 @@ export function parseFragmentString(rawHash) {
   }
 
   const encDraft = raw.kind === "directive" ? parseOptionalEncDraft(raw.encDraft) : null;
+  // An approval link names the exact action to sign. It is validated here and shown from its
+  // signed fields only; the node rejects a signature over anything but the action it requested.
+  let approval = null;
+  if (raw.kind === "approval") {
+    approval = validateApprovalAction(raw.approval);
+    if (approval.nodeId !== raw.nodeId) {
+      throw new Error("Approval link action targets a different node than the link itself");
+    }
+  }
 
   const fragment = {
     v: 1,
@@ -172,6 +182,7 @@ export function parseFragmentString(rawHash) {
     prfSalt: typeof raw.prfSalt === "string" ? raw.prfSalt.trim() : "",
     authEpoch: Number.isInteger(raw.authEpoch) && raw.authEpoch >= 1 ? raw.authEpoch : null,
     encDraft,
+    approval,
   };
 
   return { mode: "drop", fragment };
@@ -788,10 +799,32 @@ function initEnrollMode(payload) {
 // Drop Mode (#drop=...) — 3-Stage Focused Stepper
 // ============================================================================
 
+function approvalActionHeading(actionKind) {
+  switch (actionKind) {
+    case "gate.lock":
+      return "Lock Security Gate";
+    case "gate.unlock":
+      return "Unlock Security Gate";
+    case "gate.remove":
+      return "Remove Security Gate Filter";
+    case "auth.add":
+      return "Enroll Human Authority";
+    case "auth.revoke":
+      return "Revoke Human Authority";
+    default:
+      return "Security Approval";
+  }
+}
+
+function isApprovalWeakening(action) {
+  return Boolean(action) && (action.action === "gate.unlock" || action.action === "gate.remove");
+}
+
 async function initDropMode(fragment) {
   $("viewDrop").classList.remove("hidden");
 
   const isSecret = fragment.kind === "secret";
+  const isApproval = fragment.kind === "approval";
   const hasRelay = Boolean(fragment.relay && fragment.dropId && fragment.postCap);
   const relayDisplay = formatRelayDisplay(fragment.relay, hasRelay);
 
@@ -807,7 +840,9 @@ async function initDropMode(fragment) {
     expired: false,
     sealing: false,
     delivered: false,
-    activeEncDraft: !isSecret && fragment.encDraft ? fragment.encDraft : null,
+    activeEncDraft: !isSecret && !isApproval && fragment.encDraft ? fragment.encDraft : null,
+    activeApproval: isApproval ? fragment.approval : null,
+    approvalAction: null,
     draftLoaded: false,
     lastHdrop1: "",
     lastEnvelopeJson: "",
@@ -821,8 +856,10 @@ async function initDropMode(fragment) {
   }
 
   const kindBadge = $("dropKindBadge");
-  kindBadge.textContent = isSecret ? "SECRET DROP" : "DIRECTIVE";
-  kindBadge.className = `kind-label ${isSecret ? "secret" : "directive"}`;
+  kindBadge.textContent = isSecret
+    ? "SECRET DROP"
+    : (isApproval ? "SECURITY APPROVAL" : "DIRECTIVE");
+  kindBadge.className = `kind-label ${isSecret ? "secret" : (isApproval ? "approval" : "directive")}`;
 
   $("metaRelayHost").textContent = relayDisplay.host;
   if (relayDisplay.tag) {
@@ -955,7 +992,7 @@ async function initDropMode(fragment) {
 
     $("stepDot2Label").textContent = isSecret
       ? "Secret"
-      : (state.activeEncDraft || state.draftLoaded ? "Review" : "Write");
+      : (isApproval || state.activeEncDraft || state.draftLoaded ? "Review" : "Write");
 
     if (stage === "locked") {
       s1.className = "step-pill active";
@@ -973,8 +1010,14 @@ async function initDropMode(fragment) {
   }
 
   function renderLockedCopy() {
-    const hasDraft = Boolean(state.activeEncDraft && !isSecret);
-    if (hasDraft) {
+    const hasDraft = Boolean(state.activeEncDraft && !isSecret && !isApproval);
+    if (isApproval) {
+      $("lockedTitle").textContent = "Unlock Security Approval";
+      $("lockedSubtitle").textContent =
+        `Authenticate with Face ID / Touch ID to verify ${fragment.nodeId} and decrypt the requested security action.`;
+      $("btnUnlockPrimaryLabel").textContent = "Unlock Approval with Face ID / Touch ID";
+      $("btnSkipDraft").classList.add("hidden");
+    } else if (hasDraft) {
       $("lockedTitle").textContent = "Unlock Proposed Directive";
       $("lockedSubtitle").textContent =
         `Authenticate with Face ID / Touch ID to verify ${fragment.nodeId} and decrypt the agent's draft.`;
@@ -1034,6 +1077,7 @@ async function initDropMode(fragment) {
     }
     state.certVerified = false;
     state.draftLoaded = false;
+    state.approvalAction = null;
     if (clearDraft) {
       state.activeEncDraft = null;
     }
@@ -1047,11 +1091,15 @@ async function initDropMode(fragment) {
     setSecretInputMasked(true);
     $("chkOverwriteSecret").checked = false;
     $("draftApproveCheck").checked = false;
+    $("approvalConfirmCheck").checked = false;
     $("chkManualSasConfirm").checked = false;
     $("draftWarningBanner").classList.add("hidden");
     $("draftContextRow").classList.add("hidden");
     $("draftContextText").textContent = "";
     $("draftApproveRow").classList.add("hidden");
+    $("approvalReviewGroup").classList.add("hidden");
+    $("approvalWeakeningBanner").classList.add("hidden");
+    $("approvalMetaList").textContent = "";
     $("sasConfirmRow").classList.add("hidden");
     clearBanner($("uncertifiedBanner"));
     clearBanner($("sealActionBanner"));
@@ -1128,12 +1176,17 @@ async function initDropMode(fragment) {
   window.addEventListener("pagehide", () => clearInterval(countdownTimer));
 
   // --- Configure Primary vs Offline Action Buttons ---
+  const primarySendLabel = isSecret
+    ? "Seal & Send Secret"
+    : (isApproval ? "Approve & Sign with Passkey" : "Sign, Seal & Send");
   if (hasRelay) {
-    $("btnSealSendLabel").textContent = isSecret ? "Seal & Send Secret" : "Sign, Seal & Send";
+    $("btnSealSendLabel").textContent = primarySendLabel;
   } else {
     $("btnSealSend").classList.add("hidden");
     $("btnSealOffline").className = "btn-primary";
-    $("btnSealOffline").textContent = "Seal Offline hdrop1_ Token";
+    $("btnSealOffline").textContent = isApproval
+      ? "Sign Offline Approval (hdrop1_)"
+      : "Seal Offline hdrop1_ Token";
   }
 
   function syncSealControls() {
@@ -1145,20 +1198,28 @@ async function initDropMode(fragment) {
     $("btnToggleReveal").disabled = !canEdit;
     $("chkOverwriteSecret").disabled = !canEdit;
     $("inputDirectiveValue").disabled = !canEdit;
+    $("approvalConfirmCheck").disabled = !canEdit;
     $("btnUnlockPrimary").disabled = state.hardBlocked || state.expired;
     $("btnSkipDraft").disabled = state.hardBlocked || state.expired;
 
-    const activeVal = isSecret ? $("inputSecretValue").value : $("inputDirectiveValue").value;
-    const byteLen = utf8Bytes(activeVal).length;
-    const maxBodyBytes = MAX_PADDED_PLAINTEXT - 1024;
-    if (isSecret) {
-      $("secretByteCount").textContent = `${byteLen} B`;
+    let canSubmit;
+    if (isApproval) {
+      const actionReady = Boolean(state.approvalAction);
+      const approved = $("approvalConfirmCheck").checked;
+      canSubmit = canEdit && actionReady && approved;
     } else {
-      $("directiveByteCount").textContent = formatDirectiveStats(activeVal);
+      const activeVal = isSecret ? $("inputSecretValue").value : $("inputDirectiveValue").value;
+      const byteLen = utf8Bytes(activeVal).length;
+      const maxBodyBytes = MAX_PADDED_PLAINTEXT - 1024;
+      if (isSecret) {
+        $("secretByteCount").textContent = `${byteLen} B`;
+      } else {
+        $("directiveByteCount").textContent = formatDirectiveStats(activeVal);
+      }
+      const draftApproved = !state.draftLoaded || $("draftApproveCheck").checked;
+      canSubmit = canEdit && draftApproved && byteLen > 0 && byteLen <= maxBodyBytes;
     }
 
-    const draftApproved = !state.draftLoaded || $("draftApproveCheck").checked;
-    const canSubmit = canEdit && draftApproved && byteLen > 0 && byteLen <= maxBodyBytes;
     $("btnSealSend").disabled = !canSubmit || !hasRelay;
     $("btnSealOffline").disabled = !canSubmit;
   }
@@ -1175,6 +1236,7 @@ async function initDropMode(fragment) {
   });
   $("chkManualSasConfirm").addEventListener("change", syncSealControls);
   $("draftApproveCheck").addEventListener("change", syncSealControls);
+  $("approvalConfirmCheck").addEventListener("change", syncSealControls);
 
   $("btnToggleReveal").addEventListener("click", () => {
     const inp = $("inputSecretValue");
@@ -1273,11 +1335,104 @@ async function initDropMode(fragment) {
     return true;
   }
 
-  function enterUnlockedStage({ draftPayload = null } = {}) {
+  function appendApprovalMetaRow(listEl, keyText, valueText, titleText = "") {
+    const row = document.createElement("div");
+    row.className = "receipt-row";
+    const dt = document.createElement("dt");
+    dt.className = "meta-k";
+    dt.textContent = keyText;
+    const dd = document.createElement("dd");
+    dd.className = "summary-v";
+    dd.textContent = valueText;
+    if (titleText) dd.title = titleText;
+    row.append(dt, dd);
+    listEl.append(row);
+  }
+
+  function renderApprovalReview(action) {
+    const weakening = isApprovalWeakening(action);
+    $("approvalActionTitle").textContent = approvalActionHeading(action.action);
+    const codeBadge = $("approvalActionCode");
+    codeBadge.textContent = action.action;
+    codeBadge.className = weakening ? "approval-code weakening" : "approval-code";
+    kindBadge.className = weakening ? "kind-label approval-weakening" : "kind-label approval";
+
+    const warnBanner = $("approvalWeakeningBanner");
+    if (weakening) {
+      setBanner(
+        warnBanner,
+        $("approvalWeakeningTitle"),
+        $("approvalWeakeningBody"),
+        "danger",
+        "Weakening Security Change",
+        "This action weakens or unlocks Security Gate tamper protection. Approve it only if you asked for it."
+      );
+      $("approvalConfirmRow").className = "checkbox-row danger-confirm";
+    } else {
+      clearBanner(warnBanner);
+      $("approvalConfirmRow").className = "checkbox-row warn-confirm";
+    }
+
+    const metaList = $("approvalMetaList");
+    metaList.textContent = "";
+    appendApprovalMetaRow(metaList, "Target Node", action.nodeId);
+    appendApprovalMetaRow(metaList, "Lock State", action.locked ? "LOCKED (Passkey Sealed)" : "UNLOCKED");
+    if (action.sealSeq > 0) {
+      appendApprovalMetaRow(metaList, "Seal Sequence", `#${action.sealSeq}`);
+    }
+    if (action.policySha256) {
+      appendApprovalMetaRow(
+        metaList,
+        "Policy SHA-256",
+        `${action.policySha256.slice(0, 16)}…`,
+        action.policySha256
+      );
+    }
+    if (action.authoritiesDigest) {
+      appendApprovalMetaRow(
+        metaList,
+        "Authorities Digest",
+        `${action.authoritiesDigest.slice(0, 16)}…`,
+        action.authoritiesDigest
+      );
+    }
+    if (action.targetHumanId) {
+      const rolePart = action.targetRole ? ` (${action.targetRole})` : "";
+      appendApprovalMetaRow(metaList, "Target Human", `${action.targetHumanId}${rolePart}`);
+    }
+    if (action.targetKid) {
+      appendApprovalMetaRow(
+        metaList,
+        "Target Kid",
+        `${action.targetKid.slice(0, 16)}…`,
+        action.targetKid
+      );
+    }
+    if (action.bumpEpoch === true) {
+      appendApprovalMetaRow(metaList, "Bump Auth Epoch", "Yes (monotonic)");
+    }
+    if (action.cascade === true) {
+      appendApprovalMetaRow(metaList, "Cascade Peers", "Yes (revoke admitted peers)");
+    }
+  }
+
+  function enterUnlockedStage({ draftPayload = null, approvalAction = null } = {}) {
     clearBanner($("unlockBanner"));
     clearBanner($("sealActionBanner"));
 
-    if (isSecret) {
+    if (isApproval && approvalAction) {
+      state.approvalAction = approvalAction;
+      state.draftLoaded = false;
+      $("secretInputGroup").classList.add("hidden");
+      $("directiveInputGroup").classList.add("hidden");
+      $("draftWarningBanner").classList.add("hidden");
+      $("draftContextRow").classList.add("hidden");
+      $("draftApproveRow").classList.add("hidden");
+      $("approvalConfirmCheck").checked = false;
+      renderApprovalReview(approvalAction);
+      $("approvalReviewGroup").classList.remove("hidden");
+    } else if (isSecret) {
+      $("approvalReviewGroup").classList.add("hidden");
       $("secretInputGroup").classList.remove("hidden");
       $("directiveInputGroup").classList.add("hidden");
       $("draftWarningBanner").classList.add("hidden");
@@ -1285,6 +1440,7 @@ async function initDropMode(fragment) {
       $("draftApproveRow").classList.add("hidden");
     } else if (draftPayload) {
       state.draftLoaded = true;
+      $("approvalReviewGroup").classList.add("hidden");
       $("secretInputGroup").classList.add("hidden");
       $("directiveInputGroup").classList.remove("hidden");
       $("directiveFieldLabel").textContent = "Proposed Directive";
@@ -1301,6 +1457,7 @@ async function initDropMode(fragment) {
       $("inputDirectiveValue").value = draftPayload.text;
     } else {
       state.draftLoaded = false;
+      $("approvalReviewGroup").classList.add("hidden");
       $("secretInputGroup").classList.add("hidden");
       $("directiveInputGroup").classList.remove("hidden");
       $("directiveFieldLabel").textContent = "Verified Directive";
@@ -1312,28 +1469,31 @@ async function initDropMode(fragment) {
     showStage("unlocked");
     syncSealControls();
 
-    if (!isSecret) {
+    if (!isSecret && !isApproval) {
       autoSizeTextarea($("inputDirectiveValue"));
     }
   }
 
-  // --- Step 1: Unified Passkey Unlock (Handles both encDraft & standard unlock) ---
+  // --- Step 1: Unified Passkey Unlock (Handles approval, encDraft, & standard unlock) ---
   $("btnUnlockPrimary").addEventListener("click", async () => {
     if (state.hardBlocked || state.expired) return;
 
     const auth = readAuthorityInputs();
     if (!auth) return;
 
-    const isDraftFlow = Boolean(state.activeEncDraft && !isSecret);
+    const isDraftFlow = Boolean(state.activeEncDraft && !isSecret && !isApproval);
+    const isApprovalFlow = Boolean(isApproval && state.activeApproval);
     const btn = $("btnUnlockPrimary");
     const label = $("btnUnlockPrimaryLabel");
     const spinner = $("unlockSpinner");
     btn.disabled = true;
     $("btnSkipDraft").disabled = true;
     spinner.classList.remove("hidden");
-    label.textContent = isDraftFlow
-      ? "Unlocking draft with Face ID / Touch ID…"
-      : "Authenticating with Face ID / Touch ID…";
+    label.textContent = isApprovalFlow
+      ? "Unlocking security approval with Face ID / Touch ID…"
+      : (isDraftFlow
+        ? "Unlocking draft with Face ID / Touch ID…"
+        : "Authenticating with Face ID / Touch ID…");
     clearBanner($("unlockBanner"));
 
     let prfOut = null;
@@ -1351,12 +1511,12 @@ async function initDropMode(fragment) {
       prfOut = rawPrf;
 
       let draftPayload = null;
+      const approvalAction = isApprovalFlow ? state.activeApproval : null;
       if (isDraftFlow) {
         // Derive BOTH companion X25519 keypair and Ed25519 signing seed from the single PRF output.
         encKp = await derivePrfX25519Keypair(prfOut, auth.humanId, auth.authEpoch);
         edSeed = await derivePrfEd25519Seed(prfOut, auth.humanId, auth.authEpoch);
 
-        // Decrypt & strictly validate the encrypted draft, then immediately zero X25519 private key!
         try {
           draftPayload = await openHumanDraft({
             encDraft: state.activeEncDraft,
@@ -1389,7 +1549,7 @@ async function initDropMode(fragment) {
       const allowed = applyCertVerificationResult(certRes, edSeed, auth.humanId, auth.authEpoch);
       if (allowed) {
         handedOffSeed = true;
-        enterUnlockedStage({ draftPayload });
+        enterUnlockedStage({ draftPayload, approvalAction });
       }
     } catch (err) {
       setBanner(
@@ -1397,7 +1557,9 @@ async function initDropMode(fragment) {
         $("unlockBannerTitle"),
         $("unlockBannerBody"),
         "danger",
-        isDraftFlow ? "Draft Unlock Failed" : "Passkey Unlock Failed",
+        isApprovalFlow
+          ? "Approval Unlock Failed"
+          : (isDraftFlow ? "Draft Unlock Failed" : "Passkey Unlock Failed"),
         isDraftFlow
           ? `${err instanceof Error ? err.message : "Could not unlock encrypted draft"}. Retry or skip the draft to write from scratch.`
           : (err instanceof Error ? err.message : "Could not unlock Passkey")
@@ -1427,12 +1589,21 @@ async function initDropMode(fragment) {
       body: envelopeJson,
     });
     if (!resp.ok) {
-      throw new Error(`Drop Relay responded with HTTP ${resp.status}`);
+      let detail = `Drop Relay responded with HTTP ${resp.status}`;
+      try {
+        const errJson = await resp.json();
+        if (errJson && typeof errJson.error === "string" && errJson.error.trim()) {
+          detail = `${errJson.error.trim()} (HTTP ${resp.status})`;
+        }
+      } catch {
+        // Keep status message fallback.
+      }
+      throw new Error(detail);
     }
     return resp.json().catch(() => ({}));
   }
 
-  function showDeliveredDoneState(ack) {
+  function showDeliveredDoneState(ack, approvedActionName = "") {
     state.delivered = true;
     state.sealing = false;
     clearInterval(countdownTimer);
@@ -1441,9 +1612,12 @@ async function initDropMode(fragment) {
     $("metaExpires").className = "expiry-text done";
     $("securityDrawer").open = false;
 
-    $("doneTitle").textContent = isSecret ? "Secret Delivered" : "Directive Delivered";
-    $("doneSubtitle").textContent =
-      "End-to-end encrypted. Ephemeral keys wiped from memory — you can close this tab now.";
+    $("doneTitle").textContent = isSecret
+      ? "Secret Delivered"
+      : (isApproval ? "Approval Delivered" : "Directive Delivered");
+    $("doneSubtitle").textContent = isApproval
+      ? "Passkey-signed approval verified and delivered. Ephemeral keys wiped from memory — you can close this tab now."
+      : "End-to-end encrypted. Ephemeral keys wiped from memory — you can close this tab now.";
 
     $("doneTarget").textContent = isSecret && fragment.handle
       ? `${fragment.nodeId} · ${fragment.handle}`
@@ -1452,6 +1626,9 @@ async function initDropMode(fragment) {
     if (isSecret) {
       $("doneKindLabel").textContent = "Secret";
       $("doneKindValue").textContent = fragment.secretName;
+    } else if (isApproval) {
+      $("doneKindLabel").textContent = "Action";
+      $("doneKindValue").textContent = approvedActionName || "Security Approval";
     } else {
       $("doneKindLabel").textContent = "Handle";
       $("doneKindValue").textContent = fragment.handle || "Node-level";
@@ -1489,7 +1666,7 @@ async function initDropMode(fragment) {
         $("doneOfflineBannerBody"),
         "warn",
         "Relay Unreachable — Offline Token Ready",
-        `${errorMessage}. Your drop is already sealed & wiped from RAM — retry upload or copy the opaque hdrop1_ token below.`
+        `${errorMessage}. Your signed drop is already sealed & wiped from RAM — retry upload or copy the opaque hdrop1_ token below.`
       );
       retryBtn.classList.remove("hidden");
       retryBtn.disabled = false;
@@ -1501,8 +1678,10 @@ async function initDropMode(fragment) {
         $("doneOfflineBannerTitle"),
         $("doneOfflineBannerBody"),
         "verified",
-        "Offline Drop Sealed",
-        "Plaintext and ephemeral keys wiped from RAM. Copy the opaque hdrop1_ token below and paste it into chat or `hyp drop ingest`."
+        isApproval ? "Offline Approval Sealed" : "Offline Drop Sealed",
+        isApproval
+          ? "Approval signed and ephemeral keys wiped from RAM. Save the opaque hdrop1_ token to a file and pass it via --approval-file <path>."
+          : "Plaintext and ephemeral keys wiped from RAM. Copy the opaque hdrop1_ token below and paste it into chat or `hyp drop ingest`."
       );
       retryBtn.classList.add("hidden");
     }
@@ -1518,8 +1697,12 @@ async function initDropMode(fragment) {
     if (isSecret && !state.certVerified) return;
     if (!isSecret && !state.certVerified && !$("chkManualSasConfirm").checked) return;
     if (state.draftLoaded && !$("draftApproveCheck").checked) return;
+    if (isApproval && (!state.approvalAction || !$("approvalConfirmCheck").checked)) return;
 
-    const rawBody = isSecret ? $("inputSecretValue").value : $("inputDirectiveValue").value;
+    const approvedActionName = isApproval && state.approvalAction ? state.approvalAction.action : "";
+    const rawBody = isApproval
+      ? toCanonicalJson(state.approvalAction)
+      : (isSecret ? $("inputSecretValue").value : $("inputDirectiveValue").value);
     if (!rawBody) return;
 
     let signingSeed = state.unlockedEdSeed;
@@ -1558,7 +1741,7 @@ async function initDropMode(fragment) {
     $("btnLockClear").disabled = true;
     if (sendToRelay && hasRelay) {
       $("sealSendSpinner").classList.remove("hidden");
-      $("btnSealSendLabel").textContent = "Sealing & sending…";
+      $("btnSealSendLabel").textContent = isApproval ? "Signing & delivering approval…" : "Sealing & sending…";
     }
 
     const nowMs = Date.now();
@@ -1597,7 +1780,7 @@ async function initDropMode(fragment) {
       }
       wipeSecretRam({ clearDraft: true });
       $("sealSendSpinner").classList.add("hidden");
-      $("btnSealSendLabel").textContent = isSecret ? "Seal & Send Secret" : "Sign, Seal & Send";
+      $("btnSealSendLabel").textContent = primarySendLabel;
       $("btnLockClear").disabled = false;
       setBanner(
         $("unlockBanner"),
@@ -1613,7 +1796,7 @@ async function initDropMode(fragment) {
       if (signingSeed && signingSeed !== state.unlockedEdSeed) {
         zeroize(signingSeed);
       }
-      // Always wipe plaintext input, draft, and signing seed immediately after sealing!
+      // Always wipe plaintext input, draft, approval state, and signing seed immediately after sealing!
       wipeSecretRam({ clearDraft: true });
     }
 
@@ -1623,7 +1806,7 @@ async function initDropMode(fragment) {
     if (sendToRelay && hasRelay) {
       try {
         const ack = await uploadSealedEnvelope(state.lastEnvelopeJson);
-        showDeliveredDoneState(ack);
+        showDeliveredDoneState(ack, approvedActionName);
       } catch (err) {
         showOfflineDoneState({
           isRelayError: true,
@@ -1631,7 +1814,7 @@ async function initDropMode(fragment) {
         });
       } finally {
         $("sealSendSpinner").classList.add("hidden");
-        $("btnSealSendLabel").textContent = isSecret ? "Seal & Send Secret" : "Sign, Seal & Send";
+        $("btnSealSendLabel").textContent = primarySendLabel;
         $("btnLockClear").disabled = false;
       }
     } else {

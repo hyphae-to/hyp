@@ -16,13 +16,20 @@ use std::fmt;
 
 use hmac::{Hmac, Mac};
 use hyp_crypto::SecretStore;
+use hyp_crypto::human::{
+    HumanApprovalActionKind, HumanClaimV1, SignedHumanClaimV1, verify_signed_approval_claim,
+};
+use hyp_crypto::keys::OkpJwk;
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_proto::cloudevent::CloudEvent;
 use hyp_proto::filter::Filter;
 use hyp_proto::jcs::to_jcs_string;
+use hyp_store::{
+    GateLockSealRecord, HumanAuthorityRecord, HumanAuthorityRole, HumanAuthorityStatus, NodeDb,
+};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -51,7 +58,6 @@ pub const DEFAULT_POLICY_SIGNING_SECRET: &str = "gate-policy-hmac-key";
 
 const POLICY_SIG_PREFIX: &str = "hmac-sha256:";
 const POLICY_SIG_DOMAIN: &[u8] = b"hyphae/v2/gate-policy-sig\n";
-
 /// Errors returned while constructing, signing, verifying, or running the Local Security Gate pipeline.
 #[derive(Debug, Error)]
 pub enum GateError {
@@ -1245,6 +1251,225 @@ fn canonical_policy_jcs(config: &SecurityGateConfig) -> Result<String, GateError
         .map_err(|e| GateError::PolicySignature(format!("failed to serialize gate policy: {e}")))?;
     to_jcs_string(&value)
         .map_err(|e| GateError::PolicySignature(format!("failed to canonicalize gate policy: {e}")))
+}
+
+/// Computes the canonical RFC 8785 JCS SHA-256 lowercase hex digest of `config` (excluding
+/// `policy_signature`), bound cryptographically into Passkey-signed Gate Lock Seals.
+pub fn gate_policy_sha256(config: &SecurityGateConfig) -> Result<String, GateError> {
+    let canonical = canonical_policy_jcs(config)?;
+    Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
+}
+
+pub fn local_admin_secret_names_for_kid(kid: &str) -> (String, String) {
+    let prefix: String = kid
+        .chars()
+        .take(8)
+        .map(|c| {
+            let low = c.to_ascii_lowercase();
+            if low.is_ascii_lowercase() || low.is_ascii_digit() || matches!(low, '_' | '-') {
+                low
+            } else {
+                'x'
+            }
+        })
+        .collect();
+    let hash = hex::encode(&Sha256::digest(kid.as_bytes())[..4]);
+    (
+        format!("human-admin-{prefix}-{hash}"),
+        format!("human-admin-{prefix}"),
+    )
+}
+
+/// Returns `true` if a plaintext PKCS#8 private key for `kid` is present in local `SecretStore`
+/// (meaning a shell agent on the host could read it — NEVER acceptable as a Passkey boundary, H2).
+pub fn has_local_authority_secret(secrets: &SecretStore, kid: &str) -> bool {
+    let (primary, legacy) = local_admin_secret_names_for_kid(kid);
+    secrets.get(&primary).is_ok() || secrets.get(&legacy).is_ok()
+}
+
+/// Returns `true` iff `rec` is an active, Passkey-backed `Admin` authority (`prf_salt` present,
+/// `auth_epoch >= min_auth_epoch`, and NO shell-accessible private key in `secrets`).
+pub fn is_passkey_backed_admin(
+    rec: &HumanAuthorityRecord,
+    min_auth_epoch: u64,
+    secrets: Option<&SecretStore>,
+) -> bool {
+    if rec.status != HumanAuthorityStatus::Active
+        || rec.role != HumanAuthorityRole::Admin
+        || rec.auth_epoch < min_auth_epoch
+    {
+        return false;
+    }
+    if rec
+        .prf_salt
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    if let Some(store) = secrets {
+        if has_local_authority_secret(store, &rec.kid) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A `gate_lock_seal` row whose Passkey signature and bindings verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGateSeal {
+    pub seal_seq: u64,
+    pub locked: bool,
+    pub human_id: String,
+    pub authority_kid: String,
+}
+
+/// Verified lock state of the Security Gate policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateLockState {
+    pub locked: bool,
+    /// The Passkey seal in `node.sqlite`, when one exists (it may record an unlock).
+    pub seal: Option<VerifiedGateSeal>,
+}
+
+fn seal_err(msg: impl Into<String>) -> GateError {
+    GateError::PolicySignature(msg.into())
+}
+
+/// Verifies a stored `gate_lock_seal` against its signer and, when it records a lock, against the
+/// live `node.json` gate policy and `human_authorities`.
+fn verify_gate_lock_seal(
+    seal: &GateLockSealRecord,
+    config: &SecurityGateConfig,
+    db: &NodeDb,
+    secrets: Option<&SecretStore>,
+) -> Result<VerifiedGateSeal, GateError> {
+    let signed: SignedHumanClaimV1 = serde_json::from_str(&seal.signed_claim_json)
+        .map_err(|e| seal_err(format!("malformed gate_lock_seal signed claim: {e}")))?;
+    let unverified: HumanClaimV1 = serde_json::from_str(&signed.payload)
+        .map_err(|e| seal_err(format!("malformed gate_lock_seal claim payload: {e}")))?;
+
+    let min_epoch = db.human().min_auth_epoch()?;
+    let rec = db
+        .human()
+        .get_active_authority_by_kid(&unverified.human_kid)?
+        .ok_or_else(|| {
+            seal_err(format!(
+                "gate_lock_seal signer kid '{}' is unknown or revoked",
+                unverified.human_kid
+            ))
+        })?;
+    if !is_passkey_backed_admin(&rec, min_epoch, secrets) {
+        return Err(seal_err(format!(
+            "gate_lock_seal signer '{}' ({}) is not an active Passkey-backed admin authority",
+            rec.human_id, rec.kid
+        )));
+    }
+    let pk = serde_json::from_str::<OkpJwk>(&rec.jwk_json)
+        .map_err(|e| seal_err(format!("malformed authority jwk_json for lock seal: {e}")))?
+        .to_ed25519()
+        .map_err(|e| seal_err(format!("invalid Ed25519 authority key for lock seal: {e}")))?;
+    let (claim, action) = verify_signed_approval_claim(&signed, &pk, min_epoch)
+        .map_err(|e| seal_err(format!("gate_lock_seal Passkey signature invalid: {e}")))?;
+
+    if claim.human_id != rec.human_id || claim.auth_epoch != rec.auth_epoch {
+        return Err(seal_err(
+            "gate_lock_seal signer identity or authEpoch does not match the enrolled authority",
+        ));
+    }
+    if action.seal_seq != seal.seal_seq {
+        return Err(seal_err(
+            "gate_lock_seal seal_seq does not match the signed Passkey action",
+        ));
+    }
+    if !action.locked
+        && !matches!(
+            action.action,
+            HumanApprovalActionKind::GateUnlock | HumanApprovalActionKind::GateRemove
+        )
+    {
+        return Err(seal_err(format!(
+            "unlocked gate_lock_seal has invalid action '{}'",
+            action.action.as_str()
+        )));
+    }
+
+    if action.locked {
+        if !config.require_signed_policy {
+            return Err(seal_err(
+                "external gate_lock_seal is LOCKED but node.json gate.require_signed_policy is false or missing",
+            ));
+        }
+        if action.policy_sha256.as_deref() != Some(gate_policy_sha256(config)?.as_str()) {
+            return Err(seal_err(
+                "node.json gate policy SHA-256 does not match Passkey-signed gate_lock_seal",
+            ));
+        }
+        let live_digest = db.human().authorities_digest()?;
+        if action.authorities_digest.as_deref() != Some(live_digest.as_str()) {
+            return Err(seal_err(
+                "human_authorities_digest mismatch with Passkey-signed gate_lock_seal",
+            ));
+        }
+        if config
+            .human_authorities_digest
+            .as_ref()
+            .is_some_and(|d| *d != live_digest)
+        {
+            return Err(seal_err(
+                "node.json human_authorities_digest mismatch with node.sqlite",
+            ));
+        }
+    }
+
+    Ok(VerifiedGateSeal {
+        seal_seq: seal.seal_seq,
+        locked: action.locked,
+        human_id: rec.human_id,
+        authority_kid: rec.kid,
+    })
+}
+
+/// The one place that decides whether the gate policy is locked, unlocked, or tampered (`Err`).
+///
+/// 1. A Passkey `gate_lock_seal` in `node.sqlite` is checked first and is authoritative when it
+///    records a lock, so editing or deleting `gate` in `node.json` can never silently unlock.
+/// 2. Otherwise `node.json` decides: unlocked, or a legacy HMAC `policy_signature` lock.
+pub fn verify_gate_lock(
+    config: &SecurityGateConfig,
+    db: &NodeDb,
+    secrets: Option<&SecretStore>,
+) -> Result<GateLockState, GateError> {
+    let seal = db
+        .human()
+        .get_gate_lock_seal()?
+        .map(|s| verify_gate_lock_seal(&s, config, db, secrets))
+        .transpose()?;
+    if seal.as_ref().is_some_and(|s| s.locked) {
+        return Ok(GateLockState { locked: true, seal });
+    }
+
+    if !config.require_signed_policy && config.policy_signature.is_none() {
+        return Ok(GateLockState {
+            locked: false,
+            seal,
+        });
+    }
+    let sig = config
+        .policy_signature
+        .as_deref()
+        .ok_or_else(|| seal_err("require_signed_policy is true but policy_signature is missing"))?;
+    if let Some(ref expected_digest) = config.human_authorities_digest {
+        if db.human().authorities_digest()? != *expected_digest {
+            return Err(seal_err(
+                "human_authorities_digest mismatch with node.sqlite",
+            ));
+        }
+    }
+    let store = secrets.ok_or_else(|| seal_err("policy signing SecretStore unavailable"))?;
+    verify_gate_policy_sig(config, sig, store)?;
+    Ok(GateLockState { locked: true, seal })
 }
 
 /// Computes a tamper-evident domain-separated HMAC-SHA256 signature over the canonical RFC 8785 JCS

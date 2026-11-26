@@ -1,12 +1,20 @@
 //! `hyp auth` — Tier 1 Ed25519 Human Authority management, node certification (`hcert1_`),
 //! offline/CLI drop signing (`hdrop1_`), and one-shot loopback `--web` Passkey+PRF enrollment.
 //!
-//! Security invariants:
+//! Security invariants (`#10` — H1, H2):
 //! - NEVER accepts private keys, secrets, or drop bodies via CLI argv flags (stdin or `--web` only!).
 //! - NEVER prints private key material or drop plaintext to stdout, stderr, logs, or `--json`.
-//! - Automatically re-signs `gate.human_authorities_digest` + `gate.policy_signature` whenever
-//!   `node.json` has `gate.require_signed_policy == true`.
+//! - `hyp auth init --web` enrolls the browser Passkey directly as `role: admin` with ZERO
+//!   plaintext PKCS#8 laptop key stored in `SecretStore` (`H2`).
+//! - Once a Passkey Admin is enrolled or the Security Gate is locked, `hyp auth add` and
+//!   `hyp auth revoke` require a Passkey-signed approval ceremony from an existing Passkey Admin
+//!   and NEVER silently re-sign `gate_policy_sig` from a shell key (`H1`).
 
+use crate::approval::{
+    ApprovalCeremonyArgs, CeremonyOutcome, VerifiedApproval, base_approval_action,
+    emit_pending_approval, has_active_passkey_admin, inspect_external_lock_state, next_seal_seq,
+    persist_passkey_gate_seal, run_passkey_approval_ceremony,
+};
 use crate::config_file::{
     ct_eq, default_node_id, ensure_dir, load_node_or_legacy_config, open_secret_store,
     read_json_object_or_empty, resolve_config_path_for_read, resolve_config_path_for_write,
@@ -26,11 +34,12 @@ use clap::{Subcommand, ValueEnum};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyp_crypto::human::{
-    DEFAULT_DELEGATED_MAX_DEVICES, HumanAudience, HumanClaimV1, HumanDropKind, HumanInviteV1,
-    HumanPubCardV1, HumanRevocationPayloadV1, MAX_DELEGATED_DEVICES_LIMIT, NodeCertPayloadV1,
-    SecretDropSpec, SignedHumanRevocationV1, SignedNodeCertV1, decode_hcert1, decode_hpub1,
-    encode_hdrop1, encode_hjoin1, encode_hpub1, is_reserved_secret_name, seal_human_drop,
-    sign_human_invite, sign_human_revocation, sign_local_ingest_event, verify_node_cert,
+    DEFAULT_DELEGATED_MAX_DEVICES, HumanApprovalActionKind, HumanApprovalActionV1, HumanAudience,
+    HumanClaimV1, HumanDropKind, HumanInviteV1, HumanPubCardV1, HumanRevocationPayloadV1,
+    MAX_DELEGATED_DEVICES_LIMIT, NodeCertPayloadV1, SecretDropSpec, SignedHumanRevocationV1,
+    SignedNodeCertV1, decode_hcert1, decode_hpub1, encode_hdrop1, encode_hjoin1, encode_hpub1,
+    is_reserved_secret_name, seal_human_drop, sign_human_invite, sign_human_revocation,
+    sign_local_ingest_event, verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519PublicKey};
@@ -42,7 +51,10 @@ use hyp_node::engine::{
     LocalIngestConfig, NodeConfig, NodeProfile, UnifiedNode, canonical_local_event_for_signing,
     resolve_drop_portal_url, send_local_ingest_event,
 };
-use hyp_node::gates::policy::{SecurityGateConfig, sign_gate_policy, verify_gate_policy_sig};
+use hyp_node::gates::policy::{
+    DEFAULT_POLICY_SIGNING_SECRET, SecurityGateConfig, gate_policy_sha256,
+    local_admin_secret_names_for_kid,
+};
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id};
 use hyp_proto::cloudevent::{
     CONTENT_TYPE_JSON, CloudEvent as ProtoCloudEvent, EXT_LOCAL_EVENT_SIG, TYPE_HUMAN_REVOCATION_V1,
@@ -59,7 +71,6 @@ use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -164,6 +175,8 @@ pub enum AuthCommand {
         /// Explicit node.json path
         #[arg(long)]
         config: Option<PathBuf>,
+        #[command(flatten)]
+        ceremony: ApprovalCeremonyArgs,
         /// Output structured JSON envelope
         #[arg(long)]
         json: bool,
@@ -206,6 +219,8 @@ pub enum AuthCommand {
         /// Explicit node.json path
         #[arg(long)]
         config: Option<PathBuf>,
+        #[command(flatten)]
+        ceremony: ApprovalCeremonyArgs,
         /// Output structured JSON envelope
         #[arg(long)]
         json: bool,
@@ -382,9 +397,10 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             auth_epoch,
             state_dir,
             config,
+            ceremony,
             json,
         } => run_auth_add(
-            human_id, label, role, prf_salt, auth_epoch, state_dir, config, json,
+            human_id, label, role, prf_salt, auth_epoch, state_dir, config, ceremony, json,
         ),
         AuthCommand::List {
             all,
@@ -400,9 +416,11 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             broadcast,
             state_dir,
             config,
+            ceremony,
             json,
         } => run_auth_revoke(
-            kid, bump_epoch, cascade, reason, issuer_kid, broadcast, state_dir, config, json,
+            kid, bump_epoch, cascade, reason, issuer_kid, broadcast, state_dir, config, ceremony,
+            json,
         ),
         AuthCommand::Invite {
             human_id,
@@ -504,36 +522,11 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
 /// Always starts with `human-admin-` (which is blocked by the remote secret-drop denylist) and
 /// strictly matches `validate_secret_name` (`/^[a-z0-9][a-z0-9._-]{0,63}$/`).
 pub fn admin_secret_name_for_kid(kid: &str) -> String {
-    let prefix: String = kid
-        .chars()
-        .take(8)
-        .map(|c| {
-            let low = c.to_ascii_lowercase();
-            if low.is_ascii_lowercase() || low.is_ascii_digit() || matches!(low, '_' | '-') {
-                low
-            } else {
-                'x'
-            }
-        })
-        .collect();
-    let hash = hex::encode(&Sha256::digest(kid.as_bytes())[..4]);
-    format!("human-admin-{prefix}-{hash}")
+    local_admin_secret_names_for_kid(kid).0
 }
 
 fn legacy_admin_secret_name_for_kid(kid: &str) -> String {
-    let prefix: String = kid
-        .chars()
-        .take(8)
-        .map(|c| {
-            let low = c.to_ascii_lowercase();
-            if low.is_ascii_lowercase() || low.is_ascii_digit() || matches!(low, '_' | '-') {
-                low
-            } else {
-                'x'
-            }
-        })
-        .collect();
-    format!("human-admin-{prefix}")
+    local_admin_secret_names_for_kid(kid).1
 }
 
 /// Loads a local human authority Ed25519 keypair from `SecretStore` and verifies its `kid`.
@@ -562,28 +555,6 @@ fn load_local_authority_keypair(
         ));
     }
     Ok(kp)
-}
-
-fn is_gate_locked(config_path: &Path) -> bool {
-    if !config_path.exists() {
-        return false;
-    }
-    let Ok(cfg_map) = read_json_object_or_empty(config_path) else {
-        return true;
-    };
-    let Some(gate_val) = cfg_map.get("gate") else {
-        return false;
-    };
-    if gate_val
-        .get("require_signed_policy")
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        return true;
-    }
-    serde_json::from_value::<SecurityGateConfig>(gate_val.clone())
-        .map(|g| g.require_signed_policy)
-        .unwrap_or(true)
 }
 
 fn format_auth_init_confirm_summary(
@@ -749,46 +720,88 @@ fn format_auth_sign_confirm_summary(
     lines
 }
 
-/// If `config_path` exists and `gate.require_signed_policy == true`, updates
-/// `gate.human_authorities_digest = Some(db.human().authorities_digest()?)` and re-signs
-/// `gate.policy_signature` via `sign_gate_policy`.
-pub fn sync_gate_policy_digest_if_locked(
-    config_path: &Path,
-    _state_dir: &Path,
+/// A locked gate's `node.json` rewritten for a changed `human_authorities` digest. It is prepared
+/// before the Passkey ceremony so one tap binds the exact resulting `policySha256`, and nothing is
+/// ever silently re-signed from a shell key.
+struct LockedGateReseal {
+    cfg_map: serde_json::Map<String, Value>,
+    gate_cfg: SecurityGateConfig,
+    policy_sha: String,
+    authorities_digest: String,
+    seal_seq: u64,
+}
+
+impl LockedGateReseal {
+    fn prepare(config_path: &Path, db: &NodeDb, authorities_digest: &str) -> Result<Self, String> {
+        let cfg_map = read_json_object_or_empty(config_path)?;
+        let mut gate_cfg: SecurityGateConfig = match cfg_map.get("gate") {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| format!("malformed gate config in {}: {e}", config_path.display()))?,
+            None => SecurityGateConfig::default(),
+        };
+        gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
+        gate_cfg.require_signed_policy = true;
+        gate_cfg.human_authorities_digest = Some(authorities_digest.to_string());
+        gate_cfg.policy_signature = None;
+        let policy_sha = gate_policy_sha256(&gate_cfg)
+            .map_err(|e| format!("failed to compute locked gate policy SHA-256: {e}"))?;
+        Ok(Self {
+            cfg_map,
+            gate_cfg,
+            policy_sha,
+            authorities_digest: authorities_digest.to_string(),
+            seal_seq: next_seal_seq(db)?,
+        })
+    }
+
+    /// Stores the approved seal and writes the gate block whose hash the approval signed.
+    fn apply(
+        mut self,
+        db: &NodeDb,
+        config_write: &Path,
+        verified: &VerifiedApproval,
+    ) -> Result<u64, String> {
+        persist_passkey_gate_seal(db, verified)?;
+        let gate_val = serde_json::to_value(&self.gate_cfg).map_err(|e| e.to_string())?;
+        self.cfg_map.insert("gate".to_string(), gate_val);
+        write_atomic_json(config_write, &Value::Object(self.cfg_map), true)?;
+        Ok(self.seal_seq)
+    }
+}
+
+/// Runs the Passkey ceremony for an `auth.add` / `auth.revoke` `action`, binding the re-seal of a
+/// locked gate into the same approval. `Err` carries the exit code to return (pending or failed).
+#[allow(clippy::too_many_arguments)]
+fn approve_authority_change(
+    cmd: &str,
+    as_json: bool,
+    state_dir: &Path,
+    config_read: &Path,
     db: &NodeDb,
     secrets: &SecretStore,
-) -> Result<bool, String> {
-    if !config_path.exists() {
-        return Ok(false);
+    mut action: HumanApprovalActionV1,
+    reseal: Option<&LockedGateReseal>,
+    summary: &[String],
+    ceremony: &ApprovalCeremonyArgs,
+) -> Result<Box<VerifiedApproval>, ExitCode> {
+    if let Some(reseal) = reseal {
+        action.seal_seq = reseal.seal_seq;
+        action.policy_sha256 = Some(reseal.policy_sha.clone());
+        action.authorities_digest = Some(reseal.authorities_digest.clone());
     }
-    let mut cfg_map = read_json_object_or_empty(config_path)?;
-    let Some(gate_val) = cfg_map.get("gate") else {
-        return Ok(false);
-    };
-    let mut gate_cfg: SecurityGateConfig = serde_json::from_value(gate_val.clone())
-        .map_err(|e| format!("malformed gate config in {}: {e}", config_path.display()))?;
-    if !gate_cfg.require_signed_policy {
-        return Ok(false);
+    match run_passkey_approval_ceremony(
+        state_dir,
+        config_read,
+        db,
+        secrets,
+        action,
+        summary,
+        ceremony,
+    ) {
+        Ok(CeremonyOutcome::Approved(verified)) => Ok(verified),
+        Ok(CeremonyOutcome::Pending(pending)) => Err(emit_pending_approval(cmd, as_json, &pending)),
+        Err(err) => Err(err.emit(cmd, as_json)),
     }
-
-    let digest = db
-        .human()
-        .authorities_digest()
-        .map_err(|e| format!("failed to compute human authorities digest: {e}"))?;
-    gate_cfg.human_authorities_digest = Some(digest);
-    gate_cfg.policy_signature = None;
-
-    let sig = sign_gate_policy(&gate_cfg, secrets)
-        .map_err(|e| format!("failed to re-sign gate policy: {e}"))?;
-    verify_gate_policy_sig(&gate_cfg, &sig, secrets)
-        .map_err(|e| format!("failed to verify re-signed gate policy: {e}"))?;
-    gate_cfg.policy_signature = Some(sig);
-
-    let updated_gate = serde_json::to_value(&gate_cfg)
-        .map_err(|e| format!("failed to serialize updated gate config: {e}"))?;
-    cfg_map.insert("gate".to_string(), updated_gate);
-    write_atomic_json(config_path, &Value::Object(cfg_map), true)?;
-    Ok(true)
 }
 
 fn resolve_daemon_socket_for_auth(
@@ -985,7 +998,7 @@ fn sanitize_human_id(raw: &str) -> String {
         .collect()
 }
 
-fn random_b64url(len: usize) -> Result<String, String> {
+pub(crate) fn random_b64url(len: usize) -> Result<String, String> {
     let mut buf = vec![0u8; len];
     SystemRandom::new()
         .fill(&mut buf)
@@ -1156,8 +1169,6 @@ fn run_auth_init(
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
     let config_read =
         resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
-    let config_write =
-        resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
 
     // Resolve and validate Drop Portal URL fail-closed BEFORE generating keys or opening callbacks.
     let resolved_drop_portal_url = if web {
@@ -1208,11 +1219,39 @@ fn run_auth_init(
         None
     };
 
-    // P0 `#5` / `#10`: `auth init` (INCLUDING `--web`!) on a node that ALREADY has at least one
-    // authority or a locked Security Gate requires unskippable interactive TTY confirmation.
-    // Only initial `auth init` on a brand-new, unlocked node with zero authorities proceeds
-    // without prompting.
-    let gate_locked = is_gate_locked(&config_read);
+    // P0 `#10` (H1 & H2): Once a Passkey Admin is enrolled OR the Security Gate is locked,
+    // `hyp auth init` MUST fail closed and refuse to mint a shell-accessible key or silently
+    // mutate authorities! Additional authorities must go through Passkey-approved `hyp auth add`.
+    let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
+    let lock_state = inspect_external_lock_state(&config_read, &state_dir, &secrets);
+    let passkey_admin_present = has_active_passkey_admin(&state_dir, &secrets);
+    if passkey_admin_present {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "PASSKEY_ADMIN_ENROLLED",
+            "A Passkey Admin authority is already enrolled on this node; `hyp auth init` refuses to bypass the Passkey human boundary.",
+            Some(format!(
+                "Enroll additional authorities via Passkey-approved `hyp auth add --human-id <id> --label <name> --state-dir {}`.",
+                state_dir.display()
+            )),
+        );
+    }
+    if lock_state.locked {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "GATE_LOCKED",
+            "Security Gate is currently LOCKED; `hyp auth init` refuses to mutate human authorities without a Passkey approval ceremony.",
+            Some(format!(
+                "Unlock via `hyp gate unlock --state-dir {}` or enroll via Passkey-approved `hyp auth add`.",
+                state_dir.display()
+            )),
+        );
+    }
+
     let db_path = state_dir.join("node.sqlite");
     let existing_count = if db_path.exists() {
         match NodeDb::open(&db_path) {
@@ -1226,20 +1265,24 @@ fn run_auth_init(
     } else {
         0
     };
-    if existing_count > 0 || gate_locked {
-        let mut summary =
-            format_auth_init_confirm_summary(&human_id, trimmed_label, existing_count, gate_locked);
-        if web {
-            summary.push(
-                "  Mode:       --web (will also open loopback Passkey+PRF enrollment callback)"
-                    .to_string(),
-            );
-        }
-        let prompt = format!(
-            "Initialize additional human admin authority '{}' (label: {})? [y/N]: ",
-            sanitize_tty_display(&human_id),
-            sanitize_tty_display(trimmed_label)
-        );
+    // Upgrading a legacy non-Passkey node to its first Passkey Admin via `--web` or adding another
+    // local key on a node with existing non-Passkey authorities still requires TTY confirmation.
+    if existing_count > 0 {
+        let summary =
+            format_auth_init_confirm_summary(&human_id, trimmed_label, existing_count, false);
+        let prompt = if web {
+            format!(
+                "Enroll Passkey Admin authority '{}' via browser (--web, label: {}) on a node with existing authorities? [y/N]: ",
+                sanitize_tty_display(&human_id),
+                sanitize_tty_display(trimmed_label)
+            )
+        } else {
+            format!(
+                "Initialize additional human admin authority '{}' (label: {})? [y/N]: ",
+                sanitize_tty_display(&human_id),
+                sanitize_tty_display(trimmed_label)
+            )
+        };
         if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
             return emit_confirm_error(cmd, as_json, err);
         }
@@ -1248,40 +1291,6 @@ fn run_auth_init(
     if let Err(e) = ensure_dir(&state_dir, true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
-
-    let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
-    let admin_kp = match Ed25519KeyPair::generate() {
-        Ok(kp) => kp,
-        Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "KEYGEN_FAILED",
-                format!("Failed to generate Ed25519 admin keypair: {e}"),
-                None,
-            );
-        }
-    };
-    let kid = admin_kp.kid();
-    let jwk = admin_kp.to_jwk();
-    let jwk_json = match to_canonical_json(&jwk) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
-    };
-    let secret_name = admin_secret_name_for_kid(&kid);
-    let pkcs8_b64 = admin_kp.export_pkcs8_b64();
-    if let Err(e) = secrets.set(&secret_name, &pkcs8_b64) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "SECRET_STORE_ERROR",
-            format!("Failed to persist admin signing key in SecretStore: {e}"),
-            None,
-        );
-    }
-    drop(pkcs8_b64);
 
     let node = match open_local_unified_node(&state_dir, &config_read, &secrets) {
         Ok(n) => n,
@@ -1296,28 +1305,8 @@ fn run_auth_init(
         }
     };
 
-    let inserted = {
-        let db = node.db();
-        match db.human().upsert_authority(
-            &HumanAuthorityInput {
-                human_id: human_id.clone(),
-                kid: kid.clone(),
-                label: trimmed_label.to_string(),
-                role: HumanAuthorityRole::Admin,
-                jwk_json: jwk_json.clone(),
-                enc_jwk_json: None,
-                prf_salt: None,
-                auth_epoch: min_epoch,
-            },
-            now_ms(),
-        ) {
-            Ok(rec) => rec,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-        }
-    };
-
-    let mut web_enrolled: Option<Value> = None;
-    let mut passkey_hcert1: Option<String> = None;
+    // P0 `#10` (H2): `hyp auth init --web` enrolls the browser Passkey DIRECTLY as `role: admin`
+    // WITHOUT generating or storing any plaintext PKCS#8 `human-admin-*` key in SecretStore!
     if web {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1360,19 +1349,24 @@ fn run_auth_init(
                     EXIT_ERROR,
                     "WEB_ENROLL_FAILED",
                     e,
-                    Some("Run `hyp auth add --human-id <id> --label <name>` and pipe the public JWK via stdin instead.".to_string()),
+                    Some("Run `hyp auth add --human-id <id> --label <name> --role admin` and pipe the Passkey enrollment bundle via stdin instead.".to_string()),
                 );
             }
         };
 
-        let signer_rec = {
+        let effective_label = if trimmed_label != "local-cli-admin" {
+            trimmed_label.to_string()
+        } else {
+            enrolled.label.clone()
+        };
+        let inserted = {
             let db = node.db();
             match db.human().upsert_authority(
                 &HumanAuthorityInput {
                     human_id: enrolled.human_id.clone(),
                     kid: enrolled.kid.clone(),
-                    label: enrolled.label.clone(),
-                    role: HumanAuthorityRole::Signer,
+                    label: effective_label,
+                    role: HumanAuthorityRole::Admin,
                     jwk_json: enrolled.jwk_json.clone(),
                     enc_jwk_json: enrolled.enc_jwk_json.clone(),
                     prf_salt: Some(enrolled.prf_salt.clone()),
@@ -1386,52 +1380,158 @@ fn run_auth_init(
                 }
             }
         };
-        if let Some(ref verified_cert) = enrolled.node_cert {
+        let passkey_hcert1 = if let Some(ref verified_cert) = enrolled.node_cert {
             let db = node.db();
             if let Err(e) = persist_verified_node_cert(&db, verified_cert) {
                 return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
             }
-            passkey_hcert1 = Some(verified_cert.armored.clone());
-        }
-        web_enrolled = Some(json!({
-            "humanId": signer_rec.human_id,
-            "kid": signer_rec.kid,
-            "role": signer_rec.role.as_str(),
-            "label": signer_rec.label,
-            "encKey": signer_rec.enc_jwk_json.is_some(),
+            Some(verified_cert.armored.clone())
+        } else {
+            None
+        };
+
+        let public_jwk: Value = serde_json::from_str(&inserted.jwk_json).unwrap_or(Value::Null);
+        let digest = {
+            let db = node.db();
+            db.human().authorities_digest().ok()
+        };
+        let node_id_str = node.node_id().as_str().to_string();
+        drop(node);
+
+        let web_enrolled = json!({
+            "humanId": inserted.human_id,
+            "kid": inserted.kid,
+            "role": inserted.role.as_str(),
+            "label": inserted.label,
+            "encKey": inserted.enc_jwk_json.is_some(),
             "encKid": enrolled.enc_kid,
-            "prfSalt": signer_rec.prf_salt,
-            "authEpoch": signer_rec.auth_epoch,
+            "prfSalt": inserted.prf_salt,
+            "authEpoch": inserted.auth_epoch,
             "credentialId": enrolled.credential_id,
             "nodeCertSigned": enrolled.node_cert.is_some(),
-        }));
+        });
+        let next = vec![
+            format!("hyp gate lock --state-dir {}", state_dir.display()),
+            format!("hyp auth list --state-dir {}", state_dir.display()),
+        ];
+
+        if as_json {
+            let data = json!({
+                "humanId": inserted.human_id,
+                "kid": inserted.kid,
+                "role": inserted.role.as_str(),
+                "label": inserted.label,
+                "authEpoch": inserted.auth_epoch,
+                "publicJwk": public_jwk,
+                "encKey": inserted.enc_jwk_json.is_some(),
+                "encKid": enrolled.enc_kid,
+                "prfSalt": inserted.prf_salt,
+                "passkeyBacked": true,
+                "secretName": Value::Null,
+                "secretBackend": secrets.backend().as_str(),
+                "nodeId": node_id_str,
+                "nodeCert": passkey_hcert1,
+                "authoritiesDigest": digest,
+                "gatePolicyResigned": false,
+                "gateReloaded": false,
+                "webEnrolled": web_enrolled,
+                "stateDir": state_dir.display().to_string(),
+            });
+            let envelope = JsonEnvelope {
+                ok: true,
+                command: cmd.to_string(),
+                summary: Some(format!(
+                    "Enrolled Passkey Admin authority '{}' (kid {}) with zero local private key on disk",
+                    inserted.human_id, inserted.kid
+                )),
+                data: Some(data),
+                warnings: Vec::new(),
+                next,
+                error: None,
+            };
+            print_json(&envelope);
+        } else {
+            println!(
+                "OK    Enrolled Passkey Admin authority '{}' (kid={})",
+                inserted.human_id, inserted.kid
+            );
+            println!("      Label:     {}", inserted.label);
+            println!(
+                "      Boundary:  Hardware/browser Passkey+PRF (zero local private key stored)"
+            );
+            if passkey_hcert1.is_some() {
+                println!("      Node Cert: verified Passkey-signed hcert1_ for '{node_id_str}'");
+            }
+            print_next_steps(&next);
+        }
+        return ExitCode::from(EXIT_OK);
     }
 
-    let hcert1 = if let Some(cert_token) = passkey_hcert1 {
-        cert_token
-    } else {
-        match node.issue_node_cert(&admin_kp, &kid, 365) {
-            Ok((_signed_cert, token)) => token,
-            Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "CERTIFY_FAILED",
-                    format!("Failed to certify local node: {e}"),
-                    None,
-                );
-            }
+    // Local non-web CLI init (unlocked dev/hub node with 0 Passkey Admins).
+    let admin_kp = match Ed25519KeyPair::generate() {
+        Ok(kp) => kp,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "KEYGEN_FAILED",
+                format!("Failed to generate Ed25519 admin keypair: {e}"),
+                None,
+            );
+        }
+    };
+    let kid = admin_kp.kid();
+    let jwk = admin_kp.to_jwk();
+    let jwk_json = match to_canonical_json(&jwk) {
+        Ok(s) => s,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+    };
+    let secret_name = admin_secret_name_for_kid(&kid);
+    let pkcs8_b64 = admin_kp.export_pkcs8_b64();
+    if let Err(e) = secrets.set(&secret_name, &pkcs8_b64) {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "SECRET_STORE_ERROR",
+            format!("Failed to persist admin signing key in SecretStore: {e}"),
+            None,
+        );
+    }
+    drop(pkcs8_b64);
+
+    let inserted = {
+        let db = node.db();
+        match db.human().upsert_authority(
+            &HumanAuthorityInput {
+                human_id: human_id.clone(),
+                kid: kid.clone(),
+                label: trimmed_label.to_string(),
+                role: HumanAuthorityRole::Admin,
+                jwk_json: jwk_json.clone(),
+                enc_jwk_json: None,
+                prf_salt: None,
+                auth_epoch: min_epoch,
+            },
+            now_ms(),
+        ) {
+            Ok(rec) => rec,
+            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
         }
     };
 
-    let gate_resigned = {
-        let db = node.db();
-        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
-            Ok(b) => b,
-            Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
-            }
+    let hcert1 = match node.issue_node_cert(&admin_kp, &kid, 365) {
+        Ok((_signed_cert, token)) => token,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "CERTIFY_FAILED",
+                format!("Failed to certify local node: {e}"),
+                None,
+            );
         }
     };
 
@@ -1442,52 +1542,42 @@ fn run_auth_init(
     let node_id_str = node.node_id().as_str().to_string();
     drop(node);
 
-    let mut warnings = Vec::new();
-    let mut next = vec![
+    let warnings = vec![
+        "Local CLI key stored in SecretStore cannot lock/unlock the Security Gate; run `hyp auth init --web` to enroll a browser Passkey Admin."
+            .to_string(),
+    ];
+    let next = vec![
         format!("hyp auth list --state-dir {}", state_dir.display()),
         format!(
             "hyp drop create --kind directive --offline --state-dir {}",
             state_dir.display()
         ),
     ];
-    let (gate_reloaded, gate_reload_error) = if gate_resigned {
-        reload_live_gate_after_resign(
-            state_dir_arg.is_some(),
-            config_arg.is_some(),
-            &state_dir,
-            &mut warnings,
-            &mut next,
-        )
-    } else {
-        (false, None)
-    };
 
     if as_json {
-        let mut data = json!({
+        let data = json!({
             "humanId": inserted.human_id,
             "kid": inserted.kid,
             "role": inserted.role.as_str(),
             "label": inserted.label,
             "authEpoch": inserted.auth_epoch,
             "publicJwk": jwk,
+            "passkeyBacked": false,
             "secretName": secret_name,
             "secretBackend": secrets.backend().as_str(),
             "nodeId": node_id_str,
             "nodeCert": hcert1,
             "authoritiesDigest": digest,
-            "gatePolicyResigned": gate_resigned,
-            "gateReloaded": gate_reloaded,
-            "webEnrolled": web_enrolled,
+            "gatePolicyResigned": false,
+            "gateReloaded": false,
+            "webEnrolled": Value::Null,
             "stateDir": state_dir.display().to_string(),
         });
-        if let Some(ref err) = gate_reload_error {
-            data["gateReloadError"] = json!(err);
-        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
             summary: Some(format!(
-                "Initialized human admin authority '{}' (kid {}) and certified node '{}'",
+                "Initialized local human admin authority '{}' (kid {}) and certified node '{}'",
                 inserted.human_id, inserted.kid, node_id_str
             )),
             data: Some(data),
@@ -1498,7 +1588,7 @@ fn run_auth_init(
         print_json(&envelope);
     } else {
         println!(
-            "OK    Initialized human admin authority '{}' (kid={})",
+            "OK    Initialized local human admin authority '{}' (kid={})",
             inserted.human_id, inserted.kid
         );
         println!("      Label:     {}", inserted.label);
@@ -1508,18 +1598,6 @@ fn run_auth_init(
             secrets.backend().as_str()
         );
         println!("      Node Cert: issued 365d hcert1_ for '{node_id_str}'");
-        if let Some(ref w) = web_enrolled {
-            println!(
-                "      Passkey:   enrolled signer kid={}",
-                w.get("kid").and_then(Value::as_str).unwrap_or("-")
-            );
-        }
-        if gate_resigned {
-            println!("      Gate Sig:  re-signed with updated human_authorities_digest");
-            if gate_reloaded {
-                println!("      Gate Live: reloaded active daemon policy (no restart needed)");
-            }
-        }
         print_warnings(&warnings);
         print_next_steps(&next);
     }
@@ -1536,6 +1614,7 @@ fn run_auth_add(
     auth_epoch_arg: Option<u64>,
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
+    ceremony: ApprovalCeremonyArgs,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "auth add";
@@ -1562,10 +1641,36 @@ fn run_auth_add(
         );
     }
 
-    // Fail closed immediately when not attached to an interactive human terminal (`#10` / `H1`).
-    // Checking `stderr.is_terminal()` allows `hyp auth add < key.jwk` in a real human terminal
-    // (confirming via `/dev/tty` / `CONIN$`) while blocking non-TTY agent subprocesses before I/O.
-    if !io::stderr().is_terminal() {
+    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
+    let config_read =
+        resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
+    let config_write =
+        resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
+    let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
+    let passkey_admin_present = has_active_passkey_admin(&state_dir, &secrets);
+    let lock_state = inspect_external_lock_state(&config_read, &state_dir, &secrets);
+    if let Some(reason) = lock_state.tampered_reason.as_deref() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "GATE_POLICY_TAMPERED",
+            format!(
+                "Security Gate lock failed verification ({reason}); `hyp {cmd}` refuses to re-seal an unverified policy on disk."
+            ),
+            Some(format!(
+                "Inspect and explicitly re-lock the policy via `hyp gate lock --state-dir {}` before mutating human authorities.",
+                state_dir.display()
+            )),
+        );
+    }
+    let requires_passkey_ceremony = passkey_admin_present || lock_state.locked;
+
+    // When no Passkey Admin is enrolled and the gate is unlocked, keep the interactive
+    // controlling-TTY guard (`#6`) before reading stdin; when a Passkey Admin IS enrolled (or gate
+    // is locked), the real Passkey Admin signature is the boundary so forwarding agents can run
+    // `hyp auth add` without a TTY!
+    if !requires_passkey_ceremony && !io::stderr().is_terminal() {
         return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
     }
 
@@ -1724,11 +1829,6 @@ fn run_auth_add(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
     };
 
-    let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
-    let config_read =
-        resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
-    let config_write =
-        resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
     if let Err(e) = ensure_dir(&state_dir, true) {
         return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
     }
@@ -1743,17 +1843,17 @@ fn run_auth_add(
         .unwrap_or(min_epoch)
         .max(min_epoch);
     let effective_prf_salt = prf_salt_arg.or(bundle_prf_salt);
-    let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
+
+    let loaded = if config_read.exists() {
+        load_node_or_legacy_config(&config_read).ok()
+    } else {
+        None
+    };
+    let local_node_id = resolve_effective_node_id(loaded.as_ref(), Some(&db));
 
     // Validate optional Passkey-signed `nodeCert` (`hcert1_`) BEFORE mutating DB so invalid bundles
     // fail closed cleanly.
     let verified_bundle_cert = if let Some(ref raw_cert) = bundle_node_cert {
-        let loaded = if config_read.exists() {
-            load_node_or_legacy_config(&config_read).ok()
-        } else {
-            None
-        };
-        let local_node_id = resolve_effective_node_id(loaded.as_ref(), Some(&db));
         let local_identity = match secrets.load_or_create_node_keys(&local_node_id) {
             Ok(keys) => keys,
             Err(e) => {
@@ -1785,8 +1885,18 @@ fn run_auth_add(
         None
     };
 
-    let gate_locked = is_gate_locked(&config_read);
-    let summary = format_auth_add_confirm_summary(
+    let auth_input = HumanAuthorityInput {
+        human_id: human_id.clone(),
+        kid: kid.clone(),
+        label: trimmed_label.to_string(),
+        role: role.to_store_role(),
+        jwk_json: canonical_jwk_json,
+        enc_jwk_json,
+        prf_salt: effective_prf_salt,
+        auth_epoch: effective_epoch,
+    };
+
+    let mut summary = format_auth_add_confirm_summary(
         &human_id,
         role.to_store_role(),
         trimmed_label,
@@ -1794,32 +1904,76 @@ fn run_auth_add(
         effective_epoch,
         enc_kid.as_deref(),
         verified_bundle_cert.is_some(),
-        gate_locked,
+        lock_state.locked,
     );
-    let kid8: String = kid.chars().take(8).collect();
-    let prompt = format!(
-        "Enroll human authority '{}' (role: {}, kid: {})? [y/N]: ",
-        sanitize_tty_display(&human_id),
-        role.to_store_role().as_str(),
-        sanitize_tty_display(&kid8)
-    );
-    if let Err(err) = require_controlling_tty_confirmation(&summary, &prompt) {
-        return emit_confirm_error(cmd, as_json, err);
+
+    // Authorization: a Passkey Admin approval once one is enrolled (or the gate is locked),
+    // otherwise interactive controlling-TTY confirmation.
+    let mut approved: Option<Box<VerifiedApproval>> = None;
+    let mut reseal: Option<LockedGateReseal> = None;
+    if requires_passkey_ceremony {
+        if lock_state.locked {
+            let prepared = db
+                .human()
+                .projected_authorities_digest_after_upsert(&auth_input)
+                .map_err(|e| e.to_string())
+                .and_then(|digest| LockedGateReseal::prepare(&config_read, &db, &digest));
+            match prepared {
+                Ok(r) => reseal = Some(r),
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "GATE_POLICY_SYNC_FAILED",
+                        e,
+                        None,
+                    );
+                }
+            }
+            summary.push(
+                "Re-seals the locked Security Gate with the updated human_authorities_digest"
+                    .to_string(),
+            );
+        }
+        let mut action = base_approval_action(
+            HumanApprovalActionKind::AuthAdd,
+            local_node_id,
+            0,
+            lock_state.locked,
+        );
+        action.target_human_id = Some(human_id.clone());
+        action.target_kid = Some(kid.clone());
+        action.target_role = Some(role.to_store_role().as_str().to_string());
+        match approve_authority_change(
+            cmd,
+            as_json,
+            &state_dir,
+            &config_read,
+            &db,
+            &secrets,
+            action,
+            reseal.as_ref(),
+            &summary,
+            &ceremony,
+        ) {
+            Ok(verified) => approved = Some(verified),
+            Err(code) => return code,
+        }
+    } else {
+        let kid8: String = kid.chars().take(8).collect();
+        let prompt = format!(
+            "Enroll human authority '{}' (role: {}, kid: {})? [y/N]: ",
+            sanitize_tty_display(&human_id),
+            role.to_store_role().as_str(),
+            sanitize_tty_display(&kid8)
+        );
+        if let Err(err) = require_controlling_tty_confirmation(&summary, &prompt) {
+            return emit_confirm_error(cmd, as_json, err);
+        }
     }
 
-    let rec = match db.human().upsert_authority(
-        &HumanAuthorityInput {
-            human_id: human_id.clone(),
-            kid: kid.clone(),
-            label: trimmed_label.to_string(),
-            role: role.to_store_role(),
-            jwk_json: canonical_jwk_json,
-            enc_jwk_json,
-            prf_salt: effective_prf_salt,
-            auth_epoch: effective_epoch,
-        },
-        now_ms(),
-    ) {
+    let rec = match db.human().upsert_authority(&auth_input, now_ms()) {
         Ok(r) => r,
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
     };
@@ -1833,17 +1987,21 @@ fn run_auth_add(
         false
     };
 
-    let gate_resigned =
-        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
-            Ok(b) => b,
+    let approved_by_kid = approved.as_ref().map(|v| v.kid.clone());
+    let approved_seal_seq = match (reseal, approved.as_deref()) {
+        (Some(reseal), Some(verified)) => match reseal.apply(&db, &config_write, verified) {
+            Ok(seq) => Some(seq),
             Err(e) => {
                 return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
             }
-        };
+        },
+        _ => None,
+    };
+    let gate_resigned = approved_seal_seq.is_some();
     let digest = db.human().authorities_digest().ok();
     drop(db);
 
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut next = vec![format!("hyp auth list --state-dir {}", state_dir.display())];
     let (gate_reloaded, gate_reload_error) = if gate_resigned {
         reload_live_gate_after_resign(
@@ -1855,6 +2013,11 @@ fn run_auth_add(
         )
     } else {
         (false, None)
+    };
+    let via = if approved_by_kid.is_some() {
+        " via Passkey Admin approval"
+    } else {
+        ""
     };
 
     if as_json {
@@ -1870,6 +2033,8 @@ fn run_auth_add(
             "prfSalt": rec.prf_salt,
             "status": rec.status.as_str(),
             "authoritiesDigest": digest,
+            "approvedByKid": approved_by_kid,
+            "sealSeq": approved_seal_seq,
             "gatePolicyResigned": gate_resigned,
             "gateReloaded": gate_reloaded,
         });
@@ -1880,7 +2045,7 @@ fn run_auth_add(
             ok: true,
             command: cmd.to_string(),
             summary: Some(format!(
-                "Enrolled human authority '{}' ({}) kid {}",
+                "Enrolled human authority '{}' ({}) kid {}{via}",
                 rec.human_id,
                 rec.role.as_str(),
                 rec.kid
@@ -1893,7 +2058,7 @@ fn run_auth_add(
         print_json(&envelope);
     } else {
         println!(
-            "OK    Enrolled human authority '{}' (role={}, kid={})",
+            "OK    Enrolled human authority '{}' (role={}, kid={}){via}",
             rec.human_id,
             rec.role.as_str(),
             rec.kid
@@ -1906,7 +2071,7 @@ fn run_auth_add(
             println!("      NodeCert: verified & stored Passkey-signed hcert1_");
         }
         if gate_resigned {
-            println!("      Gate Sig: re-signed with updated human_authorities_digest");
+            println!("      Gate Seal: Passkey-sealed with updated human_authorities_digest");
             if gate_reloaded {
                 println!("      Gate Live: reloaded active daemon policy (no restart needed)");
             }
@@ -2050,6 +2215,7 @@ fn run_auth_revoke(
     broadcast: bool,
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
+    ceremony: ApprovalCeremonyArgs,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "auth revoke";
@@ -2064,9 +2230,6 @@ fn run_auth_revoke(
             None,
         );
     }
-    if !is_interactive_tty() {
-        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
-    }
 
     let explicit_state = state_dir_arg.is_some() || config_arg.is_some();
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
@@ -2074,6 +2237,30 @@ fn run_auth_revoke(
         resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
     let config_write =
         resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
+    let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
+    let passkey_admin_present = has_active_passkey_admin(&state_dir, &secrets);
+    let lock_state = inspect_external_lock_state(&config_read, &state_dir, &secrets);
+    if let Some(reason) = lock_state.tampered_reason.as_deref() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "GATE_POLICY_TAMPERED",
+            format!(
+                "Security Gate lock failed verification ({reason}); `hyp {cmd}` refuses to re-seal an unverified policy on disk."
+            ),
+            Some(format!(
+                "Inspect and explicitly re-lock the policy via `hyp gate lock --state-dir {}` before mutating human authorities.",
+                state_dir.display()
+            )),
+        );
+    }
+    let requires_passkey_ceremony = passkey_admin_present || lock_state.locked;
+
+    if !requires_passkey_ceremony && !is_interactive_tty() {
+        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
+    }
+
     let db_path = state_dir.join("node.sqlite");
     if !db_path.exists() {
         return emit_error(
@@ -2122,13 +2309,11 @@ fn run_auth_revoke(
     let now = now_ms();
     let revoked_at = format_rfc3339_millis(now);
 
-    let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
     let issuer_kp: Option<Ed25519KeyPair> = if let Some(ref ik) = issuer_kid_arg {
         all.iter()
             .find(|a| a.status == HumanAuthorityStatus::Active && a.kid == *ik)
             .and_then(|a| load_local_authority_keypair(&secrets, &a.kid).ok())
     } else {
-        // Prefer another active admin key in SecretStore; fallback to target itself if it is a local admin key.
         all.iter()
             .filter(|a| {
                 a.status == HumanAuthorityStatus::Active
@@ -2172,7 +2357,6 @@ fn run_auth_revoke(
         );
     }
 
-    let gate_locked = is_gate_locked(&config_read);
     let mut summary = format_auth_revoke_confirm_summary(
         &target,
         bump_epoch,
@@ -2180,7 +2364,7 @@ fn run_auth_revoke(
         new_min,
         broadcast,
         &reason,
-        gate_locked,
+        lock_state.locked,
     );
     if cascade {
         summary.push(format!(
@@ -2188,13 +2372,72 @@ fn run_auth_revoke(
             cascade_peer_ids.len()
         ));
     }
-    let prompt = format!(
-        "Revoke human authority '{}'? [y/N]: ",
-        sanitize_tty_display(&target.kid)
-    );
-    if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
-        return emit_confirm_error(cmd, as_json, err);
+
+    let mut approved: Option<Box<VerifiedApproval>> = None;
+    let mut reseal: Option<LockedGateReseal> = None;
+    if requires_passkey_ceremony {
+        let loaded = if config_read.exists() {
+            load_node_or_legacy_config(&config_read).ok()
+        } else {
+            None
+        };
+        let local_node_id = resolve_effective_node_id(loaded.as_ref(), Some(&db));
+        if lock_state.locked {
+            // Revocation keeps the row, so the authorities digest is unchanged by it.
+            let prepared = db
+                .human()
+                .authorities_digest()
+                .map_err(|e| e.to_string())
+                .and_then(|digest| LockedGateReseal::prepare(&config_read, &db, &digest));
+            match prepared {
+                Ok(r) => reseal = Some(r),
+                Err(e) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "GATE_POLICY_SYNC_FAILED",
+                        e,
+                        None,
+                    );
+                }
+            }
+        }
+        let mut action = base_approval_action(
+            HumanApprovalActionKind::AuthRevoke,
+            local_node_id,
+            0,
+            lock_state.locked,
+        );
+        action.target_human_id = Some(target.human_id.clone());
+        action.target_kid = Some(target.kid.clone());
+        action.bump_epoch = Some(bump_epoch);
+        action.cascade = Some(cascade);
+        match approve_authority_change(
+            cmd,
+            as_json,
+            &state_dir,
+            &config_read,
+            &db,
+            &secrets,
+            action,
+            reseal.as_ref(),
+            &summary,
+            &ceremony,
+        ) {
+            Ok(verified) => approved = Some(verified),
+            Err(code) => return code,
+        }
+    } else {
+        let prompt = format!(
+            "Revoke human authority '{}'? [y/N]: ",
+            sanitize_tty_display(&target.kid)
+        );
+        if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
+            return emit_confirm_error(cmd, as_json, err);
+        }
     }
+    let approved_by_kid = approved.as_ref().map(|v| v.kid.clone());
 
     let mut effective_min = current_min;
     for t in &targets {
@@ -2208,7 +2451,7 @@ fn run_auth_revoke(
                     "newMinAuthEpoch": new_min,
                     "revokedAt": revoked_at,
                     "reason": reason,
-                    "localCli": true,
+                    "approvedByKid": approved_by_kid,
                 })
                 .to_string(),
             }
@@ -2220,7 +2463,7 @@ fn run_auth_revoke(
                 "newMinAuthEpoch": new_min,
                 "revokedAt": revoked_at,
                 "reason": reason,
-                "localCli": true,
+                "approvedByKid": approved_by_kid,
             })
             .to_string()
         };
@@ -2281,13 +2524,17 @@ fn run_auth_revoke(
         }
     }
 
-    let gate_resigned =
-        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
-            Ok(b) => b,
+    let approved_seal_seq = match (reseal, approved.as_deref()) {
+        (Some(reseal), Some(verified)) => match reseal.apply(&db, &config_write, verified) {
+            Ok(seq) => Some(seq),
             Err(e) => {
                 return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
             }
-        };
+        },
+        _ => None,
+    };
+    let gate_resigned = approved_seal_seq.is_some();
+
     let digest = db.human().authorities_digest().ok();
     drop(db);
 
@@ -2358,6 +2605,8 @@ fn run_auth_revoke(
             "revokedPeers": revoked_peers,
             "peersReloaded": peers_reloaded,
             "authoritiesDigest": digest,
+            "approvedByKid": approved_by_kid,
+            "sealSeq": approved_seal_seq,
             "gatePolicyResigned": gate_resigned,
             "gateReloaded": gate_reloaded,
             "signedRevocation": signed_revocation,
@@ -2414,7 +2663,7 @@ fn run_auth_revoke(
             }
         }
         if gate_resigned {
-            println!("      Gate Sig:  re-signed with updated human_authorities_digest");
+            println!("      Gate Seal: Passkey-sealed with updated human_authorities_digest");
             if gate_reloaded {
                 println!("      Gate Live: reloaded active daemon policy (no restart needed)");
             }
@@ -3579,6 +3828,19 @@ fn run_auth_admit(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
     };
     let secrets = open_secret_store(&state_dir, explicit_state);
+    if inspect_external_lock_state(&config_write, &state_dir, &secrets).locked {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "GATE_LOCKED",
+            "Security Gate is currently LOCKED; `hyp auth admit` refuses to mutate human_authorities without a Passkey approval ceremony.",
+            Some(format!(
+                "Unlock via `hyp gate unlock --state-dir {}` or enroll via Passkey-approved `hyp auth add`.",
+                state_dir.display()
+            )),
+        );
+    }
     let now = now_ms();
     let min_epoch = db.human().min_auth_epoch().unwrap_or(1);
 
@@ -3613,34 +3875,16 @@ fn run_auth_admit(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
     };
 
-    let gate_resigned =
-        match sync_gate_policy_digest_if_locked(&config_write, &state_dir, &db, &secrets) {
-            Ok(b) => b,
-            Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
-            }
-        };
     let digest = db.human().authorities_digest().ok();
     drop(db);
 
-    let mut warnings = Vec::new();
-    let mut next = vec![format!(
+    let warnings: Vec<String> = Vec::new();
+    let next = vec![format!(
         "Device certified by '{human_id}' can now run `hyp pair join <hub-url>`"
     )];
-    let (gate_reloaded, gate_reload_error) = if gate_resigned {
-        reload_live_gate_after_resign(
-            state_dir_arg.is_some(),
-            config_arg.is_some(),
-            &state_dir,
-            &mut warnings,
-            &mut next,
-        )
-    } else {
-        (false, None)
-    };
 
     if as_json {
-        let mut data = json!({
+        let data = json!({
             "humanId": auth_rec.human_id,
             "kid": auth_rec.kid,
             "fingerprint": fingerprint,
@@ -3652,12 +3896,9 @@ fn run_auth_admit(
             "maxDevices": policy.max_devices,
             "delegationEnabled": policy.delegation_enabled,
             "authoritiesDigest": digest,
-            "gatePolicyResigned": gate_resigned,
-            "gateReloaded": gate_reloaded,
+            "gatePolicyResigned": false,
+            "gateReloaded": false,
         });
-        if let Some(ref err) = gate_reload_error {
-            data["gateReloadError"] = json!(err);
-        }
         let envelope = JsonEnvelope {
             ok: true,
             command: cmd.to_string(),
@@ -3681,9 +3922,6 @@ fn run_auth_admit(
             policy.node_prefix, policy.max_devices
         );
         println!("      Scopes:     {}", policy.scopes.join(" "));
-        if gate_resigned {
-            println!("      Gate Sig:   re-signed with updated human_authorities_digest");
-        }
         print_warnings(&warnings);
         print_next_steps(&next);
     }
@@ -3904,7 +4142,7 @@ struct WebEnrollState {
     done_tx: Mutex<Option<oneshot::Sender<Result<WebEnrolledAuthority, String>>>>,
 }
 
-fn extract_portal_origin(portal_url: &str) -> Result<String, String> {
+pub(crate) fn extract_portal_origin(portal_url: &str) -> Result<String, String> {
     let uri: http::Uri = portal_url
         .parse()
         .map_err(|e| format!("invalid Drop Portal URL '{portal_url}': {e}"))?;
@@ -3917,7 +4155,7 @@ fn extract_portal_origin(portal_url: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{authority}"))
 }
 
-fn should_skip_browser_open(no_open: bool, store: &SecretStore) -> bool {
+pub(crate) fn should_skip_browser_open(no_open: bool, store: &SecretStore) -> bool {
     if no_open {
         return true;
     }
@@ -3935,7 +4173,7 @@ fn should_skip_browser_open(no_open: bool, store: &SecretStore) -> bool {
         || dir.starts_with("/private/var/folders")
 }
 
-fn try_open_browser(url: &str) {
+pub(crate) fn try_open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "linux")]
@@ -3948,7 +4186,11 @@ fn try_open_browser(url: &str) {
     let _ = url;
 }
 
-fn apply_enroll_cors(origin: Option<&str>, allowed_origin: &str, resp: &mut Response<Full<Bytes>>) {
+pub(crate) fn apply_enroll_cors(
+    origin: Option<&str>,
+    allowed_origin: &str,
+    resp: &mut Response<Full<Bytes>>,
+) {
     if let Some(orig) = origin {
         if orig == allowed_origin {
             if let Ok(hdr_val) = HeaderValue::from_str(allowed_origin) {
@@ -3965,7 +4207,7 @@ fn apply_enroll_cors(origin: Option<&str>, allowed_origin: &str, resp: &mut Resp
     }
 }
 
-fn json_enroll_response(
+pub(crate) fn json_enroll_response(
     status: StatusCode,
     origin: Option<&str>,
     allowed_origin: &str,

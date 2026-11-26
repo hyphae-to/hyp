@@ -140,12 +140,13 @@ const RESERVED_SECRET_EXACT: &[&str] = &[
     "daemon-session-token-key",
 ];
 
-/// Supported MVP sealed drop kinds (`directive` or `secret`).
+/// Supported sealed human drop kinds (`directive`, `secret`, or `approval`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HumanDropKind {
     Directive,
     Secret,
+    Approval,
 }
 
 impl HumanDropKind {
@@ -153,8 +154,77 @@ impl HumanDropKind {
         match self {
             Self::Directive => "directive",
             Self::Secret => "secret",
+            Self::Approval => "approval",
         }
     }
+}
+
+/// Security-sensitive action authorized via a Passkey-signed `kind = "approval"` drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HumanApprovalActionKind {
+    #[serde(rename = "gate.lock")]
+    GateLock,
+    #[serde(rename = "gate.unlock")]
+    GateUnlock,
+    #[serde(rename = "gate.remove")]
+    GateRemove,
+    #[serde(rename = "auth.add")]
+    AuthAdd,
+    #[serde(rename = "auth.revoke")]
+    AuthRevoke,
+}
+
+impl HumanApprovalActionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GateLock => "gate.lock",
+            Self::GateUnlock => "gate.unlock",
+            Self::GateRemove => "gate.remove",
+            Self::AuthAdd => "auth.add",
+            Self::AuthRevoke => "auth.revoke",
+        }
+    }
+
+    const fn is_gate(self) -> bool {
+        matches!(self, Self::GateLock | Self::GateUnlock | Self::GateRemove)
+    }
+}
+
+/// Action a Passkey Admin approves. It travels in plaintext in the `#drop=` approval link
+/// (`approval`) and is signed verbatim (as RFC 8785 JCS) inside `HumanClaimV1::body` when
+/// `kind == Approval`. Every field is bound: the node accepts the signature only if the signed
+/// action equals the one it requested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HumanApprovalActionV1 {
+    pub v: u32,
+    pub action: HumanApprovalActionKind,
+    pub node_id: String,
+    /// Single-use ceremony nonce.
+    pub nonce: String,
+    /// RFC 3339 expiry of the approval request.
+    pub exp: String,
+    /// Next `gate_lock_seal` sequence (`0` when the action writes no seal).
+    pub seal_seq: u64,
+    /// Whether the gate is locked once the action is applied.
+    pub locked: bool,
+    /// SHA-256 of the resulting gate policy (required when `locked`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_sha256: Option<String>,
+    /// Resulting `human_authorities` digest (required when `locked`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorities_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_human_id: Option<String>,
+    /// RFC 7638 thumbprint of the authority key being added or revoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_kid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bump_epoch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<bool>,
 }
 
 /// Target audience bound inside `HumanClaimV1` (defeating surreptitious forwarding).
@@ -559,6 +629,25 @@ fn validate_claim_fields(claim: &HumanClaimV1) -> Result<(i64, i64), CryptoError
             }
             validate_secret_name(&spec.name)?;
         }
+        HumanDropKind::Approval => {
+            if claim.secret_spec.is_some() {
+                return Err(CryptoError::InvalidEnvelope(
+                    "approval claim must not carry secretSpec".into(),
+                ));
+            }
+            let action: HumanApprovalActionV1 = serde_json::from_str(&claim.body).map_err(|e| {
+                CryptoError::InvalidEnvelope(format!(
+                    "approval claim body is not a valid HumanApprovalActionV1: {e}"
+                ))
+            })?;
+            let _ = validate_approval_action(&action)?;
+            if action.node_id != claim.audience.node_id {
+                return Err(CryptoError::InvalidEnvelope(format!(
+                    "approval action nodeId '{}' does not match claim audience.nodeId '{}'",
+                    action.node_id, claim.audience.node_id
+                )));
+            }
+        }
     }
 
     if claim.body.is_empty() {
@@ -654,14 +743,9 @@ pub fn seal_human_drop(
     })
 }
 
-/// Opens and strictly verifies a `HumanDropEnvelopeV1` fail-closed:
-///
-/// - Enforces `v == 1`, `suite == "human.drop.v1"`, HPKE `open_base` + `unpad_bucket`.
-/// - Resolves the active authority key and monotonic `min_auth_epoch` via `lookup_authority(human_id, human_kid)`.
-/// - Verifies Ed25519 signature over `HUMAN_CLAIM_DOMAIN || payload`.
-/// - Enforces outer/inner `dropId` match, `audience.nodeId == recipient_node_id`,
-///   `audience.nodeEncKid == recipient_enc_kp.kid()`, `authEpoch >= min_auth_epoch`,
-///   TTL `<= 15m`, `issuedAt <= now_ms + 60s`, `now_ms < expiresAt`, and reserved secret-name guard.
+/// Opens and strictly verifies a `HumanDropEnvelopeV1` fail-closed, returning only the inner
+/// `HumanClaimV1`. See [`open_human_drop_with_signed`] when the verbatim `SignedHumanClaimV1`
+/// envelope is also needed (e.g. persisting a Passkey-signed Gate Lock Seal).
 pub fn open_human_drop<F>(
     envelope: &HumanDropEnvelopeV1,
     recipient_enc_kp: &X25519KeyPair,
@@ -669,6 +753,28 @@ pub fn open_human_drop<F>(
     now_ms: i64,
     lookup_authority: F,
 ) -> Result<HumanClaimV1, CryptoError>
+where
+    F: FnOnce(&str, &str) -> Option<(Ed25519PublicKey, u64)>,
+{
+    let (claim, _signed) = open_human_drop_with_signed(
+        envelope,
+        recipient_enc_kp,
+        recipient_node_id,
+        now_ms,
+        lookup_authority,
+    )?;
+    Ok(claim)
+}
+
+/// Opens and strictly verifies a `HumanDropEnvelopeV1` fail-closed, returning BOTH the parsed
+/// [`HumanClaimV1`] and the verified inner [`SignedHumanClaimV1`] (`payload` + Ed25519 `sig`).
+pub fn open_human_drop_with_signed<F>(
+    envelope: &HumanDropEnvelopeV1,
+    recipient_enc_kp: &X25519KeyPair,
+    recipient_node_id: &str,
+    now_ms: i64,
+    lookup_authority: F,
+) -> Result<(HumanClaimV1, SignedHumanClaimV1), CryptoError>
 where
     F: FnOnce(&str, &str) -> Option<(Ed25519PublicKey, u64)>,
 {
@@ -680,8 +786,7 @@ where
     let padded = hpke::open_base(&enc_bytes, recipient_enc_kp, &info, &aad, &ct_bytes)?;
     let signed_bytes = unpad_bucket(&padded)?;
 
-    let signed: Zeroizing<SignedHumanClaimV1> =
-        Zeroizing::new(serde_json::from_slice(&signed_bytes)?);
+    let signed: SignedHumanClaimV1 = serde_json::from_slice(&signed_bytes)?;
     let claim: HumanClaimV1 = serde_json::from_str(&signed.payload)?;
 
     // Look up active authority and verify Ed25519 signature BEFORE accepting claim semantics.
@@ -745,7 +850,7 @@ where
         )));
     }
 
-    Ok(claim)
+    Ok((claim, signed))
 }
 
 /// Encodes a validated `HumanDropEnvelopeV1` into an armored `hdrop1_<base64url(JCS)>` token.
@@ -1684,4 +1789,146 @@ pub fn verify_delegated_pair_proof(
         sig_b64,
     )?;
     Ok((sign_pk, enc_pk))
+}
+
+// ============================================================================
+// Passkey-Signed Security Approval Ceremonies (`kind = "approval"`)
+// ============================================================================
+
+fn is_lower_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Validates a [`HumanApprovalActionV1`] fail-closed and returns its `exp` in Unix milliseconds.
+pub fn validate_approval_action(action: &HumanApprovalActionV1) -> Result<i64, CryptoError> {
+    let invalid = |msg: String| Err(CryptoError::InvalidEnvelope(msg));
+    let kind = action.action.as_str();
+
+    if action.v != 1 {
+        return invalid(format!(
+            "unsupported HumanApprovalActionV1 version {} (expected 1)",
+            action.v
+        ));
+    }
+    if !is_valid_node_id(&action.node_id) {
+        return invalid(format!(
+            "invalid HumanApprovalActionV1 nodeId '{}'",
+            action.node_id
+        ));
+    }
+    if !is_valid_token_id(&action.nonce, false) {
+        return invalid("invalid HumanApprovalActionV1 nonce".into());
+    }
+    let exp_ms = parse_rfc3339_millis(&action.exp).map_err(|_| {
+        CryptoError::InvalidEnvelope(format!(
+            "invalid HumanApprovalActionV1 exp '{}'",
+            action.exp
+        ))
+    })?;
+
+    for (name, digest) in [
+        ("policySha256", &action.policy_sha256),
+        ("authoritiesDigest", &action.authorities_digest),
+    ] {
+        if digest.as_deref().is_some_and(|d| !is_lower_sha256_hex(d)) {
+            return invalid(format!(
+                "HumanApprovalActionV1 {name} must be 64 lowercase hex characters"
+            ));
+        }
+    }
+
+    match action.action {
+        HumanApprovalActionKind::GateLock if !action.locked => {
+            return invalid("gate.lock action requires locked=true".into());
+        }
+        HumanApprovalActionKind::GateUnlock if action.locked => {
+            return invalid("gate.unlock action requires locked=false".into());
+        }
+        _ => {}
+    }
+    // Every gate action and every action on a locked gate writes a new `gate_lock_seal`.
+    if (action.locked || action.action.is_gate()) && action.seal_seq == 0 {
+        return invalid(format!("{kind} action requires sealSeq >= 1"));
+    }
+    if action.locked && (action.policy_sha256.is_none() || action.authorities_digest.is_none()) {
+        return invalid(format!(
+            "{kind} action with locked=true requires policySha256 and authoritiesDigest"
+        ));
+    }
+
+    if let Some(ref role) = action.target_role {
+        if !matches!(role.as_str(), "admin" | "signer") {
+            return invalid(format!(
+                "{kind} action targetRole must be 'admin' or 'signer'"
+            ));
+        }
+    }
+    if matches!(
+        action.action,
+        HumanApprovalActionKind::AuthAdd | HumanApprovalActionKind::AuthRevoke
+    ) {
+        if action
+            .target_human_id
+            .as_deref()
+            .is_none_or(|h| h == LOCAL_NODE_ID || !is_valid_human_id(h))
+        {
+            return invalid(format!("{kind} action requires valid targetHumanId"));
+        }
+        if action
+            .target_kid
+            .as_deref()
+            .is_none_or(|k| !is_valid_token_id(k, false))
+        {
+            return invalid(format!("{kind} action requires valid targetKid"));
+        }
+    }
+    if action.action == HumanApprovalActionKind::AuthAdd && action.target_role.is_none() {
+        return invalid("auth.add action requires targetRole".into());
+    }
+
+    Ok(exp_ms)
+}
+
+/// Strictly verifies a persisted Passkey-signed [`SignedHumanClaimV1`] (`kind == Approval`)
+/// against `authority_pk` and `min_auth_epoch` (used to verify a durable `gate_lock_seal` row
+/// across daemon restarts without expiring a previously accepted lock seal).
+pub fn verify_signed_approval_claim(
+    signed: &SignedHumanClaimV1,
+    authority_pk: &Ed25519PublicKey,
+    min_auth_epoch: u64,
+) -> Result<(HumanClaimV1, HumanApprovalActionV1), CryptoError> {
+    verify_with_domain(
+        authority_pk,
+        HUMAN_CLAIM_DOMAIN,
+        signed.payload.as_bytes(),
+        &signed.sig,
+    )?;
+    let claim: HumanClaimV1 = serde_json::from_str(&signed.payload)?;
+    if claim.kind != HumanDropKind::Approval {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "expected approval claim kind, got '{}'",
+            claim.kind.as_str()
+        )));
+    }
+    if claim.human_kid != authority_pk.kid() {
+        return Err(CryptoError::InvalidSignature(
+            "approval claim humanKid does not match authority public key thumbprint".into(),
+        ));
+    }
+    if claim.auth_epoch < min_auth_epoch {
+        return Err(CryptoError::ReplayOrRollback(format!(
+            "approval claim authEpoch {} is below minimum allowed epoch {min_auth_epoch}",
+            claim.auth_epoch
+        )));
+    }
+    let _ = validate_claim_fields(&claim)?;
+    let action: HumanApprovalActionV1 = serde_json::from_str(&claim.body)?;
+    let _ = validate_approval_action(&action)?;
+    if action.node_id != claim.audience.node_id {
+        return Err(CryptoError::InvalidEnvelope(format!(
+            "approval action nodeId '{}' does not match claim audience.nodeId '{}'",
+            action.node_id, claim.audience.node_id
+        )));
+    }
+    Ok((claim, action))
 }

@@ -22,6 +22,7 @@ const SCHEMA_V3_SQL: &str = include_str!("../migrations/0003_wakeups.sql");
 const SCHEMA_V4_SQL: &str = include_str!("../migrations/0004_human_authority.sql");
 const SCHEMA_V5_SQL: &str = include_str!("../migrations/0005_human_enc_jwk.sql");
 const SCHEMA_V6_SQL: &str = include_str!("../migrations/0006_muted_sources_expires_at.sql");
+const SCHEMA_V7_SQL: &str = include_str!("../migrations/0007_delegated_human_admission.sql");
 
 const T0: i64 = 1_795_554_000_000;
 
@@ -802,7 +803,7 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
 
 #[test]
 fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 7);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 8);
     let dir = TempDir::new().unwrap();
 
     let v1_path = dir.path().join("from-v1").join("node.sqlite");
@@ -833,7 +834,7 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
             .into_iter()
             .map(|(v, _)| v)
             .collect();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
         // Bit-for-bit structural schema parity with fresh latest
         assert_eq!(
@@ -974,25 +975,36 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
         .unwrap();
     }
 
-    // 2. Open with NodeDb -> migrates v6 -> v7 cleanly with backup and bit-exact parity with fresh v7!
+    // 2. Open with NodeDb -> migrates v6 -> v8 cleanly with backup and bit-exact parity with fresh v8!
     let db = NodeDb::open(&v6_path).unwrap();
     let fresh = NodeDb::open(&fresh_path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 7);
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     let applied: Vec<i64> = db
         .applied_migrations()
         .unwrap()
         .into_iter()
         .map(|(v, _)| v)
         .collect();
-    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(
         snapshot_tables_and_columns(db.connection()),
         snapshot_tables_and_columns(fresh.connection())
     );
-    assert_eq!(
-        snapshot_indexes(db.connection()),
-        snapshot_indexes(fresh.connection())
-    );
+    let norm_idx = |conn: &Connection| -> BTreeMap<String, (String, Option<String>)> {
+        snapshot_indexes(conn)
+            .into_iter()
+            .map(|(k, (tbl, sql))| {
+                (
+                    k,
+                    (
+                        tbl,
+                        sql.map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")),
+                    ),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(norm_idx(db.connection()), norm_idx(fresh.connection()));
     let backups = db.list_migration_backups().unwrap();
     assert_eq!(backups.len(), 1);
     assert!(
@@ -1001,7 +1013,7 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("node.sqlite.v6-to-v7-")
+            .starts_with("node.sqlite.v6-to-v8-")
     );
 
     // Existing v6 peer & directive nonce survive untouched!
@@ -1261,5 +1273,186 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
             .unwrap()
             .unwrap()
             .delegation_enabled
+    );
+}
+
+#[test]
+fn v7_to_v8_migration_gate_lock_seal_anti_rollback_and_approval_nonces() {
+    let dir = TempDir::new().unwrap();
+    let v7_path = dir.path().join("from-v7").join("node.sqlite");
+    let fresh_path = dir.path().join("fresh-v8").join("node.sqlite");
+
+    // 1. Seed a genuine v7 SQLite database with pre-existing human_invite + directive nonces.
+    seed_db_at_version(&v7_path, 4);
+    {
+        let conn = Connection::open(&v7_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(SCHEMA_V5_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (5, ?1)",
+            params![T0 + 4],
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA_V6_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (6, ?1)",
+            params![T0 + 5],
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA_V7_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (7, ?1)",
+            params![T0 + 6],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO human_claim_nonces (claim_id, human_kid, kind, expires_at, consumed_at)
+             VALUES ('v7-invite-nonce', 'kid_v4_legacy', 'human_invite', ?1, ?2)",
+            params![T0 + 600_000, T0 + 6],
+        )
+        .unwrap();
+    }
+
+    // 2. Open with NodeDb -> migrates v7 -> v8 cleanly with backup and bit-exact parity with fresh v8!
+    let db = NodeDb::open(&v7_path).unwrap();
+    let fresh = NodeDb::open(&fresh_path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    let applied: Vec<i64> = db
+        .applied_migrations()
+        .unwrap()
+        .into_iter()
+        .map(|(v, _)| v)
+        .collect();
+    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(
+        snapshot_tables_and_columns(db.connection()),
+        snapshot_tables_and_columns(fresh.connection())
+    );
+    let norm_idx = |conn: &Connection| -> BTreeMap<String, (String, Option<String>)> {
+        snapshot_indexes(conn)
+            .into_iter()
+            .map(|(k, (tbl, sql))| {
+                (
+                    k,
+                    (
+                        tbl,
+                        sql.map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")),
+                    ),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(norm_idx(db.connection()), norm_idx(fresh.connection()));
+    let backups = db.list_migration_backups().unwrap();
+    assert_eq!(backups.len(), 1);
+    assert!(
+        backups[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("node.sqlite.v7-to-v8-")
+    );
+
+    // Pre-existing v7 human_invite nonce survives rebuild of `human_claim_nonces`.
+    assert!(
+        !db.human()
+            .consume_claim_nonce(
+                "v7-invite-nonce",
+                "kid_v4_legacy",
+                HumanClaimKind::HumanInvite,
+                T0 + 600_000,
+                T0 + 20,
+            )
+            .unwrap()
+    );
+
+    // 3. New `HumanClaimKind::Approval` single-use nonce consumption works and blocks replay.
+    assert!(
+        db.human()
+            .consume_claim_nonce(
+                "an_approval_nonce_1",
+                "kid_admin_pk",
+                HumanClaimKind::Approval,
+                T0 + 600_000,
+                T0 + 30,
+            )
+            .unwrap()
+    );
+    assert!(
+        !db.human()
+            .consume_claim_nonce(
+                "an_approval_nonce_1",
+                "kid_admin_pk",
+                HumanClaimKind::Approval,
+                T0 + 600_000,
+                T0 + 31,
+            )
+            .unwrap()
+    );
+
+    // 4. `gate_lock_seal` CRUD and strict monotonic `seal_seq` anti-rollback enforcement!
+    assert_eq!(db.human().get_gate_lock_seal().unwrap(), None);
+
+    // Reject seal_seq == 0 and a non-object signed claim.
+    let claim = |sig: &str| format!(r#"{{"payload":"{{\"v\":1}}","sig":"{sig}"}}"#);
+    assert!(matches!(
+        db.human().put_gate_lock_seal(0, &claim("s0"), T0 + 40),
+        Err(StoreError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        db.human()
+            .put_gate_lock_seal(1, "\"not-an-object\"", T0 + 40),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    let s1 = db
+        .human()
+        .put_gate_lock_seal(1, &claim("sig1"), T0 + 50)
+        .unwrap();
+    assert_eq!(s1.seal_seq, 1);
+    assert_eq!(s1.signed_claim_json, claim("sig1"));
+    assert_eq!(db.human().get_gate_lock_seal().unwrap(), Some(s1.clone()));
+
+    // Equal seal_seq = 1 MUST fail closed with InvalidState and leave the row untouched!
+    assert!(matches!(
+        db.human().put_gate_lock_seal(1, &claim("stale"), T0 + 60),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert_eq!(db.human().get_gate_lock_seal().unwrap(), Some(s1));
+
+    // Strictly higher seal_seq = 2 replaces the single row.
+    let s2 = db
+        .human()
+        .put_gate_lock_seal(2, &claim("sig2"), T0 + 70)
+        .unwrap();
+    assert_eq!(s2.seal_seq, 2);
+    assert_eq!(db.human().get_gate_lock_seal().unwrap(), Some(s2));
+
+    // 5. `projected_authorities_digest_after_upsert` matches exact post-upsert `authorities_digest()`!
+    let mut new_auth = sample_authority("alice", "kid_proj_1", HumanAuthorityRole::Admin, 1);
+    new_auth.enc_jwk_json = Some(sample_enc_jwk("proj_enc_1"));
+    let projected_new = db
+        .human()
+        .projected_authorities_digest_after_upsert(&new_auth)
+        .unwrap();
+    db.human().upsert_authority(&new_auth, T0 + 80).unwrap();
+    let actual_new = db.human().authorities_digest().unwrap();
+    assert_eq!(
+        projected_new, actual_new,
+        "projected digest before new insert must equal actual post-upsert digest"
+    );
+
+    let mut updated_auth = new_auth.clone();
+    updated_auth.enc_jwk_json = Some(sample_enc_jwk("proj_enc_2"));
+    let projected_upd = db
+        .human()
+        .projected_authorities_digest_after_upsert(&updated_auth)
+        .unwrap();
+    db.human().upsert_authority(&updated_auth, T0 + 90).unwrap();
+    let actual_upd = db.human().authorities_digest().unwrap();
+    assert_eq!(
+        projected_upd, actual_upd,
+        "projected digest before update must equal actual post-upsert digest"
     );
 }

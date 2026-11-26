@@ -1459,6 +1459,64 @@ button:disabled {
 }
 
 /* ========================================================================= */
+/* Passkey Security Approval Review (`kind === "approval"`)                  */
+/* ========================================================================= */
+.kind-label.approval {
+  color: var(--gold-bright);
+}
+
+.kind-label.approval-weakening {
+  color: var(--crimson);
+}
+
+.approval-review {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.approval-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.approval-title {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 1.24rem;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  color: var(--cream);
+}
+
+.approval-code {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--gold-bright);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--gold-dim);
+  border: 1px solid var(--gold-border);
+  white-space: nowrap;
+}
+
+.approval-code.weakening {
+  color: var(--crimson);
+  background: var(--crimson-bg);
+  border-color: var(--crimson-border);
+}
+
+.approval-meta-list {
+  background: var(--surface-inset);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-md);
+  padding: 2px 12px;
+}
+
+/* ========================================================================= */
 /* Footer                                                                    */
 /* ========================================================================= */
 .footer {

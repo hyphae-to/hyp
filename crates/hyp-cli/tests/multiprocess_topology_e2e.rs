@@ -992,7 +992,10 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
         .expect("run hyp onboard");
     assert_eq!(onb_out.status.code(), Some(0));
 
-    let gate_init = common::run_hyp_in_pty(
+    let passkey = common::TestPasskeyAdmin::generate("sec-admin", "macbook-touchid");
+    passkey.enroll_via_web(&home, &state_dir, None);
+
+    let (gate_init_code, init_json, gate_init_stderr, _) = passkey.run_and_approve_json(
         &home,
         &[
             "gate",
@@ -1004,13 +1007,13 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--lock",
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(gate_init.code, 0, "tty={}", gate_init.tty);
-    let init_json = gate_init.parse_json();
+    assert_eq!(gate_init_code, 0, "stderr={gate_init_stderr}");
     assert_eq!(init_json["data"]["locked"], true);
     assert_eq!(init_json["data"]["gatePolicySig"], "OK");
 
@@ -1321,20 +1324,21 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
     assert_eq!(mcp.close(Duration::from_secs(5)), Some(0));
     let _ = daemon.shutdown_gracefully();
 
-    let relock_out = common::run_hyp_in_pty(
+    let (relock_code, relock_json, relock_stderr, _) = passkey.run_and_approve_json(
         &home,
         &[
             "gate",
             "lock",
             "--state-dir",
             state_dir.to_str().unwrap(),
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(relock_out.code, 0, "tty={}", relock_out.tty);
-    assert_eq!(relock_out.parse_json()["data"]["gatePolicySig"], "OK");
+    assert_eq!(relock_code, 0, "stderr={relock_stderr}");
+    assert_eq!(relock_json["data"]["gatePolicySig"], "OK");
 
     let approve_out = common::run_hyp_in_pty(
         &home,

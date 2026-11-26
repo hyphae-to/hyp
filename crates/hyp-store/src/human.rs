@@ -75,6 +75,7 @@ pub enum HumanClaimKind {
     Directive,
     Secret,
     HumanInvite,
+    Approval,
 }
 
 impl HumanClaimKind {
@@ -83,6 +84,7 @@ impl HumanClaimKind {
             Self::Directive => "directive",
             Self::Secret => "secret",
             Self::HumanInvite => "human_invite",
+            Self::Approval => "approval",
         }
     }
 
@@ -91,11 +93,25 @@ impl HumanClaimKind {
             "directive" => Ok(Self::Directive),
             "secret" => Ok(Self::Secret),
             "human_invite" => Ok(Self::HumanInvite),
+            "approval" => Ok(Self::Approval),
             other => Err(StoreError::InvalidState(format!(
                 "invalid human claim kind '{other}'"
             ))),
         }
     }
+}
+
+/// The single Passkey-signed Security Gate lock seal row (`gate_lock_seal`, `id = 1`).
+///
+/// `signed_claim_json` is the Passkey Admin's `SignedHumanClaimV1` (`kind = "approval"`); every
+/// other fact about the seal (locked, policy hash, signer) is read from that signed claim, so no
+/// unsigned column can be edited to change its meaning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateLockSealRecord {
+    pub seal_seq: u64,
+    pub signed_claim_json: String,
+    pub updated_at: i64,
 }
 
 /// Input for configuring a human's delegated device admission policy (`human_delegation_policies`).
@@ -831,6 +847,181 @@ impl<'a> HumanAuthorityStore<'a> {
         )?;
         tx.commit()?;
         Ok(changed > 0)
+    }
+
+    /// Reads the Passkey-signed Security Gate lock seal, if one was ever written.
+    pub fn get_gate_lock_seal(&self) -> StoreResult<Option<GateLockSealRecord>> {
+        self.db
+            .conn()
+            .query_row(
+                "SELECT seal_seq, signed_claim_json, updated_at FROM gate_lock_seal WHERE id = 1",
+                [],
+                |row| {
+                    let seq: i64 = row.get(0)?;
+                    Ok(GateLockSealRecord {
+                        seal_seq: u64::try_from(seq).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Integer,
+                                Box::new(e),
+                            )
+                        })?,
+                        signed_claim_json: row.get(1)?,
+                        updated_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Replaces the lock seal. `seal_seq` must be strictly greater than the stored one, so an
+    /// approval requested before the latest seal can never be applied after it.
+    pub fn put_gate_lock_seal(
+        &self,
+        seal_seq: u64,
+        signed_claim_json: &str,
+        now_ms: i64,
+    ) -> StoreResult<GateLockSealRecord> {
+        let seq = i64::try_from(seal_seq)
+            .ok()
+            .filter(|s| *s >= 1)
+            .ok_or_else(|| {
+                StoreError::InvalidInput("gate_lock_seal seal_seq must be in 1..=i64::MAX".into())
+            })?;
+        validate_json_object("signed_claim_json", signed_claim_json)?;
+
+        let tx = self.db.immediate_tx()?;
+        let prev: Option<i64> = tx
+            .conn()
+            .query_row(
+                "SELECT seal_seq FROM gate_lock_seal WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if prev.is_some_and(|prev| seq <= prev) {
+            return Err(StoreError::InvalidState(format!(
+                "gate_lock_seal seal_seq rollback rejected: got {seq} <= existing {}",
+                prev.unwrap_or_default()
+            )));
+        }
+        tx.conn().execute(
+            "INSERT INTO gate_lock_seal (id, seal_seq, signed_claim_json, updated_at)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                seal_seq = excluded.seal_seq,
+                signed_claim_json = excluded.signed_claim_json,
+                updated_at = excluded.updated_at",
+            params![seq, signed_claim_json, now_ms],
+        )?;
+        tx.commit()?;
+
+        Ok(GateLockSealRecord {
+            seal_seq,
+            signed_claim_json: signed_claim_json.to_string(),
+            updated_at: now_ms,
+        })
+    }
+
+    /// Computes the exact canonical `authorities_digest()` that would result from applying
+    /// `upsert_authority(input)` WITHOUT mutating SQLite, so Passkey approval ceremonies can bind
+    /// the resulting digest before touching `human_authorities`.
+    pub fn projected_authorities_digest_after_upsert(
+        &self,
+        input: &HumanAuthorityInput,
+    ) -> StoreResult<String> {
+        validate_human_id(&input.human_id)?;
+        validate_token_id("kid", &input.kid)?;
+        validate_label(&input.label)?;
+        validate_json_object("jwk_json", &input.jwk_json)?;
+        if let Some(enc_jwk) = &input.enc_jwk_json {
+            validate_json_object("enc_jwk_json", enc_jwk)?;
+        }
+        if let Some(salt) = &input.prf_salt {
+            validate_token_id("prf_salt", salt)?;
+        }
+        let epoch_i64 = validate_epoch(input.auth_epoch)?;
+
+        // Match `upsert_authority` conflict/revocation checks fail-closed.
+        let existing: Option<(String, String)> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT human_id, status FROM human_authorities WHERE kid = ?1 LIMIT 1",
+                params![input.kid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_human_id, existing_status)) = existing {
+            if existing_human_id != input.human_id {
+                return Err(StoreError::IdConflict(format!(
+                    "human authority kid '{}' is already bound to human '{}'",
+                    input.kid, existing_human_id
+                )));
+            }
+            if existing_status == HumanAuthorityStatus::Revoked.as_str() {
+                return Err(StoreError::InvalidState(format!(
+                    "cannot reactivate revoked human authority '{}' kid '{}'",
+                    input.human_id, input.kid
+                )));
+            }
+        }
+
+        let mut stmt = self.db.conn().prepare(
+            "SELECT human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch
+             FROM human_authorities
+             ORDER BY human_id ASC, kid ASC",
+        )?;
+        let mut rows: Vec<(String, String, String, String, Option<String>, i64)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let new_tuple = (
+            input.human_id.clone(),
+            input.kid.clone(),
+            input.role.as_str().to_string(),
+            input.jwk_json.clone(),
+            input.enc_jwk_json.clone(),
+            epoch_i64,
+        );
+        if let Some(existing_row) = rows
+            .iter_mut()
+            .find(|r| r.0 == input.human_id && r.1 == input.kid)
+        {
+            *existing_row = new_tuple;
+        } else {
+            rows.push(new_tuple);
+            rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        }
+
+        let entries: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(
+                |(human_id, kid, role, jwk_json, enc_jwk_json, auth_epoch)| {
+                    json!({
+                        "humanId": human_id,
+                        "kid": kid,
+                        "role": role,
+                        "jwkJson": jwk_json,
+                        "encJwkJson": enc_jwk_json,
+                        "authEpoch": auth_epoch,
+                    })
+                },
+            )
+            .collect();
+        let payload = json!({ "authorities": entries });
+        let canon = canonical_json(&payload);
+        Ok(sha256_hex(canon.as_bytes()))
     }
 }
 

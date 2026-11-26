@@ -16,7 +16,8 @@
 //!    device card JSON for signing on a laptop browser, then reads the signed handoff bundle from
 //!    stdin to complete without the Passkey ever touching the remote host.
 
-use crate::auth_cmd::{admin_secret_name_for_kid, sync_gate_policy_digest_if_locked};
+use crate::approval::inspect_external_lock_state;
+use crate::auth_cmd::admin_secret_name_for_kid;
 use crate::config_file::{
     build_http_client, ct_eq, default_node_id, ensure_dir, ensure_v2_node_json_defaults,
     load_node_or_legacy_config, open_secret_store, read_json_object_or_empty,
@@ -1566,8 +1567,11 @@ fn finalize_join(
         );
     }
 
-    if let Err(e) = sync_gate_policy_digest_if_locked(config_write, state_dir, &db, secrets) {
-        warnings.push(format!("Locked gate policy re-sign skipped: {e}"));
+    if inspect_external_lock_state(config_write, state_dir, secrets).locked {
+        warnings.push(
+            "Security Gate is Passkey-locked; run `hyp gate lock` to approve & re-seal the gate with the updated human_authorities_digest."
+                .to_string(),
+        );
     }
 
     // 3. Call `POST <hub>/v1/auth/claim` natively over HTTPS/Tailscale if `hjoin1_` was supplied.

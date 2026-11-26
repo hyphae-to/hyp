@@ -596,8 +596,12 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
         .unwrap();
     assert_eq!(onb.status.code(), Some(0));
 
-    // `gate init --adapter anthropic --lock` (confirmed via interactive POSIX PTY)
-    let init_out = run_hyp_in_pty(
+    // Enroll a real Passkey Admin (`hyp auth init --web`) — `#10` prerequisite for locking the gate!
+    let passkey = common::TestPasskeyAdmin::generate("sec-admin", "macbook-touchid");
+    passkey.enroll_via_web(&home, &state_dir, None);
+
+    // `gate init --adapter anthropic --lock` (approved via Passkey ceremony)
+    let (init_code, init_json, init_stderr, _) = passkey.run_and_approve_json(
         &home,
         &[
             "gate",
@@ -613,13 +617,13 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--lock",
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(init_out.code, 0, "pty tty={}", init_out.tty);
-    let init_json = init_out.parse_json();
+    assert_eq!(init_code, 0, "stderr={init_stderr}");
     assert_eq!(init_json["ok"], true);
     assert_eq!(init_json["data"]["locked"], true);
     assert_eq!(init_json["data"]["gatePolicySig"], "OK");
@@ -677,20 +681,21 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
             .contains("gate_policy_tampered")
     );
 
-    // Re-lock via `gate lock` (confirmed via interactive POSIX PTY) -> doctor returns OK again
-    let lock_out = run_hyp_in_pty(
+    // Re-lock via `gate lock` (approved via Passkey ceremony) -> doctor returns OK again
+    let (lock_code, _, lock_stderr, _) = passkey.run_and_approve_json(
         &home,
         &[
             "gate",
             "lock",
             "--state-dir",
             state_dir.to_str().unwrap(),
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(lock_out.code, 0, "pty tty={}", lock_out.tty);
+    assert_eq!(lock_code, 0, "stderr={lock_stderr}");
 
     // Seed 2 quarantined mailbox items in node.sqlite
     let db = NodeDb::open(state_dir.join("node.sqlite")).unwrap();

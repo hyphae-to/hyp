@@ -5,6 +5,7 @@
 //! Performance note: `hyp hook` and `hyp statusline` intercept `std::env::args()` BEFORE
 //! constructing `clap` or Tokio so hot invocations pay zero async-runtime startup overhead (1–5 ms).
 
+mod approval;
 mod auth_cmd;
 mod config_file;
 mod connect_cmd;

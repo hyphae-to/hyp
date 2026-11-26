@@ -203,7 +203,8 @@ fn non_tty_security_sensitive_commands_fail_closed_with_zero_mutations() {
 
     let cfg_before = fs::read_to_string(&config_path).unwrap();
 
-    // 1. Non-TTY `hyp gate lock` fails closed; node.json & gate.proposed.json untouched!
+    // 1. `hyp gate lock` with ONLY a local CLI key (no Passkey Admin!) MUST fail closed (exit 1,
+    //    PASSKEY_AUTHORITY_REQUIRED, next: `hyp auth init --web`) — `#10` (H2); files untouched!
     let lock_out = isolated_cmd(home)
         .args([
             "gate",
@@ -216,14 +217,25 @@ fn non_tty_security_sensitive_commands_fail_closed_with_zero_mutations() {
         ])
         .output()
         .unwrap();
-    assert_non_tty_refused(&lock_out, "hyp gate lock");
+    assert_eq!(lock_out.status.code(), Some(1));
+    let lock_env = parse_json_stdout(&lock_out);
+    assert_eq!(lock_env["ok"], false);
+    assert_eq!(lock_env["error"]["code"], "PASSKEY_AUTHORITY_REQUIRED");
+    assert!(
+        lock_env["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("hyp auth init --web")),
+        "expected next step pointing to `hyp auth init --web`: {lock_env}"
+    );
     assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
     assert!(
         proposal_path.exists(),
         "gate.proposed.json must remain intact"
     );
 
-    // 2. Non-TTY `hyp gate init --lock` fails closed; node.json untouched!
+    // 2. `hyp gate init --lock` without Passkey Admin ALSO fails closed with PASSKEY_AUTHORITY_REQUIRED!
     let init_lock_out = isolated_cmd(home)
         .args([
             "gate",
@@ -239,7 +251,11 @@ fn non_tty_security_sensitive_commands_fail_closed_with_zero_mutations() {
         ])
         .output()
         .unwrap();
-    assert_non_tty_refused(&init_lock_out, "hyp gate init --lock");
+    assert_eq!(init_lock_out.status.code(), Some(1));
+    assert_eq!(
+        parse_json_stdout(&init_lock_out)["error"]["code"],
+        "PASSKEY_AUTHORITY_REQUIRED"
+    );
     assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
 
     // 3. Non-TTY `hyp inbox approve` & `hyp inbox reject --mute` fail closed; DB untouched!
@@ -464,7 +480,12 @@ fn non_tty_security_sensitive_commands_fail_closed_with_zero_mutations() {
         ])
         .output()
         .unwrap();
-    assert_non_tty_refused(&unlock_attempt, "hyp gate init on locked gate");
+    assert_eq!(unlock_attempt.status.code(), Some(1));
+    assert_eq!(
+        parse_json_stdout(&unlock_attempt)["error"]["code"],
+        "GATE_LOCKED",
+        "G1: `hyp gate init` without `--lock` on a locked gate MUST refuse silent unlock!"
+    );
     assert_eq!(
         fs::read_to_string(&config_path).unwrap(),
         locked_cfg_raw,
@@ -622,6 +643,10 @@ fn pty_gate_lock_and_locked_gate_init_abort_and_confirm_with_summary_diff() {
     let state_str = state_dir.to_str().unwrap();
     let cfg_str = config_path.to_str().unwrap();
 
+    // 0. Enroll a Passkey Admin (`hyp auth init --web`) for Passkey-signed gate ceremonies!
+    let passkey = common::TestPasskeyAdmin::generate("gate-admin", "macbook-touchid");
+    passkey.enroll_via_web(home, &state_dir, Some(&config_path));
+
     // 1. Seed initial unlocked Anthropic filter in node.json, then propose updated fields.
     let init_out = isolated_cmd(home)
         .args([
@@ -671,53 +696,46 @@ fn pty_gate_lock_and_locked_gate_init_abort_and_confirm_with_summary_diff() {
 
     let cfg_before = fs::read_to_string(&config_path).unwrap();
 
-    // 2. Answering `n`, empty Enter, or EOF aborts cleanly with ZERO mutations!
-    for reply in [Some("n\n"), Some("\n"), None] {
-        let abort = run_hyp_in_pty(
-            home,
-            &[
-                "gate",
-                "lock",
-                "--config",
-                cfg_str,
-                "--state-dir",
-                state_str,
-                "--json",
-            ],
-            None,
-            reply,
-        );
-        assert_eq!(abort.code, 1, "reply={reply:?} tty={}", abort.tty);
-        let env = abort.parse_json();
-        assert_eq!(env["ok"], false);
-        assert_eq!(env["error"]["code"], "CONFIRMATION_ABORTED");
-        assert!(abort.tty.contains("merging staged gate.proposed.json"));
-        assert!(
-            abort
-                .tty
-                .contains("changed: model: claude-haiku-4-5 -> claude-sonnet-4-5")
-        );
-        assert!(
-            abort
-                .tty
-                .contains("changed: auth_header: x-api-key -> bearer")
-        );
-        assert!(
-            abort
-                .tty
-                .contains("changed: secret_name: old-ant-secret -> new-proxy-secret")
-        );
-        assert!(
-            abort
-                .tty
-                .contains("Lock & sign this Security Gate policy? [y/N]:")
-        );
-        assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
-        assert!(proposal_path.exists());
-    }
+    // 2. `--no-wait` prints Passkey approval URL + full diff with ZERO mutations!
+    let preview = isolated_cmd(home)
+        .args([
+            "gate",
+            "lock",
+            "--config",
+            cfg_str,
+            "--state-dir",
+            state_str,
+            "--local",
+            "--no-wait",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(preview.status.code(), Some(0));
+    let prev_json = parse_json_stdout(&preview);
+    assert_eq!(prev_json["data"]["pending"], true);
+    let prev_diff = prev_json["data"]["diff"].to_string();
+    assert!(
+        prev_diff.contains("merging staged gate.proposed.json"),
+        "diff={prev_diff}"
+    );
+    assert!(
+        prev_diff.contains("changed: model: claude-haiku-4-5 -> claude-sonnet-4-5"),
+        "diff={prev_diff}"
+    );
+    assert!(
+        prev_diff.contains("changed: auth_header: x-api-key -> bearer"),
+        "diff={prev_diff}"
+    );
+    assert!(
+        prev_diff.contains("changed: secret_name: old-ant-secret -> new-proxy-secret"),
+        "diff={prev_diff}"
+    );
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
+    assert!(proposal_path.exists());
 
-    // 3. Answering `y` merges proposal, signs policy, deletes gate.proposed.json!
-    let ok_lock = run_hyp_in_pty(
+    // 3. Passkey-approved `gate lock` merges proposal, writes SQLite lock seal, deletes gate.proposed.json!
+    let (ok_code, ok_json, ok_stderr, approved_action) = passkey.run_and_approve_json(
         home,
         &[
             "gate",
@@ -726,53 +744,38 @@ fn pty_gate_lock_and_locked_gate_init_abort_and_confirm_with_summary_diff() {
             cfg_str,
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(ok_lock.code, 0, "tty={}", ok_lock.tty);
-    let ok_json = ok_lock.parse_json();
+    assert_eq!(ok_code, 0, "stderr={ok_stderr}");
     assert_eq!(ok_json["ok"], true);
     assert_eq!(ok_json["data"]["gatePolicySig"], "OK");
     assert_eq!(ok_json["data"]["mergedProposal"], true);
     assert!(!proposal_path.exists());
+    // The filter diff is shown on the local terminal; the signed action carries only the hash.
+    assert!(approved_action.locked && approved_action.policy_sha256.is_some());
+    let summary_joined = ok_stderr.clone();
+    assert!(
+        summary_joined.contains("changed: model: claude-haiku-4-5 -> claude-sonnet-4-5"),
+        "summary={summary_joined}"
+    );
+    assert!(
+        summary_joined.contains("changed: auth_header: x-api-key -> bearer"),
+        "summary={summary_joined}"
+    );
+    assert!(
+        summary_joined.contains("changed: secret_name: old-ant-secret -> new-proxy-secret"),
+        "summary={summary_joined}"
+    );
 
     let locked_cfg_raw = fs::read_to_string(&config_path).unwrap();
 
-    // 4. `hyp gate init` (WITHOUT `--lock`) against the now-locked gate displays bold warning!
-    //    Answering `n` keeps gate locked; answering `YES` unlocks/overwrites!
-    let abort_unlock = run_hyp_in_pty(
-        home,
-        &[
-            "gate",
-            "init",
-            "--adapter",
-            "openai-compat",
-            "--config",
-            cfg_str,
-            "--state-dir",
-            state_str,
-            "--json",
-        ],
-        None,
-        Some("n\n"),
-    );
-    assert_eq!(abort_unlock.code, 1, "tty={}", abort_unlock.tty);
-    assert_eq!(
-        abort_unlock.parse_json()["error"]["code"],
-        "CONFIRMATION_ABORTED"
-    );
-    assert!(
-        abort_unlock.tty.contains(
-            "WARNING: Security Gate is currently LOCKED. Overwriting/unlocking it will disable tamper protection until re-locked. Continue? [y/N]:"
-        ),
-        "tty={}",
-        abort_unlock.tty
-    );
-    assert_eq!(fs::read_to_string(&config_path).unwrap(), locked_cfg_raw);
-
-    let confirm_unlock = run_hyp_in_pty(
+    // 4. `hyp gate init` (WITHOUT `--lock`) against the locked gate ALWAYS fails closed (`GATE_LOCKED`,
+    //    even inside an interactive PTY!) — silent unlock is permanently eliminated (`#10` / G1)!
+    let refused_init = run_hyp_in_pty(
         home,
         &[
             "gate",
@@ -788,10 +791,34 @@ fn pty_gate_lock_and_locked_gate_init_abort_and_confirm_with_summary_diff() {
         None,
         Some("YES\n"),
     );
-    assert_eq!(confirm_unlock.code, 0, "tty={}", confirm_unlock.tty);
-    let unlocked_json = confirm_unlock.parse_json();
+    assert_eq!(refused_init.code, 1, "tty={}", refused_init.tty);
+    assert_eq!(refused_init.parse_json()["error"]["code"], "GATE_LOCKED");
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), locked_cfg_raw);
+
+    // 5. Real Passkey-signed `hyp gate unlock` cleanly unlocks tamper protection!
+    let (unlock_code, unlocked_json, unlock_stderr, unlock_action) = passkey.run_and_approve_json(
+        home,
+        &[
+            "gate",
+            "unlock",
+            "--config",
+            cfg_str,
+            "--state-dir",
+            state_str,
+            "--local",
+            "--no-open",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(unlock_code, 0, "stderr={unlock_stderr}");
     assert_eq!(unlocked_json["ok"], true);
     assert_eq!(unlocked_json["data"]["locked"], false);
+    assert!(!unlock_action.locked);
+    assert!(
+        unlock_stderr.contains("[WEAKENING]"),
+        "expected [WEAKENING] banner in the terminal unlock summary: {unlock_stderr}"
+    );
 }
 
 #[cfg(unix)]
@@ -935,7 +962,7 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
     let state_str = state_dir.to_str().unwrap();
     let cfg_str = config_path.to_str().unwrap();
 
-    // 1. Brand-new `auth init` + lock Security Gate via PTY.
+    // 1. Brand-new `auth init` on unlocked legacy node (no Passkey Admin yet).
     let init_out = isolated_cmd(home)
         .args([
             "auth",
@@ -954,26 +981,7 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
         .unwrap();
     assert_eq!(init_out.status.code(), Some(0));
 
-    let gate_init = run_hyp_in_pty(
-        home,
-        &[
-            "gate",
-            "init",
-            "--adapter",
-            "openai-compat",
-            "--lock",
-            "--config",
-            cfg_str,
-            "--state-dir",
-            state_str,
-            "--json",
-        ],
-        None,
-        Some("y\n"),
-    );
-    assert_eq!(gate_init.code, 0, "tty={}", gate_init.tty);
-
-    // 2. `hyp auth add` with JWK piped via stdin + controlling `/dev/tty` confirmation!
+    // 2. `hyp auth add` with JWK piped via stdin + controlling `/dev/tty` confirmation on unlocked node!
     let bob_kp = Ed25519KeyPair::generate().unwrap();
     let bob_kid = bob_kp.kid();
     let bob_kid8: String = bob_kid.chars().take(8).collect();
@@ -1004,7 +1012,6 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
         add_abort.parse_json()["error"]["code"],
         "CONFIRMATION_ABORTED"
     );
-    assert!(add_abort.tty.contains("Security Gate is LOCKED"));
     assert!(
         add_abort.tty.contains(&format!(
             "Enroll human authority 'bob' (role: signer, kid: {bob_kid8})? [y/N]:"
@@ -1042,9 +1049,8 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
     let add_json = add_ok.parse_json();
     assert_eq!(add_json["ok"], true);
     assert_eq!(add_json["data"]["kid"], bob_kid);
-    assert_eq!(add_json["data"]["gatePolicyResigned"], true);
 
-    // 3. `hyp auth revoke --bump-epoch`: decline aborts cleanly, confirm revokes & re-signs gate!
+    // 3. `hyp auth revoke --bump-epoch` on unlocked legacy node: decline aborts cleanly, confirm revokes!
     let rev_abort = run_hyp_in_pty(
         home,
         &[
@@ -1067,7 +1073,6 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
         "CONFIRMATION_ABORTED"
     );
     assert!(rev_abort.tty.contains("Bump Epoch: yes (1 -> 2)"));
-    assert!(rev_abort.tty.contains("Security Gate is LOCKED"));
     assert!(
         rev_abort
             .tty
@@ -1096,9 +1101,8 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
     let rev_json = rev_ok.parse_json();
     assert_eq!(rev_json["ok"], true);
     assert_eq!(rev_json["data"]["minAuthEpoch"], 2);
-    assert_eq!(rev_json["data"]["gatePolicyResigned"], true);
 
-    // 4. Non-web `hyp auth init` when authorities already exist + locked gate: abort & confirm!
+    // 4. Non-web `hyp auth init` when legacy authorities exist (unlocked, no Passkey Admin): abort & confirm!
     let init2_abort = run_hyp_in_pty(
         home,
         &[
@@ -1145,7 +1149,101 @@ fn pty_auth_add_piped_stdin_and_auth_revoke_confirm_via_controlling_tty() {
     let init2_json = init2_ok.parse_json();
     assert_eq!(init2_json["ok"], true);
     assert_eq!(init2_json["data"]["humanId"], "carol");
-    assert_eq!(init2_json["data"]["gatePolicyResigned"], true);
+
+    // 5. Once a Passkey Admin is enrolled (at epoch 3 so it survives H5 bump 2->3) & gate is locked
+    //    via Passkey, `auth init` fails closed (`PASSKEY_ADMIN_ENROLLED`) and `auth add`/`revoke` require Passkey!
+    let mut passkey = common::TestPasskeyAdmin::generate("pk-admin", "touchid-admin");
+    passkey.auth_epoch = 3;
+    passkey.enroll_via_auth_add_pty(home, &state_dir, Some(&config_path));
+
+    let (lock_code, lock_json, lock_stderr, _) = passkey.run_and_approve_json(
+        home,
+        &[
+            "gate",
+            "init",
+            "--adapter",
+            "openai-compat",
+            "--lock",
+            "--config",
+            cfg_str,
+            "--state-dir",
+            state_str,
+            "--local",
+            "--no-open",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(lock_code, 0, "stderr={lock_stderr}");
+    assert_eq!(lock_json["data"]["locked"], true);
+
+    let blocked_init = isolated_cmd(home)
+        .args([
+            "auth",
+            "init",
+            "--human-id",
+            "rogue",
+            "--state-dir",
+            state_str,
+            "--config",
+            cfg_str,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(blocked_init.status.code(), Some(1));
+    assert_eq!(
+        parse_json_stdout(&blocked_init)["error"]["code"],
+        "PASSKEY_ADMIN_ENROLLED"
+    );
+
+    let dave_kp = Ed25519KeyPair::generate().unwrap();
+    let dave_jwk = serde_json::to_string(&dave_kp.to_jwk()).unwrap();
+    let (pk_add_code, pk_add_json, pk_add_stderr, _) = passkey.run_and_approve_json(
+        home,
+        &[
+            "auth",
+            "add",
+            "--human-id",
+            "dave",
+            "--label",
+            "passkey-approved-signer",
+            "--role",
+            "signer",
+            "--state-dir",
+            state_str,
+            "--config",
+            cfg_str,
+            "--local",
+            "--no-open",
+            "--json",
+        ],
+        Some(&dave_jwk),
+    );
+    assert_eq!(pk_add_code, 0, "stderr={pk_add_stderr}");
+    assert_eq!(pk_add_json["data"]["gatePolicyResigned"], true);
+    let dave_kid = pk_add_json["data"]["kid"].as_str().unwrap().to_string();
+
+    let (pk_rev_code, pk_rev_json, pk_rev_stderr, _) = passkey.run_and_approve_json(
+        home,
+        &[
+            "auth",
+            "revoke",
+            &dave_kid,
+            "--bump-epoch",
+            "--state-dir",
+            state_str,
+            "--config",
+            cfg_str,
+            "--local",
+            "--no-open",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(pk_rev_code, 0, "stderr={pk_rev_stderr}");
+    assert_eq!(pk_rev_json["data"]["minAuthEpoch"], 3);
+    assert_eq!(pk_rev_json["data"]["gatePolicyResigned"], true);
 }
 
 #[test]
@@ -1324,6 +1422,10 @@ fn wave4c_pty_gate_lock_tamper_banner_weakening_diffs_and_policy_signing_secret_
     let state_str = state_dir.to_str().unwrap();
     let cfg_str = config_path.to_str().unwrap();
 
+    // 0. Enroll a Passkey Admin first!
+    let passkey = common::TestPasskeyAdmin::generate("tamper-admin", "macbook-touchid");
+    passkey.enroll_via_web(home, &state_dir, Some(&config_path));
+
     // 1. Seed a locked Security Gate policy with an HTTP classifier + subprocess filter.
     let init_http = isolated_cmd(home)
         .args([
@@ -1366,7 +1468,7 @@ fn wave4c_pty_gate_lock_tamper_banner_weakening_diffs_and_policy_signing_secret_
         .unwrap();
     assert_eq!(init_sub.status.code(), Some(0));
 
-    let lock1 = run_hyp_in_pty(
+    let (lock1_code, _, lock1_stderr, lock1_action) = passkey.run_and_approve_json(
         home,
         &[
             "gate",
@@ -1375,18 +1477,26 @@ fn wave4c_pty_gate_lock_tamper_banner_weakening_diffs_and_policy_signing_secret_
             cfg_str,
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(lock1.code, 0, "tty={}", lock1.tty);
-    assert!(lock1.tty.contains("Stage 1:"), "tty={}", lock1.tty);
-    assert!(lock1.tty.contains("matchers:"), "tty={}", lock1.tty);
+    assert_eq!(lock1_code, 0, "stderr={lock1_stderr}");
+    assert!(lock1_action.locked);
+    let lock1_summary = lock1_stderr.clone();
     assert!(
-        lock1.tty.contains("subprocess: args=[--strict]"),
-        "tty={}",
-        lock1.tty
+        lock1_summary.contains("Stage 1:"),
+        "summary={lock1_summary}"
+    );
+    assert!(
+        lock1_summary.contains("matchers:"),
+        "summary={lock1_summary}"
+    );
+    assert!(
+        lock1_summary.contains("subprocess: args=[--strict]"),
+        "summary={lock1_summary}"
     );
 
     // 2. Reject `gate.proposed.json` that tries to override `policySigningSecret`!
@@ -1400,33 +1510,30 @@ fn wave4c_pty_gate_lock_tamper_banner_weakening_diffs_and_policy_signing_secret_
         .unwrap(),
     )
     .unwrap();
-    let reject_prop = run_hyp_in_pty(
-        home,
-        &[
+    let reject_prop = isolated_cmd(home)
+        .args([
             "gate",
             "lock",
             "--config",
             cfg_str,
             "--state-dir",
             state_str,
+            "--local",
+            "--no-wait",
             "--json",
-        ],
-        None,
-        Some("y\n"),
-    );
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(reject_prop.status.code(), Some(1));
     assert_eq!(
-        reject_prop.code, 1,
-        "stdout={} tty={}",
-        reject_prop.stdout, reject_prop.tty
-    );
-    assert_eq!(
-        reject_prop.parse_json()["error"]["code"],
+        parse_json_stdout(&reject_prop)["error"]["code"],
         "INVALID_GATE_CONFIG"
     );
     fs::remove_file(&proposal_path).unwrap();
 
     // 3. Tamper locked `node.json` on disk (disable DLP, disable filter, empty matchers, raise threshold)
-    //    and verify `hyp gate lock` prints the LOUD tamper banner + weakening highlights BEFORE prompting!
+    //    the `--no-wait` summary (the approval link itself carries only the signed action and hash)!
+    //    the HPKE-encrypted Passkey approval payload (G7)!
     let mut cfg_val: Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     cfg_val["gate"]["stage1"]["outbound_dlp_enabled"] = Value::Bool(false);
@@ -1439,53 +1546,51 @@ fn wave4c_pty_gate_lock_tamper_banner_weakening_diffs_and_policy_signing_secret_
     )
     .unwrap();
 
-    let tampered_lock = run_hyp_in_pty(
-        home,
-        &[
+    let tampered_preview = isolated_cmd(home)
+        .args([
             "gate",
             "lock",
             "--config",
             cfg_str,
             "--state-dir",
             state_str,
+            "--local",
+            "--no-wait",
             "--json",
-        ],
-        None,
-        Some("n\n"),
-    );
-    assert_eq!(tampered_lock.code, 1, "tty={}", tampered_lock.tty);
-    assert_eq!(
-        tampered_lock.parse_json()["error"]["code"],
-        "CONFIRMATION_ABORTED"
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(tampered_preview.status.code(), Some(0));
+    let tampered_json = parse_json_stdout(&tampered_preview);
+    let url = tampered_json["data"]["url"].as_str().unwrap();
+    let frag = common::TestPasskeyAdmin::parse_approval_url(url);
+    let _tampered_action = passkey.open_approval_from_fragment(&frag);
+    let summary_text = tampered_json["data"]["diff"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        summary_text.contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"),
+        "expected loud tamper banner in the --no-wait summary: {summary_text}"
     );
     assert!(
-        tampered_lock
-            .tty
-            .contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"),
-        "expected loud tamper banner: {}",
-        tampered_lock.tty
+        summary_text.contains("WARNING — WEAKENING POLICY CHANGES DETECTED"),
+        "expected weakening summary: {summary_text}"
     );
     assert!(
-        tampered_lock
-            .tty
-            .contains("WARNING — WEAKENING POLICY CHANGES DETECTED"),
-        "expected weakening summary: {}",
-        tampered_lock.tty
+        summary_text.contains("outbound_dlp=false"),
+        "expected Stage 1 DLP shown: {summary_text}"
     );
     assert!(
-        tampered_lock.tty.contains("outbound_dlp=false"),
-        "expected Stage 1 DLP shown: {}",
-        tampered_lock.tty
+        summary_text.contains("threshold=0.99"),
+        "expected classifier threshold shown: {summary_text}"
     );
     assert!(
-        tampered_lock.tty.contains("threshold=0.99"),
-        "expected classifier threshold shown: {}",
-        tampered_lock.tty
-    );
-    assert!(
-        tampered_lock.tty.contains("EMPTY (matches nothing!)"),
-        "expected empty matchers shown: {}",
-        tampered_lock.tty
+        summary_text.contains("EMPTY (matches nothing!)"),
+        "expected empty matchers shown: {summary_text}"
     );
 }
 
@@ -2025,10 +2130,11 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
         );
     }
 
-    // 2. Non-TTY `hyp gate remove` (both without and with `--lock`) MUST fail closed with exit 2
-    //    and leave `node.json` byte-for-byte untouched!
-    for args in [
-        vec![
+    // 2. Non-TTY unlocked `hyp gate remove` fails closed (`INTERACTIVE_TTY_REQUIRED`), and
+    //    `hyp gate remove --lock` without a Passkey Admin fails closed (`PASSKEY_AUTHORITY_REQUIRED`),
+    //    leaving `node.json` byte-for-byte untouched!
+    let out_unlocked = isolated_cmd(home)
+        .args([
             "gate",
             "remove",
             "anthropic-guard",
@@ -2037,8 +2143,14 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
             "--state-dir",
             state_str,
             "--json",
-        ],
-        vec![
+        ])
+        .output()
+        .unwrap();
+    assert_non_tty_refused(&out_unlocked, "hyp gate remove (unlocked)");
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
+
+    let out_lock = isolated_cmd(home)
+        .args([
             "gate",
             "remove",
             "anthropic-guard",
@@ -2048,14 +2160,17 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
             "--state-dir",
             state_str,
             "--json",
-        ],
-    ] {
-        let out = isolated_cmd(home).args(&args).output().unwrap();
-        assert_non_tty_refused(&out, "hyp gate remove");
-        assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
-    }
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out_lock.status.code(), Some(1));
+    assert_eq!(
+        parse_json_stdout(&out_lock)["error"]["code"],
+        "PASSKEY_AUTHORITY_REQUIRED"
+    );
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
 
-    // 3. On Unix PTY: full abort/confirm lifecycle across unlocked, locked+--lock, tampered,
+    // 3. Full Passkey-signed lifecycle across unknown filter, locked+--lock, tampered,
     //    and locked-without---lock cases!
     #[cfg(unix)]
     {
@@ -2079,8 +2194,11 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
         assert_eq!(not_found.parse_json()["error"]["code"], "FILTER_NOT_FOUND");
         assert_eq!(fs::read_to_string(&config_path).unwrap(), cfg_before);
 
-        // 3b. Lock the gate first so both filters are under tamper-evident `gate_policy_sig`.
-        let lock_out = run_hyp_in_pty(
+        // 3b. Enroll Passkey Admin and lock the gate via Passkey approval!
+        let passkey = common::TestPasskeyAdmin::generate("rem-admin", "macbook-touchid");
+        passkey.enroll_via_web(home, &state_dir, Some(&config_path));
+
+        let (lock_code, _, lock_stderr, _) = passkey.run_and_approve_json(
             home,
             &[
                 "gate",
@@ -2089,18 +2207,18 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
                 cfg_str,
                 "--state-dir",
                 state_str,
+                "--local",
+                "--no-open",
                 "--json",
             ],
             None,
-            Some("y\n"),
         );
-        assert_eq!(lock_out.code, 0, "tty={}", lock_out.tty);
+        assert_eq!(lock_code, 0, "stderr={lock_stderr}");
         let locked_cfg = fs::read_to_string(&config_path).unwrap();
 
-        // 3c. Decline `hyp gate remove anthropic-guard --lock` -> zero mutation, shows `[REMOVED] [WEAKENING]`.
-        let abort_lock_rem = run_hyp_in_pty(
-            home,
-            &[
+        // 3c. Preview `hyp gate remove anthropic-guard --lock --no-wait` -> zero mutation, shows `[REMOVED] [WEAKENING]`.
+        let preview_rem = isolated_cmd(home)
+            .args([
                 "gate",
                 "remove",
                 "anthropic-guard",
@@ -2109,34 +2227,23 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
                 cfg_str,
                 "--state-dir",
                 state_str,
+                "--local",
+                "--no-wait",
                 "--json",
-            ],
-            None,
-            Some("n\n"),
-        );
-        assert_eq!(abort_lock_rem.code, 1, "tty={}", abort_lock_rem.tty);
-        assert_eq!(
-            abort_lock_rem.parse_json()["error"]["code"],
-            "CONFIRMATION_ABORTED"
-        );
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(preview_rem.status.code(), Some(0));
+        let preview_rem_json = parse_json_stdout(&preview_rem);
+        let preview_diff = preview_rem_json["data"]["diff"].to_string();
         assert!(
-            abort_lock_rem
-                .tty
-                .contains("anthropic-guard [REMOVED] [WEAKENING]"),
-            "tty={}",
-            abort_lock_rem.tty
-        );
-        assert!(
-            abort_lock_rem
-                .tty
-                .contains("Security Gate is currently LOCKED"),
-            "tty={}",
-            abort_lock_rem.tty
+            preview_diff.contains("anthropic-guard [REMOVED] [WEAKENING]"),
+            "diff={preview_diff}"
         );
         assert_eq!(fs::read_to_string(&config_path).unwrap(), locked_cfg);
 
-        // 3d. Confirm `hyp gate remove anthropic-guard --lock` -> removes filter AND re-signs cleanly!
-        let ok_lock_rem = run_hyp_in_pty(
+        // 3d. Passkey-approved `hyp gate remove anthropic-guard --lock` -> removes filter AND re-seals cleanly!
+        let (ok_rem_code, rem_env, rem_stderr, _) = passkey.run_and_approve_json(
             home,
             &[
                 "gate",
@@ -2147,17 +2254,13 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
                 cfg_str,
                 "--state-dir",
                 state_str,
+                "--local",
+                "--no-open",
                 "--json",
             ],
             None,
-            Some("y\n"),
         );
-        assert_eq!(
-            ok_lock_rem.code, 0,
-            "stdout={} tty={}",
-            ok_lock_rem.stdout, ok_lock_rem.tty
-        );
-        let rem_env = ok_lock_rem.parse_json();
+        assert_eq!(ok_rem_code, 0, "stderr={rem_stderr}");
         assert_eq!(rem_env["ok"], true);
         assert_eq!(rem_env["data"]["removedFilter"]["id"], "anthropic-guard");
         assert_eq!(rem_env["data"]["filterCount"], 1);
@@ -2165,7 +2268,7 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
         assert_eq!(rem_env["data"]["locked"], true);
         assert_eq!(rem_env["data"]["gatePolicySig"], "OK");
 
-        // Verify `hyp doctor --json` validates the newly signed `gate_policy_sig` as OK!
+        // Verify `hyp doctor --json` validates the newly Passkey-signed lock seal as OK!
         let doc_out = isolated_cmd(home)
             .args([
                 "doctor",
@@ -2181,7 +2284,7 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
         assert_eq!(doc_json["data"]["gate"]["gatePolicySig"], "OK");
         assert_eq!(doc_json["data"]["gate"]["tampered"], false);
 
-        // 3e. Tamper disk policy then run `hyp gate remove local-ollama --lock` -> loud tamper banner!
+        // 3e. Tamper disk policy then preview `hyp gate remove local-ollama --lock --no-wait` -> loud tamper banner!
         let mut tampered: Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         tampered["gate"]["stage1"]["outbound_dlp_enabled"] = Value::Bool(false);
@@ -2191,9 +2294,8 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
         )
         .unwrap();
 
-        let tamper_abort = run_hyp_in_pty(
-            home,
-            &[
+        let tamper_prev = isolated_cmd(home)
+            .args([
                 "gate",
                 "remove",
                 "local-ollama",
@@ -2202,50 +2304,44 @@ fn issue6_gate_remove_enforces_tty_lock_invariants_and_zero_bypass_flags() {
                 cfg_str,
                 "--state-dir",
                 state_str,
+                "--local",
+                "--no-wait",
                 "--json",
-            ],
-            None,
-            Some("n\n"),
-        );
-        assert_eq!(tamper_abort.code, 1, "tty={}", tamper_abort.tty);
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(tamper_prev.status.code(), Some(0));
+        let tamper_diff = parse_json_stdout(&tamper_prev)["data"]["diff"].to_string();
         assert!(
-            tamper_abort
-                .tty
-                .contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"),
-            "expected tamper banner on gate remove: {}",
-            tamper_abort.tty
+            tamper_diff.contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"),
+            "expected tamper banner on gate remove: {tamper_diff}"
         );
 
-        // 3f. Removing WITHOUT `--lock` on a locked gate warns loudly about unlocking;
-        //     confirming `YES` removes the filter and clears the stale signature!
-        let unlock_rem = run_hyp_in_pty(
-            home,
-            &[
-                "gate",
-                "remove",
-                "local-ollama",
-                "--config",
-                cfg_str,
-                "--state-dir",
-                state_str,
-                "--json",
-            ],
-            None,
-            Some("YES\n"),
-        );
-        assert_eq!(
-            unlock_rem.code, 0,
-            "stdout={} tty={}",
-            unlock_rem.stdout, unlock_rem.tty
-        );
+        // 3f. Removing WITHOUT `--lock` on a locked gate requires Passkey approval (unlocking seal);
+        //     once approved by Passkey Admin, removes the filter and writes unlocked Passkey seal!
+        let (unlock_rem_code, unlock_env, unlock_rem_stderr, unlock_rem_action) = passkey
+            .run_and_approve_json(
+                home,
+                &[
+                    "gate",
+                    "remove",
+                    "local-ollama",
+                    "--config",
+                    cfg_str,
+                    "--state-dir",
+                    state_str,
+                    "--local",
+                    "--no-open",
+                    "--json",
+                ],
+                None,
+            );
+        assert_eq!(unlock_rem_code, 0, "stderr={unlock_rem_stderr}");
+        assert!(!unlock_rem_action.locked);
         assert!(
-            unlock_rem
-                .tty
-                .contains("WARNING: Security Gate is currently LOCKED. Remove filter 'local-ollama' and unlock tamper protection? [y/N]:"),
-            "tty={}",
-            unlock_rem.tty
+            unlock_rem_stderr.contains("[WEAKENING]"),
+            "expected [WEAKENING] banner in the terminal summary: {unlock_rem_stderr}"
         );
-        let unlock_env = unlock_rem.parse_json();
         assert_eq!(unlock_env["ok"], true);
         assert_eq!(unlock_env["data"]["filterCount"], 0);
         assert_eq!(unlock_env["data"]["locked"], false);

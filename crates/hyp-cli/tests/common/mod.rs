@@ -778,3 +778,434 @@ sys.stdout.write(json.dumps({
         tty: parsed["tty"].as_str().unwrap_or_default().to_string(),
     }
 }
+
+/// Real Passkey Admin test actor for `#10` E2E tests (`hyp auth init --web` + loopback Passkey
+/// approval ceremonies + offline `--approval-file` + adversarial mutation helpers).
+pub struct TestPasskeyAdmin {
+    pub human_id: String,
+    pub label: String,
+    pub ed_kp: hyp_crypto::keys::Ed25519KeyPair,
+    pub enc_kp: hyp_crypto::keys::X25519KeyPair,
+    pub auth_epoch: u64,
+}
+
+impl TestPasskeyAdmin {
+    pub fn generate(human_id: &str, label: &str) -> Self {
+        Self {
+            human_id: human_id.to_string(),
+            label: label.to_string(),
+            ed_kp: hyp_crypto::keys::Ed25519KeyPair::generate().expect("generate passkey ed25519"),
+            enc_kp: hyp_crypto::keys::X25519KeyPair::generate().expect("generate passkey x25519"),
+            auth_epoch: 1,
+        }
+    }
+
+    pub fn kid(&self) -> String {
+        self.ed_kp.kid()
+    }
+
+    pub fn enc_kid(&self) -> String {
+        self.enc_kp.kid()
+    }
+
+    /// Enrolls this Passkey Admin via `hyp auth init --web --no-open --port 0` on a fresh node
+    /// (zero local PKCS#8 secret written to `SecretStore`, `role: admin`).
+    pub fn enroll_via_web(
+        &self,
+        home: &Path,
+        state_dir: &Path,
+        config_path: Option<&Path>,
+    ) -> Value {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use hyp_crypto::human::{NodeCertPayloadV1, encode_hcert1, sign_node_cert};
+        use hyp_crypto::keys::OkpJwk;
+        use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+
+        let mut args: Vec<String> = vec![
+            "auth".into(),
+            "init".into(),
+            "--web".into(),
+            "--human-id".into(),
+            self.human_id.clone(),
+            "--label".into(),
+            self.label.clone(),
+            "--no-open".into(),
+            "--port".into(),
+            "0".into(),
+            "--timeout".into(),
+            "20".into(),
+            "--state-dir".into(),
+            state_dir.to_str().unwrap().into(),
+            "--json".into(),
+        ];
+        if let Some(cfg) = config_path {
+            args.push("--config".into());
+            args.push(cfg.to_str().unwrap().into());
+        }
+
+        let mut cmd = isolated_cmd(home);
+        cmd.args(&args).stdin(Stdio::null());
+        let mut proc = ManagedProcess::spawn("hyp auth init --web (TestPasskeyAdmin)", &mut cmd);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let enroll_b64 = loop {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "timed out waiting for #enroll= URL; stderr={}",
+                proc.stderr_snapshot()
+            );
+            let line = proc
+                .try_read_stderr_line(rem)
+                .unwrap_or_else(|e| panic!("failed reading enroll stderr: {e}"));
+            if let Some((_, frag)) = line.split_once("#enroll=") {
+                break frag.trim().to_string();
+            }
+        };
+
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(&enroll_b64)
+            .expect("valid base64url #enroll= payload");
+        let payload: Value =
+            serde_json::from_slice(&payload_bytes).expect("valid JSON #enroll= payload");
+        let callback_url = payload["callbackUrl"].as_str().unwrap().to_string();
+        let csrf_token = payload["csrfToken"].as_str().unwrap().to_string();
+        let node_id = payload["nodeId"].as_str().unwrap().to_string();
+        let node_sign_jwk: OkpJwk =
+            serde_json::from_value(payload["nodeSignJwk"].clone()).expect("nodeSignJwk");
+        let node_enc_jwk: OkpJwk =
+            serde_json::from_value(payload["nodeEncJwk"].clone()).expect("nodeEncJwk");
+
+        let now = now_unix_ms();
+        let cert_payload = NodeCertPayloadV1 {
+            v: 1,
+            node_id,
+            signing_jwk: node_sign_jwk,
+            encryption_jwk: node_enc_jwk,
+            human_id: self.human_id.clone(),
+            human_kid: self.ed_kp.kid(),
+            auth_epoch: self.auth_epoch,
+            issued_at: format_rfc3339_millis(now),
+            expires_at: format_rfc3339_millis(now + 365 * 86_400_000),
+        };
+        let signed_cert = sign_node_cert(&cert_payload, &self.ed_kp).expect("sign NodeCertV1");
+        let hcert1 = encode_hcert1(&signed_cert).expect("encode hcert1_");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = hyp_node::engine::http_util::HttpClient::new().unwrap();
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(&callback_url)
+                .header(http::header::ORIGIN, "https://hyphae.to")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header("x-hyphae-csrf", &csrf_token)
+                .body(hyp_node::engine::http_util::full_body(
+                    serde_json::to_vec(&json!({
+                        "v": 1,
+                        "humanId": self.human_id,
+                        "kid": self.ed_kp.kid(),
+                        "jwk": self.ed_kp.to_jwk(),
+                        "encJwk": self.enc_kp.to_jwk(),
+                        "nodeCert": hcert1,
+                        "label": self.label,
+                        "credentialId": format!("cred-{}", self.ed_kp.kid()),
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap();
+            let resp = client.request(req).await.expect("POST web enroll callback");
+            assert_eq!(
+                resp.status(),
+                http::StatusCode::OK,
+                "web enroll callback failed with status {}",
+                resp.status()
+            );
+        });
+
+        let (status, out_json) = proc.wait_json_output(Duration::from_secs(10));
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "hyp auth init --web failed: {out_json}\nstderr={}",
+            proc.stderr_snapshot()
+        );
+        assert_eq!(out_json["ok"], true);
+        assert_eq!(out_json["data"]["webEnrolled"]["role"], "admin");
+        assert_eq!(out_json["data"]["passkeyBacked"], true);
+        assert!(out_json["data"]["secretName"].is_null());
+        out_json
+    }
+
+    /// Enrolls this Passkey Admin via `hyp auth add --role admin` (with `prfSalt` + `encJwk`,
+    /// zero local PKCS#8 secret in `SecretStore`) on an unlocked node that already has a local
+    /// CLI admin key (confirmed via real POSIX PTY).
+    #[cfg(unix)]
+    pub fn enroll_via_auth_add_pty(
+        &self,
+        home: &Path,
+        state_dir: &Path,
+        config_path: Option<&Path>,
+    ) -> Value {
+        let bundle = json!({
+            "v": 1,
+            "humanId": self.human_id,
+            "kid": self.ed_kp.kid(),
+            "authEpoch": self.auth_epoch,
+            "prfSalt": format!("passkey-prf-salt-{}", &self.ed_kp.kid()[..12.min(self.ed_kp.kid().len())]),
+            "jwk": self.ed_kp.to_jwk(),
+            "encJwk": self.enc_kp.to_jwk(),
+        })
+        .to_string();
+
+        let state_str = state_dir.to_str().unwrap();
+        let cfg_str = config_path.map(|p| p.to_str().unwrap().to_string());
+        let mut args: Vec<&str> = vec![
+            "auth",
+            "add",
+            "--human-id",
+            &self.human_id,
+            "--label",
+            &self.label,
+            "--role",
+            "admin",
+            "--state-dir",
+            state_str,
+        ];
+        if let Some(ref c) = cfg_str {
+            args.push("--config");
+            args.push(c.as_str());
+        }
+        args.push("--json");
+
+        let res = run_hyp_in_pty(home, &args, Some(&bundle), Some("y\n"));
+        assert_eq!(
+            res.code, 0,
+            "enroll_via_auth_add_pty failed: stdout={} tty={}",
+            res.stdout, res.tty
+        );
+        let parsed = res.parse_json();
+        assert_eq!(parsed["ok"], true);
+        parsed
+    }
+
+    /// Parses `#drop=<base64url>` from a printed Passkey approval URL.
+    pub fn parse_approval_url(url: &str) -> Value {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let (_, frag) = url
+            .split_once("#drop=")
+            .unwrap_or_else(|| panic!("expected #drop= fragment in approval URL: {url}"));
+        let raw = URL_SAFE_NO_PAD
+            .decode(frag.trim())
+            .unwrap_or_else(|e| panic!("invalid base64url #drop= fragment ({e}): {url}"));
+        serde_json::from_slice(&raw)
+            .unwrap_or_else(|e| panic!("invalid JSON #drop= fragment ({e}): {url}"))
+    }
+
+    /// Reads the requested `approval` action from a parsed `#drop=` fragment.
+    pub fn open_approval_from_fragment(
+        &self,
+        fragment: &Value,
+    ) -> hyp_crypto::human::HumanApprovalActionV1 {
+        serde_json::from_value(fragment["approval"].clone()).expect("fragment.approval")
+    }
+
+    /// Signs and HPKE-seals a `HumanApprovalActionV1` into an `hdrop1_` token + `HumanDropEnvelopeV1`
+    /// targeting `fragment["encJwk"]`.
+    pub fn seal_approval(
+        &self,
+        fragment: &Value,
+        action: &hyp_crypto::human::HumanApprovalActionV1,
+    ) -> (String, hyp_crypto::human::HumanDropEnvelopeV1) {
+        self.seal_approval_with_signer(
+            fragment,
+            action,
+            &self.ed_kp,
+            &self.human_id,
+            self.auth_epoch,
+            None,
+        )
+    }
+
+    /// Signs and HPKE-seals a `HumanApprovalActionV1` with an explicit signer keypair / identity
+    /// (for testing non-admin, revoked, wrong-nodeId, or mutated approvals).
+    pub fn seal_approval_with_signer(
+        &self,
+        fragment: &Value,
+        action: &hyp_crypto::human::HumanApprovalActionV1,
+        signer_kp: &hyp_crypto::keys::Ed25519KeyPair,
+        signer_human_id: &str,
+        auth_epoch: u64,
+        audience_node_override: Option<&str>,
+    ) -> (String, hyp_crypto::human::HumanDropEnvelopeV1) {
+        use hyp_crypto::human::{
+            HumanAudience, HumanClaimV1, HumanDropKind, encode_hdrop1, seal_human_drop,
+        };
+        use hyp_crypto::jcs::to_canonical_json;
+        use hyp_crypto::keys::OkpJwk;
+        use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+
+        let node_id = audience_node_override
+            .unwrap_or_else(|| fragment["nodeId"].as_str().expect("fragment.nodeId"));
+        let enc_jwk: OkpJwk =
+            serde_json::from_value(fragment["encJwk"].clone()).expect("fragment.encJwk");
+        let recipient_pk = enc_jwk.to_x25519().expect("recipient X25519 pubkey");
+        let drop_id = fragment["dropId"].as_str().unwrap_or_default().to_string();
+
+        let now = now_unix_ms();
+        let rand_suffix = hex::encode(
+            hyp_crypto::keys::Ed25519KeyPair::generate()
+                .unwrap()
+                .kid()
+                .as_bytes(),
+        );
+        let claim = HumanClaimV1 {
+            v: 1,
+            claim_id: format!("clm_{}_{}", now, &rand_suffix[..16]),
+            kind: HumanDropKind::Approval,
+            human_id: signer_human_id.to_string(),
+            human_kid: signer_kp.kid(),
+            auth_epoch,
+            issued_at: format_rfc3339_millis(now),
+            expires_at: format_rfc3339_millis(now + 5 * 60 * 1_000),
+            drop_id,
+            audience: HumanAudience {
+                node_id: node_id.to_string(),
+                node_enc_kid: recipient_pk.kid(),
+                handle: None,
+            },
+            secret_spec: None,
+            body: to_canonical_json(action).expect("canonical approval action JSON"),
+        };
+        let env = seal_human_drop(&claim, signer_kp, &recipient_pk).expect("seal_human_drop");
+        let hdrop1 = encode_hdrop1(&env).expect("encode_hdrop1");
+        (hdrop1, env)
+    }
+
+    /// POSTs an approval payload (`hdrop1_...` or JSON) to the fragment's loopback or remote relay.
+    pub fn post_approval_to_fragment(
+        fragment: &Value,
+        payload: &str,
+        origin: &str,
+    ) -> (u16, Value) {
+        use http_body_util::BodyExt as _;
+
+        let relay = fragment["relay"].as_str().expect("fragment.relay");
+        let drop_id = fragment["dropId"].as_str().expect("fragment.dropId");
+        let post_cap = fragment["postCap"].as_str().expect("fragment.postCap");
+        let url = format!("{relay}/v1/drops/{drop_id}");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = hyp_node::engine::http_util::HttpClient::new().unwrap();
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(&url)
+                .header(http::header::ORIGIN, origin)
+                .header("x-hyphae-drop-cap", post_cap)
+                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(hyp_node::engine::http_util::full_body(
+                    payload.as_bytes().to_vec(),
+                ))
+                .unwrap();
+            let resp = client.request(req).await.expect("POST approval to relay");
+            let status = resp.status().as_u16();
+            let body = resp
+                .into_body()
+                .collect()
+                .await
+                .map(|b| b.to_bytes())
+                .unwrap_or_default();
+            let parsed = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&body) }));
+            (status, parsed)
+        })
+    }
+
+    /// Spawns a `hyp` command that requires a Passkey approval ceremony, reads the printed
+    /// approval URL from stderr, reads the requested `approval`, signs with this Passkey Admin, POSTs
+    /// to the ephemeral loopback listener, and returns `(exit_code, stdout, stderr, action)`.
+    pub fn run_and_approve(
+        &self,
+        home: &Path,
+        args: &[&str],
+        stdin_data: Option<&str>,
+    ) -> (
+        i32,
+        String,
+        String,
+        hyp_crypto::human::HumanApprovalActionV1,
+    ) {
+        let mut cmd = isolated_cmd(home);
+        cmd.args(args);
+        if stdin_data.is_some() {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        let mut proc = ManagedProcess::spawn(format!("hyp {}", args.join(" ")), &mut cmd);
+        if let Some(data) = stdin_data {
+            let mut stdin = proc.take_stdin().expect("piped stdin");
+            stdin.write_all(data.as_bytes()).expect("write stdin");
+            drop(stdin);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let approval_url = loop {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "timed out waiting for Passkey approval URL; stderr={}",
+                proc.stderr_snapshot()
+            );
+            let line = proc.try_read_stderr_line(rem).unwrap_or_else(|e| {
+                panic!(
+                    "command exited or stalled before printing Passkey approval URL ({e}); stderr={}",
+                    proc.stderr_snapshot()
+                )
+            });
+            if let Some((_, url)) = line.split_once("Hyphae Passkey approval URL: ") {
+                break url.trim().to_string();
+            }
+        };
+
+        let fragment = Self::parse_approval_url(&approval_url);
+        let action = self.open_approval_from_fragment(&fragment);
+        let (hdrop1, _) = self.seal_approval(&fragment, &action);
+        let (http_status, resp_json) =
+            Self::post_approval_to_fragment(&fragment, &hdrop1, "https://hyphae.to");
+        assert_eq!(
+            http_status, 201,
+            "expected HTTP 201 on valid Passkey approval POST, got {http_status}: {resp_json}"
+        );
+
+        let (status, stdout) = proc.wait_stdout_output(Duration::from_secs(10));
+        let stderr = proc.stderr_snapshot();
+        (status.code().unwrap_or(-1), stdout, stderr, action)
+    }
+
+    /// Convenience wrapper around `run_and_approve` for `--json` commands.
+    pub fn run_and_approve_json(
+        &self,
+        home: &Path,
+        args: &[&str],
+        stdin_data: Option<&str>,
+    ) -> (i32, Value, String, hyp_crypto::human::HumanApprovalActionV1) {
+        let (code, stdout, stderr, action) = self.run_and_approve(home, args, stdin_data);
+        let parsed: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "invalid JSON stdout from approved hyp {args:?} ({e}):\ncode={code}\nstdout={stdout:?}\nstderr={stderr}"
+            )
+        });
+        (code, parsed, stderr, action)
+    }
+}

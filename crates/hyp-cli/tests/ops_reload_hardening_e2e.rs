@@ -4,7 +4,7 @@
 mod common;
 
 #[cfg(unix)]
-use common::{ManagedProcess, run_hyp_in_pty};
+use common::{ManagedProcess, TestPasskeyAdmin, run_hyp_in_pty};
 use common::{isolated_cmd, parse_json_stdout, repo_plugins_dir};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::Full;
@@ -252,7 +252,12 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     let alice_kid = init_json["data"]["kid"].as_str().unwrap().to_string();
     let alice_jwk_json = serde_json::to_string(&init_json["data"]["publicJwk"]).unwrap();
 
-    // Configure a Stage-1-only gate policy (zero external LLM / Ollama calls) and lock it.
+    // 2b. Enroll a Passkey Admin at epoch 2 (survives H5 `--bump-epoch` from 1 -> 2 when revoking bob!)
+    let mut passkey = TestPasskeyAdmin::generate("alice-passkey", "touchid-admin");
+    passkey.auth_epoch = 2;
+    passkey.enroll_via_auth_add_pty(&home, &state_dir, None);
+
+    // Configure a Stage-1-only gate policy (zero external LLM / Ollama calls) and lock it via Passkey!
     fs::write(
         state_dir.join("node.json"),
         serde_json::to_string_pretty(&json!({
@@ -267,24 +272,26 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     )
     .unwrap();
 
-    let lock_out = run_hyp_in_pty(
+    let (lock_code, lock_json, lock_stderr, _) = passkey.run_and_approve_json(
         &home,
-        &["gate", "lock", "--state-dir", state_str, "--json"],
+        &[
+            "gate",
+            "lock",
+            "--state-dir",
+            state_str,
+            "--local",
+            "--no-open",
+            "--json",
+        ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(
-        lock_out.code, 0,
-        "stdout={} tty={}",
-        lock_out.stdout, lock_out.tty
-    );
-    let lock_json = lock_out.parse_json();
+    assert_eq!(lock_code, 0, "stderr={lock_stderr}");
     assert_eq!(lock_json["data"]["daemonReloaded"], true);
 
-    // 3. Enroll a second human authority (`bob`) while locked daemon is LIVE!
+    // 3. Enroll a second human authority (`bob`) while locked daemon is LIVE (Passkey-approved)!
     let bob_kp = Ed25519KeyPair::generate().unwrap();
     let bob_jwk = serde_json::to_string(&bob_kp.to_jwk()).unwrap();
-    let add_out = run_hyp_in_pty(
+    let (add_code, add_json, add_stderr, _) = passkey.run_and_approve_json(
         &home,
         &[
             "auth",
@@ -295,17 +302,13 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
             "phone-key",
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         Some(&bob_jwk),
-        Some("y\n"),
     );
-    assert_eq!(
-        add_out.code, 0,
-        "stdout={} tty={}",
-        add_out.stdout, add_out.tty
-    );
-    let add_json = add_out.parse_json();
+    assert_eq!(add_code, 0, "stderr={add_stderr}");
     assert_eq!(add_json["ok"], true);
     assert_eq!(add_json["data"]["gatePolicyResigned"], true);
     assert_eq!(
@@ -367,8 +370,8 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
             .unwrap();
     }
 
-    // 5. Revoke `bob` with `--bump-epoch --broadcast` while locked daemon is LIVE!
-    let rev_out = run_hyp_in_pty(
+    // 5. Revoke `bob` with `--bump-epoch --broadcast` while locked daemon is LIVE (Passkey-approved)!
+    let (rev_code, rev_json, rev_stderr, _) = passkey.run_and_approve_json(
         &home,
         &[
             "auth",
@@ -380,17 +383,13 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
             "lost phone",
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(
-        rev_out.code, 0,
-        "stdout={} tty={}",
-        rev_out.stdout, rev_out.tty
-    );
-    let rev_json = rev_out.parse_json();
+    assert_eq!(rev_code, 0, "stderr={rev_stderr}");
     assert_eq!(rev_json["ok"], true);
     assert_eq!(rev_json["data"]["gatePolicyResigned"], true);
     assert_eq!(
@@ -511,7 +510,7 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
     let _ = daemon.shutdown_gracefully();
     let carol_kp = Ed25519KeyPair::generate().unwrap();
     let carol_jwk = serde_json::to_string(&carol_kp.to_jwk()).unwrap();
-    let add2_out = run_hyp_in_pty(
+    let (add2_code, add2_json, add2_stderr, _) = passkey.run_and_approve_json(
         &home,
         &[
             "auth",
@@ -522,13 +521,13 @@ fn r1_auth_mutations_live_reload_locked_gate_and_h4_broadcasts_revocation() {
             "backup",
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         Some(&carol_jwk),
-        Some("y\n"),
     );
-    assert_eq!(add2_out.code, 0, "tty={}", add2_out.tty);
-    let add2_json = add2_out.parse_json();
+    assert_eq!(add2_code, 0, "stderr={add2_stderr}");
     assert_eq!(add2_json["data"]["gatePolicyResigned"], true);
     assert_eq!(add2_json["data"]["gateReloaded"], false);
     assert!(

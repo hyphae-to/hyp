@@ -900,7 +900,12 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
     let init_json = parse_json_stdout(&init_out);
     let admin_kid = init_json["data"]["kid"].as_str().unwrap().to_string();
 
-    // 2. `hyp gate init` + `hyp gate lock` -> verifies `human_authorities_digest` is bound into `gate_policy_sig`!
+    // 1b. Enroll a Passkey Admin at epoch 2 (survives H5 `--bump-epoch` 1 -> 2 when revoking alice!)
+    let mut passkey = common::TestPasskeyAdmin::generate("alice-passkey", "touchid-admin");
+    passkey.auth_epoch = 2;
+    passkey.enroll_via_auth_add_pty(home, &state_dir, Some(&config_path));
+
+    // 2. `hyp gate init` + Passkey-signed `hyp gate lock` -> verifies `human_authorities_digest` is bound!
     let gate_init = isolated_cmd(home)
         .args([
             "gate",
@@ -917,7 +922,7 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
         .expect("run gate init");
     assert_eq!(gate_init.status.code(), Some(0));
 
-    let gate_lock = run_hyp_in_pty(
+    let (gate_lock_code, lock_json, gate_lock_stderr, _) = passkey.run_and_approve_json(
         home,
         &[
             "gate",
@@ -926,13 +931,13 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
             cfg_str,
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(gate_lock.code, 0, "tty={}", gate_lock.tty);
-    let lock_json = gate_lock.parse_json();
+    assert_eq!(gate_lock_code, 0, "stderr={gate_lock_stderr}");
     assert_eq!(lock_json["ok"], true);
     assert_eq!(lock_json["data"]["gatePolicySig"], "OK");
     let locked_digest = lock_json["data"]["humanAuthoritiesDigest"]
@@ -1063,7 +1068,7 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
         .unwrap()
         .to_string();
 
-    let revoke_out = run_hyp_in_pty(
+    let (revoke_code, revoke_json, revoke_stderr, _) = passkey.run_and_approve_json(
         home,
         &[
             "auth",
@@ -1074,13 +1079,13 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
             state_str,
             "--config",
             cfg_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(revoke_out.code, 0, "tty={}", revoke_out.tty);
-    let revoke_json = revoke_out.parse_json();
+    assert_eq!(revoke_code, 0, "stderr={revoke_stderr}");
     assert_eq!(revoke_json["ok"], true);
     assert_eq!(revoke_json["data"]["minAuthEpoch"], 2);
     assert_eq!(revoke_json["data"]["gatePolicyResigned"], true);
@@ -1599,7 +1604,7 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
         v: 1,
         node_id: enrolled_node_id,
         signing_jwk: enrolled_sign_jwk,
-        encryption_jwk: enrolled_enc_jwk,
+        encryption_jwk: enrolled_enc_jwk.clone(),
         human_id: "web-user".to_string(),
         human_kid: phone_kid.clone(),
         auth_epoch: 1,
@@ -1692,7 +1697,9 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
     assert_eq!(status.code(), Some(0));
     assert_eq!(out_json["ok"], true);
     assert_eq!(out_json["data"]["webEnrolled"]["kid"], phone_kid);
-    assert_eq!(out_json["data"]["webEnrolled"]["role"], "signer");
+    assert_eq!(out_json["data"]["webEnrolled"]["role"], "admin");
+    assert_eq!(out_json["data"]["passkeyBacked"], true);
+    assert!(out_json["data"]["secretName"].is_null());
     assert_eq!(out_json["data"]["webEnrolled"]["encKey"], true);
     assert_eq!(out_json["data"]["webEnrolled"]["encKid"], phone_enc_kid);
     assert_eq!(out_json["data"]["webEnrolled"]["nodeCertSigned"], true);
@@ -1787,50 +1794,33 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
         assert_eq!(mode, 0o600, "last_drop.json must be 0600, got {:o}", mode);
     }
 
-    // Sign secret bound to `drop_id` via `hyp auth sign --drop-id <drop_id>` (PTY on Unix)
+    // Sign secret bound to `drop_id` directly with the browser Passkey (`phone_kp`), proving
+    // zero local PKCS#8 secret is needed or stored on disk (`#10` / H2)!
     let relay_secret = "hyphae_zk_relay_test_value_042";
-    #[cfg(unix)]
-    let token = {
-        let signed = run_hyp_in_pty(
-            home,
-            &[
-                "auth",
-                "sign",
-                "--kind",
-                "secret",
-                "--secret-name",
-                "relay-e2e-key",
-                "--drop-id",
-                &drop_id,
-                "--state-dir",
-                state_str,
-                "--json",
-            ],
-            Some(relay_secret),
-            Some("y\n"),
-        );
-        assert_eq!(
-            signed.code, 0,
-            "auth sign failed: stdout={} tty={}",
-            signed.stdout, signed.tty
-        );
-        signed.parse_json()["data"]["token"]
-            .as_str()
-            .unwrap()
-            .to_string()
+    let node_enc_pk = enrolled_enc_jwk.to_x25519().unwrap();
+    let now_drop = now_unix_ms();
+    let claim = hyp_crypto::human::HumanClaimV1 {
+        v: 1,
+        claim_id: format!("clm_relay_e2e_{now_drop}"),
+        kind: hyp_crypto::human::HumanDropKind::Secret,
+        human_id: "web-user".to_string(),
+        human_kid: phone_kid.clone(),
+        auth_epoch: 1,
+        issued_at: format_rfc3339_millis(now_drop),
+        expires_at: format_rfc3339_millis(now_drop + 5 * 60 * 1_000),
+        drop_id: drop_id.clone(),
+        audience: hyp_crypto::human::HumanAudience {
+            node_id: out_json["data"]["nodeId"].as_str().unwrap().to_string(),
+            node_enc_kid: node_enc_pk.kid(),
+            handle: None,
+        },
+        secret_spec: Some(hyp_crypto::human::SecretDropSpec {
+            name: "relay-e2e-key".to_string(),
+            overwrite: false,
+        }),
+        body: relay_secret.to_string(),
     };
-    #[cfg(not(unix))]
-    let token = seal_hdrop1_via_stored_admin(
-        &state_dir,
-        out_json["data"]["nodeId"].as_str().unwrap(),
-        "web-user",
-        out_json["data"]["kid"].as_str().unwrap(),
-        hyp_crypto::human::HumanDropKind::Secret,
-        Some("relay-e2e-key"),
-        &drop_id,
-        relay_secret,
-    );
-    let env_obj = hyp_crypto::human::decode_hdrop1(&token).unwrap();
+    let env_obj = hyp_crypto::human::seal_human_drop(&claim, &phone_kp, &node_enc_pk).unwrap();
 
     // Post opaque ciphertext to Drop Relay using `X-Hyphae-Drop-Cap: <postCap>`
     rt.block_on(async {
@@ -1899,6 +1889,10 @@ fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
     let state_str = state_dir.to_str().unwrap();
     let cfg_str = config_path.to_str().unwrap();
 
+    // 0. Enroll a Passkey Admin (`hyp auth init --web`) first!
+    let passkey = common::TestPasskeyAdmin::generate("propose-admin", "macbook-touchid");
+    passkey.enroll_via_web(home, &state_dir, Some(&config_path));
+
     // 1. Stage a proposed filter via `hyp gate propose`
     let prop_out = isolated_cmd(home)
         .args([
@@ -1923,8 +1917,8 @@ fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
         "gate.proposed.json must exist after propose"
     );
 
-    // 2. Lock via `hyp gate lock` -> merges `gate.proposed.json` into `node.json`, signs, and removes proposal!
-    let lock_out = run_hyp_in_pty(
+    // 2. Lock via Passkey-approved `hyp gate lock` -> merges `gate.proposed.json` into `node.json`, signs, and removes proposal!
+    let (lock_code, lock_json, lock_stderr, _) = passkey.run_and_approve_json(
         home,
         &[
             "gate",
@@ -1933,17 +1927,13 @@ fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
             cfg_str,
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         None,
-        Some("y\n"),
     );
-    assert_eq!(
-        lock_out.code, 0,
-        "stdout={} tty={}",
-        lock_out.stdout, lock_out.tty
-    );
-    let lock_json = lock_out.parse_json();
+    assert_eq!(lock_code, 0, "stderr={lock_stderr}");
     assert_eq!(lock_json["ok"], true);
     assert_eq!(lock_json["data"]["mergedProposal"], true);
     assert_eq!(lock_json["data"]["filterCount"], 1);

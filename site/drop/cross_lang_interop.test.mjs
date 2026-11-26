@@ -16,7 +16,7 @@
  */
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -41,6 +41,8 @@ import {
   sealHumanDrop,
   signHumanInviteClaim,
   signNodeCert,
+  toCanonicalJson,
+  validateApprovalAction,
   verifyHumanInvite,
   verifyNodeCert,
 } from "./crypto.js";
@@ -913,5 +915,336 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
       /<input\s+id="chkOverwriteSecret"\s+type="checkbox"\s+disabled\s*\/>/.test(indexHtml),
       "#chkOverwriteSecret must remain unchecked by default (H15)",
     );
+  });
+
+  test("Issue #10 Passkey Gate Lock/Unlock E2E cross-language interop (Rust hyp <-> JS crypto.js & drop.js)", async () => {
+    const pkRoot = join(tmpRoot, "passkey-gate-interop");
+    const pkState = join(pkRoot, "state");
+    const pkCfgPath = join(pkRoot, "node.json");
+    mkdirSync(pkState, { recursive: true });
+    const pkNodeId = "passkey-interop@box";
+    writeFileSync(pkCfgPath, JSON.stringify({ v: 2, nodeId: pkNodeId }, null, 2) + "\n", "utf8");
+
+    const pkHumanId = "bogdan@passkey";
+    const pkPrfOut = randomBytes(32);
+    const pkEdSeed = await derivePrfEd25519Seed(pkPrfOut, pkHumanId, 1);
+    const pkEdKp = await ed25519KeypairFromSeed(pkEdSeed);
+    const pkEncKp = await derivePrfX25519Keypair(pkPrfOut, pkHumanId, 1);
+
+    // Helper: spawn an async `hyp` command, wait for a stderr marker line, run callback, and collect exit + JSON stdout.
+    function driveAsyncHyp(args, marker, onMarker) {
+      return new Promise((resolvePromise, rejectPromise) => {
+        const child = spawn(hypBin, args, {
+          env: { ...isoEnv, HYPHAE_NO_OPEN: "1" },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdoutBuf = "";
+        let stderrBuf = "";
+        let lineBuf = "";
+        let triggered = false;
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          rejectPromise(new Error(`Timed out driving hyp ${args.join(" ")}; stderr=${stderrBuf}`));
+        }, 20_000);
+
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+          stdoutBuf += chunk;
+        });
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk) => {
+          stderrBuf += chunk;
+          lineBuf += chunk;
+          let nl;
+          while ((nl = lineBuf.indexOf("\n")) >= 0) {
+            const line = lineBuf.slice(0, nl);
+            lineBuf = lineBuf.slice(nl + 1);
+            if (!triggered && line.includes(marker)) {
+              triggered = true;
+              Promise.resolve(onMarker(line)).catch((err) => {
+                clearTimeout(timer);
+                child.kill("SIGKILL");
+                rejectPromise(err);
+              });
+            }
+          }
+        });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          rejectPromise(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolvePromise({ code, stdout: stdoutBuf, stderr: stderrBuf });
+        });
+      });
+    }
+
+    // 1. Enroll Passkey Admin via `hyp auth init --web` -> JS verifies #enroll= & signs NodeCertV1!
+    const enrollRes = await driveAsyncHyp(
+      [
+        "auth",
+        "init",
+        "--web",
+        "--human-id",
+        pkHumanId,
+        "--label",
+        "js-passkey-admin",
+        "--no-open",
+        "--port",
+        "0",
+        "--timeout",
+        "15",
+        "--state-dir",
+        pkState,
+        "--config",
+        pkCfgPath,
+        "--json",
+      ],
+      "#enroll=",
+      async (line) => {
+        const hashIdx = line.indexOf("#enroll=");
+        const parsed = parseFragmentString(line.slice(hashIdx).trim());
+        assert.equal(parsed.mode, "enroll");
+        assert.equal(parsed.payload.nodeId, pkNodeId);
+        const nowMs = Date.now();
+        const cert = await signNodeCert(
+          {
+            nodeId: parsed.payload.nodeId,
+            signingJwk: parsed.payload.nodeSignJwk,
+            encryptionJwk: parsed.payload.nodeEncJwk,
+            humanId: pkHumanId,
+            humanKid: pkEdKp.kid,
+            authEpoch: 1,
+            issuedAt: new Date(nowMs).toISOString(),
+            expiresAt: new Date(nowMs + 365 * 86_400_000).toISOString(),
+          },
+          pkEdSeed,
+        );
+        const resp = await fetch(parsed.payload.callbackUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Origin: "https://hyphae.to",
+            "X-Hyphae-CSRF": parsed.payload.csrfToken,
+          },
+          body: JSON.stringify({
+            v: 1,
+            humanId: pkHumanId,
+            kid: pkEdKp.kid,
+            jwk: pkEdKp.publicJwk,
+            encJwk: pkEncKp.publicJwk,
+            nodeCert: cert.hcert1,
+            label: "js-passkey-admin",
+            credentialId: "cred-js-interop",
+          }),
+        });
+        assert.equal(resp.status, 200);
+      },
+    );
+    const enrollJson = parseJsonStdout(
+      { status: enrollRes.code, stdout: enrollRes.stdout, stderr: enrollRes.stderr },
+      "hyp auth init --web (JS Passkey Admin)",
+    );
+    assert.equal(enrollJson.data.webEnrolled.role, "admin");
+    assert.equal(enrollJson.data.passkeyBacked, true);
+    assert.equal(enrollJson.data.secretName, null);
+
+    // 2. Stage a filter with a secret ref canary, then run `hyp gate lock --local --no-open`!
+    const gateInitRes = runHyp(hypBin, isoEnv, [
+      "gate",
+      "init",
+      "--adapter",
+      "anthropic",
+      "--id",
+      "js-interop-filter-99",
+      "--secret",
+      "js-interop-secret-ref",
+      "--state-dir",
+      pkState,
+      "--config",
+      pkCfgPath,
+      "--json",
+    ]);
+    parseJsonStdout(gateInitRes, "hyp gate init");
+
+    let lockedAction = null;
+    const lockRes = await driveAsyncHyp(
+      [
+        "gate",
+        "lock",
+        "--local",
+        "--no-open",
+        "--state-dir",
+        pkState,
+        "--config",
+        pkCfgPath,
+        "--json",
+      ],
+      "Hyphae Passkey approval URL: ",
+      async (line) => {
+        const url = line.split("Hyphae Passkey approval URL: ")[1].trim();
+        // G7: Zero plaintext filter ID or secret ref in URL!
+        assert.ok(!url.includes("js-interop-filter-99"), "filter ID must not leak in URL");
+        assert.ok(!url.includes("js-interop-secret-ref"), "secret ref must not leak in URL");
+
+        const parsed = parseFragmentString(url.slice(url.indexOf("#")));
+        assert.equal(parsed.mode, "drop");
+        assert.equal(parsed.fragment.kind, "approval");
+        // The link carries the exact action to sign; the policy is named by hash only.
+        const opened = parsed.fragment.approval;
+        assert.deepEqual(validateApprovalAction(opened), opened);
+        assert.equal(opened.action, "gate.lock");
+        assert.equal(opened.locked, true);
+        assert.match(opened.policySha256, /^[0-9a-f]{64}$/);
+        assert.equal(opened.summary, undefined);
+        lockedAction = opened;
+
+        // JS signs & HPKE-seals the `kind: "approval"` drop and POSTs to Rust loopback relay!
+        const nowMs = Date.now();
+        const sealed = await sealHumanDrop({
+          claim: {
+            v: 1,
+            kind: "approval",
+            humanId: pkHumanId,
+            authEpoch: 1,
+            issuedAt: new Date(nowMs).toISOString(),
+            expiresAt: new Date(nowMs + 5 * 60 * 1000).toISOString(),
+            dropId: parsed.fragment.dropId,
+            audience: { nodeId: pkNodeId },
+            body: toCanonicalJson(opened),
+          },
+          humanSeed32: pkEdSeed,
+          recipientEncJwk: parsed.fragment.encJwk,
+        });
+
+        const postResp = await fetch(`${parsed.fragment.relay}/v1/drops/${parsed.fragment.dropId}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            Origin: "https://hyphae.to",
+            "X-Hyphae-Drop-Cap": parsed.fragment.postCap,
+          },
+          body: sealed.hdrop1,
+        });
+        assert.equal(postResp.status, 201, `expected HTTP 201, got ${postResp.status}: ${await postResp.text()}`);
+      },
+    );
+    const lockJson = parseJsonStdout(
+      { status: lockRes.code, stdout: lockRes.stdout, stderr: lockRes.stderr },
+      "hyp gate lock (JS Passkey approval)",
+    );
+    assert.equal(lockJson.data.gatePolicySig, "OK");
+    assert.ok(lockedAction);
+
+    // 3. Verify `hyp doctor --json` passes `OK`, then delete `"gate"` from `node.json` and confirm fail-closed!
+    const docOk = parseJsonStdout(
+      runHyp(hypBin, isoEnv, ["doctor", "--state-dir", pkState, "--config", pkCfgPath, "--json"]),
+      "hyp doctor (locked OK)",
+    );
+    assert.equal(docOk.data.gate.gatePolicySig, "OK");
+    assert.equal(docOk.data.gate.tampered, false);
+
+    const lockedCfgRaw = readFileSync(pkCfgPath, "utf8");
+    const deletedGateCfg = JSON.parse(lockedCfgRaw);
+    delete deletedGateCfg.gate;
+    writeFileSync(pkCfgPath, JSON.stringify(deletedGateCfg, null, 2) + "\n", "utf8");
+
+    const docTampered = runHyp(hypBin, isoEnv, [
+      "doctor",
+      "--state-dir",
+      pkState,
+      "--config",
+      pkCfgPath,
+      "--json",
+    ]);
+    assert.equal(docTampered.status, 1);
+    const docTamperedJson = JSON.parse(docTampered.stdout);
+    assert.equal(docTamperedJson.data.gate.gatePolicySig, "FAIL");
+    assert.equal(docTamperedJson.data.gate.tampered, true);
+
+    // Restore node.json and verify JS `parseFragmentString` fails closed on a missing action,
+    // unsigned extra text, and an action aimed at another node.
+    writeFileSync(pkCfgPath, lockedCfgRaw, "utf8");
+    const encodeFrag = (obj) => `#drop=${base64urlEncode(new TextEncoder().encode(JSON.stringify(obj)))}`;
+    const approvalFrag = (approval) =>
+      encodeFrag({ v: 1, nodeId: pkNodeId, encJwk: nodeEncJwk, kind: "approval", approval });
+    assert.throws(() => parseFragmentString(approvalFrag(undefined)), /approval action/i);
+    assert.throws(
+      () => parseFragmentString(approvalFrag({ ...lockedAction, summary: ["SPOOF"] })),
+      /Unknown approval action field: summary/,
+    );
+    assert.throws(
+      () => parseFragmentString(approvalFrag({ ...lockedAction, nodeId: "other@local" })),
+      /different node/,
+    );
+    assert.equal(parseFragmentString(approvalFrag(lockedAction)).fragment.approval.action, "gate.lock");
+
+    // 4. Rust `hyp gate unlock --local --no-open` <-> JS signs `gate.unlock`!
+    const unlockRes = await driveAsyncHyp(
+      [
+        "gate",
+        "unlock",
+        "--local",
+        "--no-open",
+        "--state-dir",
+        pkState,
+        "--config",
+        pkCfgPath,
+        "--json",
+      ],
+      "Hyphae Passkey approval URL: ",
+      async (line) => {
+        const url = line.split("Hyphae Passkey approval URL: ")[1].trim();
+        const parsed = parseFragmentString(url.slice(url.indexOf("#")));
+        const opened = parsed.fragment.approval;
+        assert.equal(opened.action, "gate.unlock");
+        assert.equal(opened.locked, false);
+
+        const nowMs = Date.now();
+        const sealed = await sealHumanDrop({
+          claim: {
+            v: 1,
+            kind: "approval",
+            humanId: pkHumanId,
+            authEpoch: 1,
+            issuedAt: new Date(nowMs).toISOString(),
+            expiresAt: new Date(nowMs + 5 * 60 * 1000).toISOString(),
+            dropId: parsed.fragment.dropId,
+            audience: { nodeId: pkNodeId },
+            body: toCanonicalJson(opened),
+          },
+          humanSeed32: pkEdSeed,
+          recipientEncJwk: parsed.fragment.encJwk,
+        });
+        const postResp = await fetch(`${parsed.fragment.relay}/v1/drops/${parsed.fragment.dropId}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            Origin: "https://hyphae.to",
+            "X-Hyphae-Drop-Cap": parsed.fragment.postCap,
+          },
+          body: sealed.hdrop1,
+        });
+        assert.equal(postResp.status, 201);
+      },
+    );
+    const unlockJson = parseJsonStdout(
+      { status: unlockRes.code, stdout: unlockRes.stdout, stderr: unlockRes.stderr },
+      "hyp gate unlock (JS Passkey approval)",
+    );
+    assert.equal(unlockJson.data.locked, false);
+
+    const docUnlocked = parseJsonStdout(
+      runHyp(hypBin, isoEnv, ["doctor", "--state-dir", pkState, "--config", pkCfgPath, "--json"]),
+      "hyp doctor (unlocked)",
+    );
+    assert.equal(docUnlocked.data.gate.gatePolicySig, "UNSIGNED");
+    assert.equal(docUnlocked.data.gate.tampered, false);
+
+    // 5. Approval UI markup invariant: `#approvalReviewGroup` & `#approvalConfirmCheck` exist and unchecked by default.
+    const indexHtml = readFileSync(join(__dirname, "index.html"), "utf8");
+    assert.ok(indexHtml.includes('id="approvalReviewGroup"'));
+    assert.ok(/<input\s+id="approvalConfirmCheck"\s+type="checkbox"\s*\/>/.test(indexHtml));
   });
 });

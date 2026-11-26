@@ -37,6 +37,13 @@ export const HUMAN_DRAFT_SUITE = "human.draft.v1";
 export const HUMAN_DRAFT_INFO_PREFIX = "hyphae/v2/human-draft\n";
 export const MAX_HUMAN_DRAFT_CHARS = 512;
 export const MAX_HUMAN_DRAFT_CONTEXT_CHARS = 160;
+export const HUMAN_APPROVAL_ACTIONS = Object.freeze([
+  "gate.lock",
+  "gate.unlock",
+  "gate.remove",
+  "auth.add",
+  "auth.revoke",
+]);
 
 export const HDROP1_PREFIX = "hdrop1_";
 export const HCERT1_PREFIX = "hcert1_";
@@ -1573,7 +1580,7 @@ export async function sealHumanDrop({ claim, humanSeed32, recipientEncJwk, hpkeO
   if (claim.v !== undefined && claim.v !== 1) {
     throw new Error(`Unsupported HumanClaimV1 version: ${claim.v}`);
   }
-  if (claim.kind !== "directive" && claim.kind !== "secret") {
+  if (claim.kind !== "directive" && claim.kind !== "secret" && claim.kind !== "approval") {
     throw new Error(`Unsupported claim kind: ${claim.kind}`);
   }
   if (typeof claim.humanId !== "string" || claim.humanId.length === 0) {
@@ -1638,6 +1645,21 @@ export async function sealHumanDrop({ claim, humanSeed32, recipientEncJwk, hpkeO
       name: claim.secretSpec.name,
       overwrite: Boolean(claim.secretSpec.overwrite),
     };
+  } else if (claim.kind === "approval") {
+    if (claim.secretSpec !== undefined && claim.secretSpec !== null) {
+      throw new Error("claim.secretSpec is forbidden for approval drops");
+    }
+    let parsedAction;
+    try {
+      parsedAction = JSON.parse(claim.body);
+    } catch {
+      throw new Error("approval claim.body must be valid HumanApprovalActionV1 JSON");
+    }
+    const validatedAction = validateApprovalAction(parsedAction);
+    if (validatedAction.nodeId !== audience.nodeId) {
+      throw new Error("approval action.nodeId must match claim.audience.nodeId");
+    }
+    normalizedClaim.body = toCanonicalJson(validatedAction);
   }
 
   const payloadJson = toCanonicalJson(normalizedClaim);
@@ -1964,6 +1986,98 @@ export async function openHumanDraft({ encDraft, recipientPriv32, expectedNodeId
     zeroize(padded);
     if (unpadded) zeroize(unpadded);
   }
+}
+
+// ============================================================================
+// Passkey Approval Ceremonies (`kind = "approval"`)
+// ============================================================================
+
+const LOWER_SHA256_RE = /^[0-9a-f]{64}$/;
+const APPROVAL_OPTIONAL_FIELDS = Object.freeze({
+  policySha256: (v) => typeof v === "string" && LOWER_SHA256_RE.test(v),
+  authoritiesDigest: (v) => typeof v === "string" && LOWER_SHA256_RE.test(v),
+  targetHumanId: (v) => typeof v === "string" && v !== "local" && isValidNodeId(v),
+  targetKid: (v) => typeof v === "string" && TOKEN_ID_RE.test(v),
+  targetRole: (v) => v === "admin" || v === "signer",
+  bumpEpoch: (v) => typeof v === "boolean",
+  cascade: (v) => typeof v === "boolean",
+});
+
+/**
+ * Strictly validates a `HumanApprovalActionV1` object fail-closed and returns a clean,
+ * whitelisted object whose RFC 8785 JCS matches Rust `hyp_crypto::human::HumanApprovalActionV1`.
+ * Every returned field is signed by the Passkey and compared by the node, so the approval page
+ * may display any of them.
+ */
+export function validateApprovalAction(action) {
+  if (!action || typeof action !== "object" || Array.isArray(action)) {
+    throw new Error("Approval action must be a JSON object");
+  }
+  if (action.v !== 1) {
+    throw new Error(`Unsupported HumanApprovalActionV1 version: ${action.v}`);
+  }
+  if (!HUMAN_APPROVAL_ACTIONS.includes(action.action)) {
+    throw new Error(`Unsupported approval action: ${action.action}`);
+  }
+  if (!isValidNodeId(action.nodeId)) {
+    throw new Error(`Invalid approval action nodeId: ${action.nodeId}`);
+  }
+  if (typeof action.nonce !== "string" || !TOKEN_ID_RE.test(action.nonce)) {
+    throw new Error("Invalid approval action nonce");
+  }
+  if (typeof action.exp !== "string" || !Number.isFinite(Date.parse(action.exp))) {
+    throw new Error(`Invalid approval action exp: ${action.exp}`);
+  }
+  if (!Number.isSafeInteger(action.sealSeq) || action.sealSeq < 0) {
+    throw new Error("Approval action sealSeq must be an integer >= 0");
+  }
+  if (typeof action.locked !== "boolean") {
+    throw new Error("Approval action locked must be a boolean");
+  }
+
+  const out = {
+    v: 1,
+    action: action.action,
+    nodeId: action.nodeId,
+    nonce: action.nonce,
+    exp: action.exp,
+    sealSeq: action.sealSeq,
+    locked: action.locked,
+  };
+  for (const key of Object.keys(action)) {
+    if (key in out) continue;
+    const isValid = APPROVAL_OPTIONAL_FIELDS[key];
+    if (!isValid) {
+      throw new Error(`Unknown approval action field: ${key}`);
+    }
+    if (action[key] === undefined || action[key] === null) continue;
+    if (!isValid(action[key])) {
+      throw new Error(`Invalid approval action ${key}`);
+    }
+    out[key] = action[key];
+  }
+
+  const kind = out.action;
+  const isGate = kind.startsWith("gate.");
+  if (kind === "gate.lock" && !out.locked) {
+    throw new Error("gate.lock requires locked=true");
+  }
+  if (kind === "gate.unlock" && out.locked) {
+    throw new Error("gate.unlock requires locked=false");
+  }
+  if ((out.locked || isGate) && out.sealSeq < 1) {
+    throw new Error(`${kind} requires sealSeq >= 1`);
+  }
+  if (out.locked && (!out.policySha256 || !out.authoritiesDigest)) {
+    throw new Error(`${kind} with locked=true requires policySha256 and authoritiesDigest`);
+  }
+  if (!isGate && (!out.targetHumanId || !out.targetKid)) {
+    throw new Error(`${kind} requires targetHumanId and targetKid`);
+  }
+  if (kind === "auth.add" && !out.targetRole) {
+    throw new Error("auth.add requires targetRole");
+  }
+  return out;
 }
 
 // ============================================================================

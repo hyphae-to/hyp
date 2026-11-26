@@ -28,7 +28,7 @@ use crate::delivery::{DeliveryUrgency, urgency_cap_gate_reason};
 use crate::gates::plugins::{FilterPlugin, build_filter_plugin};
 use crate::gates::policy::{
     GateDecision, GateError, InboundContext, OutboundContext, SecurityGateConfig, TrustTier,
-    format_quarantine_notice, verify_gate_policy_sig,
+    format_quarantine_notice, verify_gate_lock,
 };
 use crate::gates::stage1::Stage1Engine;
 use crate::gates::stage2::{FilterOutcome, Stage2Guard};
@@ -64,13 +64,16 @@ pub struct OutboundEvaluation {
     pub categories: Vec<String>,
 }
 
-/// Cached `gate_policy_sig` verification state keyed by `(config_hash, human_authorities_digest)`.
+/// Cached `gate_policy_sig` / Passkey `gate_lock_seal` verification state keyed by
+/// `(config_hash, human_authorities_digest, lock_seal_fingerprint)`.
 /// Avoids shelling out to OS Keychain / re-reading `SecretStore` on every inbound message while
-/// immediately re-verifying fail-closed whenever `human_authorities_digest` changes in SQLite.
+/// immediately re-verifying fail-closed whenever `human_authorities` or `gate_lock_seal` changes
+/// in SQLite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PolicySigCacheEntry {
     config_hash: String,
     human_authorities_digest: String,
+    seal_fingerprint: Option<String>,
 }
 
 /// Unified Local Security Gate pipeline backed by [`Stage1Engine`], [`Stage2Guard`],
@@ -158,77 +161,40 @@ impl SecurityGatePipeline {
         Arc::clone(&self.db)
     }
 
-    /// Verifies tamper-evident policy signature & `human_authorities_digest` fail-closed
-    /// whenever `require_signed_policy` is `true` OR `policy_signature` is present.
+    /// Verifies gate policy integrity fail-closed via [`verify_gate_lock`] (Passkey
+    /// `gate_lock_seal` in `node.sqlite` first, then the legacy `node.json` signature).
     ///
-    /// Caches successful `gate_policy_sig` verification in memory keyed by
-    /// `(config_hash, live human_authorities_digest)` so repeated inbound evaluations do not
-    /// re-invoke `SecretStore` / OS Keychain subprocesses while still failing closed immediately
-    /// whenever `human_authorities` in `node.sqlite` changes.
+    /// A successful result is cached per `(config_hash, human_authorities_digest, seal)` so
+    /// inbound evaluation does not hit the `SecretStore` / OS Keychain on every message, while any
+    /// change to `human_authorities` or `gate_lock_seal` re-verifies immediately.
     pub fn verify_policy_integrity(&self) -> Result<(), GateError> {
-        if !self.config.require_signed_policy && self.config.policy_signature.is_none() {
-            return Ok(());
-        }
-        let sig = self.config.policy_signature.as_deref().ok_or_else(|| {
-            GateError::PolicySignature(
-                "require_signed_policy is true but policy_signature is missing".to_string(),
-            )
-        })?;
-
-        let live_digest = {
-            let db = self
-                .db
-                .lock()
-                .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
-            db.human().authorities_digest()?
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
+        let key = PolicySigCacheEntry {
+            config_hash: self.config_hash.clone(),
+            human_authorities_digest: db.human().authorities_digest()?,
+            seal_fingerprint: db
+                .human()
+                .get_gate_lock_seal()?
+                .map(|s| sha256_hex(format!("{}:{}", s.seal_seq, s.signed_claim_json).as_bytes())),
         };
-
-        if let Some(ref expected_digest) = self.config.human_authorities_digest {
-            if live_digest != *expected_digest {
-                if let Ok(mut cache) = self.policy_sig_cache.lock() {
-                    *cache = None;
-                }
-                return Err(GateError::PolicySignature(
-                    "human_authorities_digest mismatch with node.sqlite".to_string(),
-                ));
-            }
-        }
-
         if let Ok(cache) = self.policy_sig_cache.lock() {
-            if let Some(ref cached) = *cache {
-                if cached.config_hash == self.config_hash
-                    && cached.human_authorities_digest == live_digest
-                {
-                    return Ok(());
-                }
+            if cache.as_ref() == Some(&key) {
+                return Ok(());
             }
         }
-
-        let store = self.secrets.as_deref().ok_or_else(|| {
-            GateError::PolicySignature("policy signing SecretStore unavailable".to_string())
-        })?;
-        if let Err(err) = verify_gate_policy_sig(&self.config, sig, store) {
-            if let Ok(mut cache) = self.policy_sig_cache.lock() {
-                *cache = None;
-            }
-            return Err(err);
-        }
-
+        let result = verify_gate_lock(&self.config, &db, self.secrets.as_deref());
         if let Ok(mut cache) = self.policy_sig_cache.lock() {
-            *cache = Some(PolicySigCacheEntry {
-                config_hash: self.config_hash.clone(),
-                human_authorities_digest: live_digest,
-            });
+            *cache = result.is_ok().then_some(key);
         }
-        Ok(())
+        result.map(|_| ())
     }
 
-    /// Returns `true` if `require_signed_policy` is active and either the policy signature is
-    /// missing/invalid OR the signed `human_authorities_digest` no longer matches `NodeDb`.
+    /// Returns `true` if either the external Passkey `gate_lock_seal` in `node.sqlite` OR the
+    /// `node.json` policy signature / `human_authorities_digest` fails verification (`G1`).
     pub fn is_policy_tampered(&self) -> bool {
-        if !self.config.require_signed_policy {
-            return false;
-        }
         self.verify_policy_integrity().is_err()
     }
 

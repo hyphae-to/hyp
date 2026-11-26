@@ -245,7 +245,7 @@ pub fn run_relay(command: RelayCommand) -> ExitCode {
 
 /// Validates a Drop Relay base URL fail-closed: permits strictly `https://` or loopback
 /// `http://127.0.0.1` / `http://localhost` / `http://[::1]`, with no userinfo, query, or fragment.
-pub fn validate_relay_url(raw: &str) -> Result<String, String> {
+pub(crate) fn validate_relay_url(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err("Drop Relay URL cannot be empty".to_string());
@@ -300,7 +300,7 @@ fn is_loopback_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_ed25519_auth_header(
+pub(crate) fn build_ed25519_auth_header(
     node_id: &str,
     identity: &NodeIdentityKeys,
     method: &str,
@@ -352,6 +352,7 @@ fn open_node_and_optional_gate(
     let node =
         UnifiedNode::open(node_cfg).map_err(|e| format!("failed to open UnifiedNode: {e}"))?;
 
+    let has_gate_seal = crate::approval::has_gate_lock_seal(state_dir);
     let gate = match loaded.as_ref().and_then(|c| c.raw.get("gate")) {
         Some(gate_val) => {
             let gate_cfg: SecurityGateConfig = serde_json::from_value(gate_val.clone())
@@ -362,6 +363,19 @@ fn open_node_and_optional_gate(
             ));
             let pipeline = SecurityGatePipeline::new(gate_cfg, gate_db, Some(Arc::new(secrets)))
                 .map_err(|e| format!("failed to initialize SecurityGatePipeline: {e}"))?;
+            Some(pipeline)
+        }
+        None if has_gate_seal => {
+            let gate_db = Arc::new(Mutex::new(
+                NodeDb::open(state_dir.join("node.sqlite"))
+                    .map_err(|e| format!("failed to open gate NodeDb: {e}"))?,
+            ));
+            let pipeline = SecurityGatePipeline::new(
+                SecurityGateConfig::default(),
+                gate_db,
+                Some(Arc::new(secrets)),
+            )
+            .map_err(|e| format!("failed to initialize SecurityGatePipeline: {e}"))?;
             Some(pipeline)
         }
         None => None,
@@ -979,7 +993,7 @@ fn run_drop_create(
     ExitCode::from(EXIT_OK)
 }
 
-async fn create_relay_drop_slot(
+pub(crate) async fn create_relay_drop_slot(
     relay_base: &str,
     node_id: &str,
     identity: &NodeIdentityKeys,
@@ -1232,14 +1246,18 @@ fn run_drop_wait(
         }
     };
 
-    match rt.block_on(wait_and_ingest_drop(
+    match rt.block_on(wait_for_relay_drop(
         &relay_url,
         &effective_drop_id,
         sub_cap.as_deref(),
-        &node,
-        gate.as_ref(),
-        overwrite,
+        node.node_id().as_str(),
+        node.identity(),
         timeout_secs,
+        async |envelope| {
+            node.ingest_human_drop(&envelope, gate.as_ref(), overwrite)
+                .await
+                .map_err(|e| e.to_string())
+        },
     )) {
         Ok((ingested, ack_resp, warnings)) => {
             if used_saved_last {
@@ -1259,15 +1277,28 @@ fn run_drop_wait(
     }
 }
 
-async fn wait_and_ingest_drop(
+/// Decodes a posted drop item: an armored `hdrop1_` token or `HumanDropEnvelopeV1` JSON.
+pub(crate) fn decode_drop_envelope(raw: &str) -> Result<HumanDropEnvelopeV1, String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("hdrop1_") {
+        decode_hdrop1(trimmed).map_err(|e| format!("invalid hdrop1_ token: {e}"))
+    } else {
+        serde_json::from_str(trimmed).map_err(|e| format!("invalid HumanDropEnvelopeV1 JSON: {e}"))
+    }
+}
+
+/// Streams a Drop Relay slot (SSE, reconnecting with backoff and `Last-Event-ID`) until `accept`
+/// takes an item or `timeout_secs` passes, then burns the slot. Items that fail to decode or that
+/// `accept` rejects are skipped with a warning, so junk posted to the slot cannot end the wait.
+pub(crate) async fn wait_for_relay_drop<T>(
     relay_base: &str,
     drop_id: &str,
     sub_cap: Option<&str>,
-    node: &Arc<UnifiedNode>,
-    gate: Option<&SecurityGatePipeline>,
-    overwrite: bool,
+    node_id: &str,
+    identity: &NodeIdentityKeys,
     timeout_secs: u64,
-) -> Result<(IngestedHumanDrop, Option<AckDropResponse>, Vec<String>), String> {
+    mut accept: impl AsyncFnMut(HumanDropEnvelopeV1) -> Result<T, String>,
+) -> Result<(T, Option<AckDropResponse>, Vec<String>), String> {
     let client = build_http_client::<Full<Bytes>>()?;
     let encoded_id = percent_encode(drop_id);
     let stream_path = format!("/v1/drops/{encoded_id}/stream");
@@ -1277,7 +1308,7 @@ async fn wait_and_ingest_drop(
     let mut last_event_id: Option<String> = None;
     let mut backoff_idx: usize = 0;
     let mut warnings: Vec<String> = Vec::new();
-    let mut accepted: Option<(u64, IngestedHumanDrop)> = None;
+    let mut accepted: Option<(u64, T)> = None;
 
     while accepted.is_none() {
         let now = tokio::time::Instant::now();
@@ -1297,17 +1328,11 @@ async fn wait_and_ingest_drop(
         if let Some(cap) = sub_cap {
             req_builder = req_builder.header(DROP_CAP_HEADER, cap);
         } else {
-            let auth = build_ed25519_auth_header(
-                node.node_id().as_str(),
-                node.identity(),
-                "GET",
-                &stream_path,
-                b"",
-            )?;
+            let auth = build_ed25519_auth_header(node_id, identity, "GET", &stream_path, b"")?;
             req_builder = req_builder
                 .header(header::AUTHORIZATION, auth)
-                .header("x-hyphae-node", node.node_id().as_str())
-                .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x);
+                .header("x-hyphae-node", node_id)
+                .header("X-Hyphae-Public-Key", identity.signing_jwk().x);
         }
         let req = req_builder
             .body(Full::new(Bytes::new()))
@@ -1406,18 +1431,7 @@ async fn wait_and_ingest_drop(
                             .as_deref()
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(1);
-                        let trimmed = ev.data.trim();
-                        let decoded_env: Result<HumanDropEnvelopeV1, String> =
-                            if trimmed.starts_with("hdrop1_") {
-                                decode_hdrop1(trimmed)
-                                    .map_err(|e| format!("invalid hdrop1_ in SSE event: {e}"))
-                            } else {
-                                serde_json::from_str(trimmed).map_err(|e| {
-                                    format!("invalid HumanDropEnvelopeV1 JSON in SSE event: {e}")
-                                })
-                            };
-
-                        let envelope = match decoded_env {
+                        let envelope = match decode_drop_envelope(&ev.data) {
                             Ok(env) => env,
                             Err(err) => {
                                 let msg = format!(
@@ -1429,7 +1443,7 @@ async fn wait_and_ingest_drop(
                             }
                         };
 
-                        match node.ingest_human_drop(&envelope, gate, overwrite).await {
+                        match accept(envelope).await {
                             Ok(ingested) => {
                                 accepted = Some((seq, ingested));
                                 break;
@@ -1485,17 +1499,11 @@ async fn wait_and_ingest_drop(
     if let Some(cap) = sub_cap {
         ack_builder = ack_builder.header(DROP_CAP_HEADER, cap);
     } else {
-        let auth = build_ed25519_auth_header(
-            node.node_id().as_str(),
-            node.identity(),
-            "POST",
-            &ack_path,
-            &ack_body,
-        )?;
+        let auth = build_ed25519_auth_header(node_id, identity, "POST", &ack_path, &ack_body)?;
         ack_builder = ack_builder
             .header(header::AUTHORIZATION, auth)
-            .header("x-hyphae-node", node.node_id().as_str())
-            .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x);
+            .header("x-hyphae-node", node_id)
+            .header("X-Hyphae-Public-Key", identity.signing_jwk().x);
     }
     let ack_resp = if let Ok(ack_req) = ack_builder.body(Full::new(Bytes::from(ack_body))) {
         match tokio::time::timeout(
@@ -1954,7 +1962,7 @@ async fn probe_relay_health(base_url: &str) -> Value {
     }
 }
 
-async fn collect_bounded_body(
+pub(crate) async fn collect_bounded_body(
     mut body: hyper::body::Incoming,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {

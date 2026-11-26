@@ -33,9 +33,9 @@ pub use events::{
     SubscriptionMeta, SubscriptionSpec, UpstreamPushdown, UpstreamPushdownInput,
 };
 pub use human::{
-    HUMAN_MIN_AUTH_EPOCH_META_KEY, HumanAuthorityInput, HumanAuthorityRecord, HumanAuthorityRole,
-    HumanAuthorityStatus, HumanAuthorityStore, HumanClaimKind, HumanDelegationPolicy,
-    HumanDelegationPolicyInput, HumanNodeCertInput, HumanNodeCertRecord,
+    GateLockSealRecord, HUMAN_MIN_AUTH_EPOCH_META_KEY, HumanAuthorityInput, HumanAuthorityRecord,
+    HumanAuthorityRole, HumanAuthorityStatus, HumanAuthorityStore, HumanClaimKind,
+    HumanDelegationPolicy, HumanDelegationPolicyInput, HumanNodeCertInput, HumanNodeCertRecord,
 };
 pub use kv::{
     KvDeleteInput, KvDeleteResult, KvEntry, KvEpoch, KvEpochInput, KvSetInput, KvSetResult,

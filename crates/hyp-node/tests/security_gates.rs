@@ -3485,3 +3485,333 @@ fn wave4c_g17_disabled_stage2_and_filters_do_not_abort_startup_while_enabled_fai
         );
     }
 }
+
+// ============================================================================
+// 6. Issue #10 (G1, H2) — Passkey-Signed SQLite Gate Lock Seal & Tamper Lockdown
+// ============================================================================
+
+#[tokio::test]
+async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() {
+    use hyp_crypto::human::{
+        HumanApprovalActionKind, HumanApprovalActionV1, HumanAudience, HumanClaimV1, HumanDropKind,
+        open_human_drop_with_signed, seal_human_drop,
+    };
+    use hyp_crypto::jcs::to_canonical_json;
+    use hyp_crypto::keys::{Ed25519KeyPair, X25519KeyPair};
+    use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+    use hyp_node::gates::{
+        gate_policy_sha256, is_passkey_backed_admin, local_admin_secret_names_for_kid,
+        verify_gate_lock,
+    };
+    use hyp_store::{HumanAuthorityInput, HumanAuthorityRole};
+
+    let (tmp, db) = open_ephemeral_db();
+    let secrets = file_secret_store(&tmp);
+    let t0 = now_unix_ms();
+
+    // 1. Enroll a real Passkey-backed Admin (prf_salt present, ZERO PKCS#8 key in SecretStore).
+    let passkey_ed = Ed25519KeyPair::generate().unwrap();
+    let passkey_enc = X25519KeyPair::generate().unwrap();
+    let node_enc = X25519KeyPair::generate().unwrap();
+    let passkey_kid = passkey_ed.kid();
+
+    let admin_rec = db
+        .lock()
+        .unwrap()
+        .human()
+        .upsert_authority(
+            &HumanAuthorityInput {
+                human_id: "bogdan".to_string(),
+                kid: passkey_kid.clone(),
+                label: "macbook-touchid".to_string(),
+                role: HumanAuthorityRole::Admin,
+                jwk_json: serde_json::to_string(&passkey_ed.to_jwk()).unwrap(),
+                enc_jwk_json: Some(serde_json::to_string(&passkey_enc.to_jwk()).unwrap()),
+                prf_salt: Some("passkey-prf-salt-v1".to_string()),
+                auth_epoch: 1,
+            },
+            t0,
+        )
+        .unwrap();
+    assert!(is_passkey_backed_admin(&admin_rec, 1, Some(&secrets)));
+
+    // Configure a real filter policy (Stage 1 + disabled classifier so test runs offline).
+    let mut locked_cfg = SecurityGateConfig {
+        require_signed_policy: true,
+        human_authorities_digest: Some(db.lock().unwrap().human().authorities_digest().unwrap()),
+        ..SecurityGateConfig::default()
+    };
+    locked_cfg.filters.push(FilterPluginConfig {
+        id: "passkey-guard".into(),
+        enabled: false,
+        matchers: Stage2Matchers::default(),
+        on_error: Stage2ErrorAction::Quarantine,
+        max_concurrent: 2,
+        busy_retry_after_ms: 250,
+        adapter: FilterAdapterConfig::HttpClassifier {
+            url: "https://guard.example.com/classify".into(),
+            api_key_secret: None,
+            auth_header: None,
+            score_field: "score".into(),
+            label_field: "label".into(),
+            flagged_labels: vec!["INJECTION".into()],
+            threshold: 0.80,
+            timeout_ms: 2_000,
+            max_input_chars: 16_384,
+            on_flagged: Stage2ErrorAction::Quarantine,
+        },
+    });
+    let policy_sha = gate_policy_sha256(&locked_cfg).unwrap();
+    let auth_digest = locked_cfg.human_authorities_digest.clone().unwrap();
+
+    // Helper to sign an approval action with an Ed25519 keypair, returning the signed claim JSON.
+    let sign_seal = |signer: &Ed25519KeyPair,
+                     human_id: &str,
+                     action: &HumanApprovalActionV1,
+                     issued_ms: i64,
+                     exp_ms: i64|
+     -> String {
+        let claim = HumanClaimV1 {
+            v: 1,
+            claim_id: format!("clm_{}_{}", action.seal_seq, signer.kid()),
+            kind: HumanDropKind::Approval,
+            human_id: human_id.to_string(),
+            human_kid: signer.kid(),
+            auth_epoch: 1,
+            issued_at: format_rfc3339_millis(issued_ms),
+            expires_at: format_rfc3339_millis(exp_ms),
+            drop_id: String::new(),
+            audience: HumanAudience {
+                node_id: "box@local".to_string(),
+                node_enc_kid: node_enc.kid(),
+                handle: None,
+            },
+            secret_spec: None,
+            body: to_canonical_json(action).unwrap(),
+        };
+        let env = seal_human_drop(&claim, signer, &node_enc.public_key()).unwrap();
+        let (_, signed) =
+            open_human_drop_with_signed(&env, &node_enc, "box@local", issued_ms + 1_000, |_, _| {
+                Some((signer.public_key(), 1))
+            })
+            .unwrap();
+        serde_json::to_string(&signed).unwrap()
+    };
+
+    // 2. Sign a historical Passkey `gate.lock` whose ceremony TTL (`exp`) has ALREADY elapsed!
+    //    Persisted lock seals MUST stay valid after ceremony expiry so nodes don't brick 10 minutes later.
+    let past_issued = t0 - 3_600_000;
+    let past_exp = t0 - 3_000_000;
+    let lock_action = HumanApprovalActionV1 {
+        v: 1,
+        action: HumanApprovalActionKind::GateLock,
+        node_id: "box@local".to_string(),
+        nonce: "nonce_lock_1".to_string(),
+        exp: format_rfc3339_millis(past_exp),
+        seal_seq: 1,
+        locked: true,
+        policy_sha256: Some(policy_sha.clone()),
+        authorities_digest: Some(auth_digest.clone()),
+        target_human_id: None,
+        target_kid: None,
+        target_role: None,
+        bump_epoch: None,
+        cascade: None,
+    };
+    let lock_signed_json = sign_seal(&passkey_ed, "bogdan", &lock_action, past_issued, past_exp);
+
+    db.lock()
+        .unwrap()
+        .human()
+        .put_gate_lock_seal(1, &lock_signed_json, t0)
+        .unwrap();
+
+    // Direct verifier + SecurityGatePipeline both accept the authentic Passkey lock seal!
+    {
+        let guard = db.lock().unwrap();
+        let state = verify_gate_lock(&locked_cfg, &guard, Some(&secrets))
+            .expect("valid Passkey lock seal must verify even after ceremony exp");
+        assert!(state.locked);
+        let seal = state.seal.expect("verified seal");
+        assert_eq!((seal.seal_seq, seal.locked), (1, true));
+        assert_eq!(seal.authority_kid, passkey_kid);
+    }
+    let ok_pipe = SecurityGatePipeline::new(
+        locked_cfg.clone(),
+        Arc::clone(&db),
+        Some(Arc::clone(&secrets)),
+    )
+    .unwrap();
+    assert!(!ok_pipe.is_policy_tampered());
+    let ok_eval = ok_pipe
+        .evaluate_inbound(
+            &make_inbound_dm(
+                "pk-ok-1",
+                "guest@ext",
+                "guest@ext/bot",
+                TrustTier::Guest,
+                "benign hello",
+            ),
+            t0,
+        )
+        .await
+        .unwrap();
+    assert!(ok_eval.decision.is_allow());
+
+    // 3. G1 Attack #1: Prompt-injected agent flips `require_signed_policy = false` and clears `policy_signature`!
+    let mut flipped_cfg = locked_cfg.clone();
+    flipped_cfg.require_signed_policy = false;
+    flipped_cfg.policy_signature = None;
+    let flipped_pipe =
+        SecurityGatePipeline::new(flipped_cfg, Arc::clone(&db), Some(Arc::clone(&secrets)))
+            .unwrap();
+    assert!(
+        flipped_pipe.is_policy_tampered(),
+        "G1: flipping require_signed_policy=false MUST be detected via SQLite gate_lock_seal!"
+    );
+    let q_flipped = flipped_pipe
+        .evaluate_inbound(
+            &make_inbound_dm(
+                "pk-flip-1",
+                "guest@ext",
+                "guest@ext/bot",
+                TrustTier::Guest,
+                "attack payload",
+            ),
+            t0 + 1,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        q_flipped.decision,
+        GateDecision::Quarantine { ref reason, .. } if reason.contains("gate_policy_tampered")
+    ));
+
+    // 4. G1 Attack #2: Prompt-injected agent DELETES `"gate"` completely from `node.json` (`SecurityGateConfig::default()`)!
+    let deleted_gate_pipe = SecurityGatePipeline::new(
+        SecurityGateConfig::default(),
+        Arc::clone(&db),
+        Some(Arc::clone(&secrets)),
+    )
+    .unwrap();
+    assert!(
+        deleted_gate_pipe.is_policy_tampered(),
+        "G1: deleting gate block from node.json MUST fail closed against SQLite gate_lock_seal!"
+    );
+    let q_deleted = deleted_gate_pipe
+        .evaluate_inbound(
+            &make_inbound_dm(
+                "pk-del-1",
+                "guest@ext",
+                "guest@ext/bot",
+                TrustTier::Guest,
+                "after gate delete",
+            ),
+            t0 + 2,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        q_deleted.decision,
+        GateDecision::Quarantine { ref reason, .. } if reason.contains("gate_policy_tampered")
+    ));
+
+    // 5. G1 Attack #3: Prompt-injected agent disables outbound DLP in `node.json`!
+    let mut edited_cfg = locked_cfg.clone();
+    edited_cfg.stage1.outbound_dlp_enabled = false;
+    let edited_pipe =
+        SecurityGatePipeline::new(edited_cfg, Arc::clone(&db), Some(Arc::clone(&secrets))).unwrap();
+    assert!(edited_pipe.is_policy_tampered());
+
+    // 6. H2 Attack: Storing a `human-admin-<kid>` secret in SecretStore (shell-accessible laptop key!)
+    //    immediately disqualifies that authority from satisfying the Passkey boundary!
+    let (local_secret_name, _) = local_admin_secret_names_for_kid(&passkey_kid);
+    secrets.set(&local_secret_name, "FAKE_PKCS8_KEY").unwrap();
+    assert!(!is_passkey_backed_admin(&admin_rec, 1, Some(&secrets)));
+    {
+        let guard = db.lock().unwrap();
+        assert!(
+            verify_gate_lock(&locked_cfg, &guard, Some(&secrets)).is_err(),
+            "H2: authority with local PKCS#8 secret in SecretStore MUST fail closed!"
+        );
+    }
+    let pkcs8_pipe = SecurityGatePipeline::new(
+        locked_cfg.clone(),
+        Arc::clone(&db),
+        Some(Arc::clone(&secrets)),
+    )
+    .unwrap();
+    assert!(pkcs8_pipe.is_policy_tampered());
+    secrets.delete(&local_secret_name).unwrap();
+
+    // 7. G1 Attack #4: raw SQLite tampering without a Passkey signature.
+    //    (a) Bumping the unsigned `seal_seq` column no longer matches the signed action.
+    db.lock()
+        .unwrap()
+        .connection()
+        .execute("UPDATE gate_lock_seal SET seal_seq = 9 WHERE id = 1", [])
+        .unwrap();
+    let tampered = |cfg: &SecurityGateConfig| {
+        SecurityGatePipeline::new(cfg.clone(), Arc::clone(&db), Some(Arc::clone(&secrets)))
+            .unwrap()
+            .is_policy_tampered()
+    };
+    assert!(
+        tampered(&locked_cfg),
+        "G1: raw SQLite edit of gate_lock_seal.seal_seq MUST fail closed!"
+    );
+    //    (b) Swapping in an "unlock" claim signed by a key that is not an enrolled Passkey Admin.
+    let rogue = Ed25519KeyPair::generate().unwrap();
+    let mut rogue_unlock = lock_action.clone();
+    rogue_unlock.action = HumanApprovalActionKind::GateUnlock;
+    rogue_unlock.locked = false;
+    rogue_unlock.exp = format_rfc3339_millis(t0 + 600_000);
+    let rogue_json = sign_seal(&rogue, "bogdan", &rogue_unlock, t0, t0 + 600_000);
+    db.lock()
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE gate_lock_seal SET seal_seq = 1, signed_claim_json = ?1 WHERE id = 1",
+            [&rogue_json],
+        )
+        .unwrap();
+    assert!(
+        tampered(&SecurityGateConfig::default()),
+        "G1: an unlock seal signed by a non-enrolled key MUST fail closed!"
+    );
+
+    // 8. Authentic Passkey Admin signs `gate.unlock` (`seal_seq = 2`, `locked = false`) -> cleanly unlocked!
+    let mut unlocked_cfg = locked_cfg.clone();
+    unlocked_cfg.require_signed_policy = false;
+    unlocked_cfg.policy_signature = None;
+    let unlock_action = HumanApprovalActionV1 {
+        v: 1,
+        action: HumanApprovalActionKind::GateUnlock,
+        node_id: "box@local".to_string(),
+        nonce: "nonce_unlock_2".to_string(),
+        exp: format_rfc3339_millis(t0 + 600_000),
+        seal_seq: 2,
+        locked: false,
+        policy_sha256: None,
+        authorities_digest: None,
+        target_human_id: None,
+        target_kid: None,
+        target_role: None,
+        bump_epoch: None,
+        cascade: None,
+    };
+    let unlock_signed_json = sign_seal(&passkey_ed, "bogdan", &unlock_action, t0, t0 + 600_000);
+    db.lock()
+        .unwrap()
+        .human()
+        .put_gate_lock_seal(2, &unlock_signed_json, t0 + 10)
+        .unwrap();
+
+    let unlocked_pipe =
+        SecurityGatePipeline::new(unlocked_cfg, Arc::clone(&db), Some(Arc::clone(&secrets)))
+            .unwrap();
+    assert!(
+        !unlocked_pipe.is_policy_tampered(),
+        "valid Passkey-signed gate.unlock seal must cleanly unlock the gate"
+    );
+}

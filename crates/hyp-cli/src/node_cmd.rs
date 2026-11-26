@@ -977,8 +977,9 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             .as_ref()
             .and_then(|c| c.raw.get("gate"))
             .is_some();
+        let has_gate_seal = crate::approval::has_gate_lock_seal(&state_dir);
         let (gate_pipeline, gate_db_shared) =
-            if start_local_daemon || start_local_ingest || has_gate_cfg {
+            if start_local_daemon || start_local_ingest || has_gate_cfg || has_gate_seal {
             let gate_cfg: SecurityGateConfig = match loaded.as_ref().and_then(|c| c.raw.get("gate"))
             {
                 Some(gate_val) => serde_json::from_value(gate_val.clone())

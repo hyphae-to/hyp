@@ -12,7 +12,7 @@
   <meta name="description" content="Zero-knowledge end-to-end encrypted human directives and secret drops signed with Passkey+PRF Ed25519 and sealed with RFC 9180 HPKE." />
   <link rel="icon" type="image/svg+xml" href="../assets/logo-hyphae.svg?v=2" />
   <link rel="alternate icon" type="image/png" href="../assets/logo-hyphae.png?v=2" />
-  <link rel="stylesheet" href="./styles.css?v=5" />
+  <link rel="stylesheet" href="./styles.css?v=7" />
 </head>
 <body>
   <main class="shell">
@@ -329,6 +329,26 @@
             ></textarea>
           </div>
 
+          <!-- Passkey Security Approval Review Group (kind === "approval") -->
+          <div id="approvalReviewGroup" class="approval-review hidden">
+            <div class="approval-head">
+              <h2 id="approvalActionTitle" class="approval-title">Security Gate Approval</h2>
+              <span id="approvalActionCode" class="approval-code">—</span>
+            </div>
+
+            <div id="approvalWeakeningBanner" class="banner danger hidden" aria-live="polite">
+              <strong id="approvalWeakeningTitle">Weakening Security Change</strong>
+              <span id="approvalWeakeningBody">This action reduces or disables Security Gate tamper protection. Approve it only if you asked for it.</span>
+            </div>
+
+            <dl id="approvalMetaList" class="receipt-list approval-meta-list"></dl>
+
+            <label id="approvalConfirmRow" class="checkbox-row warn-confirm">
+              <input id="approvalConfirmCheck" type="checkbox" />
+              <span id="approvalConfirmLabel">I have inspected every line above and authorize this security change with my Passkey</span>
+            </label>
+          </div>
+
           <!-- Mandatory Draft Approval Checkbox (Directives unlocked from encDraft) -->
           <label id="draftApproveRow" class="checkbox-row warn-confirm hidden">
             <input id="draftApproveCheck" type="checkbox" />
@@ -559,6 +579,6 @@
     </footer>
   </main>
 
-  <script type="module" src="./drop.js?v=5"></script>
+  <script type="module" src="./drop.js?v=7"></script>
 </body>
 </html>
