@@ -65,7 +65,7 @@ hyp drop create --kind secret --secret-name stripe-key
 hyp drop wait
 ```
 
-Scan the QR code (or tap the link) on your phone, authenticate with Face ID / Touch ID, and type or paste the secret fresh (prefilled drafts are strictly forbidden for `kind: "secret"`). The phone seals an `hdrop1_` HPKE+Ed25519 envelope to your node's certified X25519 key; your node decrypts it in memory, writes it straight into `SecretStore`, and notifies the waiting agent with metadata only.
+Open the drop link in your browser (or tap it on your phone — browser Passkeys handle cross-device phone QR natively), authenticate with Face ID / Touch ID, and type or paste the secret fresh (prefilled drafts are strictly forbidden for `kind: "secret"`). The page seals an `hdrop1_` HPKE+Ed25519 envelope to your node's certified X25519 key; your node decrypts it in memory, writes it straight into `SecretStore`, and notifies the waiting agent with metadata only.
 
 ### Approve an agent-proposed directive from your phone
 

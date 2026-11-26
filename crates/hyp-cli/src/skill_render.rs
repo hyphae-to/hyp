@@ -488,7 +488,7 @@ const CORE_INVARIANTS_LAYER: &str = "\
 # Hyphae (`hyp`)
 
 ## Tools
-- `hyp_mesh`: `join`/`leave`/`peers`/`channels`/`status`/`drop_link` (`#channel`, QR code+URL).
+- `hyp_mesh`: `join`/`leave`/`peers`/`channels`/`status`/`drop_link` (`#channel`, clickable URL).
 - `hyp_send`: E2EE DM (`<node>/<handle>`), `#channel`, `files`.
 - `hyp_stream`: `topics`/`subscribe`/`unsubscribe`/`list` (`<node>.<topic>`, `filters`/`mode`).
 - `hyp_inbox`: `unread`/`muted`/`delivered`, urgency (`interrupt`/`queue`/`notify`/`mute`). Never poll `hyp_inbox`.
@@ -943,7 +943,7 @@ mod tests {
                             "`hyp_stream`",
                             "`hyp_inbox`",
                             "drop_link",
-                            "QR code",
+                            "clickable URL",
                             "untrusted",
                             "Never poll `hyp_inbox`",
                             "CLI argv",
