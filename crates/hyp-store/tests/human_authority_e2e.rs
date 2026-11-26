@@ -803,7 +803,7 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
 
 #[test]
 fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 10);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 11);
     let dir = TempDir::new().unwrap();
 
     let v1_path = dir.path().join("from-v1").join("node.sqlite");
@@ -834,7 +834,7 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
             .into_iter()
             .map(|(v, _)| v)
             .collect();
-        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(applied, (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>());
 
         // Bit-for-bit structural schema parity with fresh latest
         assert_eq!(
@@ -924,8 +924,17 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
         Some(sample_enc_jwk("upgraded_v4_x25519").as_str())
     );
 
-    // Verify v3 wakeup survived v3->v7 untouched
-    assert!(db_v3.wakeups().get_wakeup("wk-v3").unwrap().is_some());
+    // Upgrade retires the scheduler while the pre-migration backup preserves its rows.
+    assert!(!snapshot_tables_and_columns(db_v3.connection()).contains_key("wakeups"));
+    let backups = db_v3.list_migration_backups().unwrap();
+    let backup =
+        Connection::open_with_flags(&backups[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let wakeup: String = backup
+        .query_row("SELECT label FROM wakeups WHERE id = 'wk-v3'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(wakeup, "check");
     // Verify v2 peer_route survived v2->v7 untouched
     assert_eq!(
         db_v2
@@ -985,7 +994,7 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
         .into_iter()
         .map(|(v, _)| v)
         .collect();
-    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(applied, (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>());
     assert_eq!(
         snapshot_tables_and_columns(db.connection()),
         snapshot_tables_and_columns(fresh.connection())
@@ -1323,7 +1332,7 @@ fn v7_to_v8_migration_gate_lock_seal_anti_rollback_and_approval_nonces() {
         .into_iter()
         .map(|(v, _)| v)
         .collect();
-    assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(applied, (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>());
     assert_eq!(
         snapshot_tables_and_columns(db.connection()),
         snapshot_tables_and_columns(fresh.connection())

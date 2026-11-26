@@ -28,6 +28,7 @@ import test from "node:test";
 import { HypCli } from "../lib/hyp-cli.ts";
 import { REPO_ROOT, withSandbox } from "../lib/sandbox.ts";
 
+const CURRENT_SCHEMA_VERSION = 11;
 const MIGRATIONS_DIR = path.join(REPO_ROOT, "crates", "hyp-store", "migrations");
 
 const MIGRATION_FILES: Array<{ version: number; file: string }> = [
@@ -142,6 +143,11 @@ function seedHistoricalNodeDb(dbPath: string, targetVersion: 5 | 6): void {
     );
 
     db.prepare(
+      `INSERT INTO wakeups (id, target_session_id, label, note, trigger_kind, next_fire_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'timer', ?, ?, ?)`,
+    ).run("retired-timer", "claude:legacy-sess-1", "scheduled", "old timer", appliedAt + 60_000, appliedAt, appliedAt);
+
+    db.prepare(
       `INSERT INTO human_authorities (human_id, kid, label, role, jwk_json, auth_epoch, status, created_at, enc_jwk_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
@@ -181,12 +187,12 @@ function seedHistoricalNodeDb(dbPath: string, targetVersion: 5 | 6): void {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Forward Migration (`v5 -> v8` and `v6 -> v8`) with Pre-Migration Backup & Zero Data Loss
+// 1. Forward Migration (`v5/v6 -> current`) with Pre-Migration Backup & Zero Data Loss
 // ---------------------------------------------------------------------------
 
 for (const fromVersion of [5, 6] as const) {
-  test(`Schema Compat — forward migration v${fromVersion} -> v8 creates 0600 backup, preserves all rows, passes status/doctor/daemon`, async () => {
-    await withSandbox(`schema-compat-v${fromVersion}-to-v8`, async (sandbox) => {
+  test(`Schema Compat — forward migration v${fromVersion} -> v${CURRENT_SCHEMA_VERSION} creates 0600 backup, preserves live rows, passes status/doctor/daemon`, async () => {
+    await withSandbox(`schema-compat-v${fromVersion}-to-v${CURRENT_SCHEMA_VERSION}`, async (sandbox) => {
       const hyp = new HypCli(sandbox);
       const dbPath = path.join(sandbox.paths.hyphaeStateDir, "node.sqlite");
       seedHistoricalNodeDb(dbPath, fromVersion);
@@ -206,31 +212,31 @@ for (const fromVersion of [5, 6] as const) {
         { mode: 0o600 },
       );
 
-      // Run `hyp doctor --json` to trigger atomic v{5,6} -> v8 migration + VACUUM INTO backup!
+      // Run `hyp doctor --json` to trigger atomic v5/v6 -> current migration + VACUUM INTO backup!
       const docRes = await hyp.doctor();
-      assert.equal(docRes.exitCode, 0, `hyp doctor failed after v${fromVersion}->v8 migration: ${docRes.stderr}`);
+      assert.equal(docRes.exitCode, 0, `hyp doctor failed after v${fromVersion}->v${CURRENT_SCHEMA_VERSION} migration: ${docRes.stderr}`);
       assert.equal(docRes.json?.ok, true, `hyp doctor not ok: ${docRes.stdout}`);
 
       const statusRes = await hyp.status();
       assert.equal(statusRes.exitCode, 0, `hyp status failed: ${statusRes.stderr}`);
       assert.equal(statusRes.json?.ok, true);
-      assert.equal(statusRes.json?.data?.storage?.schemaVersion, 8);
+      assert.equal(statusRes.json?.data?.storage?.schemaVersion, CURRENT_SCHEMA_VERSION);
 
       // Verify pre-migration `.bak` backup created with strictly `0600` permissions!
       const backupsDir = path.join(sandbox.paths.hyphaeStateDir, "backups");
       assert.ok(fs.existsSync(backupsDir), "Pre-migration backups/ directory must exist");
       const backups = fs
         .readdirSync(backupsDir)
-        .filter((f) => f.startsWith(`node.sqlite.v${fromVersion}-to-v8-`) && f.endsWith(".bak"));
+        .filter((f) => f.startsWith(`node.sqlite.v${fromVersion}-to-v${CURRENT_SCHEMA_VERSION}-`) && f.endsWith(".bak"));
       assert.equal(
         backups.length,
         1,
-        `Expected 1 pre-migration v${fromVersion}-to-v8 backup in ${backupsDir}, found: ${JSON.stringify(backups)}`,
+        `Expected 1 pre-migration v${fromVersion}-to-v${CURRENT_SCHEMA_VERSION} backup in ${backupsDir}, found: ${JSON.stringify(backups)}`,
       );
       const backupMode = fs.statSync(path.join(backupsDir, backups[0])).mode & 0o777;
       assert.equal(backupMode, 0o600, `Pre-migration backup must be 0600, got ${backupMode.toString(8)}`);
 
-      // Inspect migrated `node.sqlite` directly to confirm v8 schema + ZERO data loss across all tables!
+      // Inspect migrated `node.sqlite` directly to verify the current schema and live rows!
       const db = new DatabaseSync(dbPath, { readOnly: true });
       try {
         const verRow = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
@@ -288,6 +294,10 @@ for (const fromVersion of [5, 6] as const) {
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gate_lock_seal'")
           .get() as any;
         assert.equal(sealTbl?.name, "gate_lock_seal", "v8 gate_lock_seal table must be created");
+        const wakeups = db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'wakeups'")
+          .get();
+        assert.equal(wakeups, undefined, "v11 must retire the scheduled wakeups table");
       } finally {
         db.close();
       }

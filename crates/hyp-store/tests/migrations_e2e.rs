@@ -313,7 +313,7 @@ fn create_seeded_v1_db(path: &Path, enable_wal: bool) {
 
 #[test]
 fn registry_invariants_and_invalid_registry_rejection() {
-    assert_eq!(CURRENT_SCHEMA_VERSION, 10);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 11);
     assert_eq!(MIGRATIONS.len() as i64, CURRENT_SCHEMA_VERSION);
     let mut names = HashSet::new();
     for (idx, m) in MIGRATIONS.iter().enumerate() {

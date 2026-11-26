@@ -211,14 +211,6 @@ pub struct ChannelRow {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct WakeupRow {
-    pub label: String,
-    pub trigger_kind: String,
-    pub urgency: String,
-    pub state: String,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct SessionView {
     pub session_id: String,
     pub harness: String,
@@ -236,14 +228,12 @@ pub struct SessionView {
     pub count_quarantined: u64,
     pub count_muted_rules: u64,
     pub count_muted_archived: u64,
-    pub count_wakeups: u64,
     pub bridge_labels: Vec<String>,
     pub bridges: Vec<BridgeRow>,
     pub subscriptions: Vec<SubRow>,
     pub queued_items: Vec<QueuedRow>,
     pub rules_and_mutes: Vec<RuleOrMuteRow>,
     pub channels: Vec<ChannelRow>,
-    pub wakeups: Vec<WakeupRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -449,21 +439,6 @@ fn parse_session_view(val: &Value) -> SessionView {
         Vec::new()
     };
 
-    let wakeups = details
-        .and_then(|d| d.get("wakeups"))
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .map(|w| WakeupRow {
-                    label: clean_str_or(w.get("label"), ""),
-                    trigger_kind: clean_str_or(w.get("triggerKind"), "timer"),
-                    urgency: clean_str_or(w.get("urgency"), "queue"),
-                    state: clean_str_or(w.get("state"), "active"),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     SessionView {
         session_id: clean_str_or(val.get("sessionId"), ""),
         harness: clean_str_or(val.get("harness"), "unknown"),
@@ -511,17 +486,12 @@ fn parse_session_view(val: &Value) -> SessionView {
             .and_then(|c| c.get("mutedArchived"))
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        count_wakeups: counts
-            .and_then(|c| c.get("wakeups"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
         bridge_labels,
         bridges,
         subscriptions,
         queued_items,
         rules_and_mutes,
         channels,
-        wakeups,
     }
 }
 
@@ -1296,12 +1266,8 @@ fn render_mesh_tab(
     }
 
     let info2 = format!(
-        "Session: {} ({}) · delivery={} · wakeups={} · archivedMuted={}",
-        sess.session_id,
-        sess.harness,
-        sess.delivery_mode,
-        sess.count_wakeups,
-        sess.count_muted_archived
+        "Session: {} ({}) · delivery={} · archivedMuted={}",
+        sess.session_id, sess.harness, sess.delivery_mode, sess.count_muted_archived
     );
     out.push(style_wrap(&truncate_plain(&info2, cols), "2", use_color));
     if out.len() >= budget {
@@ -1324,12 +1290,7 @@ fn render_mesh_tab(
             use_color,
         ));
     } else {
-        let wakeup_reserve = if !sess.wakeups.is_empty() && budget.saturating_sub(out.len()) > 3 {
-            2
-        } else {
-            0
-        };
-        let chan_budget = budget.saturating_sub(out.len() + wakeup_reserve);
+        let chan_budget = budget.saturating_sub(out.len());
         let (start, end) = compute_window(selected, sess.channels.len(), chan_budget);
         for (idx, ch) in sess.channels[start..end].iter().enumerate() {
             let abs_idx = start + idx;
@@ -1349,25 +1310,6 @@ fn render_mesh_tab(
                 cols,
                 use_color,
             ));
-        }
-    }
-
-    // Show metadata-only wakeups summary if space remains (ZERO wakeup note!)
-    if !sess.wakeups.is_empty() && out.len() + 2 <= budget {
-        out.push(style_wrap(
-            &truncate_plain(&format!("Wakeups ({}):", sess.wakeups.len()), cols),
-            "1",
-            use_color,
-        ));
-        for wk in &sess.wakeups {
-            if out.len() >= budget {
-                break;
-            }
-            let line = format!(
-                "  {} [{}] {} ({})",
-                wk.label, wk.trigger_kind, wk.urgency, wk.state
-            );
-            out.push(truncate_plain(&line, cols));
         }
     }
 
@@ -2177,7 +2119,7 @@ mod tests {
                     "mutedRules": 1,
                     "mutedArchived": 4,
                     "channels": 2,
-                    "wakeups": 1
+
                 },
                 "details": {
                     "subscriptions": [
@@ -2244,16 +2186,6 @@ mod tests {
                             "mode": "restricted"
                         }
                     ],
-                    "wakeups": [
-                        {
-                            "id": "wk-1",
-                            "label": "check-deploy",
-                            "triggerKind": "timer",
-                            "urgency": "queue",
-                            "state": "active",
-                            "note": "SENTINEL_WAKEUP_NOTE_MUST_NEVER_APPEAR"
-                        }
-                    ]
                 }
             }]
         });
@@ -2285,7 +2217,6 @@ mod tests {
                     let joined = frame.join("\n");
                     // Security: zero untrusted body/note leakage and zero injected OSC/pwn payload!
                     assert!(!joined.contains("SENTINEL_UNTRUSTED_BODY_MUST_NEVER_APPEAR"));
-                    assert!(!joined.contains("SENTINEL_WAKEUP_NOTE_MUST_NEVER_APPEAR"));
                     assert!(!joined.contains("pwn"));
                     assert!(!joined.contains("\x1b]0;"));
 
@@ -2311,7 +2242,6 @@ mod tests {
                             UiTab::MeshAndChannels => {
                                 assert!(joined.contains("#ops"));
                                 assert!(joined.contains("#release"));
-                                assert!(joined.contains("check-deploy"));
                             }
                         }
                     }

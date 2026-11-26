@@ -4,7 +4,7 @@
 //!   session target is provided) synchronously over `connector.sock` / `connector.addr`.
 //! - `--json` emits the standard `ui::JsonEnvelope` wrapping the exact summary payload.
 //! - `--watch` streams live `inspect.watch` NDJSON updates with zero polling.
-//! - Strictly metadata-only (ZERO message bodies, ZERO wakeup notes, ZERO quarantined payloads)
+//! - Strictly metadata-only (ZERO message bodies, ZERO quarantined payloads)
 //!   and strips all terminal control/escape sequences from untrusted fields.
 
 use crate::statusline_cmd::sanitize_terminal_text;
@@ -510,30 +510,6 @@ fn render_single_session_block(out: &mut String, sess: &Value, peers_online: u64
     } else {
         let _ = writeln!(out, "  (none)");
     }
-
-    // Wakeups (metadata-only, ZERO note!)
-    if let Some(wakeups) = details
-        .and_then(|d| d.get("wakeups"))
-        .and_then(Value::as_array)
-    {
-        if !wakeups.is_empty() {
-            out.push('\n');
-            let _ = writeln!(out, "Wakeups ({}):", wakeups.len());
-            let rows: Vec<Vec<String>> = wakeups
-                .iter()
-                .map(|w| {
-                    vec![
-                        clean_str(w.get("id")),
-                        clean_str(w.get("label")),
-                        clean_str(w.get("triggerKind")),
-                        clean_str(w.get("urgency")),
-                        clean_str(w.get("state")),
-                    ]
-                })
-                .collect();
-            render_table(out, &["ID", "LABEL", "TRIGGER", "URGENCY", "STATE"], &rows);
-        }
-    }
 }
 
 /// Renders a `session.summary` or `sessions.summary` payload into crisp, sanitized plain text.
@@ -903,7 +879,7 @@ mod tests {
                     "mutedRules": 1,
                     "mutedArchived": 2,
                     "channels": 1,
-                    "wakeups": 1
+
                 },
                 "details": {
                     "subscriptions": [{
@@ -937,13 +913,6 @@ mod tests {
                         "channel": "#ops",
                         "mode": "open"
                     }],
-                    "wakeups": [{
-                        "id": "wk-1",
-                        "label": "check-ci",
-                        "triggerKind": "timer",
-                        "urgency": "queue",
-                        "state": "active"
-                    }]
                 }
             }
         });
@@ -956,7 +925,6 @@ mod tests {
         assert!(text.contains("1m"));
         assert!(text.contains("#noisy"));
         assert!(text.contains("#ops"));
-        assert!(text.contains("check-ci"));
         assert!(text.contains("hyp gate review"));
         assert!(!text.contains('\x1b'));
         assert!(!text.contains("evil"));

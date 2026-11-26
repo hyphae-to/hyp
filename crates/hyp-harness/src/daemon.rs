@@ -11404,7 +11404,7 @@ impl LocalDaemonInner {
     }
 
     /// Builds a strictly metadata-only session summary object (ZERO message bodies, ZERO
-    /// CloudEvent `data`, ZERO wakeup `note`s, ZERO quarantined payloads or sources).
+    /// CloudEvent `data`, ZERO quarantined payloads or sources).
     ///
     /// Strictly read-only and non-blocking: never awaits `wait_for_pending_probe` and never
     /// calls `reconcile_session_inbox`.
@@ -11434,7 +11434,6 @@ impl LocalDaemonInner {
             subs,
             bridge_entries,
             channel_pairs,
-            wakeups,
             queued_meta,
         ) = {
             let db = self.node.db();
@@ -11477,10 +11476,6 @@ impl LocalDaemonInner {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            let wakeups = db
-                .wakeups()
-                .list_active_wakeups_for_session(&sess.id, sess.handle.as_deref())
-                .unwrap_or_default();
             let queued_meta = if detail == SummaryDetail::Full {
                 if gate_active {
                     db.local()
@@ -11502,7 +11497,6 @@ impl LocalDaemonInner {
                 subs,
                 bridge_entries,
                 channel_pairs,
-                wakeups,
                 queued_meta,
             )
         };
@@ -11552,7 +11546,6 @@ impl LocalDaemonInner {
                 "mutedRules": mutes.len(),
                 "mutedArchived": muted_archived,
                 "channels": channel_pairs.len(),
-                "wakeups": wakeups.len(),
             }),
         );
         obj.insert(
@@ -11695,21 +11688,6 @@ impl LocalDaemonInner {
                 }));
             }
 
-            // Strictly metadata-only: NEVER include `wakeup.note`!
-            let wakeups_json: Vec<Value> = wakeups
-                .into_iter()
-                .map(|w| {
-                    json!({
-                        "id": w.id,
-                        "label": w.label,
-                        "triggerKind": w.trigger_kind.as_str(),
-                        "nextFireAt": w.next_fire_at,
-                        "urgency": w.urgency.as_str(),
-                        "state": w.state.as_str(),
-                    })
-                })
-                .collect();
-
             let bridges_json: Vec<Value> = bridge_entries
                 .into_iter()
                 .map(|(plugin, target, is_primary)| {
@@ -11732,7 +11710,6 @@ impl LocalDaemonInner {
                     "rules": rules_json,
                     "channels": channels_list,
                     "channelEntries": channel_entries,
-                    "wakeups": wakeups_json,
                 }),
             );
         }

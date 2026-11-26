@@ -21,7 +21,6 @@ pub const TYPE_KV_DELETED: &str = "to.hyphae.kv.deleted";
 pub const TYPE_TRANSFER_V1: &str = "to.hyphae.transfer.v1";
 pub const TYPE_NODE_MANIFEST: &str = "to.hyphae.node.manifest";
 pub const TYPE_NODE_DIRECTORY: &str = "to.hyphae.node.directory";
-pub const TYPE_WAKEUP_V1: &str = "to.hyphae.wakeup.v1";
 pub const TYPE_SCHEDULED_MESSAGE_V1: &str = "to.hyphae.scheduled.v1";
 pub const TYPE_LOCAL_EVENT_V1: &str = "to.hyphae.local.v1";
 pub const TYPE_HUMAN_DROP_V1: &str = "to.hyphae.human.drop.v1";
@@ -1093,7 +1092,6 @@ mod tests {
 
     #[test]
     fn local_ingest_constants_and_hyphaesig_extension_validate() {
-        assert_eq!(TYPE_WAKEUP_V1, "to.hyphae.wakeup.v1");
         assert_eq!(TYPE_SCHEDULED_MESSAGE_V1, "to.hyphae.scheduled.v1");
         assert_eq!(TYPE_LOCAL_EVENT_V1, "to.hyphae.local.v1");
         assert_eq!(EXT_LOCAL_EVENT_SIG, "hyphaesig");

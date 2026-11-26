@@ -24,7 +24,7 @@ Inspect this Claude Code session's Hyphae mesh state and render a crisp, scannab
    - **Subscriptions**: Total count and compact table (`id`, `topic`, `originNode`, `mode`, `coalesceSeconds`).
    - **Queued Metadata**: Total queued / unnotified counts and breakdown by kind (`messages`, `events`, `plugins`, `transfers`, `kv`) plus listed source labels (metadata only).
    - **Mutes & Rules**: Active session/connector mutes and per-source delivery rules (`interrupt` / `queue` / `notify` / `mute`).
-   - **Channels & Wakeups**: Joined `#channels` and scheduled durable wakeups.
+   - **Channels**: Joined `#channels`.
    - **Security Gate Quarantine Alert**: If `counts.quarantined > 0` or `daemon.quarantinedGlobal > 0`, display a prominent warning telling the human to run `hyp gate review` directly in their terminal (human-CLI-only boundary).
 
 4. Conclude with a compact **Quick Actions** line:

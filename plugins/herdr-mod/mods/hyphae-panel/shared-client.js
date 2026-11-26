@@ -331,7 +331,6 @@ export function formatPillMetrics(entry, daemonOrSnapshot = null) {
       quarantined: 0,
       mutedRules: 0,
       channels: 0,
-      wakeups: 0,
       focusMode: false,
       mutedAll: false,
       tone: "idle",
@@ -376,7 +375,6 @@ export function formatPillMetrics(entry, daemonOrSnapshot = null) {
   const quarantined = getEffectiveQuarantinedCount(entry, daemonOrSnapshot);
   const mutedRules = Math.max(0, Number(counts.mutedRules) || 0);
   const channels = Math.max(0, Number(counts.channels) || 0);
-  const wakeups = Math.max(0, Number(counts.wakeups) || 0);
 
   const enrolled = Boolean(entry.enrolled);
   const focusMode = Boolean(entry.focusMode);
@@ -398,7 +396,6 @@ export function formatPillMetrics(entry, daemonOrSnapshot = null) {
       quarantined,
       mutedRules,
       channels,
-      wakeups,
       focusMode,
       mutedAll,
       tone: "idle",
@@ -466,7 +463,6 @@ export function formatPillMetrics(entry, daemonOrSnapshot = null) {
     quarantined,
     mutedRules,
     channels,
-    wakeups,
     focusMode,
     mutedAll,
     tone,
@@ -491,21 +487,6 @@ export function formatRelativeAge(tsMs, nowMs = Date.now()) {
   const hrs = Math.floor(mins / 60);
   if (hrs < 48) return `${hrs}h`;
   return `${Math.floor(hrs / 24)}d`;
-}
-
-/**
- * Formats a future epoch millisecond timestamp (`in 45s`, `in 12m`, `due`).
- */
-export function formatNextFire(tsMs, nowMs = Date.now()) {
-  if (!Number.isFinite(tsMs) || tsMs <= 0) return "—";
-  const deltaSec = Math.floor((tsMs - nowMs) / 1000);
-  if (deltaSec <= 0) return "due";
-  if (deltaSec < 60) return `in ${deltaSec}s`;
-  const mins = Math.floor(deltaSec / 60);
-  if (mins < 60) return `in ${mins}m`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 48) return `in ${hrs}h`;
-  return `in ${Math.floor(hrs / 24)}d`;
 }
 
 /**
