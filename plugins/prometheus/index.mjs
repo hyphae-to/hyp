@@ -7,6 +7,8 @@
  *   PROMETHEUS_HOST                                                 - Bind host (default 127.0.0.1)
  *   PROMETHEUS_PORT                                                 - Bind port (default 8793)
  *   PROMETHEUS_PATH                                                 - Webhook path (default /alerts)
+ *   PROMETHEUS_MAX_BODY_BYTES                                      - Maximum request body size (default 1048576)
+ *   PROMETHEUS_LEGACY_NATIVE                                       - Keep native IDs for alerts without fingerprints when set to 1
  *   PROMETHEUS_TOPIC                                                - Target topic (default "alerts" or AGENTS_MESH_TOPIC)
  *   PROMETHEUS_BEARER_TOKEN_FILE or PROMETHEUS_BEARER_TOKEN         - Bearer token for Authorization header
  *   PROMETHEUS_BASIC_AUTH_FILE or PROMETHEUS_BASIC_AUTH             - Basic auth credentials ("user:pass") for Authorization header
@@ -17,8 +19,10 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { MeshPluginClient } from "../sdk/client.mjs";
+import { envInt } from "../sdk/source-kit.mjs";
 
-const MAX_BODY_BYTES = 1024 * 1024;
+const maxBodyBytes = envInt("PROMETHEUS_MAX_BODY_BYTES", 1024 * 1024, { min: 1 });
+const nativeCompat = process.env.PROMETHEUS_LEGACY_NATIVE === "1";
 const MAX_SAFE_DATA_BYTES = 7_500;
 const MAX_ATTRIBUTE_CHARS = 256;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
@@ -48,6 +52,14 @@ function safeEqual(a, b) {
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (!isPlainObject(value)) return JSON.stringify(value);
+  return `{${Object.keys(value).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+  ).join(",")}}`;
 }
 
 function normalizeRfc3339(raw) {
@@ -190,7 +202,7 @@ const server = createServer(async (req, res) => {
     }
   }
 
-  const raw = await readRawBody(req, MAX_BODY_BYTES);
+  const raw = await readRawBody(req, maxBodyBytes);
   if (raw === null) {
     sendJson(res, 413, { error: "payload_too_large" }, { connection: "close" });
     return;
@@ -222,11 +234,11 @@ const server = createServer(async (req, res) => {
   const commonAnnotations = isPlainObject(payload.commonAnnotations) ? payload.commonAnnotations : {};
 
   let count = 0;
+  if (!payload.alerts.every(isPlainObject)) {
+    sendJson(res, 400, { error: "invalid_alert_entry" });
+    return;
+  }
   for (const alert of payload.alerts) {
-    if (!isPlainObject(alert)) {
-      sendJson(res, 400, { error: "invalid_alert_entry" });
-      return;
-    }
 
     const alertLabels = isPlainObject(alert.labels) ? alert.labels : {};
     const alertAnnotations = isPlainObject(alert.annotations) ? alert.annotations : {};
@@ -247,7 +259,7 @@ const server = createServer(async (req, res) => {
     const fingerprint =
       typeof alert.fingerprint === "string" && alert.fingerprint.trim()
         ? alert.fingerprint.trim()
-        : createHash("sha256").update(JSON.stringify(labels)).digest("hex").slice(0, 16);
+        : createHash("sha256").update(nativeCompat ? canonicalJson(labels) : JSON.stringify(labels)).digest("hex").slice(0, 16);
 
     const startsAt = typeof alert.startsAt === "string" ? alert.startsAt : "";
     const endsAt = typeof alert.endsAt === "string" ? alert.endsAt : "";

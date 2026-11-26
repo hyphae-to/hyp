@@ -440,6 +440,9 @@ mod unix_tests {
         sub_cfg.hello_mode = HelloMode::Auto;
         sub_cfg
             .env
+            .insert("PROMETHEUS_LEGACY_NATIVE".into(), "1".into());
+        sub_cfg
+            .env
             .insert("PROMETHEUS_HOST".into(), "127.0.0.1".into());
         sub_cfg
             .env
@@ -504,7 +507,6 @@ mod unix_tests {
                 },
                 {
                     "status": "resolved",
-                    "fingerprint": "fp-resolved-002",
                     "labels": {
                         "alertname": "HighLatency",
                         "severity": "warning",
