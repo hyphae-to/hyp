@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import net from "node:net";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { test } from "node:test";
@@ -44,6 +46,8 @@ for (const runtime of ["node", "python"]) {
   test(`${runtime} v2 SDK: authenticated TCP, duplicate event IDs, out-of-order replies and interleaved post/status`, { timeout: 10_000 }, async (t) => {
     const executable = runtime === "node" ? process.execPath : "python3";
     if (runtime === "python" && spawnSync(executable, ["--version"]).error) return t.skip("python3 unavailable");
+    const home = mkdtempSync(join(tmpdir(), "hyp-sdk-v2-"));
+    t.after(() => rmSync(home, { recursive: true, force: true }));
     const token = randomBytes(32).toString("hex");
     const sockets = new Set();
     const publishes = [];
@@ -90,7 +94,7 @@ for (const runtime of ["node", "python"]) {
     });
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     const child = spawn(executable, runtime === "node" ? ["--input-type=module", "-e", nodeCode] : ["-u", "-c", pythonCode], {
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, HYPHAE_PLUGIN_ADDR: `127.0.0.1:${server.address().port}`,
+      env: { PATH: process.env.PATH, HOME: home, HYPHAE_SECRET_BACKEND: "file", HYPHAE_PLUGIN_ADDR: `127.0.0.1:${server.address().port}`,
         HYPHAE_PLUGIN_TOKEN: token, SDK_URL: pathToFileURL(join(sdkDir, "client.mjs")).href, SDK_DIR: sdkDir, TEST_EVENT: JSON.stringify(event) },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -122,7 +126,9 @@ for (const runtime of ["node", "python"]) {
     test(`${runtime} v2 SDK fails closed for ${mode} and releases pending calls`, { timeout: 5_000 }, async (t) => {
       const executable = runtime === "node" ? process.execPath : "python3";
       if (runtime === "python" && spawnSync(executable, ["--version"]).error) return t.skip("python3 unavailable");
-      const token = randomBytes(32).toString("hex");
+      const home = mkdtempSync(join(tmpdir(), "hyp-sdk-v2-"));
+    t.after(() => rmSync(home, { recursive: true, force: true }));
+    const token = randomBytes(32).toString("hex");
       const sockets = new Set();
       const errors = [];
       let published = 0;
@@ -169,7 +175,7 @@ finally:
     if "client" in locals():client.close()
 `;
       const child = spawn(executable, runtime === "node" ? ["--input-type=module", "-e", code] : ["-u", "-c", code], {
-        env: { PATH: process.env.PATH, HOME: process.env.HOME, MODE: mode,
+        env: { PATH: process.env.PATH, HOME: home, HYPHAE_SECRET_BACKEND: "file", MODE: mode,
           HYPHAE_PLUGIN_ADDR: `127.0.0.1:${server.address().port}`, HYPHAE_PLUGIN_TOKEN: token,
           SDK_URL: pathToFileURL(join(sdkDir, "client.mjs")).href, SDK_DIR: sdkDir },
         stdio: ["ignore", "pipe", "pipe"],
