@@ -31,7 +31,7 @@ node itest/scripts/provision.mjs --tools openclaw,claude,codex,gemini
 ## Running Tests
 
 ```bash
-# Run all Phase 1 + Phase 2 suites:
+# Run all Phase 1 + Phase 2 + Phase 3 suites:
 HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:all
 
 # Run Phase 1 only (llm-shim + OpenClaw + Claude Code):
@@ -39,6 +39,9 @@ HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run i
 
 # Run Phase 2 only (Gemini llm-shim + Codex + Herdr + OpenCode + Gemini + P1–P8 Parity Matrix):
 HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:phase2
+
+# Run Phase 3 only (Chat Bridges E2E + Compiled-In & SaaS Sources E2E + Plugin/Onboarding Verification):
+HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 npm --prefix itest run itest:phase3
 
 # Run individual suites:
 node --test itest/suites/llm-shim.test.ts
@@ -49,7 +52,27 @@ HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites
 HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/opencode.test.ts
 HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/gemini.test.ts
 HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/parity-matrix.test.ts
+HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/bridges-e2e.test.ts
+HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/saas-sources-e2e.test.ts
+HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites/onboarding-trees.test.ts
 ```
+
+## Phase 3: Chat Bridges, Sources & SaaS Plugins (Zero-Dependency Loopback Wire-Mocks)
+
+All external platform APIs and WebSockets are mocked in-process on `127.0.0.1:0` using zero-dependency Node 24+ TypeScript/ESM (`itest/lib/mocks/`, including a pure `node:http`+`node:crypto` RFC 6455 WebSocket server):
+
+- **Bridges (`itest/suites/bridges-e2e.test.ts`):**
+  - `telegram.ts`: Bot API (`getMe`, `getUpdates` offset persistence & `0600` file mode, `sendMessage`, `setMessageReaction`, `429 retry_after`, >4096 char chunking, non-allowlisted drop, `exposeTopic: false` manifest check).
+  - `slack-socket.ts`: Web API (`auth.test`, `apps.connections.open`, `chat.postMessage`, `reactions.add/remove`) + RFC 6455 Socket Mode (`hello`, `events_api` with `envelope_id` ack verification, `disconnect` frame reconnect, fail-closed allowlists).
+  - `whatsapp.ts`: Meta Cloud Graph API + `hub.mode=subscribe` verify challenge (`200` / `403`) + `X-Hub-Signature-256` valid & 1-bit flip (`401`) + allowlist filtering.
+  - **Blind Spot B2:** Post-`hello` plugin self-crash -> `CrashLoopBackOff` in `node.status.json` / `hyp doctor --json` + `0600` log permissions + zero secret leaks (`[REDACTED]`).
+- **Compiled-In & SaaS Sources (`itest/suites/saas-sources-e2e.test.ts`):**
+  - `github.ts`: `github-public` (`200 -> 304 -> 429 Retry-After -> 200`, multi-org `repoTokens` isolation) & `github-webhook` (`X-Hub-Signature-256`, 1-bit flip `401`, org filter, raw-body SHA-256 replay dedup).
+  - `webhook-prom.ts`: Rust vs Node differential parity for `prometheus-webhook` vs `plugins/prometheus` (incl. Blind Spot B1 detection) and bidirectional `webhook-stream` vs `plugins/webhook`, plus `localIngest` (`ingest.sock` / `hyp emit` + `--sign` Ed25519 + >64 KiB rejection).
+  - **6 SaaS Source Wire-Mocks (`agentmail.ts`, `google.ts`, `sentry.ts`, `vercel.ts`, `notion.ts`):** Always execute protocol & fault-injection unit tests on `main` (B3 inclusive cursor + interleaved WS/REST, Notion 2nd `verification_token` hijack `401`, Google OAuth PKCE + metadata-only Gmail + Calendar `410 Gone`, Sentry raw-hex HMAC-SHA256, Vercel HMAC-SHA1). Automatically run full black-box E2E tests (including fake `TAILSCALE_BIN` Funnel) whenever the 6 plugins exist in `plugins/` or via `HYPHAE_ITEST_SAAS_PLUGINS_DIR`.
+- **Plugin Verification & Onboarding Trees (`itest/suites/onboarding-trees.test.ts`):**
+  - `hyp plugin install <name> --from-dir --json` + `hyp plugin verify --json` + 1-byte tamper fail-closed + `--force` recovery.
+  - Schema, reachability, privacy audience gate, and config merge safety validator for every `hyphae.onboarding/v1` `onboarding.json` tree.
 
 ## Cross-Harness Differential Parity Matrix (P1–P8)
 
@@ -76,6 +99,7 @@ HYP_BIN=./target/debug/hyp HYPHAE_ITEST_USE_HOST_BINS=1 node --test itest/suites
 | `OPENCODE_BIN` | Explicit path to `opencode` binary (auto-discovers `PATH` and `~/.opencode/bin/opencode`). |
 | `GEMINI_BIN` | Explicit path to `gemini` binary (auto-discovers `~/.cache/hyphae-itest/` and `PATH`). |
 | `HYPHAE_ITEST_USE_HOST_BINS=1` | Prefer host binaries over `~/.cache/hyphae-itest/` (falling back to cache for tools like `gemini`). |
+| `HYPHAE_ITEST_SAAS_PLUGINS_DIR` | Optional read-only directory containing the 6 SaaS source plugins (`agentmail`, `gmail`, `google-calendar`, `sentry`, `vercel`, `notion`) to run their full black-box E2E & onboarding tests before merge. |
 | `HYPHAE_ITEST_KEEP_LOGS=1` | Always dump forensics bundles to `itest-forensics/<test-name>/` even on pass. |
 
 ## Failure Forensics
