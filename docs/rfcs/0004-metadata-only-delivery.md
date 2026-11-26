@@ -19,7 +19,7 @@ Hooks and wake nudges stop carrying message or event content. Every delivery bec
 | Tier | Trigger | Transport | Payload |
 | --- | --- | --- | --- |
 | `interrupt` | on arrival, including mid-turn | hook injection at the next tool boundary; wake nudge if idle | digest |
-| `queue` | turn end, or idle timeout | wake nudge message; hook injection if a turn boundary comes first | digest |
+| `queue` | turn end, idle timeout, or long-turn mid-turn reminder (default every 30 min, tuneable) | wake nudge message; hook injection at turn boundary or periodic `PostToolUse` reminder during long active turns | digest |
 | `notify` | never on its own | rides along on the next digest | counted in the digest |
 | `mute` | never | rides along on the next digest | one muted counter |
 
@@ -68,8 +68,9 @@ A digest sent while a turn is active is the same digest the wake nudge would hav
 5. Skills (`hyphae`, `hyphae-setup`, per-harness variants) and docs (`concepts.md`, `reference/mcp-tools.md`, site copy on delivery tiers).
 6. Tests: the delivery and cross-harness suites assert on inline text today and need rewriting against the digest; add tests that no body text of any tier appears in hook output.
 
-## Decisions (all three open questions are settled)
+## Decisions (settled)
 
 1. ~~Should `interrupt` from a trusted peer still be allowed to carry one line of content?~~ **Decided 2026-11-26 (Bogdan): digest only is absolute for now, for every source and tier. Revisit once it has been used.**
 2. ~~Does a digest list every subscription, or only those with unread items?~~ **Decided 2026-11-26 (Bogdan): only subscriptions and sources with unread items are listed.**
 3. ~~Should reading with `hyp_inbox` ack by default?~~ **Decided 2026-11-26 (Bogdan): yes. Reading acknowledges by default; passing `ack: false` peeks without acknowledging.**
+4. **Long-turn mid-turn `queue` digest reminder (Decided 2026-11-26, Bogdan):** During long active turns where `Stop` has not fired yet, inject a periodic `<hyphae-inbox>` digest on `PostToolUse` when unread `queue` items are waiting, gated by a tuneable interval (default **30 minutes** since the oldest un-reminded `queue` item arrived / last mid-turn reminder; configurable per node/session, `0` to disable). Items stay `unread` until read via `hyp_inbox` and never re-inject between intervals.
