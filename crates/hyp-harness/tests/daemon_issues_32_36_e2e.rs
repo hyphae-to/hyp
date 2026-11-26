@@ -1222,6 +1222,12 @@ exit 0
         )
         .await;
         assert_eq!(pre_exec, json!({}));
+        // Finish the hook's rollout probe before the MCP connection triggers its
+        // own probe with sparse hints. Both must retain the hook's Codex home.
+        assert_eq!(
+            session_status(&sock, &format!("codex:{exec_uuid}")).await["hasLiveTransport"],
+            false
+        );
         let (exec_txt, exec_err) = mcp
             .call_tool(
                 "hyp_mesh",

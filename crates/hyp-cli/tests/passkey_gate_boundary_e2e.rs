@@ -20,19 +20,23 @@
 mod common;
 
 use common::{ManagedProcess, TestPasskeyAdmin, isolated_cmd, parse_json_stdout};
+#[cfg(unix)]
 use hyp_crypto::human::HumanApprovalActionKind;
 use hyp_crypto::keys::Ed25519KeyPair;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
+#[cfg(unix)]
 use hyp_harness::sock::daemon_rpc_sync;
 use hyp_store::NodeDb;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write as _;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+#[cfg(unix)]
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]

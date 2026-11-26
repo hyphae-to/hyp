@@ -9224,6 +9224,22 @@ fn maybe_spawn_transport_probe(
                 .filter(|s| !s.is_empty());
 
             if let Some(thread_id) = candidate_thread {
+                // A verified MCP call can trigger another probe after the hook's probe
+                // finishes. Its connection hints may omit CODEX_HOME, so retain the
+                // hook's persisted rollout location instead of inspecting the daemon's home.
+                let codex_home = hints.codex_home.clone().or_else(|| {
+                    daemon_arc
+                        .node
+                        .db()
+                        .local()
+                        .get_session(&sid)
+                        .ok()
+                        .flatten()
+                        .and_then(|session| {
+                            TransportHints::from_session_backend(&sid, &session.backend_json)
+                                .codex_home
+                        })
+                });
                 let codex_bin = daemon_arc
                     .config
                     .codex_bin
@@ -9236,7 +9252,7 @@ fn maybe_spawn_transport_probe(
                     && is_valid_codex_uuid(thread_id)
                     && codex_queue_supported(codex_bin).await
                 {
-                    let codex_home = hints.codex_home.clone().unwrap_or_else(default_codex_home);
+                    let codex_home = codex_home.clone().unwrap_or_else(default_codex_home);
                     if hints.codex_remote.is_none() && codex_home.join("sessions").is_dir() {
                         verify_codex_rollout_thread(&codex_home, thread_id)
                     } else {
@@ -9252,7 +9268,7 @@ fn maybe_spawn_transport_probe(
                         .with_resume(
                             hints.codex_resume || daemon_arc.config.delivery_retry.codex_resume,
                         );
-                    if let Some(ref home) = hints.codex_home {
+                    if let Some(ref home) = codex_home {
                         target = target.with_codex_home(home.clone());
                     }
                     if let Some(ref remote) = hints.codex_remote {
