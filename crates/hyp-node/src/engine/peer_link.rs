@@ -37,7 +37,7 @@ use crate::engine::http_util::{
     BoxedBody, HttpClient, SseParser, empty_body, format_version_etag, full_body,
     parse_retry_after_ms, percent_encode,
 };
-use crate::engine::node::UnifiedNode;
+use crate::engine::node::{KvInspection, UnifiedNode};
 
 /// Default maximum response size for JSON control endpoints (4 MiB).
 pub const MAX_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -926,6 +926,24 @@ impl PeerLink {
         }
         self.send_json(Method::DELETE, &path, Some(&body), &headers)
             .await
+    }
+
+    pub(crate) async fn kv_inspect(&self) -> Result<KvInspection, NodeError> {
+        self.send_json::<(), _>(Method::GET, "/v1/kv-metadata", None, &[])
+            .await
+    }
+
+    pub(crate) async fn kv_preview(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<KvEntry>, NodeError> {
+        let path = format!(
+            "/v1/kv-metadata?namespace={}&key={}",
+            percent_encode(namespace),
+            percent_encode(key),
+        );
+        self.send_json::<(), _>(Method::GET, &path, None, &[]).await
     }
 
     pub async fn kv_list(

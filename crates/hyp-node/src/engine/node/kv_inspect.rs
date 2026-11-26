@@ -1,18 +1,43 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use hyp_crypto::e2ee::{EpochScope, SignedEpochKeyBundle, verify_epoch_bundle};
 use hyp_proto::cloudevent::CONTENT_TYPE_E2EE_JSON;
 use hyp_proto::manifest::KvMode;
+use hyp_proto::scopes::ScopeSet;
 use hyp_store::kv::KvEntryMetadata;
-use hyp_store::{Filter, KvEpoch, Subscription, is_kv_key, is_kv_namespace, now_ms};
+use hyp_store::{
+    Filter, KvEntry, KvEpoch, PeerStatus, Subscription, is_kv_key, is_kv_namespace, now_ms,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{NodeError, UnifiedNode};
+use super::{AuthenticatedPeer, NodeError, UnifiedNode};
 
 const MAX_NAMESPACES: usize = 32;
 const MAX_SNAPSHOT_ENTRIES_PER_NAMESPACE: usize = 4;
 const ENTRY_SCAN_PAGE: u32 = 128;
+const MAX_INSPECT_PEERS: usize = 8;
+const PEER_INSPECT_TIMEOUT: Duration = Duration::from_millis(1200);
+
+struct KvReader<'a> {
+    node_id: &'a str,
+    encryption_kid: Option<String>,
+    scopes: Option<&'a ScopeSet>,
+}
+
+impl KvReader<'_> {
+    fn may_read_namespace(&self, namespace: &str) -> bool {
+        self.scopes
+            .is_none_or(|scopes| scopes.may_kv_read_namespace(namespace))
+    }
+
+    fn may_read_key(&self, namespace: &str, key: &str) -> bool {
+        self.scopes
+            .is_none_or(|scopes| scopes.may_kv_read(namespace, key))
+    }
+}
+
 const MAX_KV_PREVIEW_BYTES: usize = 4096;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -74,13 +99,88 @@ impl From<KvEntryMetadata> for KvKeyInspection {
 impl UnifiedNode {
     /// Inspects hosted KV from the local node's point of view.
     pub fn inspect_local_kv(&self, now_ms: i64) -> Result<KvInspection, NodeError> {
+        self.inspect_hosted_kv(&self.local_kv_reader(), now_ms)
+    }
+
+    pub(in crate::engine) fn inspect_hosted_kv_for_peer(
+        &self,
+        caller: &AuthenticatedPeer,
+        now_ms: i64,
+    ) -> Result<KvInspection, NodeError> {
+        self.inspect_hosted_kv(&self.peer_kv_reader(caller)?, now_ms)
+    }
+
+    /// Fetches metadata from active peers for an explicit inspection request.
+    pub async fn inspect_kv(&self, now_ms: i64) -> Result<KvInspection, NodeError> {
+        let mut inspection = self.inspect_local_kv(now_ms)?;
+        let links = self.peer_links.read().await;
+        let peers: Vec<_> = self
+            .db()
+            .peers()
+            .list_peers(Some(PeerStatus::Active))?
+            .into_iter()
+            .filter_map(|peer| links.get(&peer.peer_id).cloned())
+            .collect();
+        drop(links);
+        inspection.namespaces_truncated |= peers.len() > MAX_INSPECT_PEERS;
+        let mut tasks = tokio::task::JoinSet::new();
+        for peer in peers.into_iter().take(MAX_INSPECT_PEERS) {
+            tasks.spawn(async move {
+                let result = tokio::time::timeout(PEER_INSPECT_TIMEOUT, peer.kv_inspect()).await;
+                match result {
+                    Ok(Ok(report)) => Some((peer.peer_id().to_owned(), report)),
+                    _ => None,
+                }
+            });
+        }
+        let mut reports = BTreeMap::new();
+        while let Some(result) = tasks.join_next().await {
+            if let Ok(Some((peer_id, report))) = result {
+                reports.insert(peer_id, report);
+            }
+        }
+        for (peer_id, report) in reports {
+            inspection.namespaces_truncated |= report.namespaces_truncated;
+            let mut names = BTreeSet::new();
+            for mut namespace in report.namespaces {
+                if namespace.origin_node != peer_id
+                    || !is_kv_namespace(&namespace.name)
+                    || !names.insert(namespace.name.clone())
+                {
+                    continue;
+                }
+                if inspection.namespaces.len() >= MAX_NAMESPACES {
+                    inspection.namespaces_truncated = true;
+                    break;
+                }
+                namespace.entries.retain(|entry| is_kv_key(&entry.key));
+                namespace
+                    .entries
+                    .truncate(MAX_SNAPSHOT_ENTRIES_PER_NAMESPACE);
+                inspection.namespaces.push(namespace);
+            }
+        }
+        Ok(inspection)
+    }
+
+    fn inspect_hosted_kv(
+        &self,
+        reader: &KvReader<'_>,
+        now_ms: i64,
+    ) -> Result<KvInspection, NodeError> {
         let host = self.config.node_id.as_str();
         let (names, watches) = {
             let db = self.db();
-            (
-                db.kv().list_namespaces(host, now_ms)?,
-                db.events().list_subscriptions(None)?,
-            )
+            let local = reader.scopes.is_none();
+            let names = if local {
+                db.kv().list_namespaces(host, now_ms)?
+            } else {
+                Vec::new()
+            };
+            let watches = db
+                .events()
+                .list_subscriptions((!local).then_some(reader.node_id))?;
+            (names, watches)
         };
         let names: BTreeSet<_> = names
             .iter()
@@ -91,10 +191,11 @@ impl UnifiedNode {
                     .iter()
                     .map(|namespace| namespace.name.as_str()),
             )
+            .filter(|namespace| reader.may_read_namespace(namespace))
             .collect();
         let mut namespaces = Vec::new();
         for name in names {
-            let Some(access) = self.local_kv_namespace_access(name)? else {
+            let Some(access) = self.kv_namespace_access(reader, name)? else {
                 continue;
             };
             if namespaces.len() == MAX_NAMESPACES {
@@ -119,6 +220,9 @@ impl UnifiedNode {
                 let page_full = page.len() == ENTRY_SCAN_PAGE as usize;
                 after = page.last().map(|entry| entry.key.clone());
                 for entry in page {
+                    if !reader.may_read_key(name, &entry.key) {
+                        continue;
+                    }
                     let access_key = (
                         entry.content_type == CONTENT_TYPE_E2EE_JSON,
                         entry.e2ee_epoch,
@@ -126,8 +230,13 @@ impl UnifiedNode {
                     let visible = if let Some(visible) = epoch_access.get(&access_key) {
                         *visible
                     } else {
-                        let visible =
-                            self.local_kv_entry_visible(name, &access, access_key.0, access_key.1)?;
+                        let visible = self.kv_entry_visible(
+                            reader,
+                            name,
+                            &access,
+                            access_key.0,
+                            access_key.1,
+                        )?;
                         epoch_access.insert(access_key, visible);
                         visible
                     };
@@ -162,31 +271,42 @@ impl UnifiedNode {
     }
 
     /// Reads and decrypts one visible key after an explicit local request.
-    pub async fn preview_local_kv(
+    pub async fn preview_kv(
         &self,
+        origin: &str,
         namespace: &str,
         key: &str,
     ) -> Result<Option<KvValuePreview>, NodeError> {
         if !is_kv_namespace(namespace) || !is_kv_key(key) {
             return Err(NodeError::BadRequest("invalid KV namespace or key".into()));
         }
-        let host = self.config.node_id.as_str();
-        let Some(access) = self.local_kv_namespace_access(namespace)? else {
-            return Ok(None);
+        let local = origin == self.config.node_id.as_str() || origin == "local";
+        let link = if local {
+            None
+        } else {
+            Some(self.require_peer_link(origin).await?)
         };
-        let entry = self.db().kv().get(host, namespace, key, now_ms())?;
+        let entry = if let Some(link) = &link {
+            link.kv_preview(namespace, key).await?
+        } else {
+            self.read_hosted_kv(&self.local_kv_reader(), namespace, key)?
+        };
         let Some(entry) = entry else {
             return Ok(None);
         };
-        if !self.local_kv_entry_visible(
-            namespace,
-            &access,
-            entry.content_type == CONTENT_TYPE_E2EE_JSON,
-            entry.e2ee_epoch,
-        )? {
-            return Ok(None);
+        let host = if local {
+            self.config.node_id.as_str()
+        } else {
+            origin
+        };
+        if entry.host_node != host || entry.namespace != namespace || entry.key != key {
+            return Err(NodeError::BadRequest(
+                "KV preview entry does not match its request".into(),
+            ));
         }
-        let entry = self.maybe_decrypt_kv_entry(host, entry, None).await?;
+        let entry = self
+            .maybe_decrypt_kv_entry(host, entry, link.as_ref())
+            .await?;
         let mut text = match entry.value {
             Value::String(text) => text,
             value => serde_json::to_string_pretty(&value)?,
@@ -206,15 +326,83 @@ impl UnifiedNode {
         }))
     }
 
-    fn local_kv_namespace_access(
+    pub(in crate::engine) fn read_hosted_kv_for_peer(
         &self,
+        caller: &AuthenticatedPeer,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<KvEntry>, NodeError> {
+        if !is_kv_namespace(namespace) || !is_kv_key(key) {
+            return Err(NodeError::BadRequest("invalid KV namespace or key".into()));
+        }
+        self.read_hosted_kv(&self.peer_kv_reader(caller)?, namespace, key)
+    }
+
+    fn read_hosted_kv(
+        &self,
+        reader: &KvReader<'_>,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<KvEntry>, NodeError> {
+        if !reader.may_read_key(namespace, key)
+            || (reader.scopes.is_some()
+                && !self
+                    .config
+                    .kv_namespaces
+                    .iter()
+                    .any(|cfg| cfg.name == namespace))
+        {
+            return Ok(None);
+        }
+        let Some(access) = self.kv_namespace_access(reader, namespace)? else {
+            return Ok(None);
+        };
+        let entry = self
+            .db()
+            .kv()
+            .get(self.config.node_id.as_str(), namespace, key, now_ms())?;
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        Ok(self
+            .kv_entry_visible(
+                reader,
+                namespace,
+                &access,
+                entry.content_type == CONTENT_TYPE_E2EE_JSON,
+                entry.e2ee_epoch,
+            )?
+            .then_some(entry))
+    }
+
+    fn local_kv_reader(&self) -> KvReader<'_> {
+        KvReader {
+            node_id: self.config.node_id.as_str(),
+            encryption_kid: Some(self.identity.encryption.kid()),
+            scopes: None,
+        }
+    }
+
+    fn peer_kv_reader<'a>(&self, caller: &'a AuthenticatedPeer) -> Result<KvReader<'a>, NodeError> {
+        Ok(KvReader {
+            node_id: &caller.peer_id,
+            encryption_kid: self
+                .lookup_peer_encryption_key(&caller.peer_id)?
+                .map(|key| key.kid()),
+            scopes: Some(&caller.scopes),
+        })
+    }
+
+    fn kv_namespace_access(
+        &self,
+        reader: &KvReader<'_>,
         namespace: &str,
     ) -> Result<Option<LocalNamespaceAccess>, NodeError> {
         let host = self.config.node_id.as_str();
         let latest = self.db().kv().latest_epoch(host, namespace)?;
         if let Some(epoch) = latest {
             return Ok(self
-                .local_kv_epoch_member_count(&epoch)?
+                .kv_epoch_member_count(reader, &epoch)?
                 .map(|member_count| LocalNamespaceAccess {
                     epoch: Some(epoch.epoch),
                     member_count,
@@ -231,8 +419,9 @@ impl UnifiedNode {
         }))
     }
 
-    fn local_kv_entry_visible(
+    fn kv_entry_visible(
         &self,
+        reader: &KvReader<'_>,
         namespace: &str,
         access: &LocalNamespaceAccess,
         is_e2ee: bool,
@@ -247,7 +436,7 @@ impl UnifiedNode {
                         .kv()
                         .get_epoch(self.config.node_id.as_str(), namespace, epoch)?;
                 match stored {
-                    Some(stored) => Ok(self.local_kv_epoch_member_count(&stored)?.is_some()),
+                    Some(stored) => Ok(self.kv_epoch_member_count(reader, &stored)?.is_some()),
                     None => Ok(false),
                 }
             }
@@ -255,7 +444,11 @@ impl UnifiedNode {
         }
     }
 
-    fn local_kv_epoch_member_count(&self, epoch: &KvEpoch) -> Result<Option<usize>, NodeError> {
+    fn kv_epoch_member_count(
+        &self,
+        reader: &KvReader<'_>,
+        epoch: &KvEpoch,
+    ) -> Result<Option<usize>, NodeError> {
         let host = self.config.node_id.as_str();
         let signer = if epoch.creator_node_id == host {
             self.identity.signing.public_key()
@@ -281,11 +474,13 @@ impl UnifiedNode {
         if payload.epoch != epoch.epoch || payload.created_by != epoch.creator_node_id {
             return Ok(None);
         }
-        let my_kid = self.identity.encryption.kid();
+        let Some(kid) = reader.encryption_kid.as_deref() else {
+            return Ok(None);
+        };
         if !payload
             .wraps
             .iter()
-            .any(|wrap| wrap.node_id == host && wrap.recipient_kid == my_kid)
+            .any(|wrap| wrap.node_id == reader.node_id && wrap.recipient_kid == kid)
         {
             return Ok(None);
         }

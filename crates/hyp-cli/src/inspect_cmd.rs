@@ -838,7 +838,7 @@ pub fn run_inspect(args: &InspectArgs) -> ExitCode {
     }
 
     let mut payload = Value::Object(res.result.unwrap_or_default());
-    if target.all && payload.get("kv").is_none() {
+    if target.all {
         if let Some(kv) = crate::kv_cmd::inspect_live_kv(&socket_path) {
             payload["kv"] = kv;
         }

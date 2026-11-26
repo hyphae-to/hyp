@@ -1185,7 +1185,7 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
         1
     );
     assert!(
-        node.preview_local_kv("sealed", "note")
+        node.preview_kv("local", "sealed", "note")
             .await
             .unwrap()
             .is_none()

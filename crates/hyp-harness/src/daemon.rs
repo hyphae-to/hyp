@@ -9449,15 +9449,16 @@ async fn handle_local_kv(daemon: &LocalDaemonInner, request: Option<&Value>) -> 
     let local = request.host_node == "local" || request.host_node == node.node_id().as_str();
     let result = match &request.action {
         LocalKvAction::Inspect if local => node
-            .inspect_local_kv(daemon.current_time_ms())
+            .inspect_kv(daemon.current_time_ms())
+            .await
             .map(LocalKvResponse::Inspect)
             .map_err(|err| LocalKvError::Other(err.to_string())),
-        LocalKvAction::Preview { key } if local => node
-            .preview_local_kv(&request.namespace, key)
+        LocalKvAction::Preview { key } => node
+            .preview_kv(&request.host_node, &request.namespace, key)
             .await
             .map(LocalKvResponse::Preview)
             .map_err(|err| LocalKvError::Other(err.to_string())),
-        LocalKvAction::Inspect | LocalKvAction::Preview { .. } => Err(LocalKvError::InvalidInput(
+        LocalKvAction::Inspect => Err(LocalKvError::InvalidInput(
             "KV inspection requires a local namespace.".into(),
         )),
         _ => request.execute(&node.db(), node.node_id().as_str()),
