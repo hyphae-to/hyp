@@ -15,7 +15,7 @@
  *   WEBHOOK_MAX_BODY_BYTES  - Maximum request body size (default 65536)
  *   WEBHOOK_SIGNATURE_HEADER - Signature header name (default X-Webhook-Signature-256)
  *   WEBHOOK_LEGACY_NATIVE  - Use the retired Rust source’s payload and event ID contract when set to 1
- *   WEBHOOK_POST_URL        - Optional outbound callback URL for hyp_plugin_post replies
+ *   WEBHOOK_POST_URL        - Optional outbound callback URL for hyp_send replies
  */
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";

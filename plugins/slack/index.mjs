@@ -8,7 +8,7 @@
  *   SLACK_TARGET                             - Target name (defaults to first target in hello)
  *   SLACK_ALLOWED_USERS                      - Optional comma-separated Slack user IDs allowlist
  *   SLACK_ALLOWED_CHANNELS                   - Optional comma-separated channel IDs allowlist
- *   SLACK_DEFAULT_CHANNEL                    - Optional default channel ID for outbound hyp_plugin_post
+ *   SLACK_DEFAULT_CHANNEL                    - Optional default channel ID for outbound hyp_send
  *   SLACK_API_BASE                           - Optional API base URL override (default https://slack.com/api)
  */
 import { readFileSync } from "node:fs";

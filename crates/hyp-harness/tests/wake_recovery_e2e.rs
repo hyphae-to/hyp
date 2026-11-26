@@ -781,7 +781,7 @@ async fn external_drop_watcher_recycles_stalled_sse_immediately_on_wake() {
             "type": "call.start",
             "harness": "claude",
             "sessionId": sid,
-            "tool": "hyp_session",
+            "tool": "hyp_mesh",
             "callId": "tu-join",
         }),
         Duration::from_secs(2),

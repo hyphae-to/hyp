@@ -7,9 +7,7 @@
 //! `openclaw`, `herdr`, `t3`).
 
 use crate::call_registry::is_valid_session_id;
-use crate::protocol::{
-    HarnessKind, UNTRUSTED_PROVENANCE, normalize_mesh_tool_name, resolve_v1_daemon_tool,
-};
+use crate::protocol::{HarnessKind, UNTRUSTED_PROVENANCE, normalize_mesh_tool_name};
 use crate::sock::{DEFAULT_HOOK_TIMEOUT, DaemonRpcResult, daemon_rpc_sync};
 use crate::transport::openclaw::{
     canonical_openclaw_session_id, parse_openclaw_agent_id_from_session_key,
@@ -187,7 +185,6 @@ struct ToolInfo {
     tool_name: Option<String>,
     call_id: Option<String>,
     wrapped_mcp_args: Option<Map<String, Value>>,
-    tool_args: Option<Map<String, Value>>,
 }
 
 fn extract_tool_info(harness: HarnessKind, payload: &Map<String, Value>) -> ToolInfo {
@@ -218,19 +215,16 @@ fn extract_tool_info(harness: HarnessKind, payload: &Map<String, Value>) -> Tool
                     return ToolInfo {
                         tool_name: Some(tool_name.to_string()),
                         call_id,
-                        wrapped_mcp_args: Some(inner_args.clone()),
-                        tool_args: Some(inner_args),
+                        wrapped_mcp_args: Some(inner_args),
                     };
                 }
             }
         }
 
-        let tool_args = call.get("args").and_then(Value::as_object).cloned();
         return ToolInfo {
             tool_name: raw_name,
             call_id,
             wrapped_mcp_args: None,
-            tool_args,
         };
     }
 
@@ -249,20 +243,11 @@ fn extract_tool_info(harness: HarnessKind, payload: &Map<String, Value>) -> Tool
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
-    let tool_args = payload
-        .get("tool_input")
-        .or_else(|| payload.get("toolInput"))
-        .or_else(|| payload.get("params"))
-        .or_else(|| payload.get("arguments"))
-        .or_else(|| payload.get("args"))
-        .and_then(Value::as_object)
-        .cloned();
 
     ToolInfo {
         tool_name,
         call_id,
         wrapped_mcp_args: None,
-        tool_args,
     }
 }
 
@@ -698,15 +683,11 @@ where
                 return default_pre_response(options.harness, options.event);
             };
 
-            // Map v2 tools (`hyp_mesh`, `hyp_inbox` with mode/mute/unmute) to the exact v1 daemon
-            // tool name that `mcp.rs` forwards in `tool.call` so live v1 `CallRegistry` verifies 100%.
-            let register_tool = resolve_v1_daemon_tool(normalized, info.tool_args.as_ref());
-
             let mut pkt = Map::new();
             pkt.insert("type".into(), json!("call.start"));
             pkt.insert("harness".into(), json!(options.harness.as_str()));
             pkt.insert("sessionId".into(), json!(session_id));
-            pkt.insert("tool".into(), json!(register_tool));
+            pkt.insert("tool".into(), json!(normalized));
             if let Some(call_id) = info.call_id {
                 pkt.insert("callId".into(), json!(call_id));
             }
@@ -1264,12 +1245,12 @@ mod tests {
                 },
             );
 
-            // `hyp_mesh` with action="join", channel="#ops" MUST register as `hyp_channel` on v1 daemon!
+            // `hyp_mesh` with action="join", channel="#ops" registers under its canonical `hyp_mesh` name.
             let recorded = calls.borrow();
             assert_eq!(recorded.len(), 1);
             assert_eq!(recorded[0]["type"], "call.start");
             assert_eq!(recorded[0]["harness"], harness.as_str());
-            assert_eq!(recorded[0]["tool"], "hyp_channel");
+            assert_eq!(recorded[0]["tool"], "hyp_mesh");
             assert_eq!(
                 recorded[0]["sessionId"],
                 format!("{}:id-1", harness.as_str())
@@ -1684,7 +1665,7 @@ mod tests {
             assert_eq!(pkts[0]["sessionId"], "openclaw:agent:ops:explicit:thread-9");
             assert_eq!(pkts[0]["openclawSessionKey"], "agent:ops:explicit:thread-9");
             assert_eq!(pkts[0]["openclawAgentId"], "ops");
-            assert_eq!(pkts[0]["tool"], "hyp_session");
+            assert_eq!(pkts[0]["tool"], "hyp_mesh");
             assert_eq!(pkts[0]["callId"], "tool_call:1:hyphae__hyp_mesh:1");
         }
 

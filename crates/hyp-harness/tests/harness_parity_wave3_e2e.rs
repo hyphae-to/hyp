@@ -1303,13 +1303,16 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         }),
     )
     .await;
-    assert!(reg_res.ok, "session.register failed: {reg_res:?}");
+    assert!(
+        !reg_res.ok,
+        "retired registration RPC must be rejected: {reg_res:?}"
+    );
+    assert_eq!(reg_res.error.as_deref(), Some("unknown_rpc_type"));
     assert!(
         reg_res
             .result
             .as_ref()
-            .unwrap()
-            .get("sessionToken")
+            .and_then(|result| result.get("sessionToken"))
             .is_none(),
         "session.register MUST NOT return sessionToken: {reg_res:?}"
     );
@@ -1341,7 +1344,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
             "type": "call.start",
             "harness": "claude",
             "sessionId": victim_sid,
-            "tool": "hyp_session",
+            "tool": "hyp_mesh",
             "callId": "call-no-mint",
             "requestSessionToken": true,
         }),
@@ -1419,7 +1422,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
             "type": "call.start",
             "harness": "claude",
             "sessionId": victim_sid,
-            "tool": "hyp_session",
+            "tool": "hyp_mesh",
             "callId": "call-victim-join"
         }),
     )
@@ -1496,10 +1499,11 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         assert_eq!(c_res.error.as_deref(), Some("session_token_invalid"));
     }
 
-    // `wait.subscribe` / `inbox.wait` / `inbox.watch` against victim (which has `envFileExported: true`):
+    // `wait.subscribe` modes against victim (which has `envFileExported: true`):
     // BOTH missing token (`env -u HYPHAE_SESSION_TOKEN`) AND wrong/attacker token MUST FAIL CLOSED!
     for bad_tok in [None, Some(attacker_token.as_str()), Some("st_forged_wrong")] {
-        let mut wait_pkt = json!({ "type": "inbox.wait", "sessionId": victim_sid });
+        let mut wait_pkt =
+            json!({ "type": "wait.subscribe", "mode": "once", "sessionId": victim_sid });
         if let Some(t) = bad_tok {
             wait_pkt["sessionToken"] = json!(t);
         }
@@ -1507,7 +1511,8 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
         assert_eq!(w_err["type"], "wait.error");
         assert_eq!(w_err["code"], "session_token_invalid");
 
-        let mut wait_handle_pkt = json!({ "type": "inbox.watch", "handle": "victim" });
+        let mut wait_handle_pkt =
+            json!({ "type": "wait.subscribe", "mode": "stream", "handle": "victim" });
         if let Some(t) = bad_tok {
             wait_handle_pkt["sessionToken"] = json!(t);
         }
@@ -1589,7 +1594,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
     // After restart, missing token on `wait.subscribe` STILL fails closed (envFileExported persisted)!
     let post_restart_missing = expect_wait_error(
         &sock2,
-        json!({ "type": "inbox.wait", "sessionId": victim_sid }),
+        json!({ "type": "wait.subscribe", "mode": "once", "sessionId": victim_sid }),
     )
     .await;
     assert_eq!(post_restart_missing["code"], "session_token_invalid");
@@ -1672,7 +1677,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
             "type": "call.start",
             "harness": "herdr",
             "sessionId": "herdr:forged-attacker",
-            "tool": "hyp_session",
+            "tool": "hyp_mesh",
             "callId": "forged-herdr-call-1"
         }),
     )
@@ -1726,7 +1731,7 @@ async fn x5_x6_session_token_blocks_cross_session_hijack_and_ephemeral_never_byp
             "harness": "claude",
             "sessionId": victim_sid,
             "sessionToken": victim_token,
-            "tool": "hyp_session",
+            "tool": "hyp_mesh",
             "callId": "call-replay-src"
         }),
     )
@@ -1894,7 +1899,7 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
     let _ = rpc(
         &sock,
         &json!({
-            "type": "session.register",
+            "type": "session.start",
             "harness": "claude",
             "sessionId": claude_sid
         }),
@@ -2175,7 +2180,7 @@ async fn openclaw_nudge_then_drain_focus_mode_restart_and_fail_closed_session_is
     let _ = rpc(
         &sock2,
         &json!({
-            "type": "session.register",
+            "type": "session.start",
             "harness": "openclaw",
             "sessionId": oc_sid_2
         }),
@@ -2783,4 +2788,163 @@ async fn openclaw_exact_multi_session_isolation_wake_default_and_native_plugin_s
     daemon.stop().await;
     node.shutdown();
     gw_srv.abort();
+}
+
+#[tokio::test]
+async fn canonical_tools_keep_live_controls_shorthands_and_reject_retired_entries() {
+    let tmp = TempDir::new().unwrap();
+    let node = open_local_node("canonical@box", tmp.path());
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        None,
+        LocalDaemonConfig {
+            auto_detect_transports: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+    let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    mcp.initialize().await;
+    let (joined, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_mesh",
+            json!({"action":"join","handle":"actor","include":["mutes"]}),
+        )
+        .await;
+    assert!(!error, "{joined}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&joined).unwrap()["handle"],
+        "actor"
+    );
+
+    let (mode, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_inbox",
+            json!({"mode":"notify"}),
+        )
+        .await;
+    assert!(!error, "{mode}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&mode).unwrap()["deliveryMode"],
+        "notify"
+    );
+    for control in [json!({"mute":"spam/*"}), json!({"unmute":"spam/*"})] {
+        let expect_muted = control.get("mute").is_some();
+        let (result, error) = mcp
+            .call_verified_claude(&sock, "canonical-session", "hyp_inbox", control)
+            .await;
+        assert!(!error, "{result}");
+        let stored = node
+            .db()
+            .local()
+            .list_mutes(Some("claude:canonical-session"))
+            .unwrap();
+        assert_eq!(
+            stored.iter().any(|rule| rule.pattern == "spam/*"),
+            expect_muted
+        );
+    }
+
+    // A second catalog entry makes the shorthand filter assertion distinguishable from
+    // merely listing all routers. No endpoint means this fixture cannot make a network call.
+    node.db()
+        .peers()
+        .upsert_peer(
+            &hyp_store::PeerInput {
+                peer_id: "otherhub".into(),
+                endpoint: None,
+                profile: hyp_store::PeerProfile::Router,
+                trust_tier: hyp_store::TrustTier::Peer,
+                status: hyp_store::PeerStatus::Active,
+                scopes: Vec::new(),
+                auth_credential_ref: None,
+            },
+            hyp_store::now_ms(),
+        )
+        .unwrap();
+    let (topics, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"topics","topic":"local.schedule"}),
+        )
+        .await;
+    assert!(!error, "{topics}");
+    let topics: Value = serde_json::from_str(&topics).unwrap();
+    assert_eq!(topics["routers"].as_array().unwrap().len(), 1);
+    assert_eq!(topics["routers"][0]["router"], "local");
+
+    let (subscription, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"subscribe","topic":"local.schedule","key":"watch:canonical"}),
+        )
+        .await;
+    assert!(!error, "{subscription}");
+    let id = serde_json::from_str::<Value>(&subscription).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (removed, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"unsubscribe","key":id}),
+        )
+        .await;
+    assert!(!error, "{removed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&removed).unwrap()["removed"],
+        true
+    );
+
+    let (invalid_action, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_mesh",
+            json!({"action":"mode","mode":"queue"}),
+        )
+        .await;
+    assert!(
+        error && invalid_action.contains("Invalid hyp_mesh action"),
+        "{invalid_action}"
+    );
+    let (retired, error) = mcp
+        .call_tool("hyp_session", json!({"action":"status"}), None)
+        .await;
+    assert!(
+        error && retired.contains("Unknown Hyphae tool"),
+        "{retired}"
+    );
+    for retired in [
+        "session.register",
+        "call.finish",
+        "mute.add",
+        "mute.remove",
+        "mute.list",
+        "inbox.wait",
+        "inbox.watch",
+    ] {
+        let response = rpc(
+            &sock,
+            &json!({"type":retired,"sessionId":"claude:canonical-session","target":"spam/*"}),
+        )
+        .await;
+        assert!(!response.ok, "retired entry {retired}: {response:?}");
+        assert_eq!(response.error.as_deref(), Some("unknown_rpc_type"));
+    }
+    mcp.close().await;
+    daemon.stop().await;
+    node.shutdown();
 }

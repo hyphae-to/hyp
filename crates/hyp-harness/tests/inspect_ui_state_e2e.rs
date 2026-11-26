@@ -574,8 +574,12 @@ async fn mckeeman_reference_model_differential_parity_and_zero_body_leakage() {
         .rules
         .insert("#noisy-ci".into(), "mute".into());
 
-    let global_mute = rpc(sock, json!({ "type": "mute.add", "target": "spam/*" })).await;
-    assert!(global_mute.ok);
+    // Global-mute storage is fixture state for the inspect/model contract. Public policy
+    // control and caller verification are exercised by the real MCP delivery suites.
+    node.db()
+        .local()
+        .add_mute("*", "spam/*", "cli", now_ms())
+        .unwrap();
     model.global_mutes.insert("spam/*".into());
 
     let rule_res = rpc(

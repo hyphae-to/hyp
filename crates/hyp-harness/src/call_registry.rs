@@ -310,7 +310,7 @@ impl CallRegistry {
         Ok(entry)
     }
 
-    /// Releases any unconsumed registration for a completed call (`call.end` / `call.finish`).
+    /// Releases any unconsumed registration for a completed call (`call.end`).
     pub fn finish_call(&self, call_id: Option<&str>, call_token: Option<&str>) {
         let mut st = self.state.lock().expect("CallRegistry lock poisoned");
         if let Some(tok) = call_token.filter(|s| !s.is_empty()) {

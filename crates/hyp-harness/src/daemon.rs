@@ -70,7 +70,9 @@ use crate::call_registry::{
     is_valid_session_id,
 };
 use crate::hooks::is_valid_session_token;
-use crate::protocol::{HarnessKind, is_bridge_destination, normalize_mesh_tool_name};
+use crate::protocol::{
+    HarnessKind, is_bridge_destination, is_valid_router_name, normalize_mesh_tool_name,
+};
 use crate::sock::{
     DEFAULT_SOCKET_FILENAME, MAX_SOCKET_LINE_BYTES, read_bounded_line_async,
     write_ndjson_line_async,
@@ -685,7 +687,7 @@ struct LocalDaemonInner {
     session_token_key: [u8; 32],
     /// Sessions that completed `SessionStart` with `envFileExported: true` (hydrated from SQLite
     /// `sessions.backend_json` on startup) and therefore REQUIRE a valid `sessionToken` on
-    /// `wait.subscribe` / `inbox.wait` / `inbox.watch`.
+    /// `wait.subscribe`.
     env_file_exported_sessions: Mutex<HashSet<String>>,
     /// Specific `session_id`s that have registered a real `PreToolUse` `call.start` (`X6`).
     /// Never poisons an entire hookless harness (e.g. OpenClaw) globally from one forged call!
@@ -1077,7 +1079,7 @@ impl LocalDaemon {
 
     /// Derives the deterministic HMAC-SHA256 per-session authentication token (`sessionToken`)
     /// for `session_id` and marks `session_id` as `envFileExported: true` so `wait.subscribe` /
-    /// `inbox.wait` / `inbox.watch` require the matching token even across daemon restarts.
+    /// `wait.subscribe` require the matching token even across daemon restarts.
     pub fn mint_session_token(&self, session_id: &str) -> Result<String, String> {
         if !is_valid_session_id(session_id) {
             return Err("invalid_session".to_string());
@@ -1087,7 +1089,7 @@ impl LocalDaemon {
     }
 
     /// Returns `true` iff `session_id` currently requires a per-session `sessionToken` on
-    /// `wait.subscribe` / `inbox.wait` / `inbox.watch` (`envFileExported: true`).
+    /// `wait.subscribe` (`envFileExported: true`).
     pub fn session_has_token(&self, session_id: &str) -> bool {
         self.inner.session_requires_wait_token(session_id)
     }
@@ -4246,7 +4248,7 @@ impl LocalDaemonInner {
         }
     }
 
-    /// Verifies `sessionToken` on `wait.subscribe` / `inbox.wait` / `inbox.watch`:
+    /// Verifies `sessionToken` on `wait.subscribe`:
     /// - If `sessionToken` is provided, ALWAYS verifies it in constant time against
     ///   `session_token_for(session_id)` (so Session A carrying `HYPHAE_SESSION_TOKEN(A)` trying
     ///   `hyp wait --session B` is immediately rejected fail-closed!).
@@ -4921,7 +4923,7 @@ impl LocalDaemonInner {
                 }
             }
 
-            // Priority 3: Streaming watcher (`hyp watch` / `inbox.watch`)
+            // Priority 3: Streaming watcher (`hyp watch` / streaming `wait.subscribe`)
             let stream_tx = self
                 .waiters
                 .lock()
@@ -4950,7 +4952,7 @@ impl LocalDaemonInner {
                 }
             }
 
-            // Priority 3: One-shot blocking waiter (`hyp wait` / `inbox.wait`)
+            // Priority 3: One-shot blocking waiter (`hyp wait` / one-shot `wait.subscribe`)
             let once_waiter = {
                 let mut map = self.waiters.lock().expect("waiters lock poisoned");
                 let extracted = map.get_mut(session_id).and_then(|list| {
@@ -5078,34 +5080,11 @@ impl LocalDaemonInner {
 
         match name {
             "hyp_mesh" => self.tool_mesh(session_id, args).await,
-            "hyp_session" => self.tool_session(session_id, args).await,
-            "hyp_join" => self.tool_join(session_id, args).await,
-            "hyp_leave" => self.tool_leave(session_id).await,
-            "hyp_peers" => self.tool_peers(session_id).await,
-            "hyp_capabilities" => self.tool_capabilities(session_id).await,
-            "hyp_mode" => self.tool_mode(session_id, args).await,
-            "hyp_mute" => self.tool_mute(session_id, args).await,
-            "hyp_unmute" => self.tool_unmute(session_id, args).await,
-            "hyp_mutes" => self.tool_mutes(session_id).await,
-            "hyp_channel" => self.tool_channel(session_id, args).await,
-            "hyp_channel_join" => self.tool_channel_join(session_id, args).await,
-            "hyp_channel_leave" => self.tool_channel_leave(session_id, args).await,
-            "hyp_channel_post" => self.tool_channel_post(session_id, args).await,
-            "hyp_channels" => self.tool_channels(args).await,
             "hyp_send" => self.tool_send(session_id, args).await,
             "hyp_inbox" => self.tool_inbox(session_id, args).await,
             "hyp_stream" => self.tool_stream(session_id, args).await,
-            "hyp_subscribe" => self.tool_subscribe(session_id, args).await,
-            "hyp_unsubscribe" => self.tool_unsubscribe(session_id, args).await,
-            "hyp_subscriptions" => self.tool_subscriptions(session_id).await,
-            "hyp_topics" => self.tool_topics(args).await,
             "hyp_kv" => self.tool_kv(args).await,
             "hyp_bridge" => self.tool_bridge(session_id, args).await,
-            "hyp_plugin_targets" => self.tool_bridge_targets(session_id).await,
-            "hyp_bridge_link" => self.tool_bridge_link(session_id, args).await,
-            "hyp_bridge_unlink" => self.tool_bridge_unlink(session_id, args).await,
-            "hyp_plugin_handoff" => self.tool_bridge_handoff(session_id, args).await,
-            "hyp_plugin_post" => self.tool_plugin_post(session_id, args).await,
             other => Err(("unknown_tool".into(), format!("Unknown tool {other}"))),
         }
     }
@@ -5130,7 +5109,16 @@ impl LocalDaemonInner {
             "channels" => self.tool_channels(args).await,
             "join" if has_channel => self.tool_channel_join(session_id, args).await,
             "leave" if has_channel => self.tool_channel_leave(session_id, args).await,
-            _ => self.tool_session(session_id, args).await,
+            "join" => self.tool_join(session_id, args).await,
+            "leave" => self.tool_leave(session_id).await,
+            "peers" => self.tool_peers(session_id).await,
+            "status" => self.tool_capabilities(session_id).await,
+            other => Err((
+                "invalid_request".into(),
+                format!(
+                    "Invalid hyp_mesh action '{other}'. Expected: join | leave | peers | channels | status | drop_link"
+                ),
+            )),
         }
     }
 
@@ -5655,31 +5643,6 @@ impl LocalDaemonInner {
         Ok(Value::Object(out))
     }
 
-    async fn tool_session(
-        self: &Arc<Self>,
-        session_id: &str,
-        args: &Map<String, Value>,
-    ) -> Result<Value, (String, String)> {
-        let action = args
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected session action".into()))?;
-        match action {
-            "join" => self.tool_join(session_id, args).await,
-            "leave" => self.tool_leave(session_id).await,
-            "peers" => self.tool_peers(session_id).await,
-            "status" => self.tool_capabilities(session_id).await,
-            "mode" => self.tool_mode(session_id, args).await,
-            "mute" => self.tool_mute(session_id, args).await,
-            "unmute" => self.tool_unmute(session_id, args).await,
-            "mutes" => self.tool_mutes(session_id).await,
-            other => Err((
-                "invalid_request".into(),
-                format!("Unsupported session action '{other}'"),
-            )),
-        }
-    }
-
     async fn tool_join(
         &self,
         session_id: &str,
@@ -6129,22 +6092,6 @@ impl LocalDaemonInner {
             })
             .collect();
         Ok(json!({ "mutes": list }))
-    }
-
-    async fn tool_channel(
-        &self,
-        session_id: &str,
-        args: &Map<String, Value>,
-    ) -> Result<Value, (String, String)> {
-        match args.get("action").and_then(Value::as_str) {
-            Some("join") => self.tool_channel_join(session_id, args).await,
-            Some("leave") => self.tool_channel_leave(session_id, args).await,
-            Some("list") => self.tool_channels(args).await,
-            _ => Err((
-                "invalid_request".into(),
-                "Expected channel action: join | leave | list".into(),
-            )),
-        }
     }
 
     async fn tool_channel_join(
@@ -6629,7 +6576,19 @@ impl LocalDaemonInner {
     }
 
     async fn tool_topics(&self, args: &Map<String, Value>) -> Result<Value, (String, String)> {
-        let router_filter = args.get("router").and_then(Value::as_str);
+        let router_filter = match args.get("router") {
+            Some(value) => value.as_str(),
+            None => args
+                .get("topic")
+                .and_then(Value::as_str)
+                .map(|topic| {
+                    topic
+                        .split_once('.')
+                        .map(|(router, _)| router)
+                        .unwrap_or(topic)
+                })
+                .filter(|router| is_valid_router_name(router)),
+        };
         let mut routers = Vec::new();
 
         if router_filter.is_none() || router_filter == Some("local") {
@@ -7396,18 +7355,6 @@ impl LocalDaemonInner {
         }))
     }
 
-    async fn tool_plugin_post(
-        &self,
-        session_id: &str,
-        args: &Map<String, Value>,
-    ) -> Result<Value, (String, String)> {
-        let (plugin, target) = parse_bridge_plugin_target(args)?;
-        let handle = self.require_session_handle(session_id)?;
-        let (text, reaction) = parse_bridge_text_and_reaction(args)?;
-        self.send_to_bridge(session_id, &handle, &plugin, &target, text, reaction, args)
-            .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn send_to_bridge(
         &self,
@@ -7480,6 +7427,9 @@ impl LocalDaemonInner {
         meta.insert("handle".into(), json!(handle));
         if let Some(reply_to) = args.get("replyTo") {
             meta.insert("replyTo".into(), reply_to.clone());
+            if !args.contains_key("threadTs") && reply_to.is_string() {
+                meta.insert("threadTs".into(), reply_to.clone());
+            }
         }
         if let Some(thread_ts) = args.get("threadTs") {
             meta.insert("threadTs".into(), thread_ts.clone());
@@ -7712,17 +7662,12 @@ async fn handle_connection<R, W>(
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
-                    "session.register" => {
-                        let resp = handle_session_register(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
                     "session.hint" => {
                         let resp = handle_session_hint(&daemon, &packet);
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
-                    "call.end" | "call.finish" => {
+                    "call.end" => {
                         let cid = packet.get("callId").and_then(Value::as_str);
                         let tok = packet.get("callToken").and_then(Value::as_str);
                         daemon.calls.finish_call(cid, tok);
@@ -7835,96 +7780,6 @@ async fn handle_connection<R, W>(
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
-                    "mute.add" => {
-                        let target = packet
-                            .get("target")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let ttl_res: Result<Option<u64>, String> = match packet.get("ttlSeconds") {
-                            None | Some(Value::Null) => Ok(None),
-                            Some(v) => match v.as_u64() {
-                                Some(secs) if (1..=MAX_MUTE_TTL_SECS).contains(&secs) => {
-                                    Ok(Some(secs))
-                                }
-                                _ => Err(format!(
-                                    "Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}"
-                                )),
-                            },
-                        };
-                        let resp = match ttl_res {
-                            Err(msg) => json!({ "ok": false, "error": msg }),
-                            Ok(ttl_seconds) => {
-                                let now = daemon.current_time_ms();
-                                let expires_at = ttl_seconds.map(|secs| {
-                                    now.saturating_add((secs as i64).saturating_mul(1_000))
-                                });
-                                match daemon
-                                    .node
-                                    .db()
-                                    .local()
-                                    .add_mute_with_expiry("*", target, "cli", now, expires_at)
-                                {
-                                    Ok(rule) => {
-                                        if let Some(ttl) = ttl_seconds {
-                                            let timer_daemon = Arc::clone(&daemon);
-                                            let mut shutdown_rx = daemon.shutdown_rx.clone();
-                                            tokio::spawn(async move {
-                                                tokio::select! {
-                                                    _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
-                                                    _ = shutdown_rx.changed() => {
-                                                        return;
-                                                    }
-                                                }
-                                                if !*shutdown_rx.borrow() {
-                                                    timer_daemon.sweep_expired_mutes_and_policies(
-                                                        timer_daemon.current_time_ms(),
-                                                    );
-                                                }
-                                            });
-                                        }
-                                        daemon.bump_ui_rev();
-                                        json!({ "ok": true, "result": { "rule": rule } })
-                                    }
-                                    Err(e) => json!({ "ok": false, "error": e.to_string() }),
-                                }
-                            }
-                        };
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "mute.remove" => {
-                        let target = packet
-                            .get("target")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        let resp = match daemon.node.db().local().remove_mute("*", target) {
-                            Ok(removed) => {
-                                if removed {
-                                    daemon.bump_ui_rev();
-                                }
-                                json!({ "ok": true, "result": { "removed": removed } })
-                            }
-                            Err(e) => json!({ "ok": false, "error": e.to_string() }),
-                        };
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "mute.list" => {
-                        let now = daemon.current_time_ms();
-                        daemon.sweep_expired_mutes_and_policies(now);
-                        let mutes = daemon
-                            .node
-                            .db()
-                            .local()
-                            .list_mutes_at(None, now)
-                            .unwrap_or_default();
-                        let _ = write_ndjson_line_async(
-                            &mut write_half,
-                            &json!({ "ok": true, "result": { "mutes": mutes } }),
-                        )
-                        .await;
-                        break;
-                    }
                     "drop.ingest" => {
                         let resp = handle_drop_ingest_rpc(&daemon, &packet).await;
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
@@ -7947,14 +7802,10 @@ async fn handle_connection<R, W>(
                     }
 
                     // ---- Blocking waiter / streaming watcher ----
-                    "wait.subscribe" | "inbox.wait" | "inbox.watch" => {
-                        let mode = match pkt_type {
-                            "inbox.wait" => WaiterKind::Once,
-                            "inbox.watch" => WaiterKind::Stream,
-                            _ => match packet.get("mode").and_then(Value::as_str) {
-                                Some("stream") => WaiterKind::Stream,
-                                _ => WaiterKind::Once,
-                            },
+                    "wait.subscribe" => {
+                        let mode = match packet.get("mode").and_then(Value::as_str) {
+                            Some("stream") => WaiterKind::Stream,
+                            _ => WaiterKind::Once,
                         };
 
                         let mut sid = packet
@@ -8249,7 +8100,14 @@ async fn handle_connection<R, W>(
                             break;
                         }
                     }
-                    _ => {}
+                    _ => {
+                        let _ = write_ndjson_line_async(
+                            &mut write_half,
+                            &json!({"ok": false, "error": "unknown_rpc_type"}),
+                        )
+                        .await;
+                        break;
+                    }
                 }
             }
         }
@@ -8738,7 +8596,7 @@ fn read_node_json_for_state_dir(state_dir: &Path) -> Option<Value> {
 
 /// Exclusive `SessionStart` hook handler returning the deterministic HMAC-derived `sessionToken`
 /// for writing into `$CLAUDE_ENV_FILE`. When `envFileExported: true` is passed, persists that
-/// flag so `wait.subscribe` / `inbox.wait` / `inbox.watch` require the matching `sessionToken`.
+/// flag so `wait.subscribe` require the matching `sessionToken`.
 async fn handle_session_start(
     daemon: &Arc<LocalDaemonInner>,
     packet: &Map<String, Value>,
@@ -8819,74 +8677,6 @@ async fn handle_session_start(
             "sessionId": session_id,
             "sessionToken": token,
             "envFileExported": env_file_exported,
-        }
-    })
-}
-
-async fn handle_session_register(
-    daemon: &Arc<LocalDaemonInner>,
-    packet: &Map<String, Value>,
-) -> Value {
-    let Some(session_id) = packet
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .filter(|s| is_valid_session_id(s))
-    else {
-        return json!({ "ok": false, "error": "invalid_session" });
-    };
-    if let Err(err) = daemon.verify_optional_session_token(session_id, packet) {
-        return json!({ "ok": false, "error": err });
-    }
-
-    let harness = packet
-        .get("harness")
-        .or_else(|| packet.get("backend"))
-        .and_then(Value::as_str)
-        .and_then(|s| s.parse::<HarnessKind>().ok());
-    let hints = TransportHints::from_packet(packet, harness);
-
-    // Issue #36: Reject explicit Herdr registration when `hc get --json` confirms a bare shell!
-    if harness == Some(HarnessKind::Herdr) && daemon.config.auto_detect_transports {
-        if let Some(ref tid) = hints.herdr_terminal_id {
-            let hc_bin = daemon
-                .config
-                .herdr_bin
-                .as_deref()
-                .unwrap_or(DEFAULT_HERDR_BIN);
-            if let HerdrProbeOutcome::BareShell { terminal_id, .. } =
-                probe_herdr_terminal_detailed(hc_bin, tid).await
-            {
-                daemon.record_herdr_bare_shell_rejection(session_id, &terminal_id);
-                return json!({
-                    "ok": false,
-                    "code": "herdr_bare_shell_rejected",
-                    "error": format!(
-                        "Refusing Herdr registration on bare shell terminal '{terminal_id}' (hc get --json reported status.app == null; no coding agent running)"
-                    ),
-                });
-            }
-        }
-    }
-
-    let patch = hints.backend_patch(harness);
-    let now = daemon.current_time_ms();
-    if patch.is_empty() {
-        let db = daemon.node.db();
-        if db.local().get_session(session_id).ok().flatten().is_none() {
-            let _ = db.local().register_session(session_id, "{}", now);
-        } else {
-            let _ = db.local().touch_session(session_id, now);
-        }
-    } else if let Err(e) = daemon.merge_session_backend_and_index(session_id, &patch, now) {
-        return json!({ "ok": false, "error": e.to_string() });
-    }
-    daemon.clear_lazy_hydrate_cooldown(session_id);
-    daemon.bump_ui_rev();
-    maybe_spawn_transport_probe(daemon, session_id, hints);
-    json!({
-        "ok": true,
-        "result": {
-            "sessionId": session_id,
         }
     })
 }

@@ -154,7 +154,7 @@ async fn issue32_focus_vip_bypass_isolates_buffered_notify_and_flushes_on_focus_
     let reg = daemon_rpc_async(
         &sock,
         &json!({
-            "type": "session.register",
+            "type": "session.start",
             "sessionId": oc_sid,
             "harness": "openclaw",
             "openclawSessionKey": oc_key,
@@ -1405,34 +1405,12 @@ esac
         .expect("start LocalDaemon");
         let sock = daemon.socket_path().to_path_buf();
 
-        // 1. Direct `session.register` and `session.start` with explicit `backend: "herdr"` on
+        // 1. Direct `session.start` with explicit `backend: "herdr"` on
         //    BOTH bare-shell shapes (`status: null` and `status.app: null`) fail closed!
         for (tid, sid) in [
             ("t-bare-null", "herdr:bare-reg-1"),
             ("t-bare-app-null", "herdr:bare-reg-2"),
         ] {
-            let reg = daemon_rpc_async(
-                &sock,
-                &json!({
-                    "type": "session.register",
-                    "sessionId": sid,
-                    "backend": "herdr",
-                    "herdrTerminalId": tid
-                }),
-                Duration::from_secs(2),
-            )
-            .await;
-            assert!(
-                !reg.ok,
-                "session.register(--backend herdr) on bare shell {tid} must fail closed: {reg:?}"
-            );
-            assert!(
-                reg.error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("bare shell")),
-                "expected explicit bare-shell error for {tid}: {reg:?}"
-            );
-
             let start = daemon_rpc_async(
                 &sock,
                 &json!({
@@ -1571,7 +1549,7 @@ esac
         let reg2 = daemon_rpc_async(
             &sock2,
             &json!({
-                "type": "session.register",
+                "type": "session.start",
                 "sessionId": "herdr:no-hc-unit-test",
                 "backend": "herdr",
                 "herdrTerminalId": "t99"
