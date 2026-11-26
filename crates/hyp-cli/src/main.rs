@@ -517,7 +517,7 @@ fn main() -> ExitCode {
         Commands::Update(args) => update::run_update(args),
         Commands::Uninstall(args) => uninstall_cmd::run_uninstall(args),
         Commands::Deploy { command } => deploy::run_deploy(command),
-        Commands::Pair { command } => pair::run_pair(command),
+        Commands::Pair { command } => finish_command(pair::run_pair(command)),
         Commands::Plugin { command } => plugin_cmd::run_plugin(command),
         Commands::Statusline(args) => statusline_cmd::run_statusline(&args),
         Commands::Inspect(args) => inspect_cmd::run_inspect(&args),
