@@ -39,10 +39,12 @@ use hyp_node::delivery::{
     PackedDeliveryBatch, archive_muted_entry, move_pending_to_muted, muted_count,
     pack_delivery_batch, query_inbox, record_delivered_receipts,
 };
+pub use hyp_node::engine::WakeRecoveryConfig;
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
 use hyp_node::engine::{
-    ChannelMode, CreateDropRequest, CreateDropResponse, DROP_CAP_HEADER, DropSubscriberAuth,
-    KvWriteRequest, NodeError, PeerReconcileReport, SubscribeRequest, UnifiedNode,
+    ChannelMode, CreateDropRequest, CreateDropResponse, DEFAULT_WAKE_CHECK_INTERVAL_SECS,
+    DROP_CAP_HEADER, DropSubscriberAuth, KvWriteRequest, NodeError, PeerReconcileReport,
+    SubscribeRequest, UnifiedNode, format_human_duration, spawn_wake_watcher,
 };
 use hyp_node::gates::{
     GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
@@ -148,6 +150,11 @@ pub const DEFAULT_QUEUE_ACTIVITY_LEASE: Duration = Duration::from_secs(15);
 /// Bounded cooldown between lazy transport rehydration probes for the same session inside
 /// `flush_session_inner` so permanently dead targets never trigger probe loops.
 const LAZY_HYDRATE_COOLDOWN: Duration = Duration::from_secs(30);
+/// Default delay before the single post-wake follow-up flush (lets reconnecting PeerLinks
+/// pull missed messages and flush them cleanly without duplicate deliveries).
+pub const DEFAULT_WAKE_FOLLOWUP_FLUSH_DELAY: Duration = Duration::from_secs(2);
+/// Upper bound waiting for external plugin `system.wake` notifications during wake recovery.
+const WAKE_HOOK_BROADCAST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Boxed `Send` future alias used by [`BridgePoster`] and [`PeersReloader`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -160,6 +167,25 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// persisted peers directly via [`UnifiedNode::reconcile_peers`].
 pub trait PeersReloader: Send + Sync {
     fn reload_peers<'a>(&'a self) -> BoxFuture<'a, Result<PeerReconcileReport, String>>;
+}
+
+/// Pluggable async callback invoked during [`LocalDaemon::handle_system_wake`]
+/// (e.g. to broadcast `system.wake` JSON-RPC notifications to external subprocess plugins).
+pub trait WakeHook: Send + Sync {
+    fn on_system_wake<'a>(&'a self, slept_for: Duration) -> BoxFuture<'a, ()>;
+}
+
+/// Structured summary returned by [`LocalDaemon::handle_system_wake`] and the `"system.wake"`
+/// local IPC RPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeRecoveryReport {
+    pub wake_epoch: u64,
+    pub slept_ms: u64,
+    pub cleared_active_sessions: Vec<String>,
+    pub cleared_hold_retries: usize,
+    pub notified_sessions: Vec<String>,
+    pub flushed_sessions: usize,
 }
 
 /// Pluggable callback invoked by the live `gate.reload` IPC RPC to re-read, validate, and
@@ -272,6 +298,12 @@ pub struct LocalDaemonConfig {
     /// Sliding activity lease duration after the last hook call before an active hooked session
     /// without TurnEnd (`Stop` / `agent_end`) decays to `Idle` and flushes held `Queue` batches to L2.
     pub queue_activity_lease: Duration,
+    /// Laptop sleep/wake recovery policy (`node.json` -> `wakeRecovery`).
+    pub wake_recovery: WakeRecoveryConfig,
+    /// Periodic check cadence for the zero-FFI wall-vs-monotonic wake watcher (default: 5s).
+    pub wake_check_interval: Duration,
+    /// Delay for the single `shutdown_rx`-cancellable post-wake follow-up flush (default: 2s).
+    pub wake_followup_flush_delay: Duration,
 }
 
 impl Default for LocalDaemonConfig {
@@ -293,6 +325,9 @@ impl Default for LocalDaemonConfig {
             drop_watcher_backoff_ms: vec![500, 1_000, 2_000, 5_000],
             interrupt_hook_grace: DEFAULT_INTERRUPT_HOOK_GRACE,
             queue_activity_lease: DEFAULT_QUEUE_ACTIVITY_LEASE,
+            wake_recovery: WakeRecoveryConfig::default(),
+            wake_check_interval: Duration::from_secs(DEFAULT_WAKE_CHECK_INTERVAL_SECS),
+            wake_followup_flush_delay: DEFAULT_WAKE_FOLLOWUP_FLUSH_DELAY,
         }
     }
 }
@@ -544,6 +579,9 @@ struct ClassifiedItemMeta {
     /// (`mailbox.drain` with `includeNudged: true`) to deliver it with its original urgency
     /// while preventing `flush_session` (`include_nudged: false`) from re-nudging in a loop.
     nudge_pending: bool,
+    /// True ONLY for trusted daemon-generated host sleep/wake notices (`gate_reason == "wake_notice"`).
+    /// Renders directly as `[hyphae notice] ...` and NEVER triggers Tier 4 Herdr cold spawns.
+    is_wake_notice: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -668,6 +706,11 @@ struct LocalDaemonInner {
     bridge_posters: Mutex<HashMap<String, Arc<dyn BridgePoster>>>,
     /// Optional custom async hook invoked on `"peers.reload"` IPC RPCs.
     peers_reloader: Mutex<Option<Arc<dyn PeersReloader>>>,
+    /// Registered async hooks invoked during [`LocalDaemon::handle_system_wake`]
+    /// (e.g. broadcasting `system.wake` JSON-RPC notifications to external subprocess plugins).
+    wake_hooks: Mutex<Vec<Arc<dyn WakeHook>>>,
+    /// Monotonic generation deduplicating post-wake follow-up flush timers.
+    wake_followup_gen: AtomicU64,
     /// Configured targets per bridge plugin (advertised even before any session links).
     configured_bridge_targets: Mutex<BTreeMap<String, Vec<String>>>,
     /// Tier 3 bounded `Hold` retry state (`session_id -> (attempt, generation)`).
@@ -707,6 +750,7 @@ pub struct LocalDaemon {
     startup_flush_task: Mutex<Option<JoinHandle<()>>>,
     projector_task: Mutex<Option<JoinHandle<()>>>,
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
+    wake_watcher_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for LocalDaemon {
@@ -801,6 +845,8 @@ impl LocalDaemon {
         let _ = inner.write_ui_state_snapshot();
         let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
         let maintenance_task = spawn_maintenance_task(Arc::clone(&inner), shutdown_tx.subscribe());
+        let wake_watcher_task =
+            spawn_daemon_wake_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
 
         Ok(Self {
             inner,
@@ -812,6 +858,7 @@ impl LocalDaemon {
             startup_flush_task: Mutex::new(startup_flush_task),
             projector_task: Mutex::new(Some(projector_task)),
             maintenance_task: Mutex::new(Some(maintenance_task)),
+            wake_watcher_task: Mutex::new(wake_watcher_task),
         })
     }
 
@@ -907,6 +954,8 @@ impl LocalDaemon {
         let _ = inner.write_ui_state_snapshot();
         let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
         let maintenance_task = spawn_maintenance_task(Arc::clone(&inner), shutdown_tx.subscribe());
+        let wake_watcher_task =
+            spawn_daemon_wake_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
 
         Ok(Self {
             inner,
@@ -918,6 +967,7 @@ impl LocalDaemon {
             startup_flush_task: Mutex::new(startup_flush_task),
             projector_task: Mutex::new(Some(projector_task)),
             maintenance_task: Mutex::new(Some(maintenance_task)),
+            wake_watcher_task: Mutex::new(wake_watcher_task),
         })
     }
 
@@ -1070,6 +1120,49 @@ impl LocalDaemon {
             }
         }
         self.set_peers_reloader(Arc::new(FnPeersReloader(callback)));
+    }
+
+    /// Registers a [`WakeHook`] invoked whenever [`LocalDaemon::handle_system_wake`] runs.
+    pub fn add_wake_hook(&self, hook: Arc<dyn WakeHook>) {
+        self.inner
+            .wake_hooks
+            .lock()
+            .expect("wake_hooks lock poisoned")
+            .push(hook);
+    }
+
+    /// Registers an async closure invoked whenever [`LocalDaemon::handle_system_wake`] runs.
+    pub fn on_system_wake<F, Fut>(&self, callback: F)
+    where
+        F: Fn(Duration) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        struct FnWakeHook<F>(F);
+        impl<F, Fut> WakeHook for FnWakeHook<F>
+        where
+            F: Fn(Duration) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            fn on_system_wake<'a>(&'a self, slept_for: Duration) -> BoxFuture<'a, ()> {
+                Box::pin((self.0)(slept_for))
+            }
+        }
+        self.add_wake_hook(Arc::new(FnWakeHook(callback)));
+    }
+
+    /// Executes full sleep/wake recovery deterministically (callable by the background
+    /// zero-FFI wake watcher, the `"system.wake"` local IPC RPC, or tests):
+    /// 1. Recycles all `PeerLink` & external Drop Relay SSE streams and kicks the scheduler.
+    /// 2. Broadcasts `system.wake` to registered external plugin wake hooks.
+    /// 3. Snapshots mid-turn `Active` sessions and clears stale activity leases, grace timers,
+    ///    transient `hold_retries`, `openclaw_missing_sessions`, and lazy hydrate cooldowns.
+    /// 4. Rehydrates any dropped persisted push transports (when `auto_detect_transports` is on).
+    /// 5. Enqueues concise `[hyphae notice]` for interrupted `Active` sessions (respecting mute,
+    ///    Focus Mode, deduplication, and never triggering Tier 4 cold spawns).
+    /// 6. Flushes pending sessions immediately and schedules one `shutdown_rx`-cancellable
+    ///    follow-up flush for newly reconnecting `PeerLink` catch-up mail.
+    pub async fn handle_system_wake(&self, slept_for: Duration) -> WakeRecoveryReport {
+        self.inner.handle_system_wake(slept_for).await
     }
 
     /// Registers a pluggable outbound [`BridgePoster`] together with its configured target list.
@@ -1261,6 +1354,15 @@ impl LocalDaemon {
         {
             h.abort();
         }
+        if let Some(h) = self
+            .wake_watcher_task
+            .lock()
+            .expect("wake_watcher_task lock poisoned")
+            .take()
+        {
+            h.abort();
+        }
+        self.inner.wake_followup_gen.fetch_add(1, Ordering::SeqCst);
         // U1 (P1): Write a final atomic offline UI snapshot (`daemon.online == false`) right
         // before removing the socket so file-based UIs immediately transition to OFFLINE.
         if !self.stopped.swap(true, Ordering::SeqCst) && self.inner.node.config().state_dir.exists()
@@ -1529,6 +1631,7 @@ impl LocalDaemon {
                 is_announcement,
                 notified: false,
                 nudge_pending: false,
+                is_wake_notice: false,
             },
         );
         self.inner.bump_ui_rev();
@@ -1645,6 +1748,30 @@ fn spawn_maintenance_task(
     })
 }
 
+/// Spawns the lightweight zero-FFI wall-vs-monotonic wake watcher task when
+/// `config.wake_recovery.enabled` is true.
+fn spawn_daemon_wake_watcher(
+    inner: Arc<LocalDaemonInner>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    if !inner.config.wake_recovery.enabled {
+        return None;
+    }
+    let check_interval = inner.config.wake_check_interval;
+    let min_sleep = inner.config.wake_recovery.min_sleep_duration();
+    Some(spawn_wake_watcher(
+        check_interval,
+        min_sleep,
+        shutdown_rx,
+        move |event| {
+            let daemon = Arc::clone(&inner);
+            async move {
+                let _ = daemon.handle_system_wake(event.slept_for).await;
+            }
+        },
+    ))
+}
+
 impl LocalDaemonInner {
     fn new(
         node: Arc<UnifiedNode>,
@@ -1708,6 +1835,8 @@ impl LocalDaemonInner {
             quarantine_notices: Mutex::new(HashMap::new()),
             bridge_posters: Mutex::new(HashMap::new()),
             peers_reloader: Mutex::new(None),
+            wake_hooks: Mutex::new(Vec::new()),
+            wake_followup_gen: AtomicU64::new(0),
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
             hold_retries: Mutex::new(HashMap::new()),
             session_activity: Mutex::new(HashMap::new()),
@@ -2671,6 +2800,271 @@ impl LocalDaemonInner {
         }
     }
 
+    fn is_trusted_wake_notice_entry(&self, entry: &MailboxEntry) -> bool {
+        entry.origin_node == self.node.node_id().as_str()
+            && entry.source == "hyphae:system"
+            && entry.gate_reason.as_deref() == Some("wake_notice")
+    }
+
+    /// Enqueues a concise local `[hyphae notice]` for `session_id` after a host sleep/wake
+    /// boundary if and only if:
+    /// - the session still exists in SQLite,
+    /// - it does NOT already hold a pending wake notice, and
+    /// - `"hyphae:system"` is NOT muted by session policy or global/session mute rules.
+    ///
+    /// Does NOT trigger `flush_session` directly so callers can coalesce wake notices alongside
+    /// any queued DMs in a single atomic `flush_pending_session_list` pass.
+    fn enqueue_wake_notice_if_eligible(
+        &self,
+        session_id: &str,
+        wake_epoch: u64,
+        slept_for: Duration,
+        was_interrupted_active: bool,
+    ) -> bool {
+        let now = now_ms();
+        let db = self.node.db();
+        if db.local().get_session(session_id).ok().flatten().is_none() {
+            return false;
+        }
+
+        // Never stack multiple pending wake notices if the agent hasn't drained the previous one.
+        if let Ok(pending) = db.local().peek_inbox(session_id, 500) {
+            if pending.iter().any(|entry| {
+                entry.gate_reason.as_deref() == Some("wake_notice")
+                    || entry.item_id.starts_with("system-wake:")
+            }) {
+                return false;
+            }
+        }
+
+        // Respect both per-session DeliveryPolicy mutes and persisted global/session mute rules.
+        let parsed = hyp_node::delivery::ParsedMailboxSource::parse(
+            self.node.node_id().as_str(),
+            "hyphae:system",
+            MailboxKind::Message,
+        );
+        let ctx = parsed.as_context();
+        if let Ok(policy) = self.delivery.policy(&db, session_id) {
+            if policy.resolve_urgency(&ctx, None, false) == DeliveryUrgency::Mute {
+                return false;
+            }
+        }
+        if let Ok(mutes) = db.local().list_mutes_at(Some(session_id), now) {
+            let muted = mutes.iter().any(|rule| {
+                DeliveryRule::new(&rule.pattern, DeliveryUrgency::Mute)
+                    .match_specificity(&ctx)
+                    .is_some()
+            });
+            if muted {
+                return false;
+            }
+        }
+
+        let human_dur = format_human_duration(slept_for);
+        let text = if was_interrupted_active {
+            format!(
+                "[hyphae notice] Host woke from sleep after {human_dur}; your previous turn may have been interrupted. Peer links reconnected."
+            )
+        } else {
+            format!(
+                "[hyphae notice] Host woke from sleep after {human_dur}. Peer links reconnected."
+            )
+        };
+
+        let res = db.local().put_in_mailbox(
+            &MailboxInsert {
+                session_id: session_id.to_string(),
+                origin_node: self.node.node_id().to_string(),
+                item_id: format!("system-wake:{wake_epoch}"),
+                text,
+                kind: MailboxKind::Message,
+                source: "hyphae:system".to_string(),
+                gate_state: GateState::Pending,
+                gate_reason: Some("wake_notice".to_string()),
+                traceparent: None,
+            },
+            now,
+        );
+        match res {
+            Ok(MailboxPutResult::Stored { receipt }) => {
+                let _ = db
+                    .local()
+                    .mark_mailbox_gate_approved(session_id, &receipt, false, now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn broadcast_wake_hooks(&self, slept_for: Duration) {
+        let hooks: Vec<Arc<dyn WakeHook>> = self
+            .wake_hooks
+            .lock()
+            .expect("wake_hooks lock poisoned")
+            .clone();
+        if hooks.is_empty() {
+            return;
+        }
+        let mut join_set = tokio::task::JoinSet::new();
+        for hook in hooks {
+            join_set.spawn(async move {
+                let _ = tokio::time::timeout(
+                    WAKE_HOOK_BROADCAST_TIMEOUT,
+                    hook.on_system_wake(slept_for),
+                )
+                .await;
+            });
+        }
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        loop {
+            tokio::select! {
+                res = join_set.join_next() => {
+                    if res.is_none() {
+                        break;
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        join_set.abort_all();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_system_wake(self: &Arc<Self>, slept_for: Duration) -> WakeRecoveryReport {
+        // 1. Recycle PeerLinks + external Drop Relay SSE watchers + sweep local topic batches
+        //    + kick the UnifiedNode deadline scheduler immediately.
+        let wake_epoch = self.node.notify_system_wake(slept_for);
+
+        // 2. Broadcast best-effort `system.wake` notifications to running external plugins.
+        self.broadcast_wake_hooks(slept_for).await;
+
+        // 3. Snapshot sessions currently marked `Active` (mid-turn interrupted across sleep),
+        //    then clear stale activity leases, grace timers, transient hold retries,
+        //    `openclaw_missing_sessions`, and lazy hydrate cooldowns so nothing stays stuck.
+        let now_inst = Instant::now();
+        let mut interrupted_active: Vec<String> = {
+            let mut map = self
+                .session_activity
+                .lock()
+                .expect("session_activity lock poisoned");
+            let active: Vec<String> = map
+                .iter()
+                .filter(|(_, act)| act.active_until > now_inst)
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            map.clear();
+            active
+        };
+        interrupted_active.sort();
+
+        self.activity_grace_timers
+            .lock()
+            .expect("activity_grace_timers lock poisoned")
+            .clear();
+        let cleared_hold_retries = {
+            let mut retries = self
+                .hold_retries
+                .lock()
+                .expect("hold_retries lock poisoned");
+            let count = retries.len();
+            retries.clear();
+            count
+        };
+        self.openclaw_missing_sessions
+            .lock()
+            .expect("openclaw_missing_sessions lock poisoned")
+            .clear();
+        self.lazy_hydrate_cooldowns
+            .lock()
+            .expect("lazy_hydrate_cooldowns lock poisoned")
+            .clear();
+
+        // 4. Rehydrate any dropped persisted push transports before flushing.
+        if self.config.auto_detect_transports {
+            let to_rehydrate = self.collect_sessions_for_transport_rehydration(&[]);
+            self.rehydrate_persisted_transports(to_rehydrate).await;
+        }
+
+        // 5. Enqueue concise `[hyphae notice]` ONLY for mid-turn interrupted sessions
+        //    (and optionally all enrolled sessions if `notify_all_enrolled` was explicitly opted in),
+        //    respecting mute/Focus Mode, deduplicating pending notices, and NEVER triggering
+        //    Tier 4 cold spawns.
+        let mut notified_sessions: Vec<String> = Vec::new();
+        let mut seen_targets: HashSet<String> = HashSet::new();
+        if self.config.wake_recovery.notify_interrupted_active {
+            for sid in &interrupted_active {
+                if sid.starts_with("local-ingest:") || !seen_targets.insert(sid.clone()) {
+                    continue;
+                }
+                if self.enqueue_wake_notice_if_eligible(sid, wake_epoch, slept_for, true) {
+                    notified_sessions.push(sid.clone());
+                }
+            }
+        }
+        if self.config.wake_recovery.notify_all_enrolled {
+            let enrolled_ids: Vec<String> = {
+                let db = self.node.db();
+                db.local()
+                    .list_sessions()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| s.handle.is_some() && !s.id.starts_with("local-ingest:"))
+                    .map(|s| s.id)
+                    .collect()
+            };
+            for sid in enrolled_ids {
+                if !seen_targets.insert(sid.clone()) {
+                    continue;
+                }
+                if self.enqueue_wake_notice_if_eligible(&sid, wake_epoch, slept_for, false) {
+                    notified_sessions.push(sid);
+                }
+            }
+        }
+
+        // 6. Flush pending sessions immediately (strictly at-most-once).
+        let pending_sessions = self.collect_pending_sessions_for_flush();
+        let flushed_sessions = pending_sessions.len();
+        self.flush_pending_session_list(pending_sessions).await;
+
+        // 7. Schedule ONE short `shutdown_rx`-cancellable follow-up flush (~2s later) so
+        //    messages pulled by reconnecting PeerLinks flush promptly with zero duplicates.
+        if !self.config.wake_followup_flush_delay.is_zero() && !*self.shutdown_rx.borrow() {
+            let followup_gen = self.wake_followup_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            let followup_daemon = Arc::clone(self);
+            let mut shutdown_rx = self.shutdown_rx.clone();
+            let delay = self.config.wake_followup_flush_delay;
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown_rx.changed() => {
+                        return;
+                    }
+                }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                if followup_daemon.wake_followup_gen.load(Ordering::SeqCst) != followup_gen {
+                    return;
+                }
+                followup_daemon.flush_all_pending_sessions().await;
+            });
+        }
+
+        self.bump_ui_rev();
+        WakeRecoveryReport {
+            wake_epoch,
+            slept_ms: slept_for.as_millis().min(u64::MAX as u128) as u64,
+            cleared_active_sessions: interrupted_active,
+            cleared_hold_retries,
+            notified_sessions,
+            flushed_sessions,
+        }
+    }
+
     fn openclaw_gateway_push_enabled(&self) -> bool {
         read_node_json_for_state_dir(&self.node.config().state_dir)
             .as_ref()
@@ -3243,6 +3637,7 @@ impl LocalDaemonInner {
             } else {
                 false
             };
+        let is_wake_notice = self.is_trusted_wake_notice_entry(&entry);
         self.record_item_meta(
             session_id,
             entry.receipt,
@@ -3256,6 +3651,7 @@ impl LocalDaemonInner {
                 is_announcement,
                 notified: entry.notified,
                 nudge_pending,
+                is_wake_notice,
             },
         );
         Some(classification.effective_urgency)
@@ -3490,6 +3886,10 @@ impl LocalDaemonInner {
                 .map(|m| m.is_announcement)
                 .unwrap_or_else(|| self.is_announcement_channel(channel.as_deref()));
 
+            let is_wake_notice = meta
+                .map(|m| m.is_wake_notice)
+                .unwrap_or_else(|| self.is_trusted_wake_notice_entry(&entry));
+
             let display_source = match human_auth_by_receipt.get(&entry.receipt) {
                 Some((hid_opt, kid_opt)) => format_human_verified_source(
                     &entry.source,
@@ -3509,7 +3909,7 @@ impl LocalDaemonInner {
                 text: entry.text,
                 created_at_ms: entry.received_at,
                 burst_demoted,
-                is_system_notice: false,
+                is_system_notice: is_wake_notice,
             });
         }
 
@@ -4600,13 +5000,27 @@ impl LocalDaemonInner {
             // Priority 4 (Issue #33): Opt-in Tier 4 allowlisted Herdr cold-spawn (`hc run <tpl> <nudge>`).
             // Strictly fail-closed:
             // - NEVER runs for Notify-only / Focus-buffered / muted batches (`batch.notify_only == true`).
+            // - NEVER runs solely for a daemon-generated host sleep/wake notice (Issue #29).
             // - NEVER runs when a live push transport or waiter exists, or a live transport is only
             //   transiently holding (`deferred_transient_hold`).
             // - NEVER runs when `herdr_spawn_allowlist` is empty or does not match the session's
             //   persisted `herdrTemplate` verbatim.
             // - Strictly enforces `maxConcurrentSpawns: 1` (`active_cold_spawns`) and uses a
             //   metadata-only `<hyphae-wake>` nudge (zero untrusted DM body in argv).
+            let has_non_wake_deliverable = {
+                let guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                let map = guard.get(session_id);
+                batch
+                    .inline_ids
+                    .iter()
+                    .chain(batch.truncated_ids.iter())
+                    .any(|receipt| {
+                        !map.and_then(|m| m.get(receipt))
+                            .is_some_and(|meta| meta.is_wake_notice)
+                    })
+            };
             if !batch.notify_only
+                && has_non_wake_deliverable
                 && !deferred_transient_hold
                 && !self.config.delivery_retry.herdr_spawn_allowlist.is_empty()
                 && !self.has_live_transport(session_id)
@@ -7487,6 +7901,11 @@ async fn handle_connection<R, W>(
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
+                    "system.wake" => {
+                        let resp = handle_system_wake_rpc(&daemon, &packet).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
 
                     // ---- Blocking waiter / streaming watcher ----
                     "wait.subscribe" | "inbox.wait" | "inbox.watch" => {
@@ -9649,6 +10068,12 @@ async fn notify_drop_secret_conflict(
         .await;
 }
 
+async fn wait_for_wake_epoch(wake_rx: &mut watch::Receiver<u64>) {
+    if wake_rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 fn spawn_external_drop_watcher(
     daemon: Arc<LocalDaemonInner>,
     requesting_session_id: String,
@@ -9660,6 +10085,7 @@ fn spawn_external_drop_watcher(
 ) {
     tokio::spawn(async move {
         let mut shutdown_rx = daemon.shutdown_rx.clone();
+        let mut wake_rx = daemon.node.subscribe_wake_epoch();
         let deadline = tokio::time::Instant::now() + deadline_dur;
         let stream_url = format!("{relay_url}/v1/drops/{drop_id}/stream");
         let backoff_schedule: Vec<u64> = if daemon.config.drop_watcher_backoff_ms.is_empty() {
@@ -9702,14 +10128,19 @@ fn spawn_external_drop_watcher(
             };
 
             let resp_res = tokio::select! {
-                r = daemon.node.http_client().request(req) => Some(r),
-                _ = tokio::time::sleep_until(deadline) => None,
+                biased;
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         return;
                     }
                     continue;
                 }
+                _ = wait_for_wake_epoch(&mut wake_rx) => {
+                    reconnect_attempt = 0;
+                    continue;
+                }
+                _ = tokio::time::sleep_until(deadline) => None,
+                r = daemon.node.http_client().request(req) => Some(r),
             };
 
             let Some(resp_result) = resp_res else {
@@ -9725,6 +10156,7 @@ fn spawn_external_drop_watcher(
                 return;
             };
 
+            let mut wake_triggered = false;
             if let Ok(mut resp) = resp_result {
                 let status = resp.status();
                 if status.is_success() {
@@ -9732,7 +10164,18 @@ fn spawn_external_drop_watcher(
                     let mut parser = SseParser::new();
                     loop {
                         let frame_opt = tokio::select! {
-                            f = resp.body_mut().frame() => f,
+                            biased;
+                            _ = shutdown_rx.changed() => {
+                                if *shutdown_rx.borrow() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            _ = wait_for_wake_epoch(&mut wake_rx) => {
+                                reconnect_attempt = 0;
+                                wake_triggered = true;
+                                break;
+                            }
                             _ = tokio::time::sleep_until(deadline) => {
                                 daemon
                                     .enqueue_system_notice(
@@ -9745,12 +10188,7 @@ fn spawn_external_drop_watcher(
                                     .await;
                                 return;
                             }
-                            _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() {
-                                    return;
-                                }
-                                continue;
-                            }
+                            f = resp.body_mut().frame() => f,
                         };
                         let Some(Ok(frame)) = frame_opt else {
                             // Mid-stream disconnect: reconnect with bounded backoff + Last-Event-ID!
@@ -9863,6 +10301,10 @@ fn spawn_external_drop_watcher(
                 }
             }
 
+            if wake_triggered {
+                continue;
+            }
+
             let delay_ms = backoff_schedule[reconnect_attempt.min(backoff_schedule.len() - 1)];
             reconnect_attempt = reconnect_attempt.saturating_add(1);
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -9871,12 +10313,16 @@ fn spawn_external_drop_watcher(
             }
             let wait_for = Duration::from_millis(delay_ms).min(remaining);
             tokio::select! {
-                _ = tokio::time::sleep(wait_for) => {}
+                biased;
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         return;
                     }
                 }
+                _ = wait_for_wake_epoch(&mut wake_rx) => {
+                    reconnect_attempt = 0;
+                }
+                _ = tokio::time::sleep(wait_for) => {}
             }
         }
     });
@@ -10368,6 +10814,51 @@ async fn handle_inbox_wake_rpc(
             "quarantinedGlobal": quarantined_global,
             "rev": rev,
         }
+    })
+}
+
+async fn handle_system_wake_rpc(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+) -> Value {
+    const MAX_SLEPT_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+    let slept_ms: u64 = if let Some(raw) = packet.get("sleptMs") {
+        let Some(ms) = raw.as_u64().filter(|&v| v <= MAX_SLEPT_MS) else {
+            return json!({
+                "ok": false,
+                "error": "invalid_request",
+                "message": "sleptMs must be a non-negative integer within 30 days",
+            });
+        };
+        ms
+    } else if let Some(raw) = packet.get("sleptSeconds") {
+        let Some(secs) = raw
+            .as_u64()
+            .and_then(|s| s.checked_mul(1_000))
+            .filter(|&v| v <= MAX_SLEPT_MS)
+        else {
+            return json!({
+                "ok": false,
+                "error": "invalid_request",
+                "message": "sleptSeconds must be a non-negative integer within 30 days",
+            });
+        };
+        secs
+    } else {
+        daemon
+            .config
+            .wake_recovery
+            .min_sleep_seconds
+            .max(1)
+            .saturating_mul(1_000)
+    };
+
+    let report = daemon
+        .handle_system_wake(Duration::from_millis(slept_ms))
+        .await;
+    json!({
+        "ok": true,
+        "result": report,
     })
 }
 

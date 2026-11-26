@@ -342,13 +342,54 @@ async function handleEnvelope(envelope) {
 }
 
 let backoff = 1000;
+let abortActiveSocket = null;
+let cancelBackoff = null;
+let wakeRequested = false;
+
+mesh.onWake(() => {
+  wakeRequested = true;
+  backoff = 1000;
+  if (abortActiveSocket) {
+    const abort = abortActiveSocket;
+    abortActiveSocket = null;
+    abort();
+  }
+  if (cancelBackoff) {
+    const cancel = cancelBackoff;
+    cancelBackoff = null;
+    cancel();
+  }
+});
+
 while (true) {
+  wakeRequested = false;
   try {
     const opened = await slackApi("apps.connections.open", appToken);
     backoff = 1000;
     await new Promise((resolve) => {
+      let settled = false;
       const ws = new WebSocket(opened.url);
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (abortActiveSocket === abort) {
+          abortActiveSocket = null;
+        }
+        resolve();
+      };
+      const abort = () => {
+        try {
+          ws.close();
+        } catch {}
+        finish();
+      };
+      abortActiveSocket = abort;
+      if (wakeRequested) {
+        abort();
+        return;
+      }
       ws.addEventListener("message", (msg) => {
+        if (settled) return;
         let envelope;
         try { envelope = JSON.parse(String(msg.data)); } catch { return; }
         if (envelope.envelope_id) {
@@ -360,12 +401,31 @@ while (true) {
         }
         void handleEnvelope(envelope).catch((err) => console.error(`slack handle error: ${err.message}`));
       });
-      ws.addEventListener("close", () => resolve());
-      ws.addEventListener("error", () => resolve());
+      ws.addEventListener("close", finish);
+      ws.addEventListener("error", finish);
     });
   } catch (error) {
     console.error(`slack socket error: ${error instanceof Error ? error.message : String(error)}`);
   }
-  await new Promise((r) => setTimeout(r, backoff));
-  backoff = Math.min(backoff * 2, 30_000);
+  if (wakeRequested) {
+    wakeRequested = false;
+    backoff = 1000;
+    continue;
+  }
+  await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      cancelBackoff = null;
+      resolve();
+    }, backoff);
+    cancelBackoff = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+  });
+  if (wakeRequested) {
+    wakeRequested = false;
+    backoff = 1000;
+  } else {
+    backoff = Math.min(backoff * 2, 30_000);
+  }
 }

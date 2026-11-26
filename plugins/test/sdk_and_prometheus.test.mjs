@@ -23,6 +23,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const PLUGINS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SDK_URL = pathToFileURL(join(PLUGINS_DIR, "sdk", "client.mjs")).href;
 const PROMETHEUS_SCRIPT = join(PLUGINS_DIR, "prometheus", "index.mjs");
+const SLACK_SCRIPT = join(PLUGINS_DIR, "slack", "index.mjs");
 const TELEGRAM_SCRIPT = join(PLUGINS_DIR, "telegram", "index.mjs");
 
 const cleanups = [];
@@ -788,4 +789,350 @@ test("Issue #42: prometheus still refuses unsigned startup on non-loopback and w
     assert.notEqual(code, 0, `${label} must refuse to start`);
     assert.match(stderr, expectedRe, `${label} stderr mismatch: ${stderr}`);
   }
+});
+
+// ============================================================================
+// Issue #29: MeshPluginClient `system.wake` JSON-RPC 2.0 notification dispatch
+// ============================================================================
+
+test("Issue #29: MeshPluginClient dispatches system.wake notification to onWake({ sleptMs }) with zero spurious reply", async () => {
+  const proc = spawnFd3Script(
+    `
+      const { MeshPluginClient } = await import(process.env.SDK_URL);
+      const wakes = [];
+      const mesh = new MeshPluginClient({
+        onWake: ({ sleptMs }) => {
+          wakes.push(sleptMs);
+          console.error("WAKE_CTOR:" + sleptMs);
+        },
+      });
+      await mesh.ready;
+      console.error("READY");
+      setTimeout(() => {
+        mesh.onWake(({ sleptMs }) => {
+          console.error("WAKE_METHOD:" + sleptMs);
+        });
+        console.error("SWAPPED");
+      }, 150);
+    `,
+    { plugin: "wake-sdk-test", targets: ["ops"] },
+  );
+
+  const inboundFrames = [];
+  createInterface({ input: proc.channel }).on("line", (line) => {
+    if (line.trim()) inboundFrames.push(line);
+  });
+
+  await until(() => proc.stderr().includes("READY"), "child ready");
+  proc.channel.write(
+    JSON.stringify({ jsonrpc: "2.0", method: "system.wake", params: { sleptMs: 600_000 } }) + "\n",
+  );
+  await until(() => proc.stderr().includes("WAKE_CTOR:600000"), "constructor onWake callback");
+
+  await until(() => proc.stderr().includes("SWAPPED"), "onWake swapped");
+  proc.channel.write(
+    JSON.stringify({ jsonrpc: "2.0", method: "system.wake", params: { sleptMs: 42_500 } }) + "\n",
+  );
+  await until(() => proc.stderr().includes("WAKE_METHOD:42500"), "method onWake callback");
+
+  assert.deepEqual(inboundFrames, [], "system.wake notification must not emit any response frame");
+  proc.channel.end();
+  const exit = await proc.waitExit(1_500);
+  assert.equal(exit.code, 0);
+});
+
+test("Issue #29: MeshPluginClient safely ignores system.wake when no onWake handler is configured", async () => {
+  const proc = spawnFd3Script(
+    `
+      const { MeshPluginClient } = await import(process.env.SDK_URL);
+      const mesh = new MeshPluginClient();
+      await mesh.ready;
+      console.error("READY");
+      setTimeout(async () => {
+        const ack = await mesh.send("ops", {
+          specversion: "1.0",
+          id: "post-wake-ev",
+          source: "test/no-wake-handler",
+          type: "to.hyphae.test.ok",
+          datacontenttype: "application/json",
+          data: { ok: true },
+        });
+        console.error("ACK:" + ack.status);
+      }, 80);
+    `,
+    { plugin: "no-wake-test", targets: ["ops"] },
+  );
+
+  createInterface({ input: proc.channel }).on("line", (line) => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.type === "event") {
+      proc.channel.write(JSON.stringify({ type: "ack", id: msg.event.id, status: "stored" }) + "\n");
+    }
+  });
+
+  await until(() => proc.stderr().includes("READY"), "child ready");
+  proc.channel.write(
+    JSON.stringify({ jsonrpc: "2.0", method: "system.wake", params: { sleptMs: 120_000 } }) + "\n",
+  );
+  await until(() => proc.stderr().includes("ACK:stored"), "post-wake send/ack succeeded");
+
+  proc.channel.end();
+  const exit = await proc.waitExit(1_500);
+  assert.equal(exit.code, 0);
+});
+
+test("Issue #29: telegram plugin aborts stalled getUpdates long-poll immediately on system.wake", async () => {
+  const http = await import("node:http");
+  let pollCount = 0;
+  let stalledRes = null;
+  let firstPollStarted = false;
+
+  const server = http.createServer((req, res) => {
+    if (req.url?.endsWith("/getUpdates")) {
+      pollCount += 1;
+      if (pollCount === 1) {
+        firstPollStarted = true;
+        stalledRes = res;
+        // Hold poll #1 open forever to simulate a half-open socket across laptop sleep.
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          result:
+            pollCount === 2
+              ? [
+                  {
+                    update_id: 9001,
+                    message: {
+                      message_id: 77,
+                      date: Math.floor(Date.now() / 1000),
+                      chat: { id: 4242, type: "private" },
+                      from: { id: 999, username: "alice", first_name: "Alice" },
+                      text: "arrived-after-telegram-wake",
+                    },
+                  },
+                ]
+              : [],
+        }),
+      );
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(
+    () =>
+      new Promise((resolve) => {
+        try {
+          stalledRes?.destroy();
+        } catch {}
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  );
+  const { port } = server.address();
+
+  const child = spawn(process.execPath, [TELEGRAM_SCRIPT], {
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      HYPHAE_FD: "3",
+      HYPHAE_PLUGIN: "telegram",
+      TELEGRAM_BOT_TOKEN: "123456:test-wake-token",
+      TELEGRAM_ALLOWED_USERS: "999",
+      TELEGRAM_TARGET: "ops",
+      TELEGRAM_API_BASE: `http://127.0.0.1:${port}`,
+    },
+    stdio: ["ignore", "ignore", "pipe", "pipe"],
+  });
+  const channel = child.stdio[3];
+  const events = [];
+  let exitInfo = null;
+  child.on("exit", (code, signal) => {
+    exitInfo = { code, signal };
+  });
+  channel.on("error", () => {});
+  createInterface({ input: channel }).on("line", (line) => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.type === "event") {
+      events.push(msg.event);
+      channel.write(JSON.stringify({ type: "ack", id: msg.event.id, status: "stored" }) + "\n");
+    }
+  });
+  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: "telegram", targets: ["ops"] }) + "\n");
+  cleanups.push(
+    () =>
+      new Promise((resolve) => {
+        try {
+          channel.destroy();
+        } catch {}
+        if (exitInfo !== null) return resolve();
+        child.once("exit", () => resolve());
+        child.kill("SIGKILL");
+      }),
+  );
+
+  await until(() => firstPollStarted, "first telegram getUpdates poll stalled");
+  assert.equal(events.length, 0);
+
+  const t0 = Date.now();
+  channel.write(
+    JSON.stringify({ jsonrpc: "2.0", method: "system.wake", params: { sleptMs: 300_000 } }) + "\n",
+  );
+  await until(() => events.length >= 1, "telegram post-wake event", 1_500);
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 1_000, `telegram wake abort took ${elapsed}ms, expected <1000ms`);
+  assert.equal(events[0].data.text, "arrived-after-telegram-wake");
+  assert.ok(pollCount >= 2);
+});
+
+test("Issue #29: slack plugin aborts stalled Socket Mode WebSocket immediately on system.wake", async () => {
+  const { createHash } = await import("node:crypto");
+  const http = await import("node:http");
+  let openCalls = 0;
+  let wsConns = 0;
+  const openSockets = new Set();
+  let firstWsOpen = false;
+
+  // Minimal RFC 6455 text frame encoder (server -> client, unmasked).
+  function wsTextFrame(str) {
+    const payload = Buffer.from(str, "utf8");
+    if (payload.length < 126) {
+      return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+    }
+    const hdr = Buffer.alloc(4);
+    hdr[0] = 0x81;
+    hdr[1] = 126;
+    hdr.writeUInt16BE(payload.length, 2);
+    return Buffer.concat([hdr, payload]);
+  }
+
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    if (req.url?.endsWith("/auth.test")) {
+      res.end(JSON.stringify({ ok: true, user_id: "UBOT1", team_id: "TWAKE" }));
+      return;
+    }
+    if (req.url?.endsWith("/apps.connections.open")) {
+      openCalls += 1;
+      const { port } = server.address();
+      res.end(JSON.stringify({ ok: true, url: `ws://127.0.0.1:${port}/ws?n=${openCalls}` }));
+      return;
+    }
+    res.end(JSON.stringify({ ok: false, error: "not_found" }));
+  });
+
+  server.on("upgrade", (req, socket) => {
+    const key = req.headers["sec-websocket-key"];
+    const accept = createHash("sha1")
+      .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+      .digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    socket.on("error", () => {});
+    openSockets.add(socket);
+    socket.on("close", () => openSockets.delete(socket));
+    wsConns += 1;
+    if (wsConns === 1) {
+      // Hold WebSocket #1 open silently (never reply to close frames either!) to simulate half-open socket.
+      firstWsOpen = true;
+    } else if (wsConns === 2) {
+      // On reconnected WebSocket #2 after wake, push a Slack DM event!
+      const envelope = {
+        envelope_id: "env-wake-1",
+        type: "events_api",
+        payload: {
+          event: {
+            type: "message",
+            channel_type: "im",
+            user: "UALICE",
+            channel: "DWAKE1",
+            ts: "1700000001.000100",
+            text: "arrived-after-slack-wake",
+          },
+        },
+      };
+      socket.write(wsTextFrame(JSON.stringify(envelope)));
+    }
+  });
+
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(
+    () =>
+      new Promise((resolve) => {
+        for (const s of openSockets) {
+          try {
+            s.destroy();
+          } catch {}
+        }
+        openSockets.clear();
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  );
+  const { port } = server.address();
+
+  const child = spawn(process.execPath, [SLACK_SCRIPT], {
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      HYPHAE_FD: "3",
+      HYPHAE_PLUGIN: "slack",
+      SLACK_APP_TOKEN: "xapp-test-wake-token",
+      SLACK_BOT_TOKEN: "xoxb-test-wake-token",
+      SLACK_ALLOWED_USERS: "UALICE",
+      SLACK_TARGET: "ops",
+      SLACK_API_BASE: `http://127.0.0.1:${port}`,
+    },
+    stdio: ["ignore", "ignore", "pipe", "pipe"],
+  });
+  const channel = child.stdio[3];
+  const events = [];
+  let exitInfo = null;
+  child.on("exit", (code, signal) => {
+    exitInfo = { code, signal };
+  });
+  channel.on("error", () => {});
+  createInterface({ input: channel }).on("line", (line) => {
+    if (!line.trim()) return;
+    const msg = JSON.parse(line);
+    if (msg.type === "event") {
+      events.push(msg.event);
+      channel.write(JSON.stringify({ type: "ack", id: msg.event.id, status: "stored" }) + "\n");
+    }
+  });
+  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: "slack", targets: ["ops"] }) + "\n");
+  cleanups.push(
+    () =>
+      new Promise((resolve) => {
+        try {
+          channel.destroy();
+        } catch {}
+        if (exitInfo !== null) return resolve();
+        child.once("exit", () => resolve());
+        child.kill("SIGKILL");
+      }),
+  );
+
+  await until(() => firstWsOpen, "first slack Socket Mode WS connected");
+  assert.equal(events.length, 0);
+
+  const t0 = Date.now();
+  channel.write(
+    JSON.stringify({ jsonrpc: "2.0", method: "system.wake", params: { sleptMs: 600_000 } }) + "\n",
+  );
+  await until(() => events.length >= 1, "slack post-wake event", 1_500);
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 1_000, `slack wake recycle took ${elapsed}ms, expected <1000ms`);
+  assert.equal(events[0].data.text, "arrived-after-slack-wake");
+  assert.ok(wsConns >= 2);
 });

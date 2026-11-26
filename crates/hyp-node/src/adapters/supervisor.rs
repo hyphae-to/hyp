@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use hyp_proto::rpc::{
     DeliveryFailedParams, JsonRpcNotification, JsonRpcRequest, LegacyV1Frame,
-    METHOD_DELIVERY_FAILED, METHOD_POST, METHOD_STATUS, PluginFrame, PostParams, RpcId,
-    StatusParams, encode_frame,
+    METHOD_DELIVERY_FAILED, METHOD_POST, METHOD_STATUS, METHOD_SYSTEM_WAKE, PluginFrame,
+    PostParams, RpcId, StatusParams, SystemWakeParams, encode_frame,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -563,6 +563,34 @@ impl SubprocessSupervisor {
             ))
         };
 
+        let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
+        tx.send(wire)
+            .await
+            .map_err(|_| AdapterError::NotRunning(self.inner.config.id.clone()))
+    }
+
+    /// Sends a best-effort JSON-RPC 2.0 `system.wake` notification (`{ "jsonrpc": "2.0",
+    /// "method": "system.wake", "params": { "sleptMs": <u64> } }`) to the running subprocess so
+    /// external bridge/source plugins can recycle half-open sockets and polls immediately.
+    ///
+    /// Because this is a JSON-RPC 2.0 notification (no `id`), older or custom plugins that do not
+    /// implement `system.wake` ignore it cleanly without crashing.
+    pub async fn send_system_wake(&self, slept_for: Duration) -> Result<(), AdapterError> {
+        let tx = {
+            let guard = self.inner.active.lock().await;
+            let Some(conn) = guard.as_ref() else {
+                return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
+            };
+            conn.tx.clone()
+        };
+
+        let slept_ms = slept_for.as_millis().min(u64::MAX as u128) as u64;
+        let params = serde_json::to_value(SystemWakeParams { slept_ms })
+            .map_err(|e| AdapterError::Protocol(e.to_string()))?;
+        let frame = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
+            METHOD_SYSTEM_WAKE,
+            Some(params),
+        ));
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         tx.send(wire)
             .await

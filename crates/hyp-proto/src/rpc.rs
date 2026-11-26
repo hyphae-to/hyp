@@ -18,6 +18,7 @@ pub const METHOD_PUBLISH: &str = "hyphae/publish";
 pub const METHOD_POST: &str = "hyphae/post";
 pub const METHOD_STATUS: &str = "hyphae/status";
 pub const METHOD_DELIVERY_FAILED: &str = "hyphae/deliveryFailed";
+pub const METHOD_SYSTEM_WAKE: &str = "system.wake";
 
 // ---- Standard JSON-RPC 2.0 error codes + Hyphae server codes ----
 
@@ -181,6 +182,12 @@ pub struct DeliveryFailedParams {
     pub target: String,
     pub events: Vec<EventKeyRef>,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemWakeParams {
+    pub slept_ms: u64,
 }
 
 // ---- Legacy fd-3 v1 Frame Types (`src/core/plugins/protocol.ts`) ----
@@ -506,6 +513,17 @@ mod tests {
             json!({"status": "stored"}),
         ));
         assert_eq!(decode_frame(&encode_frame(&resp).unwrap()).unwrap(), resp);
+
+        let wake = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
+            METHOD_SYSTEM_WAKE,
+            Some(serde_json::to_value(SystemWakeParams { slept_ms: 600_000 }).unwrap()),
+        ));
+        let wake_wire = encode_frame(&wake).unwrap();
+        assert_eq!(
+            wake_wire,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"system.wake\",\"params\":{\"sleptMs\":600000}}\n"
+        );
+        assert_eq!(decode_frame(&wake_wire).unwrap(), wake);
     }
 
     #[test]

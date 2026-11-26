@@ -246,14 +246,37 @@ function saveOffset(next) {
 }
 
 let backoff = 1000;
+let pollAbort = null;
+let cancelBackoff = null;
+let wakeRequested = false;
+
+mesh.onWake(() => {
+  wakeRequested = true;
+  backoff = 1000;
+  if (pollAbort) {
+    const ac = pollAbort;
+    pollAbort = null;
+    ac.abort(new Error("system.wake"));
+  }
+  if (cancelBackoff) {
+    const cancel = cancelBackoff;
+    cancelBackoff = null;
+    cancel();
+  }
+});
+
 while (true) {
+  wakeRequested = false;
+  const ac = new AbortController();
+  pollAbort = ac;
   try {
     const res = await fetch(`${apiBase}/bot${token}/getUpdates`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ offset, timeout: 30, allowed_updates: ["message", "edited_message"] }),
-      signal: AbortSignal.timeout(40_000),
+      signal: AbortSignal.any([AbortSignal.timeout(40_000), ac.signal]),
     });
+    if (pollAbort === ac) pollAbort = null;
     const body = await res.json();
     if (!body.ok || !Array.isArray(body.result)) {
       throw new Error(`Telegram getUpdates failed: ${body.description ?? res.status}`);
@@ -307,8 +330,28 @@ while (true) {
       saveOffset(nextOffset);
     }
   } catch (error) {
+    if (pollAbort === ac) pollAbort = null;
+    if (wakeRequested) {
+      wakeRequested = false;
+      backoff = 1000;
+      continue;
+    }
     console.error(`telegram poll error: ${redactToken(error instanceof Error ? error.message : String(error))}`);
-    await new Promise((r) => setTimeout(r, backoff));
-    backoff = Math.min(backoff * 2, 30_000);
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        cancelBackoff = null;
+        resolve();
+      }, backoff);
+      cancelBackoff = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    if (wakeRequested) {
+      wakeRequested = false;
+      backoff = 1000;
+    } else {
+      backoff = Math.min(backoff * 2, 30_000);
+    }
   }
 }

@@ -59,6 +59,7 @@ export class MeshPluginClient {
   #fatal = false;
   #fatalHandler = null;
   #onPost;
+  #onWake;
   #onError;
 
   constructor({
@@ -66,11 +67,13 @@ export class MeshPluginClient {
     onStatus,
     onDeliveryFailed,
     onPost,
+    onWake,
     onError,
     handleFatalErrors = true,
   } = {}) {
     this.plugin = process.env.HYPHAE_PLUGIN ?? process.env.AGENTS_MESH_PLUGIN ?? process.env.T3_MESH_PLUGIN ?? "plugin";
     this.#onPost = onPost;
+    this.#onWake = onWake;
     this.#onError = onError;
 
     const pluginAddr = fd === undefined ? process.env.HYPHAE_PLUGIN_ADDR?.trim() : "";
@@ -190,6 +193,8 @@ export class MeshPluginClient {
           onDeliveryFailed?.(msg);
         } else if (msg.type === "request" && typeof msg.id === "string") {
           void this.#handleRequest(msg);
+        } else if (msg.method === "system.wake" && msg.id === undefined) {
+          this.#handleSystemWake(msg);
         }
       });
       rl.on("close", () => {
@@ -283,6 +288,28 @@ export class MeshPluginClient {
   /** Register or replace the outbound `hyp_plugin_post` handler for this plugin. */
   onPost(handler) {
     this.#onPost = handler;
+  }
+
+  /** Register or replace the host sleep/wake recovery notification handler (`system.wake`). */
+  onWake(handler) {
+    this.#onWake = handler;
+  }
+
+  #handleSystemWake(msg) {
+    if (typeof this.#onWake !== "function") return;
+    const rawSlept = Number(msg.params?.sleptMs ?? 0);
+    const sleptMs = Number.isFinite(rawSlept) && rawSlept >= 0 ? rawSlept : 0;
+    try {
+      void Promise.resolve(this.#onWake({ sleptMs })).catch((err) => {
+        console.error(
+          `${this.plugin} plugin wake handler error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    } catch (err) {
+      console.error(
+        `${this.plugin} plugin wake handler error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   async #handleRequest(msg) {

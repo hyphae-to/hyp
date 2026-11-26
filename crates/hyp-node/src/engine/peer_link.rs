@@ -1091,14 +1091,23 @@ fn is_permanent_sse_auth_denial(status: StatusCode, body: &[u8]) -> bool {
         || text.contains("all grants for peer")
 }
 
+async fn wait_for_wake(wake_rx: &mut watch::Receiver<u64>) {
+    if wake_rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Spawns a background WHATWG SSE `/v1/inbox` worker for `link` with crash-safe
 /// commit-before-ack semantics and exponential backoff reconnect.
 ///
-/// Security / resilience (P1-20):
+/// Security / resilience (P1-20, Issue #29):
 /// - On HTTP `403` with a permanent revocation or `not_granted` denial body, stops polling
 ///   until the next `reconcile_peers` or node restart.
 /// - On HTTP `401` or other `403`, applies strong exponential backoff (`2s .. 60s`) instead of
 ///   tight-loop retrying.
+/// - On host sleep/wake (`node.subscribe_wake_epoch()`), immediately aborts any active
+///   half-open HTTP/SSE stream or backoff sleep, resets exponential backoff, and reconnects
+///   right away to pull missed messages and flush pending outbox.
 /// - On malformed SSE item JSON, logs and skips cleanly (best-effort reject-ack if an event ID
 ///   is available) without stalling the stream.
 pub fn spawn_sse_worker(
@@ -1106,6 +1115,7 @@ pub fn spawn_sse_worker(
     link: Arc<PeerLink>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
+    let mut wake_rx = node.subscribe_wake_epoch();
     tokio::spawn(async move {
         let mut backoff_ms = SSE_INITIAL_BACKOFF_MS;
         let mut auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
@@ -1116,13 +1126,21 @@ pub fn spawn_sse_worker(
                 break;
             }
 
-            let (_stream_cancel_tx, stream_cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let (stream_cancel_tx, stream_cancel_rx) = tokio::sync::oneshot::channel::<()>();
             let connect_res = tokio::select! {
-                res = link.open_inbox_sse_cancellable(last_event_id.as_deref(), Some(stream_cancel_rx)) => res,
+                biased;
                 _ = shutdown_rx.changed() => {
+                    let _ = stream_cancel_tx.send(());
                     if *shutdown_rx.borrow() { break; }
                     continue;
                 }
+                _ = wait_for_wake(&mut wake_rx) => {
+                    let _ = stream_cancel_tx.send(());
+                    backoff_ms = SSE_INITIAL_BACKOFF_MS;
+                    auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
+                    continue;
+                }
+                res = link.open_inbox_sse_cancellable(last_event_id.as_deref(), Some(stream_cancel_rx)) => res,
             };
 
             match connect_res {
@@ -1135,13 +1153,25 @@ pub fn spawn_sse_worker(
                     let mut body = resp.into_body();
                     let mut parser = SseParser::new();
 
+                    let mut wake_triggered = false;
                     loop {
                         let next_frame = tokio::select! {
-                            frame = body.frame() => frame,
+                            biased;
                             _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() { return; }
+                                if *shutdown_rx.borrow() {
+                                    let _ = stream_cancel_tx.send(());
+                                    return;
+                                }
                                 continue;
                             }
+                            _ = wait_for_wake(&mut wake_rx) => {
+                                let _ = stream_cancel_tx.send(());
+                                backoff_ms = SSE_INITIAL_BACKOFF_MS;
+                                auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
+                                wake_triggered = true;
+                                break;
+                            }
+                            frame = body.frame() => frame,
                         };
 
                         match next_frame {
@@ -1164,6 +1194,10 @@ pub fn spawn_sse_worker(
                             }
                             Some(Err(_)) | None => break,
                         }
+                    }
+                    drop(body);
+                    if wake_triggered {
+                        continue;
                     }
                 }
                 Ok(resp)
@@ -1190,11 +1224,21 @@ pub fn spawn_sse_worker(
                         .max(auth_backoff_ms)
                         .min(SSE_AUTH_MAX_BACKOFF_MS);
                     let wait = Duration::from_millis(wait_ms);
+                    let mut woke = false;
                     tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
+                        biased;
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() { break; }
                         }
+                        _ = wait_for_wake(&mut wake_rx) => {
+                            backoff_ms = SSE_INITIAL_BACKOFF_MS;
+                            auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
+                            woke = true;
+                        }
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    if woke {
+                        continue;
                     }
                     auth_backoff_ms =
                         (auth_backoff_ms.saturating_mul(2)).min(SSE_AUTH_MAX_BACKOFF_MS);
@@ -1202,21 +1246,41 @@ pub fn spawn_sse_worker(
                 Ok(resp) => {
                     let retry_ms = parse_retry_after_ms(resp.headers()).unwrap_or(backoff_ms);
                     let wait = Duration::from_millis(retry_ms.min(SSE_MAX_BACKOFF_MS));
+                    let mut woke = false;
                     tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
+                        biased;
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() { break; }
                         }
+                        _ = wait_for_wake(&mut wake_rx) => {
+                            backoff_ms = SSE_INITIAL_BACKOFF_MS;
+                            auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
+                            woke = true;
+                        }
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    if woke {
+                        continue;
                     }
                     backoff_ms = (backoff_ms * 2).min(SSE_MAX_BACKOFF_MS);
                 }
                 Err(_) => {
                     let wait = Duration::from_millis(backoff_ms);
+                    let mut woke = false;
                     tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
+                        biased;
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() { break; }
                         }
+                        _ = wait_for_wake(&mut wake_rx) => {
+                            backoff_ms = SSE_INITIAL_BACKOFF_MS;
+                            auth_backoff_ms = SSE_AUTH_INITIAL_BACKOFF_MS;
+                            woke = true;
+                        }
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    if woke {
+                        continue;
                     }
                     backoff_ms = (backoff_ms * 2).min(SSE_MAX_BACKOFF_MS);
                 }

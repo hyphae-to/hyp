@@ -18,7 +18,7 @@ use hyp_crypto::keystore::{SecretBackend, validate_secret_name};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_harness::daemon::{
     BoxFuture as DaemonBoxFuture, DEFAULT_PEERS_RELOAD_TIMEOUT, DaemonError, DeliveryRetryConfig,
-    LocalDaemon, LocalDaemonConfig, PeersReloader,
+    LocalDaemon, LocalDaemonConfig, PeersReloader, WakeRecoveryConfig,
 };
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::adapters::github_public::normalize_repo_token_pattern;
@@ -30,9 +30,10 @@ use hyp_node::adapters::{
 };
 use hyp_node::engine::config::{ForwardingPolicy, validate_trusted_proxy_cidr};
 use hyp_node::engine::{
-    DEFAULT_PEER_SOCKET_FILENAME, DropRelayConfig, E2eePolicy, EscalationConfig,
-    GuestPairingConfig, LocalIngestConfig, LocalIngestServer, NodeConfig, NodeProfile,
-    PeerReconcileReport, TopicConfig, UnifiedNode, normalize_drop_portal_url,
+    DEFAULT_PEER_SOCKET_FILENAME, DEFAULT_WAKE_CHECK_INTERVAL_SECS, DropRelayConfig, E2eePolicy,
+    EscalationConfig, GuestPairingConfig, LocalIngestConfig, LocalIngestServer, NodeConfig,
+    NodeProfile, PeerReconcileReport, TopicConfig, UnifiedNode, normalize_drop_portal_url,
+    spawn_wake_watcher,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_proto::address::{
@@ -380,6 +381,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     let mut github_public_cfg: Option<GitHubPublicConfig> = None;
     let mut webhook_sources = ParsedWebhookSources::default();
     let mut delivery_retry_cfg = DeliveryRetryConfig::default();
+    let mut wake_recovery_cfg = WakeRecoveryConfig::default();
     let mut parsed_plugins: Vec<ParsedPlugin> = Vec::new();
     let mut skipped_plugin_statuses: Vec<Value> = Vec::new();
 
@@ -452,6 +454,21 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                         "Invalid deliveryRetry config in {}: {e}",
                         cfg.path.display()
                     ),
+                    None,
+                );
+            }
+        }
+
+        // Parse optional `wakeRecovery` sleep/wake detector & recovery settings.
+        match parse_wake_recovery_config(&cfg.raw) {
+            Ok(wr_cfg) => wake_recovery_cfg = wr_cfg,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "CONFIG_ERROR",
+                    format!("Invalid wakeRecovery config in {}: {e}", cfg.path.display()),
                     None,
                 );
             }
@@ -959,6 +976,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 socket_path: explicit_socket,
                 auto_detect_transports: true,
                 delivery_retry: delivery_retry_cfg,
+                wake_recovery: wake_recovery_cfg.clone(),
                 ..Default::default()
             };
             match LocalDaemon::start(Arc::clone(&node), gate_pipeline.clone(), local_cfg).await {
@@ -1037,6 +1055,41 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             &mut startup_warnings,
         )
         .await;
+
+        // Wire best-effort `system.wake` JSON-RPC notifications into running external plugins.
+        // When `LocalDaemon` is active, its built-in wake watcher invokes this hook; for headless
+        // nodes without `LocalDaemon`, spawn a lightweight node-only wake watcher.
+        let mut headless_wake_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
+        let mut headless_wake_task = None;
+        if let Some(ref daemon) = local_daemon {
+            if !running_plugins.is_empty() {
+                let wake_plugins = running_plugins.clone();
+                daemon.on_system_wake(move |slept_for| {
+                    let plugins = wake_plugins.clone();
+                    async move {
+                        plugin_runtime::notify_plugins_wake(&plugins, slept_for).await;
+                    }
+                });
+            }
+        } else if wake_recovery_cfg.enabled {
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let wake_node = Arc::clone(&node);
+            let wake_plugins = running_plugins.clone();
+            headless_wake_task = Some(spawn_wake_watcher(
+                Duration::from_secs(DEFAULT_WAKE_CHECK_INTERVAL_SECS),
+                wake_recovery_cfg.min_sleep_duration(),
+                rx,
+                move |ev| {
+                    let n = Arc::clone(&wake_node);
+                    let plugins = wake_plugins.clone();
+                    async move {
+                        n.notify_system_wake(ev.slept_for);
+                        plugin_runtime::notify_plugins_wake(&plugins, ev.slept_for).await;
+                    }
+                },
+            ));
+            headless_wake_shutdown = Some(tx);
+        }
 
         let plugin_statuses = plugin_registry.snapshot();
 
@@ -1257,6 +1310,14 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         wait_for_shutdown_signal().await;
+
+        if let Some(tx) = headless_wake_shutdown {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = headless_wake_task {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         plugin_runtime::stop_plugins(running_plugins).await;
 
@@ -2342,6 +2403,48 @@ fn parse_delivery_retry_config(raw: &Value) -> Result<DeliveryRetryConfig, Strin
         parse_delivery_retry_fields(obj, &mut cfg)?;
     }
 
+    Ok(cfg)
+}
+
+fn parse_wake_recovery_config(raw: &Value) -> Result<WakeRecoveryConfig, String> {
+    let mut cfg = WakeRecoveryConfig::default();
+    let Some(wr_val) = raw.as_object().and_then(|o| o.get("wakeRecovery")) else {
+        return Ok(cfg);
+    };
+    let obj = wr_val
+        .as_object()
+        .ok_or_else(|| "wakeRecovery must be a JSON object".to_string())?;
+    if let Some(raw_enabled) = obj.get("enabled") {
+        cfg.enabled = raw_enabled
+            .as_bool()
+            .ok_or_else(|| "wakeRecovery.enabled must be a boolean".to_string())?;
+    }
+    if let Some(raw_secs) = obj
+        .get("minSleepSeconds")
+        .or_else(|| obj.get("min_sleep_seconds"))
+    {
+        let secs = raw_secs
+            .as_u64()
+            .filter(|&v| v >= 1)
+            .ok_or_else(|| "wakeRecovery.minSleepSeconds must be an integer >= 1".to_string())?;
+        cfg.min_sleep_seconds = secs;
+    }
+    if let Some(raw_active) = obj
+        .get("notifyInterruptedActive")
+        .or_else(|| obj.get("notify_interrupted_active"))
+    {
+        cfg.notify_interrupted_active = raw_active
+            .as_bool()
+            .ok_or_else(|| "wakeRecovery.notifyInterruptedActive must be a boolean".to_string())?;
+    }
+    if let Some(raw_all) = obj
+        .get("notifyAllEnrolled")
+        .or_else(|| obj.get("notify_all_enrolled"))
+    {
+        cfg.notify_all_enrolled = raw_all
+            .as_bool()
+            .ok_or_else(|| "wakeRecovery.notifyAllEnrolled must be a boolean".to_string())?;
+    }
     Ok(cfg)
 }
 
@@ -3438,6 +3541,20 @@ mod plugin_runtime {
         (started, registry)
     }
 
+    pub(super) async fn notify_plugins_wake(
+        plugins: &[Arc<SubprocessSupervisor>],
+        slept_for: Duration,
+    ) {
+        let mut join_set = tokio::task::JoinSet::new();
+        for sup in plugins {
+            let sup = Arc::clone(sup);
+            join_set.spawn(async move {
+                let _ = sup.send_system_wake(slept_for).await;
+            });
+        }
+        while join_set.join_next().await.is_some() {}
+    }
+
     pub(super) async fn stop_plugins(plugins: Vec<Arc<SubprocessSupervisor>>) {
         for sup in plugins {
             let _ = sup.stop().await;
@@ -3512,6 +3629,51 @@ mod tests {
             }
         ]);
         assert!(parse_webhook_sources(&unauth_prom, &secrets).is_err());
+    }
+
+    #[test]
+    fn parse_wake_recovery_config_handles_defaults_camel_snake_and_rejects_invalid() {
+        let def = parse_wake_recovery_config(&json!({})).expect("defaults");
+        assert_eq!(def, WakeRecoveryConfig::default());
+
+        let camel = parse_wake_recovery_config(&json!({
+            "wakeRecovery": {
+                "enabled": false,
+                "minSleepSeconds": 45,
+                "notifyInterruptedActive": false,
+                "notifyAllEnrolled": true
+            }
+        }))
+        .expect("camelCase");
+        assert!(!camel.enabled);
+        assert_eq!(camel.min_sleep_seconds, 45);
+        assert!(!camel.notify_interrupted_active);
+        assert!(camel.notify_all_enrolled);
+
+        let snake = parse_wake_recovery_config(&json!({
+            "wakeRecovery": {
+                "min_sleep_seconds": 30,
+                "notify_interrupted_active": true,
+                "notify_all_enrolled": false
+            }
+        }))
+        .expect("snake_case");
+        assert!(snake.enabled);
+        assert_eq!(snake.min_sleep_seconds, 30);
+
+        // Fail closed on invalid shapes/types.
+        assert!(parse_wake_recovery_config(&json!({ "wakeRecovery": [] })).is_err());
+        assert!(
+            parse_wake_recovery_config(&json!({ "wakeRecovery": { "enabled": "yes" } })).is_err()
+        );
+        assert!(
+            parse_wake_recovery_config(&json!({ "wakeRecovery": { "minSleepSeconds": 0 } }))
+                .is_err()
+        );
+        assert!(
+            parse_wake_recovery_config(&json!({ "wakeRecovery": { "notifyAllEnrolled": 1 } }))
+                .is_err()
+        );
     }
 
     #[test]

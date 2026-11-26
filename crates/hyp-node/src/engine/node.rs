@@ -121,6 +121,7 @@ use crate::engine::peer_link::{
     PutKvEpochRequest, PutSubscriptionsRequest, SubscriptionInputWire, guest_pair_proof_canonical,
     http_auth_signing_input, spawn_sse_worker,
 };
+use crate::engine::wake::SystemWakeEvent;
 use crate::gates::{
     GateDecision, InboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
     VerifiedHumanClaim,
@@ -339,6 +340,8 @@ pub struct UnifiedNode {
     local_inbox_tx: broadcast::Sender<String>,
     in_flight_by_peer: Mutex<HashMap<String, HashSet<String>>>,
     scheduler_notify: Arc<Notify>,
+    wake_epoch: watch::Sender<u64>,
+    last_wake: Mutex<Option<SystemWakeEvent>>,
     shutdown_tx: watch::Sender<bool>,
     scheduler_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -443,6 +446,7 @@ impl UnifiedNode {
         );
         let (inbox_tx, _) = broadcast::channel(256);
         let (local_inbox_tx, _) = broadcast::channel(256);
+        let (wake_epoch, _) = watch::channel(0u64);
         let (shutdown_tx, _) = watch::channel(false);
 
         let node = Arc::new(Self {
@@ -474,6 +478,8 @@ impl UnifiedNode {
             local_inbox_tx,
             in_flight_by_peer: Mutex::new(HashMap::new()),
             scheduler_notify: Arc::new(Notify::new()),
+            wake_epoch,
+            last_wake: Mutex::new(None),
             shutdown_tx,
             scheduler_handle: Mutex::new(None),
         });
@@ -912,6 +918,48 @@ impl UnifiedNode {
     /// Subscribes to zero-polling wakeups when new items land in any local session mailbox.
     pub fn subscribe_local_inbox(&self) -> broadcast::Receiver<String> {
         self.local_inbox_tx.subscribe()
+    }
+
+    /// Subscribes to the shared monotonic system wake epoch incremented whenever the host
+    /// resumes from sleep/suspend (`PeerLink` SSE workers and external Drop Relay watchers
+    /// observe this channel to immediately abort half-open sockets and reset backoff).
+    pub fn subscribe_wake_epoch(&self) -> watch::Receiver<u64> {
+        self.wake_epoch.subscribe()
+    }
+
+    /// Returns the current monotonic system wake epoch (`0` until the first wake event).
+    pub fn current_wake_epoch(&self) -> u64 {
+        *self.wake_epoch.borrow()
+    }
+
+    /// Returns the most recent [`SystemWakeEvent`] observed by this node, if any.
+    pub fn last_system_wake(&self) -> Option<SystemWakeEvent> {
+        *self.last_wake.lock().expect("last_wake lock poisoned")
+    }
+
+    /// Signals a host sleep/wake recovery pass:
+    /// 1. Increments `wake_epoch` so all `PeerLink` SSE workers and external Drop Relay SSE
+    ///    watchers immediately abort half-open sockets, reset backoff, and reconnect.
+    /// 2. Wakes any server-side peer inbox SSE streams.
+    /// 3. Sweeps pending local topic batches whose coalesce windows elapsed during sleep.
+    /// 4. Kicks the exact zero-polling deadline scheduler immediately.
+    ///
+    /// Returns the newly incremented `wake_epoch`.
+    pub fn notify_system_wake(&self, slept_for: Duration) -> u64 {
+        let ev = SystemWakeEvent {
+            slept_for,
+            woke_at_ms: now_ms(),
+        };
+        *self.last_wake.lock().expect("last_wake lock poisoned") = Some(ev);
+        let mut next_epoch = 0u64;
+        self.wake_epoch.send_modify(|epoch| {
+            *epoch = epoch.saturating_add(1);
+            next_epoch = *epoch;
+        });
+        self.notify_all_inbox_subscribers();
+        let _ = self.flush_pending_local_topic_batches_inner(false);
+        self.notify_scheduler();
+        next_epoch
     }
 
     /// Immediately wakes the background zero-polling deadline scheduler loop.

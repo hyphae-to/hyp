@@ -11,6 +11,7 @@ pub mod local_ingest;
 pub mod node;
 pub mod peer_link;
 pub mod server;
+pub mod wake;
 
 pub use config::{
     ChannelMode, ChannelPolicy, DEFAULT_DROP_PORTAL_URL, DEFAULT_HYPHAE_VERSION,
@@ -44,3 +45,8 @@ pub use peer_link::{
     PeerAuth, PeerKeyDirectoryEntry, PeerKeysResponse, PeerLink, guest_pair_proof_canonical,
 };
 pub use server::DEFAULT_PEER_SOCKET_FILENAME;
+pub use wake::{
+    DEFAULT_WAKE_CHECK_INTERVAL_SECS, DEFAULT_WAKE_MIN_SLEEP_SECONDS, SleepWakeDetector,
+    SystemWakeEvent, WakeRecoveryConfig, detect_sleep_gap, format_human_duration,
+    spawn_wake_watcher,
+};
