@@ -719,7 +719,6 @@ const NON_RESTRICTED_SCOPE_TOKENS: &[&str] = &[
     "events:*",
     "files:*",
     "kv:*",
-    "forks:*",
     "messages:send",
     "messages:receive",
     "events:subscribe",
@@ -746,12 +745,6 @@ const NON_RESTRICTED_SCOPE_TOKENS: &[&str] = &[
     "kv:read=shared/*",
     "kv:write=*",
     "kv:write=shared/plan*",
-    "forks:send",
-    "forks:send=alice@mac",
-    "forks:receive/approval-required",
-    "forks:receive/auto-accept-edits",
-    "forks:receive/auto",
-    "forks:receive/full-access",
 ];
 
 const MALFORMED_ESCALATION_ATTEMPTS: &[&str] = &[
@@ -766,6 +759,10 @@ const MALFORMED_ESCALATION_ATTEMPTS: &[&str] = &[
     "forward:via=",
     "forward:via=*.*",
     "forward:via=-bad",
+    "forks:receive",
+    "forks:receive/bogus",
+    "forks:send=",
+    "forks:send=BAD!",
     "admin:*",
     "**",
     "*:*",
@@ -844,9 +841,11 @@ fn fuzz_v1_v2_scopes_never_escalate_restricted_privileges() {
             panic!("seed=0x{seed:016x} step={step}: expand_v2_scopes failed on valid tokens: {e}")
         });
         assert!(
-            !expanded_v2
-                .iter()
-                .any(|s| s.starts_with("bridge:post") || s.starts_with("forward:via")),
+            !expanded_v2.iter().any(|s| {
+                s.starts_with("bridge:post")
+                    || s.starts_with("forward:via")
+                    || s.starts_with("forks:")
+            }),
             "seed=0x{seed:016x} step={step}: expand_v2_scopes leaked restricted scope in {expanded_v2:?}"
         );
 
@@ -861,6 +860,7 @@ fn fuzz_v1_v2_scopes_never_escalate_restricted_privileges() {
         let set_direct = ScopeSet::from_strings(&valid_tokens);
         let set_expanded = ScopeSet::from_strings(&combined_with_bogus);
         let set_rfc = ScopeSet::from_rfc6749(&combined_with_bogus.join(" "));
+        let set_parsed = ScopeSet::parse(&combined_with_bogus.join(","));
 
         // Also test v1 scope expansion sets.
         let v1_pick: Vec<&str> = (0..rng.gen_range(1..=3))
@@ -871,11 +871,12 @@ fn fuzz_v1_v2_scopes_never_escalate_restricted_privileges() {
             Err(_) => ScopeSet::from_strings(&v1_pick),
         };
 
-        for (label, set) in [
-            ("direct", &set_direct),
-            ("expanded+bogus", &set_expanded),
-            ("rfc6749", &set_rfc),
-            ("v1", &set_v1),
+        for (label, set, check_forks) in [
+            ("direct", &set_direct, true),
+            ("expanded+bogus", &set_expanded, true),
+            ("rfc6749", &set_rfc, true),
+            ("parsed", &set_parsed, true),
+            ("v1", &set_v1, false),
         ] {
             for &plugin in &probe_plugins {
                 for &target in &probe_targets {
@@ -890,6 +891,20 @@ fn fuzz_v1_v2_scopes_never_escalate_restricted_privileges() {
                 assert!(
                     !set.may_forward_via(node),
                     "seed=0x{seed:016x} step={step}: {label} ScopeSet escalated to forward:via({node})! raw={:?}",
+                    set.raw_scopes()
+                );
+                if check_forks {
+                    assert!(
+                        !set.may_send_forks(node),
+                        "seed=0x{seed:016x} step={step}: {label} ScopeSet escalated to forks:send({node})! raw={:?}",
+                        set.raw_scopes()
+                    );
+                }
+            }
+            if check_forks {
+                assert!(
+                    !set.may_fork_out() && set.fork_ceiling().is_none(),
+                    "seed=0x{seed:016x} step={step}: {label} ScopeSet escalated to forks privilege! raw={:?}",
                     set.raw_scopes()
                 );
             }

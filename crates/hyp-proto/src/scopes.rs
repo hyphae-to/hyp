@@ -91,6 +91,9 @@ const V1_BASE_SCOPES: &[&str] = &[
     "forks:receive",
 ];
 
+/// Frozen v1 `t3-mesh` `*` expansion (`src/core/identity/scopes.ts`).
+/// Kept strictly for v1 wire interoperability (`expand_v1_scopes`, `golden_interop.rs`);
+/// Hyphae v2 (`V2_STAR_EXPANSION`, `ScopePreset::Full`, `ScopeSet`) NEVER grants `forks:*` via `*`.
 pub const V1_ALL_SCOPES: &[&str] = &[
     "messages:send",
     "messages:receive",
@@ -251,7 +254,8 @@ impl ScopePreset {
         }
     }
 
-    /// Expands this preset into concrete v2 scope tokens (never includes `bridge:post` or `forward:via`).
+    /// Expands this preset into concrete v2 scope tokens (never includes `bridge:post`,
+    /// `forward:via`, `forks:send`, or `forks:receive/*`).
     pub fn expand(&self) -> Vec<String> {
         match self {
             Self::GuestRo => vec![
@@ -286,7 +290,8 @@ impl ScopePreset {
     }
 }
 
-/// What `*` expands to in Hyphae v2: explicitly EXCLUDES `bridge:post` and `forward:via`!
+/// What `*` expands to in Hyphae v2: explicitly EXCLUDES `bridge:post`, `forward:via`,
+/// `forks:send`, and `forks:receive/*` (all high-privilege opt-in only)!
 pub const V2_STAR_EXPANSION: &[&str] = &[
     "dm:send=*",
     "dm:receive",
@@ -298,8 +303,6 @@ pub const V2_STAR_EXPANSION: &[&str] = &[
     "files:receive",
     "kv:read=*",
     "kv:write=*",
-    "forks:send",
-    "forks:receive/full-access",
     "drop:create",
 ];
 
@@ -430,7 +433,9 @@ pub enum ParsedScopeV2 {
     },
     /// Explicit opt-in only (NEVER implied by `*`).
     ForwardVia(String),
+    /// Explicit opt-in only (NEVER implied by `*`).
     ForksSend(TargetFilter),
+    /// Explicit opt-in only (NEVER implied by `*`).
     ForksReceive(RuntimeMode),
     /// Allows allocating ephemeral blind drop relay slots (`POST /v1/drops`).
     DropCreate,
@@ -830,7 +835,7 @@ fn looks_like_byte_size_with_unit(s: &str) -> bool {
 
 /// Expands v2 shorthands (`*`, `dm:*`, `messages:*`, `channel:*`, `stream:*`, `events:*`,
 /// `files:*`, `kv:*`, `forks:*`) and validates every scope token.
-/// Note: `*` NEVER expands to `bridge:post` or `forward:via`!
+/// Note: `*` NEVER expands to `bridge:post`, `forward:via`, `forks:send`, or `forks:receive/*`!
 pub fn expand_v2_scopes<S: AsRef<str>>(input: &[S]) -> Result<Vec<String>, ScopeError> {
     if input.is_empty() {
         return Err(ScopeError::EmptyScopes);
@@ -897,7 +902,8 @@ impl ScopeSet {
         for item in scopes {
             let s = item.as_ref();
             raw.push(s.to_string());
-            // Note: `*` inside a signed grant is also expanded safely (never implies bridge:post / forward:via).
+            // Note: `*` inside a signed grant is also expanded safely (never implies
+            // bridge:post, forward:via, forks:send, or forks:receive/*).
             if s == "*" {
                 for &star_item in V2_STAR_EXPANSION {
                     if let Ok(parsed) = parse_scope_v2(star_item) {
@@ -911,6 +917,48 @@ impl ScopeSet {
             }
         }
         Self { raw, rules }
+    }
+
+    /// Parses a whitespace- and/or comma-delimited Hyphae v2 scope string (e.g. `"*"`,
+    /// `"dm:send dm:receive"`, or `"forks:send,forks:receive/approval-required"`) without
+    /// breaking parameter commas inside `dm:send=a,b`, `files:send=a,b`, `forks:send=a,b`,
+    /// or `stream:subscribe=github[repo=a/b,c/d]`. Unknown or malformed scopes are ignored
+    /// fail-closed.
+    pub fn parse(raw: &str) -> Self {
+        let mut tokens = Vec::new();
+        for piece in raw.split_ascii_whitespace() {
+            if piece.is_empty() {
+                continue;
+            }
+            if piece == "*" || parse_scope_v2(piece).is_ok() {
+                tokens.push(piece.to_string());
+                continue;
+            }
+            let mut bracket_depth: usize = 0;
+            let mut start = 0usize;
+            for (i, &b) in piece.as_bytes().iter().enumerate() {
+                match b {
+                    b'[' => bracket_depth += 1,
+                    b']' => bracket_depth = bracket_depth.saturating_sub(1),
+                    b',' if bracket_depth == 0 => {
+                        let tail = &piece[i + 1..];
+                        if looks_like_v2_scope_start(tail) {
+                            let seg = &piece[start..i];
+                            if !seg.is_empty() {
+                                tokens.push(seg.to_string());
+                            }
+                            start = i + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let last = &piece[start..];
+            if !last.is_empty() {
+                tokens.push(last.to_string());
+            }
+        }
+        Self::from_strings(&tokens)
     }
 
     /// Parses an RFC 6749 space-delimited scope string (e.g. `"dm:send dm:receive kv:read=shared/*"`).
@@ -1190,7 +1238,7 @@ impl ScopeSet {
         })
     }
 
-    /// v1 `forks:send` check.
+    /// Explicit opt-in only (NEVER granted by `*`!): `forks:send` target check.
     pub fn may_send_forks(&self, to: &str) -> bool {
         self.rules.iter().any(|r| match r {
             ParsedScopeV2::ForksSend(targets) => targets.matches(to),
@@ -1198,13 +1246,14 @@ impl ScopeSet {
         })
     }
 
+    /// Explicit opt-in only (NEVER granted by `*`!): returns `true` if any `forks:send` rule exists.
     pub fn may_fork_out(&self) -> bool {
         self.rules
             .iter()
             .any(|r| matches!(r, ParsedScopeV2::ForksSend(_)))
     }
 
-    /// v1 `forks:receive/<mode>` highest runtime mode, or `None`.
+    /// Explicit opt-in only (NEVER granted by `*`!): `forks:receive/<mode>` highest runtime mode, or `None`.
     pub fn fork_ceiling(&self) -> Option<RuntimeMode> {
         self.rules
             .iter()
@@ -1221,6 +1270,24 @@ impl ScopeSet {
             .iter()
             .any(|r| matches!(r, ParsedScopeV2::DropCreate))
     }
+}
+
+fn looks_like_v2_scope_start(s: &str) -> bool {
+    if s == "*" || s.starts_with("*,") {
+        return true;
+    }
+    let head = s.split([',', '=', '[']).next().unwrap_or("");
+    let Some((ns, action)) = head.split_once(':') else {
+        return false;
+    };
+    !ns.is_empty()
+        && ns.bytes().all(|b| b.is_ascii_lowercase())
+        && !action.is_empty()
+        && (action == "*"
+            || action
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase()))
 }
 
 /// Computes the guaranteed finite set of values of `attribute` required by `filters`
@@ -1395,7 +1462,7 @@ pub struct NotGrantedMcpError {
 }
 
 /// Returns `true` if a raw scope token is forbidden in delegated human admission policies
-/// (`*`, `bridge:post`, or `forward:via`).
+/// (`*`, `bridge:post`, `forward:via`, `forks:*`, `forks:send`, or `forks:receive/*`).
 pub fn is_forbidden_delegated_scope(raw: &str) -> bool {
     let s = raw.trim();
     s == "*"
@@ -1403,12 +1470,18 @@ pub fn is_forbidden_delegated_scope(raw: &str) -> bool {
         || s.starts_with("bridge:post=")
         || s == "forward:via"
         || s.starts_with("forward:via=")
+        || s == "forks:*"
+        || s == "forks:send"
+        || s.starts_with("forks:send=")
+        || s == "forks:receive"
+        || s.starts_with("forks:receive/")
 }
 
 /// Validates a list of concrete expanded Hyphae v2 scopes for delegated human admission
 /// (`HumanInviteV1` / `human_delegation_policies`) fail-closed:
 /// - Rejects empty lists.
-/// - Rejects literal `"*"`, `bridge:post`, and `forward:via` (both syntactically and post-parse).
+/// - Rejects literal `"*"`, `bridge:post`, `forward:via`, `forks:send`, and `forks:receive/*`
+///   (both syntactically and post-parse).
 /// - Validates every concrete token via `parse_scope_v2` and deduplicates preserving order.
 pub fn validate_delegated_human_scopes<S: AsRef<str>>(
     scopes: &[S],
@@ -1429,18 +1502,21 @@ pub fn validate_delegated_human_scopes<S: AsRef<str>>(
         if is_forbidden_delegated_scope(s) {
             return Err(ScopeError::InvalidScope {
                 scope: s.to_string(),
-                reason: "delegated human admission forbids '*', 'bridge:post', and 'forward:via'"
+                reason: "delegated human admission forbids '*', 'bridge:post', 'forward:via', 'forks:send', and 'forks:receive/*'"
                     .to_string(),
             });
         }
         let parsed = parse_scope_v2(s)?;
         if matches!(
             parsed,
-            ParsedScopeV2::BridgePost { .. } | ParsedScopeV2::ForwardVia(_)
+            ParsedScopeV2::BridgePost { .. }
+                | ParsedScopeV2::ForwardVia(_)
+                | ParsedScopeV2::ForksSend(_)
+                | ParsedScopeV2::ForksReceive(_)
         ) {
             return Err(ScopeError::InvalidScope {
                 scope: s.to_string(),
-                reason: "delegated human admission forbids 'bridge:post' and 'forward:via'"
+                reason: "delegated human admission forbids 'bridge:post', 'forward:via', 'forks:send', and 'forks:receive/*'"
                     .to_string(),
             });
         }
@@ -1452,7 +1528,7 @@ pub fn validate_delegated_human_scopes<S: AsRef<str>>(
 }
 
 /// Expands CLI/preset v2 scopes for delegated human admission while strictly rejecting literal `*`,
-/// `bridge:post`, and `forward:via` fail-closed.
+/// `bridge:post`, `forward:via`, `forks:*`, `forks:send`, and `forks:receive/*` fail-closed.
 pub fn expand_delegated_human_scopes<S: AsRef<str>>(
     input: &[S],
 ) -> Result<Vec<String>, ScopeError> {
@@ -1464,7 +1540,7 @@ pub fn expand_delegated_human_scopes<S: AsRef<str>>(
         if is_forbidden_delegated_scope(s) {
             return Err(ScopeError::InvalidScope {
                 scope: s.to_string(),
-                reason: "delegated human admission forbids '*', 'bridge:post', and 'forward:via'"
+                reason: "delegated human admission forbids '*', 'bridge:post', 'forward:via', 'forks:send', and 'forks:receive/*'"
                     .to_string(),
             });
         }
@@ -1567,27 +1643,102 @@ mod tests {
     }
 
     #[test]
-    fn star_never_grants_bridge_post_or_forward_via() {
-        let full = ScopeSet::from_preset(ScopePreset::Full);
-        assert!(full.may_dm_send("bob@laptop/codex"));
-        assert!(full.may_dm_receive());
-        assert!(full.may_channel_join("#incidents"));
-        assert!(full.may_channel_post("#incidents"));
-        assert!(full.may_stream_publish("github"));
-        assert!(full.may_kv_read("shared", "plan"));
-        assert!(full.may_kv_write("shared", "plan"));
-        assert!(full.may_send_files("bob@laptop", Some(1024)));
-        assert!(full.may_receive_files(1024));
-        // Explicitly excluded from `*`!
-        assert!(!full.may_bridge_post("slack", "ops"));
-        assert!(!full.may_forward_via("acme-team"));
+    fn star_never_grants_bridge_post_forward_via_or_forks() {
+        // V2_STAR_EXPANSION & expand_v2_scopes(["*"]) MUST NEVER contain high-privilege scopes.
+        assert!(!V2_STAR_EXPANSION.iter().any(|s| {
+            s.starts_with("bridge:post") || s.starts_with("forward:via") || s.starts_with("forks:")
+        }));
+        let expanded_star = expand_v2_scopes(&["*"]).unwrap();
+        assert!(!expanded_star.iter().any(|s| {
+            s.starts_with("bridge:post") || s.starts_with("forward:via") || s.starts_with("forks:")
+        }));
+        assert_eq!(ScopePreset::Full.expand(), expanded_star);
 
-        // Explicit opt-in works.
+        for (label, set) in [
+            (
+                "ScopePreset::Full",
+                ScopeSet::from_preset(ScopePreset::Full),
+            ),
+            ("ScopeSet::parse(\"*\")", ScopeSet::parse("*")),
+            (
+                "ScopeSet::from_strings(&[\"*\"])",
+                ScopeSet::from_strings(&["*"]),
+            ),
+            ("ScopeSet::from_rfc6749(\"*\")", ScopeSet::from_rfc6749("*")),
+        ] {
+            // Standard scopes remain granted.
+            assert!(set.may_dm_send("bob@laptop/codex"), "{label}");
+            assert!(set.may_dm_receive(), "{label}");
+            assert!(set.may_channel_join("#incidents"), "{label}");
+            assert!(set.may_channel_post("#incidents"), "{label}");
+            assert!(set.may_stream_publish("github"), "{label}");
+            assert!(set.may_kv_read("shared", "plan"), "{label}");
+            assert!(set.may_kv_write("shared", "plan"), "{label}");
+            assert!(set.may_send_files("bob@laptop", Some(1024)), "{label}");
+            assert!(set.may_receive_files(1024), "{label}");
+            assert!(set.allows_drop_create(), "{label}");
+
+            // High-privilege opt-in scopes MUST be denied (#37).
+            assert!(!set.may_bridge_post("slack", "ops"), "{label}");
+            assert!(!set.may_forward_via("acme-team"), "{label}");
+            assert!(!set.may_fork_out(), "{label}");
+            assert!(!set.may_send_forks("bob@laptop"), "{label}");
+            assert!(!set.may_send_forks("*"), "{label}");
+            assert_eq!(set.fork_ceiling(), None, "{label}");
+            assert_ne!(
+                set.fork_ceiling(),
+                Some(RuntimeMode::ApprovalRequired),
+                "{label}"
+            );
+            assert_ne!(
+                set.fork_ceiling(),
+                Some(RuntimeMode::AutoAcceptEdits),
+                "{label}"
+            );
+            assert_ne!(set.fork_ceiling(), Some(RuntimeMode::Auto), "{label}");
+            assert_ne!(set.fork_ceiling(), Some(RuntimeMode::FullAccess), "{label}");
+        }
+
+        // Explicit opt-in still parses cleanly and grants ONLY those exact scopes.
         let explicit = ScopeSet::from_strings(&["bridge:post=slack:ops", "forward:via=acme-team"]);
         assert!(explicit.may_bridge_post("slack", "ops"));
         assert!(!explicit.may_bridge_post("slack", "other"));
         assert!(explicit.may_forward_via("acme-team"));
         assert!(!explicit.may_forward_via("other-hub"));
+        assert!(!explicit.may_fork_out());
+        assert_eq!(explicit.fork_ceiling(), None);
+
+        let explicit_forks = ScopeSet::parse("forks:send,forks:receive/approval-required");
+        assert!(explicit_forks.may_fork_out());
+        assert!(explicit_forks.may_send_forks("bob@laptop"));
+        assert_eq!(
+            explicit_forks.fork_ceiling(),
+            Some(RuntimeMode::ApprovalRequired)
+        );
+        assert!(!explicit_forks.may_dm_send("bob@laptop/codex"));
+        assert!(!explicit_forks.may_dm_receive());
+        assert!(!explicit_forks.may_bridge_post("slack", "ops"));
+        assert!(!explicit_forks.may_forward_via("acme-team"));
+
+        let scoped_forks =
+            ScopeSet::parse("forks:send=alice@mac,bob@lap,forks:receive/auto-accept-edits");
+        assert!(scoped_forks.may_fork_out());
+        assert!(scoped_forks.may_send_forks("alice@mac"));
+        assert!(scoped_forks.may_send_forks("bob@lap"));
+        assert!(!scoped_forks.may_send_forks("carol@box"));
+        assert_eq!(
+            scoped_forks.fork_ceiling(),
+            Some(RuntimeMode::AutoAcceptEdits)
+        );
+
+        let full_fork = ScopeSet::parse("forks:receive/full-access");
+        assert!(!full_fork.may_fork_out());
+        assert_eq!(full_fork.fork_ceiling(), Some(RuntimeMode::FullAccess));
+
+        // Frozen v1 wire-compat (`expand_v1_scopes`) stays intact while v2 stays strictly fail-closed.
+        let v1_star = expand_v1_scopes(&["*"]).unwrap();
+        assert!(v1_star.iter().any(|s| s == "forks:send"));
+        assert!(v1_star.iter().any(|s| s == "forks:receive/full-access"));
     }
 
     #[test]
@@ -1728,15 +1879,22 @@ mod tests {
         let full = ScopePreset::Full.expand();
         assert!(validate_delegated_human_scopes(&full).is_ok());
 
-        // Literal '*', bridge:post, forward:via, empty, and unknown scopes MUST fail closed.
+        // Literal '*', bridge:post, forward:via, forks:*, forks:send, forks:receive/*, empty, and unknown scopes MUST fail closed.
         assert!(validate_delegated_human_scopes(&["*"]).is_err());
         assert!(validate_delegated_human_scopes(&["dm:send", "*"]).is_err());
         assert!(validate_delegated_human_scopes(&["bridge:post=slack:ops"]).is_err());
         assert!(validate_delegated_human_scopes(&["forward:via=hub-b"]).is_err());
+        assert!(validate_delegated_human_scopes(&["forks:send"]).is_err());
+        assert!(validate_delegated_human_scopes(&["forks:send=bob@laptop"]).is_err());
+        assert!(validate_delegated_human_scopes(&["forks:receive/approval-required"]).is_err());
+        assert!(validate_delegated_human_scopes(&["forks:receive/full-access"]).is_err());
         assert!(validate_delegated_human_scopes(&[] as &[&str]).is_err());
         assert!(expand_delegated_human_scopes(&["*"]).is_err());
         assert!(expand_delegated_human_scopes(&["bridge:post=slack:*"]).is_err());
         assert!(expand_delegated_human_scopes(&["forward:via=*"]).is_err());
+        assert!(expand_delegated_human_scopes(&["forks:*"]).is_err());
+        assert!(expand_delegated_human_scopes(&["forks:send"]).is_err());
+        assert!(expand_delegated_human_scopes(&["forks:receive/full-access"]).is_err());
         assert!(expand_delegated_human_scopes(&["dm:*", "kv:read=shared/*"]).is_ok());
 
         // nodePrefix glob validation and matching.

@@ -52,7 +52,7 @@ use hyp_proto::manifest::{
 };
 use hyp_proto::problem::ProblemDetails;
 use hyp_proto::scopes::{
-    EscalationNote, ScopePreset, ScopeSet, V2_STAR_EXPANSION, expand_v2_scopes,
+    EscalationNote, RuntimeMode, ScopePreset, ScopeSet, V2_STAR_EXPANSION, expand_v2_scopes,
 };
 use hyp_store::{
     GrantDirection, GrantInput, KeyStatus, KeyUse, ManifestCacheUpdate, NodeDb, PeerInput,
@@ -476,7 +476,7 @@ fn build_presets() -> Vec<PresetGuide> {
         (
             ScopePreset::Full,
             "full",
-            "Full standard scopes (*) — explicitly EXCLUDES bridge:post and forward:via (opt-in only).",
+            "Full standard scopes (*) — explicitly EXCLUDES bridge:post, forward:via, forks:send, and forks:receive/* (opt-in only).",
         ),
     ]
     .into_iter()
@@ -607,7 +607,9 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> ExitCode {
     }
     println!();
 
-    println!("Scope Presets (note: '*' and 'full' NEVER grant bridge:post or forward:via):");
+    println!(
+        "Scope Presets (note: '*' and 'full' NEVER grant bridge:post, forward:via, forks:send, or forks:receive/*):"
+    );
     for p in &presets {
         println!("  {:<10}  tier={:<6}  {}", p.name, p.trust_tier, p.summary);
         println!("              scopes: {}", p.scopes.join(" "));
@@ -748,8 +750,13 @@ fn project_v2_to_v1_scopes(v2_scopes: &[String]) -> Vec<&'static str> {
     if set.may_fork_out() {
         v1.push("forks:send");
     }
-    if set.fork_ceiling().is_some() {
-        v1.push("forks:receive/full-access");
+    if let Some(ceiling) = set.fork_ceiling() {
+        v1.push(match ceiling {
+            RuntimeMode::ApprovalRequired => "forks:receive/approval-required",
+            RuntimeMode::AutoAcceptEdits => "forks:receive/auto-accept-edits",
+            RuntimeMode::Auto => "forks:receive/auto",
+            RuntimeMode::FullAccess => "forks:receive/full-access",
+        });
     }
     if v1.is_empty() {
         v1.push("events:subscribe");
@@ -774,18 +781,25 @@ fn infer_trust_tier(
     }
 }
 
-/// Returns `true` for high-privilege opt-in scopes (`bridge:post` / `forward:via`) that MUST
-/// NEVER be auto-granted in default counter-grants without explicit `--grant` opt-in (`P1-8`).
+/// Returns `true` for high-privilege opt-in scopes (`bridge:post`, `forward:via`, `forks:send`,
+/// `forks:receive/*`, `forks:*`) that MUST NEVER be auto-granted in default counter-grants
+/// without explicit `--grant` opt-in (`P1-8`, #37).
 fn is_privileged_opt_in_scope(scope: &str) -> bool {
     let s = scope.trim();
     s == "bridge:post"
         || s.starts_with("bridge:post=")
         || s == "forward:via"
         || s.starts_with("forward:via=")
+        || s == "forks:*"
+        || s == "forks:send"
+        || s.starts_with("forks:send=")
+        || s == "forks:receive"
+        || s.starts_with("forks:receive/")
 }
 
-/// Strips `bridge:post` and `forward:via` from default counter-grants, recording a clear warning
-/// whenever any privileged scope was removed (`P1-8`).
+/// Strips privileged opt-in scopes (`bridge:post`, `forward:via`, `forks:*`, `forks:send`,
+/// `forks:receive/*`) from default counter-grants, recording a clear warning whenever any
+/// privileged scope was removed (`P1-8`, #37).
 fn strip_privileged_default_scopes(scopes: Vec<String>, warnings: &mut Vec<String>) -> Vec<String> {
     let mut safe = Vec::with_capacity(scopes.len());
     let mut stripped = Vec::new();
@@ -809,7 +823,7 @@ fn strip_privileged_default_scopes(scopes: Vec<String>, warnings: &mut Vec<Strin
 }
 
 /// Emits explicit security warnings in `hyp pair inspect` when a token offers or requests `*`,
-/// `bridge:post`, or `forward:via` (`P1-8`).
+/// `bridge:post`, `forward:via`, `forks:send`, or `forks:receive/*` (`P1-8`, #37).
 fn warn_privileged_token_scopes(label: &str, scopes: &[String], warnings: &mut Vec<String>) {
     let has_literal_star = scopes.iter().any(|s| s.trim() == "*");
     let has_full_star_expansion = !scopes.is_empty()
@@ -847,6 +861,24 @@ fn warn_privileged_token_scopes(label: &str, scopes: &[String], warnings: &mut V
         warnings.push(format!(
             "Token {label} privileged scope 'forward:via' ({}) — allows multi-hop transit forwarding (stripped by default unless explicitly opted in via --grant).",
             forward_scopes.join(", ")
+        ));
+    }
+    let fork_scopes: Vec<&str> = scopes
+        .iter()
+        .map(String::as_str)
+        .filter(|s| {
+            let t = s.trim();
+            t == "forks:*"
+                || t == "forks:send"
+                || t.starts_with("forks:send=")
+                || t == "forks:receive"
+                || t.starts_with("forks:receive/")
+        })
+        .collect();
+    if !fork_scopes.is_empty() {
+        warnings.push(format!(
+            "Token {label} privileged scope 'forks' ({}) — allows remote session forking / execution (stripped by default unless explicitly opted in via --grant).",
+            fork_scopes.join(", ")
         ));
     }
 }
@@ -8410,6 +8442,9 @@ mod tests {
                 "dm:send".to_string(),
                 "bridge:post=slack:#general".to_string(),
                 "forward:via=acme-hub".to_string(),
+                "forks:send".to_string(),
+                "forks:receive/full-access".to_string(),
+                "forks:receive/approval-required".to_string(),
                 "kv:read=pair/*".to_string(),
             ],
             &mut warnings,
@@ -8418,17 +8453,24 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("bridge:post=slack:#general"));
         assert!(warnings[0].contains("forward:via=acme-hub"));
+        assert!(warnings[0].contains("forks:send"));
+        assert!(warnings[0].contains("forks:receive/full-access"));
+        assert!(warnings[0].contains("forks:receive/approval-required"));
 
         // Only privileged scopes requested -> falls back to minimal DM pair
         let mut only_priv_warnings = Vec::new();
         let fallback = strip_privileged_default_scopes(
-            vec!["bridge:post=telegram:*".to_string()],
+            vec![
+                "bridge:post=telegram:*".to_string(),
+                "forks:send=bob@laptop".to_string(),
+                "forks:receive/auto-accept-edits".to_string(),
+            ],
             &mut only_priv_warnings,
         );
         assert_eq!(fallback, vec!["dm:send", "dm:receive"]);
         assert_eq!(only_priv_warnings.len(), 1);
 
-        // `warn_privileged_token_scopes` warns on `*`, `bridge:post`, and `forward:via`
+        // `warn_privileged_token_scopes` warns on `*`, `bridge:post`, `forward:via`, and `forks:*`
         let mut insp_warnings = Vec::new();
         warn_privileged_token_scopes(
             "requests",
@@ -8436,13 +8478,43 @@ mod tests {
                 "*".to_string(),
                 "bridge:post=slack:#ops".to_string(),
                 "forward:via=*".to_string(),
+                "forks:send".to_string(),
+                "forks:receive/approval-required".to_string(),
             ],
             &mut insp_warnings,
         );
-        assert_eq!(insp_warnings.len(), 3);
+        assert_eq!(insp_warnings.len(), 4);
         assert!(insp_warnings.iter().any(|w| w.contains("wildcard '*'")));
         assert!(insp_warnings.iter().any(|w| w.contains("bridge:post")));
         assert!(insp_warnings.iter().any(|w| w.contains("forward:via")));
+        assert!(insp_warnings.iter().any(|w| w.contains("'forks'")));
+
+        // `full` preset triggers the wildcard warning but NEVER includes or projects forks!
+        let full_scopes = ScopePreset::Full.expand();
+        assert!(!full_scopes.iter().any(|s| s.starts_with("forks:")));
+        let mut full_warnings = Vec::new();
+        warn_privileged_token_scopes("offers", &full_scopes, &mut full_warnings);
+        assert_eq!(full_warnings.len(), 1);
+        assert!(full_warnings[0].contains("wildcard '*'"));
+        assert!(
+            !project_v2_to_v1_scopes(&full_scopes)
+                .iter()
+                .any(|s| s.starts_with("forks:"))
+        );
+        assert!(
+            !project_v2_to_v1_scopes(&["*".to_string()])
+                .iter()
+                .any(|s| s.starts_with("forks:"))
+        );
+
+        // Explicit opt-in fork scopes project cleanly without escalating runtime mode!
+        assert_eq!(
+            project_v2_to_v1_scopes(&[
+                "forks:send".to_string(),
+                "forks:receive/approval-required".to_string(),
+            ]),
+            vec!["forks:send", "forks:receive/approval-required"]
+        );
 
         // Normal `member` scopes emit zero warnings
         let mut normal_warnings = Vec::new();
