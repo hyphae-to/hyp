@@ -31,9 +31,8 @@ mod unix_tests {
     use crate::common::{MockHttpServer, MockRequest, MockResponse, UnifiedNodeAdapterHost};
     use hyp_crypto::SecretBackend;
     use hyp_node::adapters::{
-        AdapterError, AdapterHealth, AdapterKind, HelloMode, NodeAdapter, PrometheusWebhookAdapter,
-        PrometheusWebhookConfig, SubprocessConfig, SubprocessSupervisor,
-        compute_hmac_sha256_header, verify_hmac_sha256_header,
+        AdapterError, AdapterHealth, AdapterKind, HelloMode, NodeAdapter, SubprocessConfig,
+        SubprocessSupervisor, compute_hmac_sha256_header, verify_hmac_sha256_header,
     };
     use hyp_node::engine::http_util::{HttpClient, empty_body, full_body};
     use hyp_node::engine::{NodeConfig, SubscribeRequest, UnifiedNode};
@@ -381,22 +380,21 @@ mod unix_tests {
     }
 
     // ========================================================================
-    // 2. `plugins/prometheus/index.mjs` vs native Rust `PrometheusWebhookAdapter`
+    // 2. `plugins/prometheus/index.mjs` signed Alertmanager streams
     //    (Differential Assertion + Invalid Auth 401)
     // ========================================================================
 
     #[tokio::test]
-    async fn real_prometheus_plugin_differential_parity_with_native_rust_adapter() {
+    async fn real_prometheus_plugin_preserves_native_event_fields_and_auth() {
         let Some(node_bin) = find_binary("node") else {
             eprintln!(
-                "SKIP real_prometheus_plugin_differential_parity_with_native_rust_adapter: `node` not on PATH"
+                "SKIP real_prometheus_plugin_preserves_native_event_fields_and_auth: `node` not on PATH"
             );
             return;
         };
 
         let tmp = TempDir::new().unwrap();
         let node_plugin_dir = tmp.path().join("node-plugin");
-        let node_rust_dir = tmp.path().join("node-rust");
 
         let bearer_token = "prom-bearer-secret-998877";
         let hmac_secret = "prom-hmac-secret-112233";
@@ -407,19 +405,6 @@ mod unix_tests {
 
         let plugin_node = open_test_node("prom-plugin-node", &node_plugin_dir);
         let plugin_host = UnifiedNodeAdapterHost::new(Arc::clone(&plugin_node));
-
-        let rust_node = open_test_node("prom-rust-node", &node_rust_dir);
-        let rust_host = UnifiedNodeAdapterHost::new(Arc::clone(&rust_node));
-
-        // Start native Rust `PrometheusWebhookAdapter`.
-        let mut rust_cfg = PrometheusWebhookConfig::new("prom-native", "alerts");
-        rust_cfg.bearer_token = Some(Zeroizing::new(bearer_token.to_string()));
-        rust_cfg.webhook_secret = Some(Zeroizing::new(hmac_secret.to_string()));
-        let rust_adapter = PrometheusWebhookAdapter::new(rust_cfg);
-        rust_adapter
-            .start(Arc::clone(&rust_host) as _)
-            .await
-            .unwrap();
 
         // Start real `plugins/prometheus/index.mjs` subprocess.
         let port = pick_free_loopback_port().await;
@@ -549,73 +534,61 @@ mod unix_tests {
         assert_eq!(body_json["ok"], json!(true));
         assert_eq!(body_json["alerts"], json!(2));
 
-        // 2. Feed EXACT same headers & body to native Rust `PrometheusWebhookAdapter`!
-        let mut rust_headers = HeaderMap::new();
-        rust_headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {bearer_token}")).unwrap(),
-        );
-        rust_headers.insert(
-            "x-webhook-signature-256",
-            HeaderValue::from_str(&valid_sig).unwrap(),
-        );
-        rust_adapter
-            .ingest_webhook(&rust_headers, &alertmanager_v4_payload)
-            .await
-            .expect("native Rust PrometheusWebhookAdapter must succeed");
-
-        // 3. Differential oracle comparison: Node plugin CloudEvents == Rust adapter CloudEvents!
+        // Frozen against identical deliveries to the former native adapter.
         let plugin_events = plugin_host
             .wait_for_event_count(2, Duration::from_secs(5))
             .await;
-        let rust_events = rust_host.published_events().await;
-        assert_eq!(plugin_events.len(), 2);
-        assert_eq!(rust_events.len(), 2);
-
-        for (idx, ((ptopic, pev), (rtopic, rev))) in
-            plugin_events.iter().zip(rust_events.iter()).enumerate()
+        for (index, (id, kind, time, name, severity)) in [
+            (
+                "fp-firing-001:firing:2026-11-24T12:00:00Z",
+                "firing",
+                "2026-11-24T12:00:00Z",
+                "HighErrorRate",
+                "critical",
+            ),
+            (
+                "fcf345f016fa3eae:resolved:2026-11-24T11:30:00Z",
+                "resolved",
+                "2026-11-24T12:05:00Z",
+                "HighLatency",
+                "warning",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
         {
-            assert_eq!(ptopic, rtopic, "alert[{idx}] topic mismatch");
-            assert_eq!(pev.id, rev.id, "alert[{idx}] id mismatch");
-            assert_eq!(pev.event_type, rev.event_type, "alert[{idx}] type mismatch");
-            assert_eq!(pev.source, rev.source, "alert[{idx}] source mismatch");
-            assert_eq!(pev.subject, rev.subject, "alert[{idx}] subject mismatch");
-            assert_eq!(pev.time, rev.time, "alert[{idx}] time mismatch");
-
-            let pdata = pev.data.as_ref().expect("plugin alert data");
-            let rdata = rev.data.as_ref().expect("rust alert data");
-            for field in [
-                "status",
-                "alertname",
-                "severity",
-                "service",
-                "instance",
-                "summary",
-                "description",
-                "labels",
-                "annotations",
-                "startsAt",
-                "endsAt",
-                "generatorURL",
-                "receiver",
-                "externalURL",
-            ] {
-                assert_eq!(
-                    pdata.get(field),
-                    rdata.get(field),
-                    "alert[{idx}] data.{field} mismatch: plugin={:?} vs rust={:?}",
-                    pdata.get(field),
-                    rdata.get(field)
-                );
-            }
+            let (topic, event) = &plugin_events[index];
+            assert_eq!(topic, "alerts");
+            assert_eq!(event.id, id);
+            assert_eq!(event.event_type, format!("io.prometheus.alert.{kind}"));
+            assert_eq!(event.source, "prometheus/alertmanager");
+            assert_eq!(
+                event.subject.as_deref(),
+                Some(format!("severity={severity}/{name}").as_str())
+            );
+            assert_eq!(event.time.as_deref(), Some(time));
+            let data = event.data.as_ref().unwrap();
+            assert_eq!(data["alertname"], name);
+            assert_eq!(data["severity"], severity);
+            assert_eq!(
+                data["annotations"]["runbook"],
+                "https://runbooks.internal/errors"
+            );
         }
-        assert_eq!(plugin_events[0].1.event_type, "io.prometheus.alert.firing");
+
+        let basic = Request::builder()
+            .method(Method::POST)
+            .uri(&alerts_url)
+            .header(AUTHORIZATION, "Basic YWxlcnRtYW5hZ2VyOmZpeHR1cmU=")
+            .header("x-webhook-signature-256", &valid_sig)
+            .body(full_body(alertmanager_v4_payload.clone()))
+            .unwrap();
         assert_eq!(
-            plugin_events[1].1.event_type,
-            "io.prometheus.alert.resolved"
+            client.request(basic).await.unwrap().status(),
+            StatusCode::OK
         );
 
-        // 4. Invalid auth (wrong Bearer AND bad HMAC) -> 401 on BOTH plugin and Rust adapter!
+        // 4. Invalid auth (wrong Bearer AND bad HMAC) -> 401 even when both auth modes are available.
         let req_bad_bearer = Request::builder()
             .method(Method::POST)
             .uri(&alerts_url)
@@ -628,22 +601,6 @@ mod unix_tests {
             client.request(req_bad_bearer).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
-
-        let mut bad_rust_headers = HeaderMap::new();
-        bad_rust_headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer wrong-token"),
-        );
-        bad_rust_headers.insert(
-            "x-webhook-signature-256",
-            HeaderValue::from_str(&valid_sig).unwrap(),
-        );
-        assert!(matches!(
-            rust_adapter
-                .ingest_webhook(&bad_rust_headers, &alertmanager_v4_payload)
-                .await,
-            Err(AdapterError::Unauthorized(_))
-        ));
 
         let req_bad_hmac = Request::builder()
             .method(Method::POST)
@@ -661,10 +618,8 @@ mod unix_tests {
             StatusCode::UNAUTHORIZED
         );
 
-        let _ = rust_adapter.stop().await;
         let _ = supervisor.stop().await;
         plugin_node.shutdown();
-        rust_node.shutdown();
     }
 
     // ========================================================================

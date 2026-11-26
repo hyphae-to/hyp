@@ -157,8 +157,7 @@ async fn source_plugin_event_reaches_matching_local_sessions_only_after_the_flus
 async fn compiled_in_source_drains_backlog_without_skipping_holds_or_caps() {
     use http::HeaderMap;
     use hyp_node::adapters::{
-        GenericWebhookAdapter, GenericWebhookConfig, WebhookIngestOutcome,
-        compute_hmac_sha256_header,
+        GitHubWebhookAdapter, GitHubWebhookConfig, WebhookIngestOutcome, compute_hmac_sha256_header,
     };
     use hyp_store::{AckOutcome, BatchState, SubscriptionSpec};
 
@@ -166,10 +165,9 @@ async fn compiled_in_source_drains_backlog_without_skipping_holds_or_caps() {
     let topic = "ci";
     let node = open_node_with_source_topic(&tmp, topic);
     let secret = "test-secret";
-    let mut config = GenericWebhookConfig::new(topic, topic);
-    config.secret = Some(secret.to_string().into());
-    let adapter = Arc::new(GenericWebhookAdapter::new(config));
-    node.attach_generic_webhook(Arc::clone(&adapter))
+    let config = GitHubWebhookConfig::new(topic, topic, secret);
+    let adapter = Arc::new(GitHubWebhookAdapter::new(config));
+    node.attach_github_webhook(Arc::clone(&adapter))
         .await
         .unwrap();
 
@@ -224,10 +222,11 @@ async fn compiled_in_source_drains_backlog_without_skipping_holds_or_caps() {
         );
     }
 
-    let body = br#"{"label":"final-publish"}"#;
+    let body = br#"{"action":"opened","repository":{"full_name":"acme/ci"},"issue":{"number":71,"title":"final-publish"},"sender":{"login":"ci"}}"#;
     let mut headers = HeaderMap::new();
+    headers.insert("x-github-event", "issues".parse().unwrap());
     headers.insert(
-        "x-webhook-signature-256",
+        "x-hub-signature-256",
         compute_hmac_sha256_header(secret.as_bytes(), body)
             .parse()
             .unwrap(),
