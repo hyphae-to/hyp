@@ -2,8 +2,6 @@
 //!
 //! Retains the byte contracts used by am2 invites and `/v1/pair`.
 
-use std::collections::BTreeMap;
-
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -145,113 +143,39 @@ fn uuid_from_bytes(b: &[u8; 16]) -> String {
 // v1 Scopes expansion (`src/core/identity/scopes.ts`)
 // ============================================================================
 
-const V1_BASE_SCOPES: [&str; 7] = [
-    "messages:send",
-    "messages:receive",
-    "events:subscribe",
-    "files:send",
-    "files:receive",
-    "forks:send",
-    "forks:receive",
-];
-
-const V1_RUNTIME_MODES: [&str; 4] = [
-    "approval-required",
-    "auto-accept-edits",
-    "auto",
-    "full-access",
-];
-
-/// Expands v1 scope shorthands identically to `expandScopes()` in `src/core/identity/scopes.ts`.
+/// Expands v1 scope shorthands through the protocol owner, preserving crypto diagnostics.
 pub fn expand_scopes_v1(input: &[&str]) -> Result<Vec<String>, CryptoError> {
-    if input.is_empty() {
-        return Err(CryptoError::InvalidPairing(
-            "a grant needs at least one scope".into(),
-        ));
-    }
-    let mut expanded_items: Vec<&str> = Vec::new();
-    for &item in input {
-        match item {
-            "*" => expanded_items.extend_from_slice(&[
-                "messages:send",
-                "messages:receive",
-                "events:subscribe",
-                "files:send",
-                "files:receive",
-                "forks:send",
-                "forks:receive/full-access",
-            ]),
-            "messages:*" => {
-                expanded_items.extend_from_slice(&["messages:send", "messages:receive"])
-            }
-            "events:*" => expanded_items.push("events:subscribe"),
-            "files:*" => expanded_items.extend_from_slice(&["files:send", "files:receive"]),
-            "forks:*" => {
-                expanded_items.extend_from_slice(&["forks:send", "forks:receive/full-access"])
-            }
-            other => expanded_items.push(other),
-        }
-    }
+    use hyp_proto::scopes::{ScopeError, expand_v1_scopes};
 
-    let mut by_base: BTreeMap<&str, String> = BTreeMap::new();
-    for scope in expanded_items {
-        let (base, formatted) = if let Some(rest) = scope.strip_prefix("forks:receive") {
-            let mode = rest
-                .strip_prefix('/')
-                .ok_or_else(|| CryptoError::InvalidPairing(format!("invalid scope '{scope}'")))?;
-            if !V1_RUNTIME_MODES.contains(&mode) {
-                return Err(CryptoError::InvalidPairing(format!(
-                    "unknown runtime mode '{mode}'"
-                )));
+    expand_v1_scopes(input).map_err(|error| {
+        let message = match error {
+            ScopeError::EmptyScopes => "a grant needs at least one scope".to_owned(),
+            ScopeError::DuplicateBase {
+                first,
+                second,
+                base,
+            } => format!("conflicting forms of scope '{base}': '{first}' vs '{second}'"),
+            ScopeError::InvalidScope { scope, .. } => {
+                if let Some(rest) = scope.strip_prefix("forks:receive") {
+                    if let Some(mode) = rest.strip_prefix('/') {
+                        format!("unknown runtime mode '{mode}'")
+                    } else {
+                        format!("invalid scope '{scope}'")
+                    }
+                } else if let Some((base, _)) = scope.split_once('=') {
+                    if matches!(base, "files:send" | "forks:send") {
+                        format!("invalid recipient in scope '{scope}'")
+                    } else {
+                        format!("scope '{scope}' does not accept recipients")
+                    }
+                } else {
+                    format!("unknown scope '{scope}'")
+                }
             }
-            ("forks:receive", format!("forks:receive/{mode}"))
-        } else if let Some((base, recips)) = scope.split_once('=') {
-            if base != "files:send" && base != "forks:send" {
-                return Err(CryptoError::InvalidPairing(format!(
-                    "scope '{scope}' does not accept recipients"
-                )));
-            }
-            let mut list: Vec<&str> = recips.split(',').collect();
-            if list.is_empty() || list.iter().any(|id| !is_valid_node_id(id)) {
-                return Err(CryptoError::InvalidPairing(format!(
-                    "invalid recipient in scope '{scope}'"
-                )));
-            }
-            list.sort_unstable();
-            list.dedup();
-            (base, format!("{base}={}", list.join(",")))
-        } else {
-            if !V1_BASE_SCOPES.contains(&scope) || scope == "forks:receive" {
-                return Err(CryptoError::InvalidPairing(format!(
-                    "unknown scope '{scope}'"
-                )));
-            }
-            (scope, scope.to_string())
         };
-
-        if let Some(existing) = by_base.get(base) {
-            if existing != &formatted {
-                return Err(CryptoError::InvalidPairing(format!(
-                    "conflicting forms of scope '{base}': '{existing}' vs '{formatted}'"
-                )));
-            }
-        } else {
-            by_base.insert(base, formatted);
-        }
-    }
-
-    let mut out = Vec::new();
-    for base in V1_BASE_SCOPES {
-        if let Some(val) = by_base.get(base) {
-            out.push(val.clone());
-        }
-    }
-    Ok(out)
+        CryptoError::InvalidPairing(message)
+    })
 }
-
-// ============================================================================
-// v1 Grants, Bindings, Entries, Revocations & `t3mp1_` Pairing Codes
-// ============================================================================
 
 /// Exact v1 `Grant` (`src/core/identity/grant.ts`). Field order matches TS `JSON.stringify`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +320,32 @@ pub fn issue_grant_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_errors_keep_crypto_diagnostics() {
+        let cases: &[(&[&str], &str)] = &[
+            (&[], "a grant needs at least one scope"),
+            (&["forks:receive"], "invalid scope 'forks:receive'"),
+            (&["forks:receive/fast"], "unknown runtime mode 'fast'"),
+            (&["files:send="], "invalid recipient in scope 'files:send='"),
+            (
+                &["events:subscribe=alice"],
+                "scope 'events:subscribe=alice' does not accept recipients",
+            ),
+            (&["unknown"], "unknown scope 'unknown'"),
+            (
+                &["files:send", "files:send=alice"],
+                "conflicting forms of scope 'files:send': 'files:send' vs 'files:send=alice'",
+            ),
+        ];
+        for (input, expected) in cases {
+            let error = expand_scopes_v1(input).unwrap_err();
+            assert!(
+                matches!(error, CryptoError::InvalidPairing(ref message) if message == expected),
+                "{input:?}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn issued_grant_retains_pairing_code_key_and_signature_contract() {
