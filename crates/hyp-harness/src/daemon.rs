@@ -8362,7 +8362,7 @@ async fn resolve_tool_caller(
                         m.insert("kind".into(), json!(harness.as_str()));
                         m
                     });
-                let _ = daemon.merge_session_backend_and_index(
+                let session = daemon.merge_session_backend_and_index(
                     &session_id,
                     &patch,
                     daemon.current_time_ms(),
@@ -8376,6 +8376,17 @@ async fn resolve_tool_caller(
                         }
                     }
                     let mut hints = ctx.hints.clone();
+                    // Sparse MCP calls must keep T3 hints previously supplied by hooks.
+                    // Another probe may start after the hook's own probe has completed.
+                    if let Ok(session) = session {
+                        let persisted = TransportHints::from_session_backend(
+                            &session_id,
+                            &session.backend_json,
+                        );
+                        hints.t3_url = hints.t3_url.or(persisted.t3_url);
+                        hints.t3_base_dir = hints.t3_base_dir.or(persisted.t3_base_dir);
+                        hints.t3_thread_id = hints.t3_thread_id.or(persisted.t3_thread_id);
+                    }
                     if hints.harness.is_none() {
                         hints.harness = Some(harness);
                     }

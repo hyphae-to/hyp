@@ -1169,6 +1169,10 @@ async fn x9_daemon_honors_node_json_t3_block_and_explicit_hint_precedence() {
         },
     )
     .await;
+    // session.status waits for the first probe to finish. The sparse MCP call must
+    // keep the persisted explicit URL even when it is free to start a second probe.
+    let before_join = session_status(&sock, "claude:sess-override-t3").await;
+    assert_eq!(before_join["hasLiveTransport"], false);
     let (join2_txt, join2_err) = mcp
         .call_tool(
             "hyp_mesh",
