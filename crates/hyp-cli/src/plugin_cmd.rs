@@ -1092,7 +1092,13 @@ fn retire_legacy_claude_panel(
     root: &Path,
     previous: Option<&PluginInstallReceipt>,
 ) -> Result<(), String> {
-    const LEGACY_TREE: &str = "63620469bad933435dfa3850f3ef49b8bf728a5efb584484cbb53e062c44bdf6";
+    const LEGACY_TREES: &[&str] = &[
+        "63620469bad933435dfa3850f3ef49b8bf728a5efb584484cbb53e062c44bdf6",
+        "d8d361b10aebd295df11789d31205de1dae46aaccf59d9e8218b52fdde206e9b",
+        "277e55ec2cdf1be944d44f505d4f7c31423546ae8466b97b9f1bd29d995a9f79",
+        "930b74f28f54ecb82695f875516e288f3dece74f6f85806db4b6e77879e0436e",
+        "e59fc404a19828e99d32b37955e87303dd586419f45d5cf7e6b33437f52ad7df",
+    ];
     if root.file_name().is_none_or(|name| name != "hyp-panel") {
         return Ok(());
     }
@@ -1141,7 +1147,7 @@ fn retire_legacy_claude_panel(
         .map(|(rel, sha)| (*rel, sha.as_str()))
         .collect();
     let digest = compute_tree_sha256(&pairs);
-    if digest != LEGACY_TREE
+    if !LEGACY_TREES.contains(&digest.as_str())
         && !previous.is_some_and(|receipt| {
             receipt.tree_sha256 == digest
                 && receipt

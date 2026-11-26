@@ -256,7 +256,7 @@ pub(crate) struct SlashCommand {
     pub filename: &'static str,
     pub content: &'static str,
     pub legacy_name: &'static str,
-    pub legacy_sha256: &'static str,
+    pub legacy_sha256: &'static [&'static str],
 }
 
 // Original bundled command digests identify files safe to retire on upgrade.
@@ -265,25 +265,28 @@ pub(crate) const CLAUDE_SLASH_COMMANDS: [SlashCommand; 4] = [
         filename: "hyp.md",
         content: CLAUDE_CMD_HYP,
         legacy_name: "hyphae.md",
-        legacy_sha256: "a395e833d24ebb4c6ce33cfcd611cd4fc508f7a872c335b8683fb25577656f3c",
+        legacy_sha256: &[
+            "a395e833d24ebb4c6ce33cfcd611cd4fc508f7a872c335b8683fb25577656f3c",
+            "e017fd237c1a747556f564b77a75c967934a68dbfb3940299b9e03497d52e0fe",
+        ],
     },
     SlashCommand {
         filename: "hyp-subs.md",
         content: CLAUDE_CMD_HYP_SUBS,
         legacy_name: "hyphae-subs.md",
-        legacy_sha256: "a8939e5519e150a099cfbab968e4c6234469b121a2a5dc19caafe3cc4e402eff",
+        legacy_sha256: &["a8939e5519e150a099cfbab968e4c6234469b121a2a5dc19caafe3cc4e402eff"],
     },
     SlashCommand {
         filename: "hyp-focus.md",
         content: CLAUDE_CMD_HYP_FOCUS,
         legacy_name: "hyphae-focus.md",
-        legacy_sha256: "5a8e0d1781421630132f74c99b3079a8b3cfff9d3754aad11dccd097adfbd926",
+        legacy_sha256: &["5a8e0d1781421630132f74c99b3079a8b3cfff9d3754aad11dccd097adfbd926"],
     },
     SlashCommand {
         filename: "hyp-mute.md",
         content: CLAUDE_CMD_HYP_MUTE,
         legacy_name: "hyphae-mute.md",
-        legacy_sha256: "e5d5b7414393f538dd98528f91a62da8f7f67ed0e22834099ec88b8d53f2b533",
+        legacy_sha256: &["e5d5b7414393f538dd98528f91a62da8f7f67ed0e22834099ec88b8d53f2b533"],
     },
 ];
 
@@ -291,7 +294,10 @@ const OPENCODE_SLASH_COMMAND: SlashCommand = SlashCommand {
     filename: "hyp.md",
     content: include_str!("../../../plugins/opencode/commands/hyp.md"),
     legacy_name: "hyphae.md",
-    legacy_sha256: "80a3d44e5a96420427601034572d32e9e7f5fc43a0139afef63a0b2430190b84",
+    legacy_sha256: &[
+        "80a3d44e5a96420427601034572d32e9e7f5fc43a0139afef63a0b2430190b84",
+        "6116fb34dc4ae700a8e305b23eccebee1ec46e4988860386040ceee35d8b4907",
+    ],
 };
 
 /// OpenClaw message delivery mode chosen during `hyp setup` / `hyp onboard`.
@@ -2603,7 +2609,8 @@ impl SlashCommand {
         let Ok(text) = std::str::from_utf8(&bytes) else {
             return Ok(false);
         };
-        Ok(hyp_store::sha256_hex(text.replace("\r\n", "\n").as_bytes()) == self.legacy_sha256)
+        let digest = hyp_store::sha256_hex(text.replace("\r\n", "\n").as_bytes());
+        Ok(self.legacy_sha256.contains(&digest.as_str()))
     }
 
     pub(crate) fn retire_legacy(&self, directory: &Path, dry_run: bool) -> Result<(), String> {
