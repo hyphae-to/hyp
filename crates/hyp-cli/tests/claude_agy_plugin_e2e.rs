@@ -144,12 +144,50 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
     assert!(skill.starts_with("---\nname: hyphae\n"));
     assert!(skill.to_ascii_lowercase().contains("untrusted"));
 
-    // 5. Run `claude plugin validate --strict` if `claude` binary is present on PATH.
-    if let Ok(output) = Command::new("claude")
-        .args(["plugin", "validate", "--strict", "--json"])
-        .arg(&plugin_dir)
+    // Capability discovery is separate from validation: once supported, validation errors fail.
+    let strict_supported = match Command::new("claude")
+        .args(["plugin", "validate", "--help"])
         .output()
     {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("could not inspect claude plugin validate capabilities: {error}"),
+        Ok(help) => {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&help.stdout),
+                String::from_utf8_lossy(&help.stderr)
+            );
+            if !help.status.success() {
+                let message = text.to_ascii_lowercase();
+                assert!(
+                    [
+                        "unknown command",
+                        "unknown subcommand",
+                        "unrecognized command"
+                    ]
+                    .iter()
+                    .any(|marker| message.contains(marker)),
+                    "Claude capability probe failed unexpectedly: {}",
+                    text.trim()
+                );
+            }
+            if !help.status.success() || !text.contains("--strict") {
+                eprintln!(
+                    "SKIP external Claude strict validation: installed CLI does not advertise plugin validate --strict: {}",
+                    text.trim()
+                );
+                false
+            } else {
+                true
+            }
+        }
+    };
+    if strict_supported {
+        let output = Command::new("claude")
+            .args(["plugin", "validate", "--strict", "--json"])
+            .arg(&plugin_dir)
+            .output()
+            .expect("run supported claude strict validation");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

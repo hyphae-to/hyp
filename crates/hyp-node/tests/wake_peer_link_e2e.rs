@@ -7,6 +7,9 @@
 //!   "system.wake", "params": { "sleptMs": ... } }` to external plugins and cleanly tolerates
 //!   older plugins that omit `onWake`.
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -488,6 +491,10 @@ impl NodeAdapterHost for RecordingHost {
 
 #[tokio::test]
 async fn subprocess_supervisor_sends_system_wake_notification_to_plugins() {
+    assert!(
+        node_runtime::node_available(),
+        "requires Node >= 24; node not found"
+    );
     let sdk_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/sdk/client.mjs");
     assert!(sdk_path.is_file(), "missing SDK at {}", sdk_path.display());
     let sdk_path = sdk_path

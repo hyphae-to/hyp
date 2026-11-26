@@ -7,6 +7,9 @@
 //! `HYPHAE_INSTALL_DIR`, `HERDR_APP_HOME`, and `HYPHAE_SECRET_BACKEND=file` — zero
 //! mutations to live `$HOME`, running daemons, LaunchAgents, or OS Keychain!
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 mod common;
 
 use std::fs;
@@ -1025,6 +1028,10 @@ fast_mode = true
             return;
         }
 
+        assert!(crate::node_runtime::node_available_at(
+            node_path.as_os_str()
+        ));
+
         // Build a shim bin dir exposing `node` + standard POSIX utils, WITHOUT `python3`.
         let no_py_bin = TempDir::new().expect("no-python bin dir");
         symlink(&node_path, no_py_bin.path().join("node")).expect("symlink node");
@@ -1612,6 +1619,9 @@ fast_mode = true
         if let Ok(which_node) = Command::new("/usr/bin/which").arg("node").output() {
             let node_path = PathBuf::from(String::from_utf8_lossy(&which_node.stdout).trim());
             if which_node.status.success() && node_path.is_file() {
+                assert!(crate::node_runtime::node_available_at(
+                    node_path.as_os_str()
+                ));
                 let no_py_bin = TempDir::new().expect("no-python bin dir");
                 symlink(&node_path, no_py_bin.path().join("node")).expect("symlink node");
                 for util in [
