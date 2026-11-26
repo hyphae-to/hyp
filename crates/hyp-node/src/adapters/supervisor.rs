@@ -613,6 +613,7 @@ mod runtime {
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use hyp_crypto::constant_time_eq;
     use hyp_proto::cloudevent::{CloudEventError, check_cloudevent_v2};
     use hyp_proto::rpc::{
         DeliveryFailedParams, ERR_ID_CONFLICT, ERR_INTERNAL_ERROR, ERR_INVALID_EVENT,
@@ -622,7 +623,6 @@ mod runtime {
         METHOD_DELIVERY_FAILED, METHOD_HELLO, METHOD_PUBLISH, METHOD_STATUS, PluginFrame,
         PublishParams, RpcId, StatusParams, decode_frame, encode_frame,
     };
-    use ring::hmac;
     use ring::rand::{SecureRandom, SystemRandom};
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -805,18 +805,6 @@ mod runtime {
             std::io::Error::other("CSPRNG failed generating plugin handshake token")
         })?;
         Ok(hex::encode(bytes))
-    }
-
-    /// Length-hiding constant-time token comparison via HMAC-SHA256 over a fresh CSPRNG key.
-    fn constant_time_token_eq(expected: &str, actual: &str) -> bool {
-        let rng = SystemRandom::new();
-        let mut rand_key = [0u8; 32];
-        if rng.fill(&mut rand_key).is_err() {
-            return false;
-        }
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &rand_key);
-        let tag = hmac::sign(&key, expected.as_bytes());
-        hmac::verify(&key, actual.as_bytes(), tag.as_ref()).is_ok()
     }
 
     #[derive(Deserialize)]
@@ -1038,7 +1026,7 @@ mod runtime {
                 "TCP plugin auth failed: first frame must have type=\"auth\"".to_string(),
             ));
         }
-        if !constant_time_token_eq(expected_token, &frame.token) {
+        if !constant_time_eq(expected_token.as_bytes(), frame.token.as_bytes()) {
             return Err(TcpHandshakeError::AuthFailed(
                 "TCP plugin auth failed: invalid handshake token".to_string(),
             ));

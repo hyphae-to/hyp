@@ -30,9 +30,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hyp_crypto::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::human::verify_local_ingest_event;
 use hyp_crypto::rfc3339::format_rfc3339_millis;
+use hyp_crypto::{OkpJwk as CryptoOkpJwk, constant_time_eq};
 use hyp_proto::address::is_valid_topic;
 use hyp_proto::cloudevent::{
     CONTENT_TYPE_JSON, CloudEvent, CloudEventLimits, EXT_LOCAL_EVENT_SIG, MAX_ATTRIBUTE_CHARS,
@@ -44,7 +44,6 @@ use hyp_store::{
     GateAuditInput, GateDecision as StoreGateDecision, GateDirection, HumanAuthorityRecord,
     MailboxKind, MailboxPutOptions, now_ms, sha256_hex, uuid_v4,
 };
-use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -1151,7 +1150,7 @@ async fn handle_connection<S>(
                     });
 
             if let Some(candidate) = provided {
-                if !constant_time_token_eq(&candidate, expected.as_str()) {
+                if !constant_time_eq(expected.as_bytes(), candidate.as_bytes()) {
                     let resp = json!({
                         "ok": false,
                         "error": "unauthorized",
@@ -1678,18 +1677,6 @@ fn generate_bearer_token() -> Result<Zeroizing<String>, NodeError> {
     rng.fill(&mut *raw)
         .map_err(|_| NodeError::Io(io::Error::other("OS CSPRNG failure")))?;
     Ok(Zeroizing::new(URL_SAFE_NO_PAD.encode(*raw)))
-}
-
-/// Constant-time, length-hiding token equality via ephemeral-key HMAC-SHA256.
-fn constant_time_token_eq(candidate: &str, expected: &str) -> bool {
-    let rng = SystemRandom::new();
-    let mut rand_key = Zeroizing::new([0u8; 32]);
-    if rng.fill(&mut *rand_key).is_err() {
-        return false;
-    }
-    let key = hmac::Key::new(hmac::HMAC_SHA256, &*rand_key);
-    let expected_tag = hmac::sign(&key, expected.as_bytes());
-    hmac::verify(&key, candidate.as_bytes(), expected_tag.as_ref()).is_ok()
 }
 
 fn write_atomic_addr_file(

@@ -3,6 +3,7 @@
 
 pub use hyp_proto::PROTOCOL_VERSION;
 
+mod compare;
 pub mod compat_v1;
 pub mod e2ee;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod rfc3339;
 pub mod transfer;
 mod x25519;
 
+pub use compare::constant_time_eq;
 pub use error::CryptoError;
 pub use keys::{
     Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk, SignedPayload, X25519KeyPair,

@@ -295,17 +295,7 @@ pub const fn profile_as_str(p: NodeProfile) -> &'static str {
     }
 }
 
-/// Constant-time byte-slice equality comparison (avoids deprecated `ring::constant_time`).
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    std::hint::black_box(diff) == 0
-}
+pub use hyp_crypto::constant_time_eq as ct_eq;
 
 pub use hyp_node::engine::http_util::build_http_client;
 
