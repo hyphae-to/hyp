@@ -393,6 +393,27 @@ fn release_workflows_package_sign_and_checksum_plugins_tarball() {
         release_wf.contains("steps.plugins.outputs.changed_claude_code == 'true'"),
         "release-rust.yml must gate Claude Code plugin tagging on changed_claude_code == 'true'"
     );
+
+    let nightly_wf = fs::read_to_string(root.join(".github/workflows/nightly-rust.yml")).unwrap();
+    assert_eq!(
+        nightly_wf
+            .matches("HYPHAE_BUILD_VERSION: ${{ needs.prepare.outputs.version }}")
+            .count(),
+        2,
+        "nightly-rust.yml must pass HYPHAE_BUILD_VERSION to both Unix and Windows build steps"
+    );
+    assert_eq!(
+        nightly_wf.matches("HYPHAE_BUILD_CHANNEL: nightly").count(),
+        2,
+        "nightly-rust.yml must pass HYPHAE_BUILD_CHANNEL: nightly to both Unix and Windows build steps"
+    );
+    assert_eq!(
+        nightly_wf
+            .matches("HYPHAE_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}")
+            .count(),
+        2,
+        "nightly-rust.yml must pass HYPHAE_RELEASE_TAG to both Unix and Windows build steps"
+    );
 }
 
 #[test]
@@ -1074,6 +1095,159 @@ fn compiled_hyp_plugin_install_telegram_resolves_bot_username_via_getme_and_fall
             .is_some_and(|w| !w.is_empty()),
         "expected non-fatal fallback warning"
     );
+
+    let _ = server.join();
+}
+
+#[test]
+fn compiled_hyp_plugin_update_respects_env_url_and_local_dir_precedence() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let bin = env!("CARGO_BIN_EXE_hyp");
+    let root = repo_root();
+    let plugins_dir = root.join("plugins");
+    let tmp = TempDir::new().expect("create temp dir");
+    let home = tmp.path().join("home");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+
+    // Build an in-memory tarball identical to the nightly release asset (`hyp-nightly-plugins.tar.gz`).
+    let mut tarball_bytes = Vec::new();
+    let entries: Vec<TarInputEntry> = PINNED_PLUGIN_FILES
+        .iter()
+        .map(|p| TarInputEntry {
+            archive_path: p.rel_path.to_string(),
+            source_path: plugins_dir.join(p.rel_path),
+        })
+        .collect();
+    pack_tar_gz(&entries, &mut tarball_bytes, TarPackOptions::default()).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock plugins server");
+    let addr = listener.local_addr().unwrap();
+    let server_body = tarball_bytes.clone();
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first = req.lines().next().unwrap_or("");
+            if first.starts_with("GET /releases/download/nightly/hyp-nightly-plugins.tar.gz ") {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    server_body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&server_body);
+            } else {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+
+    // 1. Install `telegram` from local dir, then simulate an outdated install (`disk == receipt != pinned`).
+    let install_out = Command::new(bin)
+        .args([
+            "plugin",
+            "install",
+            "telegram",
+            "--from-dir",
+            plugins_dir.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", &home)
+        .env_remove("HYPHAE_PLUGINS_DIR")
+        .env_remove("HYPHAE_PLUGINS_ARCHIVE")
+        .env_remove("HYPHAE_PLUGINS_URL")
+        .output()
+        .expect("install telegram");
+    assert!(install_out.status.success());
+
+    let mark_telegram_outdated = |state: &Path| {
+        let tg_path = state.join("plugins/telegram/index.mjs");
+        let old_tg = b"// simulated outdated telegram script\n";
+        fs::write(&tg_path, old_tg).unwrap();
+        let old_sha = sha256_file_hex(old_tg, false);
+        let old_tree = compute_tree_sha256(&[("telegram/index.mjs", &old_sha)]);
+        let receipts_path = state.join("plugins/installed.json");
+        let mut doc: Value =
+            serde_json::from_str(&fs::read_to_string(&receipts_path).unwrap()).unwrap();
+        doc["installed"]["telegram"]["treeSha256"] = Value::String(old_tree);
+        fs::write(&receipts_path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    };
+
+    // 2. `HYPHAE_PLUGINS_URL` override resolves & verifies the nightly archive cleanly!
+    mark_telegram_outdated(&state_dir);
+    let env_url = format!("http://{addr}/releases/download/nightly/hyp-nightly-plugins.tar.gz");
+    let upd_env_url = Command::new(bin)
+        .args([
+            "plugin",
+            "update",
+            "--all",
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", &home)
+        .env("HYPHAE_PLUGINS_URL", &env_url)
+        .env_remove("HYPHAE_PLUGINS_DIR")
+        .env_remove("HYPHAE_PLUGINS_ARCHIVE")
+        .output()
+        .expect("plugin update via HYPHAE_PLUGINS_URL");
+    assert!(
+        upd_env_url.status.success(),
+        "plugin update via HYPHAE_PLUGINS_URL failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&upd_env_url.stdout),
+        String::from_utf8_lossy(&upd_env_url.stderr)
+    );
+    let upd_json: Value = serde_json::from_slice(&upd_env_url.stdout).unwrap();
+    assert_eq!(upd_json["data"]["updated"], json!(["telegram"]));
+    assert_eq!(upd_json["data"]["source"], "release");
+    assert_eq!(upd_json["data"]["sourceLocation"], env_url);
+
+    // 3. `HYPHAE_PLUGINS_DIR` takes precedence over an unreachable `HYPHAE_PLUGINS_URL`!
+    mark_telegram_outdated(&state_dir);
+    let _ = fs::remove_dir_all(state_dir.join("plugins-cache"));
+    let upd_env_dir = Command::new(bin)
+        .args([
+            "plugin",
+            "update",
+            "--all",
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", &home)
+        .env("HYPHAE_PLUGINS_DIR", &plugins_dir)
+        .env(
+            "HYPHAE_PLUGINS_URL",
+            "http://127.0.0.1:1/unreachable.tar.gz",
+        )
+        .env_remove("HYPHAE_PLUGINS_ARCHIVE")
+        .output()
+        .expect("plugin update via HYPHAE_PLUGINS_DIR");
+    assert!(
+        upd_env_dir.status.success(),
+        "HYPHAE_PLUGINS_DIR must beat unreachable HYPHAE_PLUGINS_URL: stdout={} stderr={}",
+        String::from_utf8_lossy(&upd_env_dir.stdout),
+        String::from_utf8_lossy(&upd_env_dir.stderr)
+    );
+    let upd_dir_json: Value = serde_json::from_slice(&upd_env_dir.stdout).unwrap();
+    assert_eq!(upd_dir_json["data"]["updated"], json!(["telegram"]));
+    assert_eq!(upd_dir_json["data"]["source"], "dir");
 
     let _ = server.join();
 }

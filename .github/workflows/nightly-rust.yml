@@ -181,6 +181,9 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          HYPHAE_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+          HYPHAE_BUILD_CHANNEL: nightly
+          HYPHAE_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           IFS=',' read -ra TRIPLE_LIST <<< "$TARGETS"
@@ -194,6 +197,9 @@ jobs:
         shell: pwsh
         env:
           TARGET: ${{ matrix.targets }}
+          HYPHAE_BUILD_VERSION: ${{ needs.prepare.outputs.version }}
+          HYPHAE_BUILD_CHANNEL: nightly
+          HYPHAE_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           $ErrorActionPreference = "Stop"
           cargo build --release --locked --target $env:TARGET -p hyp-cli

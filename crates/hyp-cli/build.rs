@@ -301,6 +301,66 @@ fn main() {
     );
 
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=HYPHAE_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=HYPHAE_BUILD_CHANNEL");
+    println!("cargo:rerun-if-env-changed=HYPHAE_RELEASE_TAG");
+
+    let pkg_version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION not set");
+    let build_version = env::var("HYPHAE_BUILD_VERSION")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| pkg_version.clone());
+    let explicit_tag = env::var("HYPHAE_RELEASE_TAG")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let explicit_channel = env::var("HYPHAE_BUILD_CHANNEL")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    let is_nightly_ver = build_version
+        .split('+')
+        .next()
+        .unwrap_or(&build_version)
+        .split_once('-')
+        .is_some_and(|(_, pre)| {
+            pre.split('.')
+                .any(|ident| ident.eq_ignore_ascii_case("nightly"))
+        });
+
+    let build_channel = explicit_channel.unwrap_or_else(|| {
+        if explicit_tag
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("nightly"))
+            || is_nightly_ver
+        {
+            "nightly".to_string()
+        } else {
+            "stable".to_string()
+        }
+    });
+
+    let release_tag = explicit_tag.unwrap_or_else(|| {
+        if build_channel.eq_ignore_ascii_case("nightly") {
+            "nightly".to_string()
+        } else {
+            format!("v{}", build_version.trim_start_matches('v'))
+        }
+    });
+
+    for (name, val) in [
+        ("HYPHAE_BUILD_VERSION", &build_version),
+        ("HYPHAE_BUILD_CHANNEL", &build_channel),
+        ("HYPHAE_RELEASE_TAG", &release_tag),
+    ] {
+        assert!(
+            !val.chars().any(char::is_control),
+            "{name} must not contain control characters"
+        );
+        println!("cargo:rustc-env={name}={val}");
+    }
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");

@@ -389,7 +389,7 @@ pub fn read_cached_update_status(
         .unwrap_or("stable")
         .trim()
         .to_ascii_lowercase();
-    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let current_version = env!("HYPHAE_BUILD_VERSION").to_string();
 
     let available_version = db.and_then(|d| {
         d.local()
@@ -876,7 +876,7 @@ fn run_update_check(
         })
         .and_then(|s| s.parse::<i64>().ok());
 
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("HYPHAE_BUILD_VERSION");
     let (manifest, _published_ms) = match verify_release_manifest(
         &signed,
         &pubkey,
@@ -1059,7 +1059,7 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         })
         .and_then(|s| s.parse::<i64>().ok());
 
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version = env!("HYPHAE_BUILD_VERSION");
     let (manifest, published_ms) = match verify_release_manifest(
         &signed,
         &pubkey,
@@ -1254,10 +1254,12 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     let mut next = vec!["hyp version --json".to_string()];
 
     // 5. Post-upgrade selective plugin sync (best-effort, non-fatal if offline, skippable via `--no-plugins`).
+    let plugins_artifact_url = manifest.artifacts.get("plugins").map(|a| a.url.as_str());
     let plugins_sync = run_post_upgrade_plugin_sync(
         &target_bin,
         &dir,
         args.config.as_deref(),
+        plugins_artifact_url,
         args.no_plugins,
         &mut warnings,
         &mut next,
@@ -1407,6 +1409,34 @@ fn run_post_upgrade_service_restart(
     outcome
 }
 
+fn build_post_upgrade_plugin_sync_command(
+    new_bin: &Path,
+    state_dir: &Path,
+    config_path: Option<&Path>,
+    plugins_artifact_url: Option<&str>,
+    caller_plugins_url_env: Option<&str>,
+) -> Command {
+    let mut cmd = Command::new(new_bin);
+    cmd.args(["plugin", "update", "--all", "--state-dir"])
+        .arg(state_dir);
+    if let Some(cfg) = config_path {
+        cmd.arg("--config").arg(cfg);
+    }
+    let has_caller_override = caller_plugins_url_env
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty());
+    if !has_caller_override {
+        if let Some(url) = plugins_artifact_url
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            cmd.env("HYPHAE_PLUGINS_URL", url);
+        }
+    }
+    cmd.arg("--json");
+    cmd
+}
+
 /// Invokes `<new_hyp> plugin update --all --json` after a successful binary swap so installed
 /// bridges and harness UI mods stay selectively synced. Strictly best-effort & non-fatal (offline
 /// or modified plugins produce clear warnings and actionable `next` commands without failing the
@@ -1415,6 +1445,7 @@ fn run_post_upgrade_plugin_sync(
     new_bin: &Path,
     state_dir: &Path,
     config_path: Option<&Path>,
+    plugins_artifact_url: Option<&str>,
     no_plugins: bool,
     warnings: &mut Vec<String>,
     next: &mut Vec<String>,
@@ -1434,13 +1465,14 @@ fn run_post_upgrade_plugin_sync(
         });
     }
 
-    let mut cmd = Command::new(new_bin);
-    cmd.args(["plugin", "update", "--all", "--state-dir"])
-        .arg(state_dir);
-    if let Some(cfg) = config_path {
-        cmd.arg("--config").arg(cfg);
-    }
-    cmd.arg("--json");
+    let caller_plugins_url_env = std::env::var("HYPHAE_PLUGINS_URL").ok();
+    let mut cmd = build_post_upgrade_plugin_sync_command(
+        new_bin,
+        state_dir,
+        config_path,
+        plugins_artifact_url,
+        caller_plugins_url_env.as_deref(),
+    );
 
     match cmd.output() {
         Ok(out) => {
@@ -1689,7 +1721,7 @@ async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'stati
             .uri(&current_uri)
             .header(
                 header::USER_AGENT,
-                format!("hyp/{}", env!("CARGO_PKG_VERSION")),
+                format!("hyp/{}", env!("HYPHAE_BUILD_VERSION")),
             )
             .body(Empty::new())
             .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
@@ -2272,6 +2304,9 @@ mod tests {
             Path::new("/nonexistent/hyp"),
             &state_dir,
             None,
+            Some(
+                "https://github.com/hyphae-to/hyp/releases/download/nightly/hyp-nightly-plugins.tar.gz",
+            ),
             true,
             &mut warnings,
             &mut next,
@@ -2279,6 +2314,69 @@ mod tests {
         assert_eq!(sync["skipped"], true);
         assert!(warnings.is_empty());
         assert!(next.iter().any(|s| s == "hyp plugin update --all"));
+    }
+
+    #[test]
+    fn post_upgrade_plugin_sync_command_forwards_manifest_plugins_url_without_clobbering_override()
+    {
+        let nightly_url =
+            "https://github.com/hyphae-to/hyp/releases/download/nightly/hyp-nightly-plugins.tar.gz";
+        let state = Path::new("/tmp/hyphae-state");
+        let cfg = Path::new("/tmp/hyphae-state/node.json");
+
+        // 1. When caller did not set HYPHAE_PLUGINS_URL, manifest's plugins artifact URL is forwarded!
+        let cmd = build_post_upgrade_plugin_sync_command(
+            Path::new("/usr/local/bin/hyp"),
+            state,
+            Some(cfg),
+            Some(nightly_url),
+            None,
+        );
+        let envs: BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|val| val.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("HYPHAE_PLUGINS_URL").and_then(|v| v.as_deref()),
+            Some(nightly_url)
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "plugin",
+                "update",
+                "--all",
+                "--state-dir",
+                "/tmp/hyphae-state",
+                "--config",
+                "/tmp/hyphae-state/node.json",
+                "--json"
+            ]
+        );
+
+        // 2. When caller explicitly set HYPHAE_PLUGINS_URL, preserve caller override!
+        let cmd_override = build_post_upgrade_plugin_sync_command(
+            Path::new("/usr/local/bin/hyp"),
+            state,
+            None,
+            Some(nightly_url),
+            Some("https://mirror.example.com/custom.tar.gz"),
+        );
+        assert!(
+            !cmd_override
+                .get_envs()
+                .any(|(k, _)| k == "HYPHAE_PLUGINS_URL"),
+            "explicit caller HYPHAE_PLUGINS_URL must not be overwritten"
+        );
     }
 
     #[test]

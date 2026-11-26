@@ -10,8 +10,9 @@
 //!   1. `--archive <path>` / `HYPHAE_PLUGINS_ARCHIVE`
 //!   2. `--from-dir <path>` / `HYPHAE_PLUGINS_DIR`
 //!   3. Local verified cache `<state_dir>/plugins-cache/hyp-v<ver>-plugins.tar.gz` (`0600`)
-//!   4. HTTPS release asset `https://github.com/hyphae-to/hyp/releases/download/v<ver>/hyp-v<ver>-plugins.tar.gz`
-//!      (enforcing `https://` or loopback `http://127.0.0.1` / `http://[::1]` for local tests,
+//!   4. HTTPS release asset `https://github.com/hyphae-to/hyp/releases/download/<tag>/hyp-<tag>-plugins.tar.gz`
+//!      (where `<tag>` is `nightly` on nightly builds and `v<ver>` on stable builds;
+//!      enforcing `https://` or loopback `http://127.0.0.1` / `http://[::1]` for local tests,
 //!      <= 4 MiB, 30s timeout, <= 5 redirects with zero HTTPS->HTTP downgrade).
 //! - Three-way hash state machine (`<state_dir>/plugins/installed.json`, `0600` atomic write):
 //!   - `up_to_date` (`disk == pinned`): skipped with 0 network calls & 0 disk writes.
@@ -559,11 +560,69 @@ pub fn run_plugin(command: PluginCommand) -> ExitCode {
     }
 }
 
-/// Default GitHub Release URL for the official plugins tarball matching this binary's version.
+/// Returns `true` when `version` carries a `nightly` SemVer prerelease identifier
+/// (e.g. `0.7.1-nightly.20261126.bd3a90b`).
+pub fn is_nightly_build_version(version: &str) -> bool {
+    let trimmed = version.trim();
+    let no_build = trimmed.split('+').next().unwrap_or(trimmed);
+    let Some((_, prerelease)) = no_build.split_once('-') else {
+        return false;
+    };
+    prerelease
+        .split('.')
+        .any(|ident| ident.eq_ignore_ascii_case("nightly"))
+}
+
+/// Resolves the GitHub Release URL for the official plugins tarball given build metadata.
+///
+/// Precedence:
+/// 1. Explicit non-empty `release_tag` (e.g. `"nightly"` or `"v0.7.0"`).
+/// 2. Nightly channel (`channel == Some("nightly")`) or `-nightly` prerelease `version`
+///    -> rolling `nightly` GitHub Release asset (`.../releases/download/nightly/hyp-nightly-plugins.tar.gz`).
+/// 3. Stable / tagged SemVer `version` (e.g. `"0.7.0"` or `"0.8.0-rc.1"`)
+///    -> `.../releases/download/v<ver>/hyp-v<ver>-plugins.tar.gz`.
+pub fn resolve_release_plugins_url(
+    version: &str,
+    channel: Option<&str>,
+    release_tag: Option<&str>,
+) -> String {
+    let tag = if let Some(explicit_tag) = release_tag.map(str::trim).filter(|s| !s.is_empty()) {
+        explicit_tag.to_string()
+    } else if channel
+        .map(str::trim)
+        .is_some_and(|c| c.eq_ignore_ascii_case("nightly"))
+        || is_nightly_build_version(version)
+    {
+        "nightly".to_string()
+    } else {
+        let ver = version.trim().trim_start_matches('v');
+        format!("v{ver}")
+    };
+    format!("https://github.com/hyphae-to/hyp/releases/download/{tag}/hyp-{tag}-plugins.tar.gz")
+}
+
+/// Resolves the effective plugins archive download URL applying CLI `--url` and
+/// `HYPHAE_PLUGINS_URL` overrides ahead of `default_url`.
+pub fn resolve_effective_plugins_download_url(
+    explicit_url: Option<&str>,
+    env_url: Option<&str>,
+    default_url: &str,
+) -> String {
+    if let Some(u) = explicit_url.map(str::trim).filter(|s| !s.is_empty()) {
+        return u.to_string();
+    }
+    if let Some(u) = env_url.map(str::trim).filter(|s| !s.is_empty()) {
+        return u.to_string();
+    }
+    default_url.to_string()
+}
+
+/// Default GitHub Release URL for the official plugins tarball matching this binary's build metadata.
 pub fn default_release_plugins_url() -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    format!(
-        "https://github.com/hyphae-to/hyp/releases/download/v{version}/hyp-v{version}-plugins.tar.gz"
+    resolve_release_plugins_url(
+        env!("HYPHAE_BUILD_VERSION"),
+        Some(env!("HYPHAE_BUILD_CHANNEL")),
+        option_env!("HYPHAE_RELEASE_TAG"),
     )
 }
 
@@ -572,12 +631,34 @@ pub fn receipts_file_path(state_dir: &Path) -> PathBuf {
     state_dir.join("plugins").join("installed.json")
 }
 
-/// Path to `<state_dir>/plugins-cache/hyp-v<ver>-plugins.tar.gz`.
+/// Computes the local verified archive cache path for a given build version and channel,
+/// isolating nightly builds from stable release caches.
+pub fn cached_plugins_archive_path_for(
+    state_dir: &Path,
+    version: &str,
+    channel: Option<&str>,
+) -> PathBuf {
+    let ver = version.trim().trim_start_matches('v');
+    let filename = if is_nightly_build_version(ver) {
+        format!("hyp-v{ver}-plugins.tar.gz")
+    } else if channel
+        .map(str::trim)
+        .is_some_and(|c| c.eq_ignore_ascii_case("nightly"))
+    {
+        "hyp-nightly-plugins.tar.gz".to_string()
+    } else {
+        format!("hyp-v{ver}-plugins.tar.gz")
+    };
+    state_dir.join("plugins-cache").join(filename)
+}
+
+/// Path to `<state_dir>/plugins-cache/hyp-v<ver>-plugins.tar.gz` (isolated per build version/channel).
 pub fn cached_plugins_archive_path(state_dir: &Path) -> PathBuf {
-    let version = env!("CARGO_PKG_VERSION");
-    state_dir
-        .join("plugins-cache")
-        .join(format!("hyp-v{version}-plugins.tar.gz"))
+    cached_plugins_archive_path_for(
+        state_dir,
+        env!("HYPHAE_BUILD_VERSION"),
+        Some(env!("HYPHAE_BUILD_CHANNEL")),
+    )
 }
 
 /// Normalizes `\r\n` -> `\n` so Windows and Unix produce identical SHA-256 digests.
@@ -2061,8 +2142,10 @@ fn resolve_and_verify_files(
     }
 
     // 5. HTTPS release download (`HYPHAE_PLUGINS_URL` override or GitHub Releases default)
+    let env_url = non_empty_env_str("HYPHAE_PLUGINS_URL");
+    let default_url = default_release_plugins_url();
     let download_url =
-        non_empty_env_str("HYPHAE_PLUGINS_URL").unwrap_or_else(default_release_plugins_url);
+        resolve_effective_plugins_download_url(None, env_url.as_deref(), &default_url);
     let (archive_bytes, final_url) = block_on_download(&download_url)?;
     let files = extract_and_verify_archive(&archive_bytes, required_entries)?;
     write_verified_cache(state_dir, &archive_bytes);
@@ -5145,5 +5228,147 @@ mod tests {
         assert_eq!(offline.source, "fallback");
         let w = offline.warning.expect("warning expected");
         assert!(!w.contains(secret_ok), "token leaked on offline error: {w}");
+    }
+
+    #[test]
+    fn release_plugins_url_and_cache_path_resolve_stable_nightly_and_overrides() {
+        // Stable SemVer -> vX.Y.Z release asset
+        assert_eq!(
+            resolve_release_plugins_url("0.7.0", None, None),
+            "https://github.com/hyphae-to/hyp/releases/download/v0.7.0/hyp-v0.7.0-plugins.tar.gz"
+        );
+        assert_eq!(
+            resolve_release_plugins_url("0.7.0", Some("stable"), None),
+            "https://github.com/hyphae-to/hyp/releases/download/v0.7.0/hyp-v0.7.0-plugins.tar.gz"
+        );
+        assert_eq!(
+            resolve_release_plugins_url("v0.7.0", Some("stable"), Some("v0.7.0")),
+            "https://github.com/hyphae-to/hyp/releases/download/v0.7.0/hyp-v0.7.0-plugins.tar.gz"
+        );
+
+        // Non-nightly tagged prerelease -> vX.Y.Z-rc.N release asset
+        assert!(!is_nightly_build_version("0.8.0-rc.1"));
+        assert_eq!(
+            resolve_release_plugins_url("0.8.0-rc.1", Some("stable"), None),
+            "https://github.com/hyphae-to/hyp/releases/download/v0.8.0-rc.1/hyp-v0.8.0-rc.1-plugins.tar.gz"
+        );
+
+        // Nightly prerelease version -> rolling `nightly` GitHub Release asset
+        assert!(is_nightly_build_version("0.7.1-nightly.20261126.bd3a90b"));
+        assert!(is_nightly_build_version(
+            "0.7.1-nightly.20261126.bd3a90b+ci"
+        ));
+        assert!(is_nightly_build_version("0.7.1-nightly"));
+        assert!(!is_nightly_build_version("0.7.0"));
+        assert!(!is_nightly_build_version("0.7.0+nightly"));
+        assert_eq!(
+            resolve_release_plugins_url("0.7.1-nightly.20261126.bd3a90b", None, None),
+            "https://github.com/hyphae-to/hyp/releases/download/nightly/hyp-nightly-plugins.tar.gz"
+        );
+        assert_eq!(
+            resolve_release_plugins_url(
+                "0.7.1-nightly.20261126.bd3a90b",
+                Some("nightly"),
+                Some("nightly")
+            ),
+            "https://github.com/hyphae-to/hyp/releases/download/nightly/hyp-nightly-plugins.tar.gz"
+        );
+
+        // Nightly channel or explicit `nightly` release tag on a Cargo.toml base version (e.g. 0.7.0)
+        assert_eq!(
+            resolve_release_plugins_url("0.7.0", Some("nightly"), None),
+            "https://github.com/hyphae-to/hyp/releases/download/nightly/hyp-nightly-plugins.tar.gz"
+        );
+        assert_eq!(
+            resolve_release_plugins_url("0.7.0", Some("stable"), Some("nightly")),
+            "https://github.com/hyphae-to/hyp/releases/download/nightly/hyp-nightly-plugins.tar.gz"
+        );
+
+        // Explicit CLI `--url` > `HYPHAE_PLUGINS_URL` env > build metadata default
+        let nightly_default = resolve_release_plugins_url(
+            "0.7.1-nightly.20261126.bd3a90b",
+            Some("nightly"),
+            Some("nightly"),
+        );
+        let stable_default = resolve_release_plugins_url("0.7.0", Some("stable"), None);
+        assert_eq!(
+            resolve_effective_plugins_download_url(
+                Some("https://mirror.example.com/cli.tar.gz"),
+                Some("https://mirror.example.com/env.tar.gz"),
+                &nightly_default,
+            ),
+            "https://mirror.example.com/cli.tar.gz"
+        );
+        assert_eq!(
+            resolve_effective_plugins_download_url(
+                None,
+                Some("  https://mirror.example.com/custom-nightly.tar.gz  "),
+                &nightly_default,
+            ),
+            "https://mirror.example.com/custom-nightly.tar.gz"
+        );
+        assert_eq!(
+            resolve_effective_plugins_download_url(Some("   "), Some("   "), &nightly_default),
+            "https://github.com/hyphae-to/hyp/releases/download/nightly/hyp-nightly-plugins.tar.gz"
+        );
+        assert_eq!(
+            resolve_effective_plugins_download_url(None, None, &stable_default),
+            "https://github.com/hyphae-to/hyp/releases/download/v0.7.0/hyp-v0.7.0-plugins.tar.gz"
+        );
+
+        // All resolved URLs pass strict URL validator
+        for url in [
+            resolve_release_plugins_url("0.7.0", Some("stable"), None),
+            resolve_release_plugins_url("0.7.1-nightly.20261126.bd3a90b", Some("nightly"), None),
+            resolve_release_plugins_url("0.8.0-rc.1", Some("stable"), None),
+            default_release_plugins_url(),
+        ] {
+            assert!(
+                validate_plugin_download_url(&url).is_ok(),
+                "resolved URL must pass validation: {url}"
+            );
+        }
+
+        // Cache archive path isolates nightly builds from stable v0.7.0 caches
+        let state = Path::new("/tmp/hyphae-state");
+        let stable_cache = cached_plugins_archive_path_for(state, "0.7.0", Some("stable"));
+        let nightly_ver_cache = cached_plugins_archive_path_for(
+            state,
+            "0.7.1-nightly.20261126.bd3a90b",
+            Some("nightly"),
+        );
+        let nightly_ch_cache = cached_plugins_archive_path_for(state, "0.7.0", Some("nightly"));
+        assert_eq!(
+            stable_cache,
+            state.join("plugins-cache/hyp-v0.7.0-plugins.tar.gz")
+        );
+        assert_eq!(
+            nightly_ver_cache,
+            state.join("plugins-cache/hyp-v0.7.1-nightly.20261126.bd3a90b-plugins.tar.gz")
+        );
+        assert_eq!(
+            nightly_ch_cache,
+            state.join("plugins-cache/hyp-nightly-plugins.tar.gz")
+        );
+        assert_ne!(stable_cache, nightly_ver_cache);
+        assert_ne!(stable_cache, nightly_ch_cache);
+
+        // Local `--from-dir` precedence beats URL/cache cleanly via `resolve_and_verify_files`
+        let tmp = TempDir::new().unwrap();
+        let spec = pinned_spec_for("telegram").expect("telegram spec");
+        let required: Vec<&'static PinnedPluginFile> = spec.files.iter().collect();
+        let (kind, loc, files) = resolve_and_verify_files(
+            tmp.path(),
+            &required,
+            PluginSourceOverrides {
+                archive: None,
+                from_dir: Some(&repo_plugins_dir()),
+                url: Some("http://127.0.0.1:1/unreachable.tar.gz"),
+            },
+        )
+        .expect("--from-dir must take precedence over unreachable URL");
+        assert_eq!(kind, InstallSourceKind::Dir);
+        assert_eq!(loc, repo_plugins_dir().display().to_string());
+        assert!(files.contains_key("telegram/index.mjs"));
     }
 }
