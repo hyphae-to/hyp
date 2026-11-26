@@ -127,8 +127,8 @@ for (const runtime of ["node", "python"]) {
       const executable = runtime === "node" ? process.execPath : "python3";
       if (runtime === "python" && spawnSync(executable, ["--version"]).error) return t.skip("python3 unavailable");
       const home = mkdtempSync(join(tmpdir(), "hyp-sdk-v2-"));
-    t.after(() => rmSync(home, { recursive: true, force: true }));
-    const token = randomBytes(32).toString("hex");
+      t.after(() => rmSync(home, { recursive: true, force: true }));
+      const token = randomBytes(32).toString("hex");
       const sockets = new Set();
       const errors = [];
       let published = 0;
