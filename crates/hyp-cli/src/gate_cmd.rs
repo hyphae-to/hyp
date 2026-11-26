@@ -1,22 +1,21 @@
-//! `hyp gate` (`init`, `propose`, `lock`, `unlock`, `remove`, `review`, `show`, `log`) & `hyp inbox` (`approve`, `reject`).
+//! `hyp gate` (`init`, `propose`, `apply`, `remove`, `review`, `show`, `log`) & `hyp inbox` (`approve`, `reject`).
 //!
 //! Human-boundary Local Security Gate management (`#10` — G1, G6, G7, H2):
 //! - Never writes plaintext API keys (`{ "secret": "<name>" }` / `api_key_secret` references only!).
-//! - Locking, unlocking, or mutating a locked Security Gate requires a real Passkey Admin Ed25519
-//!   approval ceremony (`hdrop1_` / Blind Drop Relay or loopback listener) bound to an external
-//!   SQLite `gate_lock_seal` row outside agent-writable `node.json`.
+//! - Every live policy mutation requires its own fresh Passkey Admin approval ceremony.
+//!   SQLite keeps durable signed policy evidence for integrity checks, never an unlock grant.
 //! - Human-only quarantine review, approval, rejection (+ atomic Stage 1 mute), and immutable
 //!   `gate_audit` log inspection.
 
 use crate::approval::{
-    ApprovalCeremonyArgs, CeremonyOutcome, base_approval_action, emit_pending_approval,
-    inspect_external_lock_state, next_seal_seq, persist_passkey_gate_seal,
+    ApprovalCeremonyArgs, CeremonyOutcome, base_approval_action, execute_approved_operation,
+    inspect_policy_integrity, next_seal_seq, persist_passkey_gate_seal,
     run_passkey_approval_ceremony, select_passkey_admin,
 };
 use crate::config_file::{
-    default_node_id, ensure_dir, ensure_v2_node_json_defaults, load_node_or_legacy_config,
-    open_secret_store, read_json_object_or_empty, resolve_config_path_for_read,
-    resolve_config_path_for_write, resolve_effective_node_id, resolve_state_dir, write_atomic_json,
+    ensure_dir, ensure_v2_node_json_defaults, load_node_or_legacy_config, open_secret_store,
+    read_json_object_or_empty, resolve_config_path_for_read, resolve_config_path_for_write,
+    resolve_effective_node_id, resolve_state_dir, write_atomic_json,
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -34,7 +33,7 @@ use hyp_node::gates::policy::{
     DEFAULT_STAGE2_MAX_OUTPUT_TOKENS, DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE,
     DEFAULT_STAGE2_TIMEOUT_MS, FilterAdapterConfig, FilterPluginConfig, LlmProvider,
     RateLimitAction, SecurityGateConfig, Stage1Config, Stage1DenyAction, Stage2ErrorAction,
-    Stage2Matchers, TierDeliveryAction, TrustTier, gate_policy_sha256, verify_gate_lock,
+    Stage2Matchers, TierDeliveryAction, TrustTier, gate_policy_sha256, verify_gate_policy_for_node,
 };
 use hyp_node::gates::stage2::validate_stage2_endpoint_urls;
 use hyp_store::{
@@ -981,7 +980,7 @@ fn summarize_stage1_and_diffs(
     }
 }
 
-fn format_gate_lock_summary(
+fn format_gate_policy_summary(
     before: Option<&SecurityGateConfig>,
     after: &SecurityGateConfig,
     merged_proposal: bool,
@@ -1454,9 +1453,6 @@ pub struct GateInitArgs {
     /// Explicit state directory for SecretStore and node.json
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
-    /// Immediately lock & seal gate policy via a Passkey Admin approval ceremony
-    #[arg(long)]
-    pub lock: bool,
     #[command(flatten)]
     pub ceremony: ApprovalCeremonyArgs,
     /// Output structured JSON envelope
@@ -1469,10 +1465,10 @@ pub enum GateCommand {
     /// Configure a Local Security Gate filter adapter in node.json (never plaintext API keys!)
     #[command(alias = "add")]
     Init(GateInitArgs),
-    /// Stage an unsigned gate policy proposal for human inspection before `gate lock`
+    /// Stage an unsigned gate policy proposal for human inspection before `gate apply`
     Propose(GateInitArgs),
     /// Validate gate policy in node.json (+ gate.proposed.json) and seal via a Passkey Admin approval URL
-    Lock {
+    Apply {
         /// Explicit node.json path
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1485,21 +1481,7 @@ pub enum GateCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Unlock a Passkey-locked Security Gate via a Passkey Admin approval URL
-    Unlock {
-        /// Explicit node.json path
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Explicit state directory containing node.sqlite and secrets/
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
-        #[command(flatten)]
-        ceremony: ApprovalCeremonyArgs,
-        /// Output structured JSON envelope
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove a configured Security Gate filter adapter (Passkey approval when locked, interactive TTY when unlocked)
+    /// Remove a configured Security Gate filter adapter (fresh live Passkey approval required)
     #[command(alias = "rm")]
     Remove {
         /// Filter ID to remove (e.g. anthropic-guard, openai-compat-guard)
@@ -1510,9 +1492,6 @@ pub enum GateCommand {
         /// Explicit state directory for SecretStore and node.json
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Immediately re-seal & keep tamper-evident Passkey lock enabled
-        #[arg(long)]
-        lock: bool,
         #[command(flatten)]
         ceremony: ApprovalCeremonyArgs,
         /// Output structured JSON envelope
@@ -1690,7 +1669,7 @@ pub fn inspect_gate_status(
         };
     }
 
-    // `verify_gate_lock` checks the Passkey `gate_lock_seal` in `node.sqlite` first, so a locked
+    // `verify_gate_policy_integrity` checks the Passkey `gate_lock_seal` in `node.sqlite` first, so a locked
     // gate is reported (or flagged tampered) even if `gate` was deleted from `node.json`.
     let mem_db;
     let lock_db = match db {
@@ -1701,7 +1680,15 @@ pub fn inspect_gate_status(
         }
     };
     let lock = match lock_db {
-        Some(d) => verify_gate_lock(&gate_cfg, d, Some(secrets)).map_err(|e| e.to_string()),
+        Some(d) => {
+            let stored_id = d.local().get_metadata("node_id").ok().flatten();
+            let node_id = raw_config
+                .and_then(|c| c.get("nodeId"))
+                .and_then(Value::as_str)
+                .or(stored_id.as_deref());
+            verify_gate_policy_for_node(&gate_cfg, d, Some(secrets), node_id)
+                .map_err(|e| e.to_string())
+        }
         None => Err("node.sqlite unavailable".to_string()),
     };
     let summary = |locked: bool, sig: &str, detail: String, filters| GateStatusSummary {
@@ -1715,10 +1702,10 @@ pub fn inspect_gate_status(
     };
     match lock {
         Err(e) => summary(true, "FAIL", format!("gate_policy_tampered: {e}"), filters),
-        Ok(state) if state.locked => {
-            let detail = match state.seal {
-                Some(seal) if seal.locked => format!(
-                    "Passkey-locked gate policy verified (seal_seq={}, admin={}, {} filter adapter(s), {} quarantined)",
+        Ok(state) if state.approved => {
+            let mut detail = match state.seal {
+                Some(seal) if seal.approved => format!(
+                    "Passkey-approved gate policy verified (seal_seq={}, admin={}, {} filter adapter(s), {} quarantined)",
                     seal.seal_seq,
                     seal.human_id,
                     filters.len(),
@@ -1730,6 +1717,26 @@ pub fn inspect_gate_status(
                     quarantined_count
                 ),
             };
+            let eligible_admin = db.and_then(|database| {
+                let epoch = database.human().min_auth_epoch().ok()?;
+                Some(
+                    database
+                        .human()
+                        .list_active_authorities()
+                        .ok()?
+                        .iter()
+                        .any(|record| {
+                            hyp_node::gates::is_passkey_backed_admin(record, epoch, Some(secrets))
+                        }),
+                )
+            });
+            if eligible_admin == Some(false)
+                && db.is_some_and(|database| {
+                    database.human().requires_live_approval().unwrap_or(true)
+                })
+            {
+                detail.push_str("; no eligible Passkey Admin: policy remains enforced, new policy/authority changes are blocked (inspect hyp auth list)");
+            }
             summary(true, "OK", detail, filters)
         }
         Ok(_) if !configured => summary(
@@ -1743,7 +1750,7 @@ pub fn inspect_gate_status(
             false,
             "UNSIGNED",
             format!(
-                "Unsigned gate policy ({} filter adapter(s)); run `hyp gate lock` to enforce Passkey-signed lock protection",
+                "Unsigned gate policy ({} filter adapter(s)); run `hyp gate apply` to enforce Passkey-signed policy integrity",
                 filters.len()
             ),
             filters,
@@ -1830,26 +1837,19 @@ pub fn run_gate(command: GateCommand) -> ExitCode {
     match command {
         GateCommand::Init(args) => run_gate_init_or_propose(args, false),
         GateCommand::Propose(args) => run_gate_init_or_propose(args, true),
-        GateCommand::Lock {
+        GateCommand::Apply {
             config,
             state_dir,
             ceremony,
             json,
-        } => run_gate_lock(config, state_dir, ceremony, json),
-        GateCommand::Unlock {
-            config,
-            state_dir,
-            ceremony,
-            json,
-        } => run_gate_unlock(config, state_dir, ceremony, json),
+        } => run_gate_apply(config, state_dir, ceremony, json),
         GateCommand::Remove {
             filter_id,
             config,
             state_dir,
-            lock,
             ceremony,
             json,
-        } => run_gate_remove(filter_id, config, state_dir, lock, ceremony, json),
+        } => run_gate_remove(filter_id, config, state_dir, ceremony, json),
         GateCommand::Review {
             receipt,
             session,
@@ -2082,11 +2082,11 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     };
 
     let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
-    let lock_state = inspect_external_lock_state(&config_path, &state_dir, &secrets);
+    let lock_state = inspect_policy_integrity(&config_path, &state_dir, &secrets);
     let existing_gate: Option<SecurityGateConfig> = cfg_map
         .get("gate")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-    let was_locked = lock_state.locked
+    let was_locked = lock_state.approved
         || existing_gate
             .as_ref()
             .is_some_and(|g| g.require_signed_policy)
@@ -2121,7 +2121,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         let next = vec![
             format!("Review proposed policy at {}", proposal_path.display()),
             format!(
-                "Approve & lock with Passkey: hyp gate lock --config {} --state-dir {}",
+                "Approve & lock with Passkey: hyp gate apply --config {} --state-dir {}",
                 config_path.display(),
                 state_dir.display()
             ),
@@ -2139,7 +2139,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
                     "proposalPath": proposal_path.display().to_string(),
                     "adapter": args.adapter.as_str(),
                     "filterId": plugin.id,
-                    "locked": false,
+                    "approved": false,
                     "gate": proposal_val,
                 })),
                 warnings: Vec::new(),
@@ -2155,13 +2155,12 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         return ExitCode::from(EXIT_OK);
     }
 
-    let mut locked = false;
-    let mut approved_seal_seq: Option<u64> = None;
-    let mut approved_human_id: Option<String> = None;
-    let mut approved_kid: Option<String> = None;
-    let mut approved_policy_sha256: Option<String> = None;
+    let approved_seal_seq: Option<u64>;
+    let approved_human_id: Option<String>;
+    let approved_kid: Option<String>;
+    let approved_policy_sha256: Option<String>;
 
-    if args.lock {
+    {
         if let Err(e) = ensure_dir(&state_dir, true) {
             return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
         }
@@ -2208,7 +2207,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
         };
 
-        let mut summary = format_gate_lock_summary(
+        let mut summary = format_gate_policy_summary(
             existing_gate.as_ref(),
             &gate_cfg,
             false,
@@ -2218,21 +2217,21 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         if was_locked && existing_tampered.is_none() {
             summary.insert(
                 0,
-                "WARNING: Security Gate is currently LOCKED. Updating and re-sealing will replace the locked policy."
+                "The existing approved policy will be replaced only by this operation’s fresh approval."
                     .to_string(),
             );
         }
 
         let mut action = base_approval_action(
-            HumanApprovalActionKind::GateLock,
+            HumanApprovalActionKind::GateApply,
             effective_node_id,
             seal_seq,
-            true,
         );
+        action.parameters = Some(json!({"policy": gate_cfg}));
         action.policy_sha256 = Some(policy_sha.clone());
         action.authorities_digest = Some(auth_digest);
 
-        let verified = match approve_and_seal_gate(
+        let verified = match approve_gate_operation(
             cmd,
             as_json,
             &state_dir,
@@ -2246,54 +2245,53 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             Ok(v) => v,
             Err(code) => return code,
         };
-        approved_seal_seq = Some(verified.action.seal_seq);
-        approved_human_id = Some(verified.human_id);
-        approved_kid = Some(verified.kid);
-        approved_policy_sha256 = Some(policy_sha);
-        locked = true;
-    } else {
-        // P0 `#10` (G1): `hyp gate init` MUST NEVER silently unlock or overwrite a locked gate!
-        if was_locked {
+        let node_id = cfg_map
+            .get("nodeId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| verified.action.node_id.clone());
+        ensure_v2_node_json_defaults(&mut cfg_map, &node_id, NodeProfile::Local, &state_dir);
+        cfg_map.insert(
+            "gate".to_string(),
+            match serde_json::to_value(&gate_cfg) {
+                Ok(value) => value,
+                Err(error) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "JSON_ERROR",
+                        error.to_string(),
+                        None,
+                    );
+                }
+            },
+        );
+        if let Err(error) =
+            execute_approved_operation(&config_path, &config_path, &db, &verified, || {
+                persist_passkey_gate_seal(&db, &verified)?;
+                write_atomic_json(&config_path, &Value::Object(cfg_map), true)
+            })
+        {
             return emit_error(
                 cmd,
                 as_json,
                 EXIT_ERROR,
-                "GATE_LOCKED",
-                "Security Gate is currently LOCKED; `hyp gate init` refuses to overwrite or silently unlock a locked policy.",
-                Some(format!(
-                    "Stage changes with `hyp gate propose --adapter {} ...` then approve via `hyp gate lock`, or unlock with Passkey via `hyp gate unlock --config {} --state-dir {}`.",
-                    args.adapter.as_str(),
-                    config_path.display(),
-                    state_dir.display()
-                )),
+                "APPROVAL_COMMIT_FAILED",
+                error,
+                None,
             );
         }
-        // Clear any stale signature because the policy is unlocked.
-        gate_cfg.policy_signature = None;
-        gate_cfg.require_signed_policy = false;
+        approved_seal_seq = Some(verified.action.seal_seq);
+        approved_human_id = Some(verified.human_id);
+        approved_kid = Some(verified.kid);
+        approved_policy_sha256 = Some(policy_sha);
     }
 
-    let node_id = cfg_map
-        .get("nodeId")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(default_node_id);
-    ensure_v2_node_json_defaults(&mut cfg_map, &node_id, NodeProfile::Local, &state_dir);
-
-    let gate_val = match serde_json::to_value(&gate_cfg) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
-    };
-    cfg_map.insert("gate".to_string(), gate_val);
-
-    if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
-
-    let mut daemon_reloaded = false;
+    let daemon_reloaded;
     let mut daemon_reload_error: Option<String> = None;
     let mut warnings: Vec<String> = Vec::new();
-    if locked {
+    {
         let reload_res =
             try_live_gate_reload(args.state_dir.is_some(), args.config.is_some(), &state_dir);
         daemon_reloaded = reload_res.ok
@@ -2318,13 +2316,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             "Store API key out-of-band: hyp secret set {secret_ref} --web"
         ));
     }
-    if !locked {
-        next.push(format!(
-            "Lock tamper-evident Passkey seal: hyp gate lock --config {} --state-dir {}",
-            config_path.display(),
-            state_dir.display()
-        ));
-    }
+
     next.push(format!(
         "hyp doctor --config {} --state-dir {}",
         config_path.display(),
@@ -2336,9 +2328,9 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             "configPath": config_path.display().to_string(),
             "stateDir": state_dir.display().to_string(),
             "filter": summary_filter,
-            "locked": locked,
+            "approved": true,
             "requireSignedPolicy": gate_cfg.require_signed_policy,
-            "gatePolicySig": if locked { "OK" } else { "UNSIGNED" },
+            "gatePolicySig": "OK",
             "policySigningSecret": gate_cfg.policy_signing_secret,
             "sealSeq": approved_seal_seq,
             "authorityHumanId": approved_human_id,
@@ -2357,7 +2349,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
                 plugin.id,
                 args.adapter.as_str(),
                 config_path.display(),
-                if locked { " [PASSKEY LOCKED]" } else { "" }
+                { " [PASSKEY APPROVED]" }
             )),
             data: Some(data),
             warnings,
@@ -2370,17 +2362,13 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             "OK    Configured Security Gate adapter '{}' ({}){}",
             plugin.id,
             args.adapter.as_str(),
-            if locked {
-                " · Passkey gate_lock_seal LOCKED"
-            } else {
-                ""
-            }
+            { " · Passkey policy approved" }
         );
         println!("      Config: {}", config_path.display());
         if let Some(ref sec) = summary_filter.api_key_secret {
             println!("      Secret: {{ \"secret\": \"{sec}\" }} (never plaintext)");
         }
-        if locked {
+        {
             if let (Some(seq), Some(hid)) = (approved_seal_seq, &approved_human_id) {
                 println!("      Seal:   seq={seq} (Passkey admin: {hid})");
             }
@@ -2427,10 +2415,10 @@ fn check_raw_gate_json_signing_secret(val: &Value, label: &str) -> Result<(), St
     Ok(())
 }
 
-/// Runs the Passkey ceremony for a gate `action` and, once approved, stores it as the new
-/// `gate_lock_seal`. `Err` carries the exit code to return (pending URL printed, or failure).
+/// Runs the Passkey ceremony for one gate operation. The caller commits its policy and
+/// evidence only through the serialized approved-operation transaction. `Err` carries the exit code to return (pending URL printed, or failure).
 #[allow(clippy::too_many_arguments)]
-fn approve_and_seal_gate(
+fn approve_gate_operation(
     cmd: &str,
     as_json: bool,
     state_dir: &std::path::Path,
@@ -2451,23 +2439,18 @@ fn approve_and_seal_gate(
         ceremony,
     ) {
         Ok(CeremonyOutcome::Approved(verified)) => verified,
-        Ok(CeremonyOutcome::Pending(pending)) => {
-            return Err(emit_pending_approval(cmd, as_json, &pending));
-        }
         Err(err) => return Err(err.emit(cmd, as_json)),
     };
-    persist_passkey_gate_seal(db, &verified)
-        .map_err(|e| emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None))?;
     Ok(verified)
 }
 
-fn run_gate_lock(
+fn run_gate_apply(
     config: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     ceremony: ApprovalCeremonyArgs,
     as_json: bool,
 ) -> ExitCode {
-    let cmd = "gate lock";
+    let cmd = "gate apply";
 
     let dir = resolve_state_dir(state_dir.as_deref(), config.as_deref(), None);
     let config_path = resolve_config_path_for_read(config.as_deref(), state_dir.as_deref(), None);
@@ -2515,7 +2498,7 @@ fn run_gate_lock(
             .get("nodeId")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .unwrap_or_else(default_node_id);
+            .unwrap_or_else(|| resolve_effective_node_id(None, Some(&db)));
         ensure_v2_node_json_defaults(&mut cfg_map, &node_id, NodeProfile::Local, &dir);
     }
 
@@ -2542,7 +2525,7 @@ fn run_gate_lock(
 
     // Tamper laundering defense: verify existing external lock seal / policy FIRST before merging
     // any proposal so unauthorized disk edits are surfaced inside the Passkey approval diff!
-    let lock_state = inspect_external_lock_state(&config_path, &dir, &secrets);
+    let lock_state = inspect_policy_integrity(&config_path, &dir, &secrets);
     let existing_tampered = lock_state.tampered_reason.clone();
 
     let mut gate_cfg = before_gate.clone().unwrap_or_default();
@@ -2691,7 +2674,7 @@ fn run_gate_lock(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| resolve_effective_node_id(loaded_cfg.as_ref(), Some(&db)));
 
-    let summary = format_gate_lock_summary(
+    let summary = format_gate_policy_summary(
         before_gate.as_ref(),
         &gate_cfg,
         merged_proposal,
@@ -2700,15 +2683,15 @@ fn run_gate_lock(
     );
 
     let mut action = base_approval_action(
-        HumanApprovalActionKind::GateLock,
+        HumanApprovalActionKind::GateApply,
         effective_node_id,
         seal_seq,
-        true,
     );
+    action.parameters = Some(json!({"policy": gate_cfg}));
     action.policy_sha256 = Some(policy_sha.clone());
     action.authorities_digest = Some(auth_digest);
 
-    let verified = match approve_and_seal_gate(
+    let verified = match approve_gate_operation(
         cmd,
         as_json,
         &dir,
@@ -2728,8 +2711,20 @@ fn run_gate_lock(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
     };
     cfg_map.insert("gate".to_string(), gate_val);
-    if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    if let Err(error) =
+        execute_approved_operation(&config_path, &config_path, &db, &verified, || {
+            persist_passkey_gate_seal(&db, &verified)?;
+            write_atomic_json(&config_path, &Value::Object(cfg_map), true)
+        })
+    {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "APPROVAL_COMMIT_FAILED",
+            error,
+            None,
+        );
     }
     if merged_proposal {
         let _ = std::fs::remove_file(&proposal_path);
@@ -2770,7 +2765,7 @@ fn run_gate_lock(
             "configPath": config_path.display().to_string(),
             "stateDir": dir.display().to_string(),
             "gatePolicySig": "OK",
-            "locked": true,
+            "approved": true,
             "requireSignedPolicy": true,
             "mergedProposal": merged_proposal,
             "filterCount": gate_cfg.filters.len(),
@@ -2789,7 +2784,7 @@ fn run_gate_lock(
             ok: true,
             command: cmd.to_string(),
             summary: Some(format!(
-                "Locked and Passkey-sealed Security Gate for {} ({} filter(s){})",
+                "Applied Passkey-approved Security Gate policy for {} ({} filter(s){})",
                 config_path.display(),
                 gate_cfg.filters.len(),
                 if merged_proposal {
@@ -2806,7 +2801,7 @@ fn run_gate_lock(
         print_json(&envelope);
     } else {
         println!(
-            "OK    Locked Security Gate in {} (Passkey seal seq={}, admin={})",
+            "OK    Applied Security Gate policy in {} (Passkey seal seq={}, admin={})",
             config_path.display(),
             verified.action.seal_seq,
             verified.human_id
@@ -2835,303 +2830,10 @@ fn run_gate_lock(
     ExitCode::from(EXIT_OK)
 }
 
-fn run_gate_unlock(
-    config: Option<PathBuf>,
-    state_dir: Option<PathBuf>,
-    ceremony: ApprovalCeremonyArgs,
-    as_json: bool,
-) -> ExitCode {
-    let cmd = "gate unlock";
-
-    let dir = resolve_state_dir(state_dir.as_deref(), config.as_deref(), None);
-    let config_path = resolve_config_path_for_read(config.as_deref(), state_dir.as_deref(), None);
-    if let Err(e) = ensure_dir(&dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
-    let db = match NodeDb::open(dir.join("node.sqlite")) {
-        Ok(d) => d,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
-    let secrets = open_secret_store(&dir, state_dir.is_some());
-
-    // Fail closed immediately if no Passkey Admin authority is enrolled (`#10` / G1 & H2).
-    if let Err(err) = select_passkey_admin(&db, &secrets, &dir, None) {
-        return err.emit(cmd, as_json);
-    }
-
-    let lock_state = inspect_external_lock_state(&config_path, &dir, &secrets);
-    if !lock_state.locked && lock_state.tampered_reason.is_none() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "GATE_NOT_LOCKED",
-            "Security Gate is already unlocked.",
-            Some(format!(
-                "Run `hyp gate lock --config {} --state-dir {}` to lock it with your Passkey.",
-                config_path.display(),
-                dir.display()
-            )),
-        );
-    }
-
-    let mut cfg_map = match read_json_object_or_empty(&config_path) {
-        Ok(m) => m,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
-    };
-    let loaded_cfg = if config_path.exists() {
-        load_node_or_legacy_config(&config_path).ok()
-    } else {
-        None
-    };
-    let effective_node_id = cfg_map
-        .get("nodeId")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| resolve_effective_node_id(loaded_cfg.as_ref(), Some(&db)));
-
-    let seal_seq = match next_seal_seq(&db) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
-    };
-
-    let mut summary = Vec::new();
-    if let Some(ref tamper) = lock_state.tampered_reason {
-        summary.push(format!(
-            "WARNING: POLICY TAMPERED SINCE LAST SIGNATURE ({})",
-            sanitize_tty_display(tamper)
-        ));
-    }
-    summary.push(
-        "[WEAKENING] Unlocking Security Gate disables tamper-evident Passkey policy lock"
-            .to_string(),
-    );
-    summary.push(format!(
-        "Config: {}",
-        sanitize_tty_display(&config_path.display().to_string())
-    ));
-    summary.push(format!("Next seal sequence: {seal_seq} (locked=false)"));
-
-    let action = base_approval_action(
-        HumanApprovalActionKind::GateUnlock,
-        effective_node_id,
-        seal_seq,
-        false,
-    );
-
-    let verified = match approve_and_seal_gate(
-        cmd,
-        as_json,
-        &dir,
-        &config_path,
-        &db,
-        &secrets,
-        action,
-        &summary,
-        &ceremony,
-    ) {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-
-    if let Some(raw_gate) = cfg_map.get("gate") {
-        let mut gate_cfg: SecurityGateConfig =
-            serde_json::from_value(raw_gate.clone()).unwrap_or_default();
-        gate_cfg.require_signed_policy = false;
-        gate_cfg.policy_signature = None;
-        gate_cfg.human_authorities_digest = None;
-        if let Ok(gate_val) = serde_json::to_value(&gate_cfg) {
-            cfg_map.insert("gate".to_string(), gate_val);
-            if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
-                return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-            }
-        }
-    }
-
-    let reload_res = try_live_gate_reload(state_dir.is_some(), config.is_some(), &dir);
-    let daemon_reloaded = reload_res.ok
-        && reload_res
-            .result
-            .as_ref()
-            .and_then(|r| r.get("reloaded"))
-            .and_then(Value::as_bool)
-            == Some(true);
-    let mut warnings: Vec<String> = Vec::new();
-    let daemon_reload_error = if !daemon_reloaded {
-        if let Some(err) = reload_res.error {
-            warnings.push(format!("Live daemon gate.reload failed: {err}"));
-            Some(err)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let next = vec![
-        format!(
-            "Re-lock after changes: hyp gate lock --config {} --state-dir {}",
-            config_path.display(),
-            dir.display()
-        ),
-        format!(
-            "hyp doctor --config {} --state-dir {}",
-            config_path.display(),
-            dir.display()
-        ),
-    ];
-
-    if as_json {
-        let mut data = json!({
-            "configPath": config_path.display().to_string(),
-            "stateDir": dir.display().to_string(),
-            "locked": false,
-            "requireSignedPolicy": false,
-            "gatePolicySig": "UNSIGNED",
-            "sealSeq": verified.action.seal_seq,
-            "authorityHumanId": verified.human_id,
-            "authorityKid": verified.kid,
-            "daemonReloaded": daemon_reloaded,
-        });
-        if let Some(ref err) = daemon_reload_error {
-            data["daemonReloadError"] = json!(err);
-        }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
-                "Unlocked Security Gate in {} via Passkey approval (seal seq={}, admin={})",
-                config_path.display(),
-                verified.action.seal_seq,
-                verified.human_id
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error: None,
-        };
-        print_json(&envelope);
-    } else {
-        println!(
-            "OK    Unlocked Security Gate in {} (Passkey seal seq={}, admin={})",
-            config_path.display(),
-            verified.action.seal_seq,
-            verified.human_id
-        );
-        if daemon_reloaded {
-            println!(
-                "      Live daemon reloaded — unlocked Security Gate policy active immediately."
-            );
-        } else if let Some(ref err) = daemon_reload_error {
-            println!(
-                "WARN  Live daemon reload failed ({err}); run `hyp service restart` or `hyp node start` to apply."
-            );
-        }
-        print_next_steps(&next);
-    }
-    ExitCode::from(EXIT_OK)
-}
-
-fn format_gate_remove_summary(
-    before: &SecurityGateConfig,
-    after: &SecurityGateConfig,
-    removed: &FilterPluginConfig,
-    was_locked: bool,
-    will_lock: bool,
-    config_path: &Path,
-    existing_tampered: Option<&str>,
-) -> Vec<String> {
-    if will_lock {
-        let mut lines =
-            format_gate_lock_summary(Some(before), after, false, config_path, existing_tampered);
-        if was_locked && existing_tampered.is_none() {
-            lines.insert(
-                0,
-                format!(
-                    "WARNING: Security Gate is currently LOCKED. Removing filter '{}' and re-signing will replace the locked policy.",
-                    sanitize_tty_display(&removed.id)
-                ),
-            );
-        }
-        return lines;
-    }
-
-    let snap = FilterSnapshot::from_config(removed);
-    let mut lines = Vec::new();
-    if let Some(tamper_detail) = existing_tampered {
-        lines.push(
-            "========================================================================".to_string(),
-        );
-        lines.push("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE".to_string());
-        lines.push(format!(
-            "  Existing node.json failed gate_policy_sig verification: {}",
-            sanitize_tty_display(tamper_detail)
-        ));
-        lines.push(
-            "  Do NOT modify unless you have personally inspected EVERY field below!".to_string(),
-        );
-        lines.push(
-            "========================================================================".to_string(),
-        );
-    }
-
-    lines.push(format!(
-        "Security Gate Filter Removal (config: {})",
-        sanitize_tty_display(&config_path.display().to_string())
-    ));
-    lines.push(
-        "  Signing:   unlocked (pass --lock to keep tamper-evident gate_policy_sig active)"
-            .to_string(),
-    );
-    lines.push(format!("  Removing:  {} [REMOVED] [WEAKENING]", snap.id));
-    lines.push(format!(
-        "    details: enabled={}, adapter={}, model={}, base_url={}, auth_header={}, secret_name={}, on_error={}, {}, max_input_chars={}",
-        snap.enabled,
-        snap.adapter,
-        snap.model,
-        snap.base_url,
-        snap.auth_header,
-        snap.secret_name,
-        snap.on_error,
-        snap.threshold_summary(),
-        snap.max_input_chars,
-    ));
-    lines.push(format!(
-        "    matchers: {}",
-        format_matchers_display(&snap.matchers)
-    ));
-    let remaining_names: Vec<String> = after
-        .filters
-        .iter()
-        .map(|f| sanitize_tty_display(&f.id))
-        .collect();
-    if remaining_names.is_empty() {
-        lines.push(
-            "  Remaining: 0 filters configured (Stage 1 deterministic defaults only)".to_string(),
-        );
-    } else {
-        lines.push(format!(
-            "  Remaining: {} filter(s) [{}]",
-            remaining_names.len(),
-            remaining_names.join(", ")
-        ));
-    }
-    lines.push("  WARNING — WEAKENING POLICY CHANGES DETECTED:".to_string());
-    lines.push(format!("    ! Filter '{}' removed", snap.id));
-    if was_locked {
-        lines.push(
-            "  WARNING:   Security Gate is currently LOCKED. Removing without --lock will disable tamper protection until re-locked."
-                .to_string(),
-        );
-    }
-    lines
-}
-
 fn run_gate_remove(
     filter_id: String,
     config: Option<PathBuf>,
     state_dir: Option<PathBuf>,
-    lock: bool,
     ceremony: ApprovalCeremonyArgs,
     as_json: bool,
 ) -> ExitCode {
@@ -3198,20 +2900,7 @@ fn run_gate_remove(
     };
 
     let secrets = open_secret_store(&dir, state_dir.is_some());
-    let lock_state = inspect_external_lock_state(&config_path, &dir, &secrets);
-    let was_locked = lock_state.locked
-        || existing_gate.require_signed_policy
-        || raw_gate_val
-            .get("require_signed_policy")
-            .and_then(Value::as_bool)
-            == Some(true);
-
-    // When unlocked and not re-locking, keep the unskippable interactive TTY guard (`#6`).
-    // When locked OR `--lock` is requested, a Passkey Admin ceremony is the cryptographic boundary!
-    if !was_locked && !lock && !is_interactive_tty() {
-        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
-    }
-
+    let lock_state = inspect_policy_integrity(&config_path, &dir, &secrets);
     let Some(removed_pos) = existing_gate
         .filters
         .iter()
@@ -3250,7 +2939,7 @@ fn run_gate_remove(
             None,
         );
     }
-    if lock {
+    {
         if after_gate.stage2.enabled {
             if let Err(e) = validate_stage2_endpoint_urls(&after_gate.stage2) {
                 return emit_error(
@@ -3282,21 +2971,11 @@ fn run_gate_remove(
     let existing_tampered = lock_state.tampered_reason.clone();
     after_gate.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
 
-    let summary = format_gate_remove_summary(
-        &existing_gate,
-        &after_gate,
-        &removed_filter,
-        was_locked,
-        lock,
-        &config_path,
-        existing_tampered.as_deref(),
-    );
+    let approved_seal_seq: Option<u64>;
+    let approved_human_id: Option<String>;
+    let approved_kid: Option<String>;
 
-    let mut approved_seal_seq: Option<u64> = None;
-    let mut approved_human_id: Option<String> = None;
-    let mut approved_kid: Option<String> = None;
-
-    if was_locked || lock {
+    {
         if let Err(e) = ensure_dir(&dir, true) {
             return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
         }
@@ -3315,7 +2994,7 @@ fn run_gate_remove(
             Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
         };
 
-        let (policy_sha_opt, auth_digest_opt) = if lock {
+        let (policy_sha_opt, auth_digest_opt) = {
             let auth_digest = match db.human().authorities_digest() {
                 Ok(d) => d,
                 Err(e) => {
@@ -3339,23 +3018,25 @@ fn run_gate_remove(
                 }
             };
             (Some(psha), Some(auth_digest))
-        } else {
-            after_gate.human_authorities_digest = None;
-            after_gate.require_signed_policy = false;
-            after_gate.policy_signature = None;
-            (None, None)
         };
 
+        let summary = format_gate_policy_summary(
+            Some(&existing_gate),
+            &after_gate,
+            false,
+            &config_path,
+            existing_tampered.as_deref(),
+        );
         let mut action = base_approval_action(
             HumanApprovalActionKind::GateRemove,
             effective_node_id,
             seal_seq,
-            lock,
         );
+        action.parameters = Some(json!({"policy": after_gate}));
         action.policy_sha256 = policy_sha_opt;
         action.authorities_digest = auth_digest_opt;
 
-        let verified = match approve_and_seal_gate(
+        let verified = match approve_gate_operation(
             cmd,
             as_json,
             &dir,
@@ -3369,32 +3050,46 @@ fn run_gate_remove(
             Ok(v) => v,
             Err(code) => return code,
         };
+        cfg_map.insert(
+            "gate".to_string(),
+            match serde_json::to_value(&after_gate) {
+                Ok(value) => value,
+                Err(error) => {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "JSON_ERROR",
+                        error.to_string(),
+                        None,
+                    );
+                }
+            },
+        );
+        if let Err(error) =
+            execute_approved_operation(&config_path, &config_path, &db, &verified, || {
+                persist_passkey_gate_seal(&db, &verified)?;
+                write_atomic_json(&config_path, &Value::Object(cfg_map), true)
+            })
+        {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "APPROVAL_COMMIT_FAILED",
+                error,
+                None,
+            );
+        }
         approved_seal_seq = Some(verified.action.seal_seq);
         approved_human_id = Some(verified.human_id);
         approved_kid = Some(verified.kid);
-    } else {
-        let safe_id = sanitize_tty_display(&removed_filter.id);
-        let prompt = format!("Remove filter '{safe_id}' from Security Gate policy? [y/N]: ");
-        if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
-            return emit_confirm_error(cmd, as_json, err);
-        }
-        after_gate.policy_signature = None;
-        after_gate.require_signed_policy = false;
     }
 
-    let gate_val = match serde_json::to_value(&after_gate) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
-    };
-    cfg_map.insert("gate".to_string(), gate_val);
-    if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
-
-    let mut daemon_reloaded = false;
+    let daemon_reloaded;
     let mut daemon_reload_error: Option<String> = None;
     let mut warnings: Vec<String> = Vec::new();
-    if lock || was_locked {
+    {
         let reload_res = try_live_gate_reload(state_dir.is_some(), config.is_some(), &dir);
         daemon_reloaded = reload_res.ok
             && reload_res
@@ -3419,13 +3114,7 @@ fn run_gate_remove(
         .collect();
 
     let mut next = Vec::new();
-    if !lock {
-        next.push(format!(
-            "Lock tamper-evident Passkey seal: hyp gate lock --config {} --state-dir {}",
-            config_path.display(),
-            dir.display()
-        ));
-    } else if !daemon_reloaded {
+    {
         next.push("hyp service restart".to_string());
     }
     next.push(format!(
@@ -3441,9 +3130,9 @@ fn run_gate_remove(
             "removedFilter": removed_summary,
             "remainingFilters": remaining_summaries,
             "filterCount": after_gate.filters.len(),
-            "locked": lock,
+            "approved": true,
             "requireSignedPolicy": after_gate.require_signed_policy,
-            "gatePolicySig": if lock { "OK" } else { "UNSIGNED" },
+            "gatePolicySig": "OK",
             "sealSeq": approved_seal_seq,
             "authorityHumanId": approved_human_id,
             "authorityKid": approved_kid,
@@ -3460,7 +3149,7 @@ fn run_gate_remove(
                 removed_summary.id,
                 removed_summary.adapter_type,
                 config_path.display(),
-                if lock { " [LOCKED]" } else { "" }
+                { " [APPROVED]" }
             )),
             data: Some(data),
             warnings,
@@ -3473,11 +3162,7 @@ fn run_gate_remove(
             "OK    Removed Security Gate filter '{}' ({}){}",
             sanitize_tty_display(&removed_summary.id),
             removed_summary.adapter_type,
-            if lock {
-                " · gate_policy_sig LOCKED"
-            } else {
-                ""
-            }
+            { " · policy integrity verified" }
         );
         println!("      Config:    {}", config_path.display());
         println!("      Remaining: {} filter(s)", after_gate.filters.len());
@@ -3487,7 +3172,7 @@ fn run_gate_remove(
                 sanitize_tty_display(sec)
             );
         }
-        if lock {
+        {
             if daemon_reloaded {
                 println!(
                     "      Live daemon reloaded — updated Security Gate policy active immediately (no restart needed)."
@@ -4237,7 +3922,6 @@ mod tests {
             policy_notes: None,
             config: None,
             state_dir: None,
-            lock: false,
             ceremony: ApprovalCeremonyArgs::default(),
             json: true,
         }
@@ -4365,7 +4049,7 @@ mod tests {
         let mut after = SecurityGateConfig::default();
         after.filters.push(after_filter);
 
-        let lines = format_gate_lock_summary(
+        let lines = format_gate_policy_summary(
             Some(&before),
             &after,
             true,
@@ -4505,7 +4189,7 @@ mod tests {
             },
         });
 
-        let text = format_gate_lock_summary(
+        let text = format_gate_policy_summary(
             Some(&before),
             &after,
             true,
@@ -4573,49 +4257,18 @@ mod tests {
         let mut after = SecurityGateConfig::default();
         after.filters.push(f2);
 
-        // Unlocked removal summary
-        let unlocked_text = format_gate_remove_summary(
-            &before,
+        after.require_signed_policy = true;
+        let text = format_gate_policy_summary(
+            Some(&before),
             &after,
-            &f1,
             false,
-            false,
-            Path::new("/tmp/node.json"),
-            None,
-        )
-        .join("\n");
-        assert!(unlocked_text.contains("anthropic-guard [REMOVED] [WEAKENING]"));
-        assert!(unlocked_text.contains("Remaining: 1 filter(s) [local-ollama]"));
-        assert!(unlocked_text.contains("Filter 'anthropic-guard' removed"));
-        assert!(!unlocked_text.contains("require_signed_policy=true"));
-
-        // Locked removal WITH --lock + tampered banner
-        let locked_text = format_gate_remove_summary(
-            &before,
-            &after,
-            &f1,
-            true,
-            true,
             Path::new("/tmp/node.json"),
             Some("signature mismatch"),
         )
         .join("\n");
-        assert!(locked_text.contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"));
-        assert!(locked_text.contains("anthropic-guard [REMOVED] [WEAKENING]"));
-        assert!(locked_text.contains("require_signed_policy=true"));
-
-        // Locked removal WITHOUT --lock warns loudly about unlocking
-        let unlock_warn_text = format_gate_remove_summary(
-            &before,
-            &after,
-            &f1,
-            true,
-            false,
-            Path::new("/tmp/node.json"),
-            None,
-        )
-        .join("\n");
-        assert!(unlock_warn_text.contains("Security Gate is currently LOCKED"));
-        assert!(unlock_warn_text.contains("disable tamper protection until re-locked"));
+        assert!(text.contains("anthropic-guard [REMOVED] [WEAKENING]"));
+        assert!(text.contains("Filter 'anthropic-guard' removed"));
+        assert!(text.contains("require_signed_policy=true"));
+        assert!(text.contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"));
     }
 }

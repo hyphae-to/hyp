@@ -165,7 +165,7 @@ enum Commands {
     },
     /// Run a child command with stored secrets injected into env vars and streaming stdout/stderr scrubbing
     Exec(exec_cmd::ExecArgs),
-    /// Local Security Gate configuration, tamper-evident signing (`lock`), quarantine `review`, and `log`
+    /// Local Security Gate configuration with per-operation Passkey approval, quarantine review, and audit log
     Gate {
         #[command(subcommand)]
         command: gate_cmd::GateCommand,

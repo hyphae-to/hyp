@@ -210,6 +210,26 @@ impl<'a> HumanAuthorityStore<'a> {
         input: &HumanAuthorityInput,
         now_ms: i64,
     ) -> StoreResult<HumanAuthorityRecord> {
+        self.upsert_authority_inner(input, now_ms, false)
+    }
+
+    /// Bootstrap enrollment is serialized with other writers and refuses once Passkey
+    /// enrollment history or signed policy evidence exists. A pending initial ceremony cannot
+    /// become an authority-injection bypass after another process enrolls the first admin.
+    pub fn bootstrap_authority(
+        &self,
+        input: &HumanAuthorityInput,
+        now_ms: i64,
+    ) -> StoreResult<HumanAuthorityRecord> {
+        self.upsert_authority_inner(input, now_ms, true)
+    }
+
+    fn upsert_authority_inner(
+        &self,
+        input: &HumanAuthorityInput,
+        now_ms: i64,
+        bootstrap: bool,
+    ) -> StoreResult<HumanAuthorityRecord> {
         validate_human_id(&input.human_id)?;
         validate_token_id("kid", &input.kid)?;
         validate_label(&input.label)?;
@@ -223,6 +243,11 @@ impl<'a> HumanAuthorityStore<'a> {
         let epoch_i64 = validate_epoch(input.auth_epoch)?;
 
         let tx = self.db.immediate_tx()?;
+        if bootstrap && self.requires_live_approval()? {
+            return Err(StoreError::InvalidState(
+                "Passkey enrollment history exists; bootstrap cannot mutate authorities".into(),
+            ));
+        }
 
         // Prevent cross-human kid collisions and fail closed on revoked-key resurrection.
         let existing: Option<(String, String, i64)> = tx
@@ -478,6 +503,16 @@ impl<'a> HumanAuthorityStore<'a> {
         tx.commit()?;
 
         Ok(effective_min)
+    }
+
+    /// Whether normal authority mutations require a live local Passkey ceremony. This uses
+    /// enrollment history, not active-key availability or the legacy locked/unlocked bit.
+    pub fn requires_live_approval(&self) -> StoreResult<bool> {
+        Ok(self.get_gate_lock_seal()?.is_some()
+            || self
+                .list_authorities(true)?
+                .iter()
+                .any(|a| a.role == HumanAuthorityRole::Admin && a.prf_salt.is_some()))
     }
 
     /// Computes a canonical SHA-256 hex digest over sorted enrolled authority identity tuples

@@ -801,12 +801,16 @@ function initEnrollMode(payload) {
 
 function approvalActionHeading(actionKind) {
   switch (actionKind) {
+    case "gate.apply":
+      return "Apply Security Gate Policy";
     case "gate.lock":
       return "Lock Security Gate";
     case "gate.unlock":
       return "Unlock Security Gate";
     case "gate.remove":
       return "Remove Security Gate Filter";
+    case "auth.admit":
+      return "Admit Human and Device Policy";
     case "auth.add":
       return "Enroll Human Authority";
     case "auth.revoke":
@@ -1376,7 +1380,10 @@ async function initDropMode(fragment) {
     const metaList = $("approvalMetaList");
     metaList.textContent = "";
     appendApprovalMetaRow(metaList, "Target Node", action.nodeId);
-    appendApprovalMetaRow(metaList, "Lock State", action.locked ? "LOCKED (Passkey Sealed)" : "UNLOCKED");
+    appendApprovalMetaRow(metaList, "Permission", "This operation only; a fresh approval is required for every change.");
+    if (action.parameters) {
+      appendApprovalMetaRow(metaList, "Parameters", JSON.stringify(action.parameters, null, 2));
+    }
     if (action.sealSeq > 0) {
       appendApprovalMetaRow(metaList, "Seal Sequence", `#${action.sealSeq}`);
     }

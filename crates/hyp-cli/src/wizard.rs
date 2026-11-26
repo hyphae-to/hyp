@@ -10855,7 +10855,7 @@ command = "other"
         assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp secret set"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("--web"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp gate propose"));
-        assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp gate lock"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp gate apply"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("Herdr"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("Codex Queue"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("--claude-channel"));

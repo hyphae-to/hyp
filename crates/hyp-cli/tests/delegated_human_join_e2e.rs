@@ -14,8 +14,6 @@
 
 mod common;
 
-#[cfg(unix)]
-use common::run_hyp_in_pty;
 use common::{ManagedProcess, isolated_cmd, parse_json_stdout};
 use http::{Method, Request, StatusCode};
 use hyp_crypto::human::{
@@ -287,37 +285,41 @@ async fn delegated_human_join_cli_e2e_full_lifecycle() {
     let bob_card = decode_hpub1(&bob_hpub1).unwrap();
     assert_eq!(bob_card.human_id, "bob");
 
-    let admit_out = isolated_cmd(hub_home)
-        .args([
-            "auth",
-            "admit",
-            "bob",
-            "--id",
-            &bob_hpub1,
-            "--node-prefix",
-            "bob@*",
-            "--max-devices",
-            "3",
-            "--state-dir",
-            hub_state_str,
-            "--config",
-            hub_cfg_str,
-            "--json",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(
-        admit_out.status.code(),
-        Some(0),
-        "hyp auth admit failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&admit_out.stdout),
-        String::from_utf8_lossy(&admit_out.stderr)
-    );
-    let admit_json = parse_json_stdout(&admit_out);
-    assert_eq!(admit_json["ok"], true);
-    assert_eq!(admit_json["data"]["humanId"], "bob");
-    assert_eq!(admit_json["data"]["nodePrefix"], "bob@*");
+    // Legacy unmanaged-hub fixture: signed invites remain supported before Passkey migration.
+    {
+        let db = NodeDb::open(hub_state.join("node.sqlite")).unwrap();
+        db.human()
+            .upsert_authority(
+                &HumanAuthorityInput {
+                    human_id: "bob".into(),
+                    kid: bob_card.signing_jwk.to_ed25519().unwrap().kid(),
+                    label: "bob".into(),
+                    role: HumanAuthorityRole::Signer,
+                    jwk_json: serde_json::to_string(&bob_card.signing_jwk).unwrap(),
+                    enc_jwk_json: bob_card
+                        .enc_jwk
+                        .as_ref()
+                        .map(|j| serde_json::to_string(j).unwrap()),
+                    prf_salt: None,
+                    auth_epoch: 1,
+                },
+                now_ms(),
+            )
+            .unwrap();
+        db.human()
+            .upsert_delegation_policy(
+                &hyp_store::HumanDelegationPolicyInput {
+                    human_id: "bob".into(),
+                    node_prefix: "bob@*".into(),
+                    scopes: hyp_proto::scopes::ScopePreset::Member.expand(),
+                    max_devices: 3,
+                    delegation_enabled: true,
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+
     assert!(
         hub.db()
             .human()
@@ -842,10 +844,10 @@ async fn delegated_human_join_cli_e2e_full_lifecycle() {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert_eq!(non_tty_rev.status.code(), Some(2));
+    assert_eq!(non_tty_rev.status.code(), Some(1));
     assert_eq!(
         parse_json_stdout(&non_tty_rev)["error"]["code"],
-        "INTERACTIVE_TTY_REQUIRED"
+        "PASSKEY_ADMIN_REQUIRED_AFTER_REVOKE"
     );
     assert_eq!(
         hub.db()
@@ -860,29 +862,35 @@ async fn delegated_human_join_cli_e2e_full_lifecycle() {
     // 10b. Real POSIX PTY confirmation executes `hyp auth revoke philip --cascade --bump-epoch`!
     #[cfg(unix)]
     {
-        let pty_res = run_hyp_in_pty(
-            hub_home,
-            &[
-                "auth",
-                "revoke",
-                "philip",
-                "--cascade",
-                "--bump-epoch",
-                "--state-dir",
-                hub_state_str,
-                "--config",
-                hub_cfg_str,
-                "--json",
-            ],
-            None,
-            Some("y\n"),
-        );
-        assert_eq!(
-            pty_res.code, 0,
-            "PTY hyp auth revoke --cascade failed: stdout={} tty={}",
-            pty_res.stdout, pty_res.tty
-        );
-        let rev_json: Value = serde_json::from_str(&pty_res.stdout).unwrap();
+        let mut admin = common::TestPasskeyAdmin::generate("migration-admin", "passkey");
+        admin.auth_epoch = 2;
+        admin.seed_existing_passkey_fixture(&hub_state);
+        let (code, rev_json, stderr, _) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    admin.run_and_approve_json(
+                        hub_home,
+                        &[
+                            "auth",
+                            "revoke",
+                            "philip",
+                            "--cascade",
+                            "--bump-epoch",
+                            "--state-dir",
+                            hub_state_str,
+                            "--config",
+                            hub_cfg_str,
+                            "--local",
+                            "--no-open",
+                            "--json",
+                        ],
+                        None,
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(code, 0, "{stderr}");
         assert_eq!(rev_json["ok"], true);
         let revoked_peers: Vec<&str> = rev_json["data"]["revokedPeers"]
             .as_array()

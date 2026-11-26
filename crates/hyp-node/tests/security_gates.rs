@@ -3501,7 +3501,7 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
     use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
     use hyp_node::gates::{
         gate_policy_sha256, is_passkey_backed_admin, local_admin_secret_names_for_kid,
-        verify_gate_lock,
+        verify_gate_policy_integrity,
     };
     use hyp_store::{HumanAuthorityInput, HumanAuthorityRole};
 
@@ -3600,6 +3600,11 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
 
     // 2. Sign a historical Passkey `gate.lock` whose ceremony TTL (`exp`) has ALREADY elapsed!
     //    Persisted lock seals MUST stay valid after ceremony expiry so nodes don't brick 10 minutes later.
+    db.lock()
+        .unwrap()
+        .local()
+        .ensure_metadata("node_id", "box@local")
+        .unwrap();
     let past_issued = t0 - 3_600_000;
     let past_exp = t0 - 3_000_000;
     let lock_action = HumanApprovalActionV1 {
@@ -3617,6 +3622,7 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
         target_role: None,
         bump_epoch: None,
         cascade: None,
+        parameters: None,
     };
     let lock_signed_json = sign_seal(&passkey_ed, "bogdan", &lock_action, past_issued, past_exp);
 
@@ -3629,12 +3635,23 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
     // Direct verifier + SecurityGatePipeline both accept the authentic Passkey lock seal!
     {
         let guard = db.lock().unwrap();
-        let state = verify_gate_lock(&locked_cfg, &guard, Some(&secrets))
+        let state = verify_gate_policy_integrity(&locked_cfg, &guard, Some(&secrets))
             .expect("valid Passkey lock seal must verify even after ceremony exp");
-        assert!(state.locked);
+        assert!(state.approved);
         let seal = state.seal.expect("verified seal");
-        assert_eq!((seal.seal_seq, seal.locked), (1, true));
+        assert_eq!((seal.seal_seq, seal.approved), (1, true));
         assert_eq!(seal.authority_kid, passkey_kid);
+    }
+    // The same authentic signed row cannot be transplanted to another local node.
+    {
+        let guard = db.lock().unwrap();
+        guard
+            .local()
+            .set_metadata("node_id", "another@node")
+            .unwrap();
+        let err = verify_gate_policy_integrity(&locked_cfg, &guard, Some(&secrets)).unwrap_err();
+        assert!(err.to_string().contains("another node"));
+        guard.local().set_metadata("node_id", "box@local").unwrap();
     }
     let ok_pipe = SecurityGatePipeline::new(
         locked_cfg.clone(),
@@ -3731,7 +3748,7 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
     {
         let guard = db.lock().unwrap();
         assert!(
-            verify_gate_lock(&locked_cfg, &guard, Some(&secrets)).is_err(),
+            verify_gate_policy_integrity(&locked_cfg, &guard, Some(&secrets)).is_err(),
             "H2: authority with local PKCS#8 secret in SecretStore MUST fail closed!"
         );
     }
@@ -3799,6 +3816,7 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
         target_role: None,
         bump_epoch: None,
         cascade: None,
+        parameters: None,
     };
     let unlock_signed_json = sign_seal(&passkey_ed, "bogdan", &unlock_action, t0, t0 + 600_000);
     db.lock()

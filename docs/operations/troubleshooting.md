@@ -23,8 +23,8 @@ Use `--json` on any command for structured diagnostics and suggested `next` comm
 ### 2. `AlreadyRunning` when running `hyp node start`
 `hyp onboard` already installs and starts the persistent background service (`LaunchAgent` / `systemd --user` / Windows `schtasks`). Do **not** run `hyp node start` manually alongside it — use `hyp service status` and `hyp service restart`.
 
-### 3. `INTERACTIVE_TTY_REQUIRED` on `hyp gate lock`, `hyp inbox approve`, `hyp auth revoke`, or `hyp emit --sign`
-Security-sensitive mutations enforce interactive TTY confirmation and **fail closed inside non-TTY agent subshells** (such as a coding agent's bash tool). Run the printed command directly in your own interactive terminal.
+### 3. Human approval required
+Gate policy and authority mutations require a fresh live browser Passkey Admin approval. Enroll the first admin with `hyp auth init --web`; keep each mutation command waiting and approve its URL. There is no unlocked mode or offline approval-file fallback. Quarantine disposition and local-key signing retain interactive TTY confirmation and fail closed inside non-TTY agent subshells.
 
 ### 4. `caller_unverifiable` / `caller_not_found` from MCP tools
 - A harness's `PreToolUse` / `BeforeTool` hook did not run before `tools/call` (re-run `hyp setup --harness <name>` and restart the harness).
@@ -32,7 +32,7 @@ Security-sensitive mutations enforce interactive TTY confirmation and **fail clo
 - Inside **Codex**, verify `$CODEX_HOME/sessions/` contains the active thread rollout JSONL file and `~/.codex/hooks.json` is wired (`hyp setup --harness codex`).
 
 ### 5. `gate_policy_sig` verification failed in `hyp doctor`
-A locked `gate` block in `node.json` (or `human_authorities` in `node.sqlite`) was modified without re-signing. Inspect the diff, then re-lock from an interactive terminal with `hyp gate lock`.
+A locked `gate` block in `node.json` (or `human_authorities` in `node.sqlite`) was modified without re-signing. Inspect the diff, then approve the exact resulting policy with `hyp gate apply`.
 
 ### 6. Messages held in Quarantine (`⚠ N held`)
 Untrusted inbound messages held by Stage 1/Stage 2 gates never appear in `hyp_inbox`. Inspect metadata and decide in a terminal:

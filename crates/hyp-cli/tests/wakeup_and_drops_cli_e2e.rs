@@ -3,7 +3,7 @@
 //! - `hyp auth` (`init`, `init --web` with `encJwk` + Passkey `nodeCert`, `add`, `list`, `revoke`, `certify-node`, `sign`)
 //! - `hyp drop` (`create` with HPKE `encDraft`, zero-flag `wait` via `last_drop.json`, `ingest`) & `hyp relay` (`set`, `status`)
 //! - `hyp deploy init drop-relay` (including Cloudflare Workers kit README) & `--enable-drop-relay` & fail-closed `deploy check`
-//! - `hyp gate propose` -> `hyp gate lock` merging `gate.proposed.json` + `human_authorities_digest` binding
+//! - `hyp gate propose` -> `hyp gate apply` merging `gate.proposed.json` + `human_authorities_digest` binding
 //! - Cross-language Rust -> JS (`encDraft` open) & JS -> Rust (`hdrop1_` ingest) interop
 //!
 //! Security & isolation invariants:
@@ -432,7 +432,9 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
         "authEpoch": auth_epoch,
     }))
     .unwrap();
-    let add_out = run_hyp_in_pty(
+    let approving_admin = common::TestPasskeyAdmin::generate("fixture-admin", "fixture-passkey");
+    approving_admin.seed_existing_passkey_fixture(&state_dir);
+    let (add_code, add_json, add_stderr, _) = approving_admin.run_and_approve_json(
         home,
         &[
             "auth",
@@ -445,17 +447,13 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
             "signer",
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         Some(&bundle_json),
-        Some("y\n"),
     );
-    assert_eq!(
-        add_out.code, 0,
-        "stdout={} tty={}",
-        add_out.stdout, add_out.tty
-    );
-    let add_json = add_out.parse_json();
+    assert_eq!(add_code, 0, "{add_stderr}");
     assert_eq!(add_json["ok"], true);
     assert_eq!(add_json["data"]["encKey"], true);
     assert_eq!(add_json["data"]["encKid"], passkey_x.kid());
@@ -480,7 +478,7 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
         .expect("run status");
     assert_eq!(st_out.status.code(), Some(0));
     let st_json = parse_json_stdout(&st_out);
-    assert_eq!(st_json["data"]["humanDrops"]["hasEncJwkCount"], 1);
+    assert_eq!(st_json["data"]["humanDrops"]["hasEncJwkCount"], 2);
 
     // 4. Create directive drop with encrypted draft + context!
     let draft_text = "Approve deploy v0.5.0 to eu-1";
@@ -903,13 +901,13 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
     // 1b. Enroll a Passkey Admin at epoch 2 (survives H5 `--bump-epoch` 1 -> 2 when revoking alice!)
     let mut passkey = common::TestPasskeyAdmin::generate("alice-passkey", "touchid-admin");
     passkey.auth_epoch = 2;
-    passkey.enroll_via_auth_add_pty(home, &state_dir, Some(&config_path));
+    passkey.seed_existing_passkey_fixture(&state_dir);
 
-    // 2. `hyp gate init` + Passkey-signed `hyp gate lock` -> verifies `human_authorities_digest` is bound!
+    // 2. `hyp gate init` + Passkey-signed `hyp gate apply` -> verifies `human_authorities_digest` is bound!
     let gate_init = isolated_cmd(home)
         .args([
             "gate",
-            "init",
+            "propose",
             "--adapter",
             "openai-compat",
             "--config",
@@ -926,7 +924,7 @@ fn cli_auth_directive_gate_lock_replay_and_revocation_fail_closed() {
         home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--config",
             cfg_str,
             "--state-dir",
@@ -1481,8 +1479,9 @@ process.stdout.write(JSON.stringify({{ publicJwk, kid, hdrop1: sealed.hdrop1 }})
     let js_hdrop1 = js_json["hdrop1"].as_str().unwrap();
     assert!(js_hdrop1.starts_with("hdrop1_"));
 
-    // Enroll JS-derived Passkey+PRF public JWK via `hyp auth add` (stdin + controlling /dev/tty!)
-    let add_out = run_hyp_in_pty(
+    let approving_admin = common::TestPasskeyAdmin::generate("fixture-admin", "fixture-passkey");
+    approving_admin.seed_existing_passkey_fixture(&state_dir);
+    let (add_code, add_json, add_stderr, _) = approving_admin.run_and_approve_json(
         home,
         &[
             "auth",
@@ -1495,13 +1494,14 @@ process.stdout.write(JSON.stringify({{ publicJwk, kid, hdrop1: sealed.hdrop1 }})
             "signer",
             "--state-dir",
             state_str,
+            "--local",
+            "--no-open",
             "--json",
         ],
         Some(&pub_jwk_str),
-        Some("y\n"),
     );
-    assert_eq!(add_out.code, 0, "tty={}", add_out.tty);
-    let add_json = add_out.parse_json();
+    assert_eq!(add_code, 0, "{add_stderr}");
+    assert_eq!(add_json["ok"], true);
     assert_eq!(add_json["data"]["kid"], js_json["kid"]);
 
     // Pipe JS-sealed `hdrop1_` into compiled Rust `hyp drop ingest --json`!
@@ -1530,7 +1530,7 @@ process.stdout.write(JSON.stringify({{ publicJwk, kid, hdrop1: sealed.hdrop1 }})
         .expect("run hyp status");
     assert_eq!(status_out.status.code(), Some(0));
     let status_json = parse_json_stdout(&status_out);
-    assert_eq!(status_json["data"]["humanDrops"]["activeAuthorities"], 2);
+    assert_eq!(status_json["data"]["humanDrops"]["activeAuthorities"], 3);
     assert_eq!(status_json["data"]["humanDrops"]["hasNodeCert"], true);
     assert_eq!(status_json["data"]["localIngest"]["enabled"], true);
 }
@@ -1876,7 +1876,7 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
 }
 
 // ============================================================================
-// 7. `hyp gate propose` -> `hyp gate lock` merges `gate.proposed.json` & cleans up
+// 7. `hyp gate propose` -> `hyp gate apply` merges `gate.proposed.json` & cleans up
 // ============================================================================
 
 #[cfg(unix)]
@@ -1917,12 +1917,12 @@ fn cli_gate_propose_then_lock_merges_and_cleans_proposal() {
         "gate.proposed.json must exist after propose"
     );
 
-    // 2. Lock via Passkey-approved `hyp gate lock` -> merges `gate.proposed.json` into `node.json`, signs, and removes proposal!
+    // 2. Lock via Passkey-approved `hyp gate apply` -> merges `gate.proposed.json` into `node.json`, signs, and removes proposal!
     let (lock_code, lock_json, lock_stderr, _) = passkey.run_and_approve_json(
         home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--config",
             cfg_str,
             "--state-dir",
