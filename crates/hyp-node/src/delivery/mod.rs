@@ -25,7 +25,7 @@ pub use policy::{
     DEFAULT_BURST_MIN_DELIVERY_INTERVAL_SECS, DEFAULT_BURST_NOISY_COOLDOWN_SECS,
     DEFAULT_BURST_WINDOW_SECS, DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryError, DeliveryRule,
     DeliveryTargetContext, DeliveryUrgency, ParsedMailboxSource, SessionDeliveryPolicy,
-    gate_reason_urgency_cap,
+    gate_reason_urgency_cap, strictest_urgency_cap, urgency_cap_gate_reason,
 };
 
 /// Result of classifying a single inbound item through [`DeliveryEngine`].
@@ -106,30 +106,10 @@ impl DeliveryEngine {
         Ok(current)
     }
 
-    /// Classifies an inbound mailbox entry using the session's policy + per-source burst tracker.
-    pub fn classify_entry(
-        &self,
-        db: &NodeDb,
-        session_id: &str,
-        entry: &MailboxEntry,
-        subscription_mode: Option<DeliveryUrgency>,
-        gate_downgraded_to_notify: bool,
-        now_ms: i64,
-    ) -> Result<DeliveryClassification, DeliveryError> {
-        self.classify_entry_with_cap(
-            db,
-            session_id,
-            entry,
-            subscription_mode,
-            gate_downgraded_to_notify.then_some(DeliveryUrgency::Notify),
-            now_ms,
-        )
-    }
-
     /// Classifies an inbound mailbox entry with an explicit optional Stage 1 urgency ceiling
     /// (`Some(DeliveryUrgency::Queue)` for `CapToQueue` or `Some(DeliveryUrgency::Notify)` for
     /// `DowngradeToNotify`).
-    pub fn classify_entry_with_cap(
+    pub fn classify_entry(
         &self,
         db: &NodeDb,
         session_id: &str,
@@ -140,11 +120,8 @@ impl DeliveryEngine {
     ) -> Result<DeliveryClassification, DeliveryError> {
         let policy = self.policy(db, session_id)?;
         let parsed = ParsedMailboxSource::from_entry(entry);
-        let policy_urgency = policy.resolve_urgency_with_cap(
-            &parsed.as_context(),
-            subscription_mode,
-            gate_max_urgency,
-        );
+        let policy_urgency =
+            policy.resolve_urgency(&parsed.as_context(), subscription_mode, gate_max_urgency);
         let burst_key = parsed.burst_source_key();
         let burst = {
             let mut guard = self.bursts.lock().expect("bursts lock poisoned");

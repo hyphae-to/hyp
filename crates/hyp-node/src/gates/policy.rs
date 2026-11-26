@@ -130,19 +130,17 @@ impl From<hyp_store::TrustTier> for TrustTier {
     }
 }
 
-fn is_false_gate(b: &bool) -> bool {
-    !*b
-}
+use crate::delivery::DeliveryUrgency;
 
 /// Terminal or backpressure verdict returned by the Local Security Gate pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum GateDecision {
-    /// Deliver to the target session inbox (optionally capped to `queue` or downgraded to `notify`).
+    /// Deliver to the target session inbox. `max_urgency` is the Stage 1 trust-tier ceiling:
+    /// `Some(Queue)` for `CapToQueue`, `Some(Notify)` for `DowngradeToNotify`, `None` for `Allow`.
     Allow {
-        downgraded_to_notify: bool,
-        #[serde(default, skip_serializing_if = "is_false_gate")]
-        capped_to_queue: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_urgency: Option<DeliveryUrgency>,
     },
     /// Park in the human-reviewed quarantine mailbox (`gate_state = "quarantined"`).
     /// `notice` is strictly metadata-only and NEVER contains unscreened body text.
@@ -155,32 +153,11 @@ pub enum GateDecision {
 }
 
 impl GateDecision {
+    /// Unrestricted allow (no Stage 1 urgency ceiling).
+    pub const ALLOW: Self = Self::Allow { max_urgency: None };
+
     pub const fn is_allow(&self) -> bool {
         matches!(self, Self::Allow { .. })
-    }
-
-    pub const fn is_capped_to_queue(&self) -> bool {
-        matches!(
-            self,
-            Self::Allow {
-                capped_to_queue: true,
-                ..
-            }
-        )
-    }
-
-    pub const fn gate_reason_tag(&self) -> Option<&'static str> {
-        match self {
-            Self::Allow {
-                downgraded_to_notify: true,
-                ..
-            } => Some("downgraded_to_notify"),
-            Self::Allow {
-                capped_to_queue: true,
-                ..
-            } => Some("capped_to_queue"),
-            _ => None,
-        }
     }
 
     pub const fn is_quarantine(&self) -> bool {

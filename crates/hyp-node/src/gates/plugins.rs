@@ -491,10 +491,7 @@ impl LakeraGuardPlugin {
             }
         } else {
             FilterOutcome {
-                decision: GateDecision::Allow {
-                    downgraded_to_notify: false,
-                    capped_to_queue: false,
-                },
+                decision: GateDecision::ALLOW,
                 confidence: Some(1.0),
                 categories: vec!["lakera_clean".to_string()],
                 had_error: false,
@@ -676,10 +673,7 @@ impl HttpClassifierPlugin {
                 categories.push(lbl);
             }
             FilterOutcome {
-                decision: GateDecision::Allow {
-                    downgraded_to_notify: false,
-                    capped_to_queue: false,
-                },
+                decision: GateDecision::ALLOW,
                 confidence: Some(score),
                 categories,
                 had_error: false,

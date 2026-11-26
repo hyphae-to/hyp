@@ -542,10 +542,7 @@ async fn startup_flush_respects_security_gate_and_mute_rules() {
                     }
                 } else {
                     FilterOutcome {
-                        decision: GateDecision::Allow {
-                            downgraded_to_notify: false,
-                            capped_to_queue: false,
-                        },
+                        decision: GateDecision::ALLOW,
                         confidence: Some(0.01),
                         categories: Vec::new(),
                         had_error: false,

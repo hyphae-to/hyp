@@ -57,6 +57,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
+use crate::delivery::{DeliveryUrgency, urgency_cap_gate_reason};
 use crate::engine::config::NodeError;
 pub use crate::engine::config::{
     DEFAULT_LOCAL_INGEST_BURST, DEFAULT_LOCAL_INGEST_MAX_PAYLOAD_BYTES,
@@ -507,8 +508,7 @@ impl LocalIngestState {
 
         // 6. Security Gate verification (`if route.gate` and `gate` is `Some(g)`).
         let mut audit_seq: Option<i64> = None;
-        let mut downgraded_to_notify = false;
-        let mut capped_to_queue = false;
+        let mut gate_cap: Option<DeliveryUrgency> = None;
         let qualified_topic = format!("local.{topic}");
 
         if route.gate {
@@ -542,13 +542,7 @@ impl LocalIngestState {
                     .map_err(|e| LocalIngestError::GateError(e.to_string()))?;
                 audit_seq = eval.audit_seq;
                 match eval.decision {
-                    GateDecision::Allow {
-                        downgraded_to_notify: downgraded,
-                        capped_to_queue: capped,
-                    } => {
-                        downgraded_to_notify = downgraded;
-                        capped_to_queue = capped;
-                    }
+                    GateDecision::Allow { max_urgency } => gate_cap = max_urgency,
                     GateDecision::Block { reason } => {
                         return Err(LocalIngestError::GateBlocked {
                             reason,
@@ -652,18 +646,11 @@ impl LocalIngestState {
             coalesce_key: effective_coalesce_key.clone(),
             expires_at,
         };
-        let gate_reason = if downgraded_to_notify {
-            Some("downgraded_to_notify")
-        } else if capped_to_queue {
-            Some("capped_to_queue")
-        } else {
-            None
-        };
-        let delivered_sessions = self.node.deliver_local_topic_batches_with_gate_reason(
+        let delivered_sessions = self.node.deliver_local_topic_batches(
             &topic,
             &put_opts,
             verified_claim.as_ref(),
-            gate_reason,
+            urgency_cap_gate_reason(gate_cap),
             now_ms,
         )?;
 
@@ -680,8 +667,8 @@ impl LocalIngestState {
             decision: "allow".to_string(),
             coalesced,
             coalesce_key: effective_coalesce_key,
-            downgraded_to_notify,
-            capped_to_queue,
+            downgraded_to_notify: gate_cap == Some(DeliveryUrgency::Notify),
+            capped_to_queue: gate_cap == Some(DeliveryUrgency::Queue),
             audit_seq,
             deduplicated: ingest_res.deduplicated,
         })

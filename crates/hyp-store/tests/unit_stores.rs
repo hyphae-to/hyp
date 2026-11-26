@@ -2339,7 +2339,12 @@ fn g3_coalesce_update_resets_reviewed_at_human_auth_and_gate_reason() {
     // Simulate prior gate approval + HumanVerified cryptographic badge + notified = 1.
     assert!(
         db.local()
-            .mark_mailbox_gate_approved("claude:s1", &receipt, true, t0 + 10)
+            .mark_mailbox_gate_approved(
+                "claude:s1",
+                &receipt,
+                Some("downgraded_to_notify"),
+                t0 + 10
+            )
             .unwrap()
     );
     assert!(

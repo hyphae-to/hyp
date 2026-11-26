@@ -18,6 +18,7 @@ use hyp_crypto::transfer::{
     TarInputEntry, TarPackOptions, TarUnpackOptions, pack_tar_gz, unpack_tar_gz,
 };
 use hyp_crypto::{SecretBackend, SecretStore};
+use hyp_node::delivery::DeliveryUrgency;
 use hyp_node::gates::{
     ClassifierVerdict, CustomDlpPattern, DEFAULT_CORE_RUBRIC, FilterAdapterConfig,
     FilterPluginConfig, GateDecision, InboundContext, LlmProvider, MAX_POLICY_NOTES_CHARS,
@@ -310,8 +311,7 @@ async fn stage1_guest_rate_limit_4kib_cap_and_notify_downgrade() {
         assert_eq!(
             eval.decision,
             GateDecision::Allow {
-                downgraded_to_notify: false,
-                capped_to_queue: true,
+                max_urgency: Some(DeliveryUrgency::Queue),
             },
             "guest msg #{i} must be allowed and capped to queue"
         );
@@ -357,8 +357,7 @@ async fn stage1_guest_rate_limit_4kib_cap_and_notify_downgrade() {
     assert_eq!(
         eval_refill.decision,
         GateDecision::Allow {
-            downgraded_to_notify: false,
-            capped_to_queue: true,
+            max_urgency: Some(DeliveryUrgency::Queue),
         }
     );
 
@@ -412,8 +411,7 @@ async fn stage1_guest_rate_limit_4kib_cap_and_notify_downgrade() {
     assert_eq!(
         eval_wh.decision,
         GateDecision::Allow {
-            downgraded_to_notify: false,
-            capped_to_queue: true,
+            max_urgency: Some(DeliveryUrgency::Queue),
         }
     );
 
@@ -542,13 +540,7 @@ async fn stage1_mute_drop_cloudevents_filter_acl_and_regex_denylist() {
         "PR #108 passed CI",
     );
     let eval_clean = pipeline.evaluate_inbound(&clean, t0).await.unwrap();
-    assert_eq!(
-        eval_clean.decision,
-        GateDecision::Allow {
-            downgraded_to_notify: false,
-            capped_to_queue: false,
-        }
-    );
+    assert_eq!(eval_clean.decision, GateDecision::ALLOW);
 }
 
 #[tokio::test]
@@ -867,8 +859,7 @@ async fn stage2_allow_high_conf_low_conf_downgrade_and_block_with_audit_rows() {
     assert_eq!(
         eval_allow.decision,
         GateDecision::Allow {
-            downgraded_to_notify: false,
-            capped_to_queue: true,
+            max_urgency: Some(DeliveryUrgency::Queue),
         }
     );
     assert_eq!(eval_allow.stage, "stage2");

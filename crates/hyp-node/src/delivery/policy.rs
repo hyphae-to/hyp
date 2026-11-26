@@ -29,6 +29,26 @@ pub fn gate_reason_urgency_cap(gate_reason: Option<&str>) -> Option<DeliveryUrge
     }
 }
 
+/// Inverse of [`gate_reason_urgency_cap`]: the mailbox `gate_reason` recorded for a Stage 1 ceiling.
+pub const fn urgency_cap_gate_reason(cap: Option<DeliveryUrgency>) -> Option<&'static str> {
+    match cap {
+        Some(DeliveryUrgency::Notify) => Some("downgraded_to_notify"),
+        Some(DeliveryUrgency::Queue) => Some("capped_to_queue"),
+        _ => None,
+    }
+}
+
+/// Returns the stricter (lower-priority) of two optional urgency ceilings.
+pub fn strictest_urgency_cap(
+    a: Option<DeliveryUrgency>,
+    b: Option<DeliveryUrgency>,
+) -> Option<DeliveryUrgency> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if x.rank() >= y.rank() { x } else { y }),
+        (x, y) => x.or(y),
+    }
+}
+
 /// Errors returned by the Delivery Engine, policy validation, or filtered inbox queries.
 #[derive(Debug, Error)]
 pub enum DeliveryError {
@@ -458,32 +478,11 @@ impl SessionDeliveryPolicy {
         self.overrides.len() != before
     }
 
-    /// Resolves the effective `DeliveryUrgency` for an inbound item according to:
-    /// 1. Specificity-ordered `overrides` (exact qualified > exact shorthand > scoped wildcard > `*`).
-    /// 2. Focus Mode (`* -> notify`, optionally preserving explicit `Interrupt` VIPs when
-    ///    `focus_allow_interrupt_vips == true`, while always preserving `Mute`).
-    /// 3. Optional per-subscription urgency (`subscription_mode`).
-    /// 4. Session `default_mode`.
-    /// 5. Security Gate Stage 1 `downgraded_to_notify` ceiling (can step `Interrupt`/`Queue` down
-    ///    to `Notify`, never promotes `Mute`).
-    pub fn resolve_urgency(
-        &self,
-        ctx: &DeliveryTargetContext<'_>,
-        subscription_mode: Option<DeliveryUrgency>,
-        gate_downgraded_to_notify: bool,
-    ) -> DeliveryUrgency {
-        self.resolve_urgency_with_cap(
-            ctx,
-            subscription_mode,
-            gate_downgraded_to_notify.then_some(DeliveryUrgency::Notify),
-        )
-    }
-
     /// Resolves effective `DeliveryUrgency` with an optional Stage 1 urgency ceiling
     /// (`Some(DeliveryUrgency::Queue)` for RFC 0004 `CapToQueue`, `Some(DeliveryUrgency::Notify)`
     /// for `DowngradeToNotify`). Only steps urgency down (higher rank); never promotes `Mute`
     /// or `Notify` upward.
-    pub fn resolve_urgency_with_cap(
+    pub fn resolve_urgency(
         &self,
         ctx: &DeliveryTargetContext<'_>,
         subscription_mode: Option<DeliveryUrgency>,
@@ -729,14 +728,14 @@ mod tests {
         let oncall =
             ParsedMailboxSource::parse("acme-team", "ops@host/oncall", MailboxKind::Message);
         assert_eq!(
-            policy.resolve_urgency(&oncall.as_context(), None, false),
+            policy.resolve_urgency(&oncall.as_context(), None, None),
             DeliveryUrgency::Interrupt
         );
 
         // Strict Focus Mode disables VIP interrupt pass-through.
         let strict_focus = policy.clone().with_focus_mode(true, false);
         assert_eq!(
-            strict_focus.resolve_urgency(&oncall.as_context(), None, false),
+            strict_focus.resolve_urgency(&oncall.as_context(), None, None),
             DeliveryUrgency::Notify
         );
 
@@ -744,7 +743,7 @@ mod tests {
         let alice =
             ParsedMailboxSource::parse("acme-team", "alice@mac/claude", MailboxKind::Message);
         assert_eq!(
-            policy.resolve_urgency(&alice.as_context(), None, false),
+            policy.resolve_urgency(&alice.as_context(), None, None),
             DeliveryUrgency::Notify
         );
 
@@ -755,13 +754,13 @@ mod tests {
             MailboxKind::Message,
         );
         assert_eq!(
-            policy.resolve_urgency(&deploy.as_context(), None, false),
+            policy.resolve_urgency(&deploy.as_context(), None, None),
             DeliveryUrgency::Mute
         );
 
         // Stage 1 gate downgrade steps VIP Interrupt down to Notify.
         assert_eq!(
-            policy.resolve_urgency(&oncall.as_context(), None, true),
+            policy.resolve_urgency(&oncall.as_context(), None, Some(DeliveryUrgency::Notify)),
             DeliveryUrgency::Notify
         );
     }
@@ -784,11 +783,11 @@ mod tests {
         );
 
         assert_eq!(
-            policy.resolve_urgency(&sec.as_context(), None, false),
+            policy.resolve_urgency(&sec.as_context(), None, None),
             DeliveryUrgency::Interrupt
         );
         assert_eq!(
-            policy.resolve_urgency(&gh.as_context(), None, false),
+            policy.resolve_urgency(&gh.as_context(), None, None),
             DeliveryUrgency::Notify
         );
     }

@@ -53,6 +53,7 @@ use hyp_node::adapters::{
     PrometheusWebhookAdapter, PrometheusWebhookConfig, PublishErrorCode, PublishOutcome,
     PublishStatus, WebhookIngestOutcome, compute_hmac_sha256_header,
 };
+use hyp_node::delivery::DeliveryUrgency;
 use hyp_node::engine::http_util::{HttpClient, empty_body, full_body};
 use hyp_node::engine::{
     AuthenticatedPeer, ChannelPolicy, EscalationConfig, KvNamespaceConfig, KvWriteRequest,
@@ -3133,8 +3134,7 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
         assert_eq!(
             res.decision,
             GateDecision::Allow {
-                downgraded_to_notify: false,
-                capped_to_queue: true,
+                max_urgency: Some(DeliveryUrgency::Queue),
             }
         );
     }

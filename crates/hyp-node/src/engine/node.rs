@@ -105,6 +105,7 @@ use crate::adapters::{
     GitHubPublicAdapter, GitHubWebhookAdapter, NodeAdapter, NodeAdapterHost,
     PrometheusWebhookAdapter, PublishErrorCode, PublishOutcome, PublishStatus,
 };
+use crate::delivery::DeliveryUrgency;
 use crate::engine::config::{
     ChannelMode, ChannelPolicy, NodeConfig, NodeError, NodeProfile, crypto_jwk_to_proto,
     profile_to_store, proto_ce_to_store, proto_filter_to_store, proto_jwk_to_crypto,
@@ -8530,30 +8531,9 @@ impl UnifiedNode {
         total_batches
     }
 
-    /// Flushes due batches for local-session subscribers of local topic `topic` into their
-    /// `mailbox` (applying optional TTL / coalesce metadata and attaching `human_auth_json`
-    /// when cryptographically verified), acknowledges the delivered `EventStore` batches, and
-    /// immediately wakes each matched local session via `local_inbox_tx`.
-    pub fn deliver_local_topic_batches(
-        &self,
-        topic: &str,
-        put_opts: &MailboxPutOptions,
-        human_auth: Option<&VerifiedHumanClaim>,
-        gate_downgraded: bool,
-        now_ms: i64,
-    ) -> Result<usize, NodeError> {
-        self.deliver_local_topic_batches_with_gate_reason(
-            topic,
-            put_opts,
-            human_auth,
-            gate_downgraded.then_some("downgraded_to_notify"),
-            now_ms,
-        )
-    }
-
     /// Like [`Self::deliver_local_topic_batches`], recording an explicit Stage 1 `gate_reason`
     /// (e.g. `"capped_to_queue"` or `"downgraded_to_notify"`).
-    pub fn deliver_local_topic_batches_with_gate_reason(
+    pub fn deliver_local_topic_batches(
         &self,
         topic: &str,
         put_opts: &MailboxPutOptions,
@@ -9433,10 +9413,7 @@ impl UnifiedNode {
                         NodeError::Unauthorized(format!("security gate error: {e}"))
                     })?;
                     match eval.decision {
-                        GateDecision::Allow {
-                            downgraded_to_notify,
-                            ..
-                        } => {
+                        GateDecision::Allow { max_urgency } => {
                             self.notify_local_session(&target_session);
                             self.notify_scheduler();
                             Ok(IngestedHumanDrop {
@@ -9450,7 +9427,7 @@ impl UnifiedNode {
                                 secret_name: None,
                                 mailbox_receipt: eval.receipt,
                                 audit_seq: eval.audit_seq,
-                                downgraded_to_notify,
+                                downgraded_to_notify: max_urgency == Some(DeliveryUrgency::Notify),
                             })
                         }
                         GateDecision::Hold {
@@ -9766,7 +9743,7 @@ impl NodeAdapterHost for UnifiedNodeAdapterHost {
                         topic,
                         &MailboxPutOptions::default(),
                         None,
-                        false,
+                        None,
                         now_ms(),
                     );
                 }

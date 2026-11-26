@@ -39,23 +39,23 @@ fn all_four_tiers_and_focus_mode_with_and_without_vip_interrupt() {
 
     // Normal mode resolves all 4 tiers accurately.
     assert_eq!(
-        base_policy.resolve_urgency(&oncall.as_context(), None, false),
+        base_policy.resolve_urgency(&oncall.as_context(), None, None),
         DeliveryUrgency::Interrupt
     );
     assert_eq!(
-        base_policy.resolve_urgency(&alice.as_context(), None, false),
+        base_policy.resolve_urgency(&alice.as_context(), None, None),
         DeliveryUrgency::Queue
     );
     assert_eq!(
-        base_policy.resolve_urgency(&bob.as_context(), None, false),
+        base_policy.resolve_urgency(&bob.as_context(), None, None),
         DeliveryUrgency::Queue
     );
     assert_eq!(
-        base_policy.resolve_urgency(&pub_gh.as_context(), None, false),
+        base_policy.resolve_urgency(&pub_gh.as_context(), None, None),
         DeliveryUrgency::Notify
     );
     assert_eq!(
-        base_policy.resolve_urgency(&deploys.as_context(), None, false),
+        base_policy.resolve_urgency(&deploys.as_context(), None, None),
         DeliveryUrgency::Mute
     );
 
@@ -63,23 +63,23 @@ fn all_four_tiers_and_focus_mode_with_and_without_vip_interrupt() {
     // `@oncall` VIP still interrupts; normal Queue peers demote to Notify; muted stays Mute!
     let focus_vip = base_policy.clone().with_focus_mode(true, true);
     assert_eq!(
-        focus_vip.resolve_urgency(&oncall.as_context(), None, false),
+        focus_vip.resolve_urgency(&oncall.as_context(), None, None),
         DeliveryUrgency::Interrupt
     );
     assert_eq!(
-        focus_vip.resolve_urgency(&alice.as_context(), None, false),
+        focus_vip.resolve_urgency(&alice.as_context(), None, None),
         DeliveryUrgency::Notify
     );
     assert_eq!(
-        focus_vip.resolve_urgency(&bob.as_context(), None, false),
+        focus_vip.resolve_urgency(&bob.as_context(), None, None),
         DeliveryUrgency::Notify
     );
     assert_eq!(
-        focus_vip.resolve_urgency(&pub_gh.as_context(), None, false),
+        focus_vip.resolve_urgency(&pub_gh.as_context(), None, None),
         DeliveryUrgency::Notify
     );
     assert_eq!(
-        focus_vip.resolve_urgency(&deploys.as_context(), None, false),
+        focus_vip.resolve_urgency(&deploys.as_context(), None, None),
         DeliveryUrgency::Mute
     );
 
@@ -87,11 +87,11 @@ fn all_four_tiers_and_focus_mode_with_and_without_vip_interrupt() {
     // even `@oncall` VIP demotes to Notify; muted stays Mute!
     let focus_strict = base_policy.with_focus_mode(true, false);
     assert_eq!(
-        focus_strict.resolve_urgency(&oncall.as_context(), None, false),
+        focus_strict.resolve_urgency(&oncall.as_context(), None, None),
         DeliveryUrgency::Notify
     );
     assert_eq!(
-        focus_strict.resolve_urgency(&deploys.as_context(), None, false),
+        focus_strict.resolve_urgency(&deploys.as_context(), None, None),
         DeliveryUrgency::Mute
     );
 }

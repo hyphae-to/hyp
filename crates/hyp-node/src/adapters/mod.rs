@@ -49,7 +49,7 @@ pub fn deliver_source_topic_to_local_sessions(
             topic,
             &hyp_store::MailboxPutOptions::default(),
             None,
-            false,
+            None,
             hyp_store::now_ms(),
         )?;
         if pass == 0 {

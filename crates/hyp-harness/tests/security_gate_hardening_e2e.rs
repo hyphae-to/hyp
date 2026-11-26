@@ -216,10 +216,7 @@ impl FilterPlugin for InspectingStage2Filter {
                 }
             } else {
                 FilterOutcome {
-                    decision: GateDecision::Allow {
-                        downgraded_to_notify: false,
-                        capped_to_queue: false,
-                    },
+                    decision: GateDecision::ALLOW,
                     confidence: Some(0.98),
                     categories: vec!["clean".to_string()],
                     had_error: false,
@@ -1257,7 +1254,7 @@ async fn g3_coalesce_over_approved_human_verified_row_rescreens_and_quarantines(
     };
     node.db()
         .local()
-        .mark_mailbox_gate_approved(sid, &rcpt, false, now + 1)
+        .mark_mailbox_gate_approved(sid, &rcpt, None, now + 1)
         .unwrap();
     node.db()
         .human()

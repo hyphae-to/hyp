@@ -12,7 +12,7 @@
 //! - Quarantined items are stored with `gate_state = "quarantined"` and are invisible to
 //!   `peek_inbox` / `drain_inbox` until a human invokes [`SecurityGatePipeline::approve_quarantined`].
 //! - Outbound DLP blocks never write leaked secret strings into errors or `gate_audit`.
-//! - Stage 2 / filter plugins can NEVER undo a Stage 1 `downgraded_to_notify` or `Block`/`Quarantine`.
+//! - Stage 2 / filter plugins can NEVER undo a Stage 1 urgency ceiling or `Block`/`Quarantine`.
 //! - The `NodeDb` mutex is NEVER held across `.await` points.
 
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,7 @@ use hyp_store::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::delivery::{DeliveryUrgency, urgency_cap_gate_reason};
 use crate::gates::plugins::{FilterPlugin, build_filter_plugin};
 use crate::gates::policy::{
     GateDecision, GateError, InboundContext, OutboundContext, SecurityGateConfig, TrustTier,
@@ -31,19 +32,6 @@ use crate::gates::policy::{
 };
 use crate::gates::stage1::Stage1Engine;
 use crate::gates::stage2::{FilterOutcome, Stage2Guard};
-
-const fn stage1_allow_reason(
-    downgraded_to_notify: bool,
-    capped_to_queue: bool,
-) -> Option<&'static str> {
-    if downgraded_to_notify {
-        Some("downgraded_to_notify")
-    } else if capped_to_queue {
-        Some("capped_to_queue")
-    } else {
-        None
-    }
-}
 
 /// Complete result of evaluating an inbound post-decrypt CloudEvent through the pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -349,11 +337,8 @@ impl SecurityGatePipeline {
             self.stage1.evaluate_inbound(ctx, Some(&db_guard), now_ms)
         };
 
-        let (downgraded_from_stage1, capped_from_stage1) = match stage1_out.decision {
-            GateDecision::Allow {
-                downgraded_to_notify,
-                capped_to_queue,
-            } => (downgraded_to_notify, capped_to_queue),
+        let stage1_cap = match stage1_out.decision {
+            GateDecision::Allow { max_urgency } => max_urgency,
             GateDecision::Hold {
                 reason,
                 retry_after_ms,
@@ -494,8 +479,7 @@ impl SecurityGatePipeline {
                 existing_receipt,
                 ctx,
                 &payload_text,
-                downgraded_from_stage1,
-                capped_from_stage1,
+                stage1_cap,
                 traceparent.clone(),
                 now_ms,
             )?;
@@ -554,8 +538,7 @@ impl SecurityGatePipeline {
                     trust_tier: Some("human-verified".to_string()),
                     confidence: Some(1.0),
                     categories: cats.clone(),
-                    reason: stage1_allow_reason(downgraded_from_stage1, capped_from_stage1)
-                        .map(str::to_string),
+                    reason: urgency_cap_gate_reason(stage1_cap).map(str::to_string),
                     traceparent,
                     payload_sha256: payload_sha256.clone(),
                     reviewer: Some(format!("human:{}:{}", auth.human_id, kid8)),
@@ -564,8 +547,7 @@ impl SecurityGatePipeline {
             )?;
             return Ok(InboundEvaluation {
                 decision: GateDecision::Allow {
-                    downgraded_to_notify: downgraded_from_stage1,
-                    capped_to_queue: capped_from_stage1,
+                    max_urgency: stage1_cap,
                 },
                 stage: "human_authority".to_string(),
                 receipt,
@@ -640,8 +622,7 @@ impl SecurityGatePipeline {
             &payload_sha256,
             traceparent,
             &last_stage,
-            downgraded_from_stage1,
-            capped_from_stage1,
+            stage1_cap,
             last_confidence,
             cats,
             now_ms,
@@ -783,10 +764,7 @@ impl SecurityGatePipeline {
                 now_ms,
             )?;
             return Ok(InboundEvaluation {
-                decision: GateDecision::Allow {
-                    downgraded_to_notify: false,
-                    capped_to_queue: false,
-                },
+                decision: GateDecision::ALLOW,
                 stage: "local_ingest".to_string(),
                 receipt: None,
                 duplicate: false,
@@ -806,11 +784,8 @@ impl SecurityGatePipeline {
             self.stage1.evaluate_inbound(ctx, Some(&db_guard), now_ms)
         };
 
-        let (downgraded_from_stage1, capped_from_stage1) = match stage1_out.decision {
-            GateDecision::Allow {
-                downgraded_to_notify,
-                capped_to_queue,
-            } => (downgraded_to_notify, capped_to_queue),
+        let stage1_cap = match stage1_out.decision {
+            GateDecision::Allow { max_urgency } => max_urgency,
             GateDecision::Hold {
                 reason,
                 retry_after_ms,
@@ -987,8 +962,7 @@ impl SecurityGatePipeline {
                 trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                 confidence: last_confidence,
                 categories: cats.clone(),
-                reason: stage1_allow_reason(downgraded_from_stage1, capped_from_stage1)
-                    .map(str::to_string),
+                reason: urgency_cap_gate_reason(stage1_cap).map(str::to_string),
                 traceparent,
                 payload_sha256: payload_sha256.clone(),
                 reviewer: None,
@@ -998,8 +972,7 @@ impl SecurityGatePipeline {
 
         Ok(InboundEvaluation {
             decision: GateDecision::Allow {
-                downgraded_to_notify: downgraded_from_stage1,
-                capped_to_queue: capped_from_stage1,
+                max_urgency: stage1_cap,
             },
             stage: last_stage,
             receipt: None,
@@ -1321,8 +1294,7 @@ impl SecurityGatePipeline {
         payload_sha256: &str,
         traceparent: Option<String>,
         stage: &str,
-        downgraded_to_notify: bool,
-        capped_to_queue: bool,
+        max_urgency: Option<DeliveryUrgency>,
         confidence: Option<f64>,
         categories: Vec<String>,
         now_ms: i64,
@@ -1331,8 +1303,7 @@ impl SecurityGatePipeline {
             existing_receipt,
             ctx,
             payload_text,
-            downgraded_to_notify,
-            capped_to_queue,
+            max_urgency,
             traceparent.clone(),
             now_ms,
         )?;
@@ -1377,8 +1348,7 @@ impl SecurityGatePipeline {
                 trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                 confidence,
                 categories: categories.clone(),
-                reason: stage1_allow_reason(downgraded_to_notify, capped_to_queue)
-                    .map(str::to_string),
+                reason: urgency_cap_gate_reason(max_urgency).map(str::to_string),
                 traceparent,
                 payload_sha256: payload_sha256.to_string(),
                 reviewer: None,
@@ -1387,10 +1357,7 @@ impl SecurityGatePipeline {
         )?;
 
         Ok(InboundEvaluation {
-            decision: GateDecision::Allow {
-                downgraded_to_notify,
-                capped_to_queue,
-            },
+            decision: GateDecision::Allow { max_urgency },
             stage: stage.to_string(),
             receipt,
             duplicate,
@@ -1401,29 +1368,25 @@ impl SecurityGatePipeline {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn approve_existing_or_store_pending(
         &self,
         existing_receipt: Option<&str>,
         ctx: &InboundContext,
         payload_text: &str,
-        downgraded_to_notify: bool,
-        capped_to_queue: bool,
+        max_urgency: Option<DeliveryUrgency>,
         traceparent: Option<String>,
         now_ms: i64,
     ) -> Result<(Option<String>, bool), GateError> {
-        let gate_reason = stage1_allow_reason(downgraded_to_notify, capped_to_queue);
+        let gate_reason = urgency_cap_gate_reason(max_urgency);
         let db = self
             .db
             .lock()
             .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
         if let Some(r) = existing_receipt {
-            if db.local().mark_mailbox_gate_approved_with_reason(
-                &ctx.session_id,
-                r,
-                gate_reason,
-                now_ms,
-            )? {
+            if db
+                .local()
+                .mark_mailbox_gate_approved(&ctx.session_id, r, gate_reason, now_ms)?
+            {
                 return Ok((Some(r.to_string()), false));
             }
         }
@@ -1443,7 +1406,7 @@ impl SecurityGatePipeline {
         )?;
         match res {
             MailboxPutResult::Stored { receipt } => {
-                let _ = db.local().mark_mailbox_gate_approved_with_reason(
+                let _ = db.local().mark_mailbox_gate_approved(
                     &ctx.session_id,
                     &receipt,
                     gate_reason,

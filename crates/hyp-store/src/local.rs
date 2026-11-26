@@ -861,30 +861,11 @@ impl<'a> LocalStateStore<'a> {
     }
 
     /// Atomically marks a `pending` mailbox row as gate-screened & approved (`reviewed_at = now_ms`),
-    /// optionally recording `"downgraded_to_notify"` in `gate_reason`.
-    ///
-    /// Returns `true` if the row existed in `pending` state and was promoted.
-    pub fn mark_mailbox_gate_approved(
-        &self,
-        session_id: &str,
-        receipt: &str,
-        downgraded_to_notify: bool,
-        now_ms: i64,
-    ) -> StoreResult<bool> {
-        self.mark_mailbox_gate_approved_with_reason(
-            session_id,
-            receipt,
-            downgraded_to_notify.then_some("downgraded_to_notify"),
-            now_ms,
-        )
-    }
-
-    /// Atomically marks a `pending` mailbox row as gate-screened & approved (`reviewed_at = now_ms`),
     /// optionally recording a specific Stage 1 `gate_reason` (e.g. `"capped_to_queue"` or
     /// `"downgraded_to_notify"`).
     ///
     /// Returns `true` if the row existed in `pending` state and was promoted.
-    pub fn mark_mailbox_gate_approved_with_reason(
+    pub fn mark_mailbox_gate_approved(
         &self,
         session_id: &str,
         receipt: &str,

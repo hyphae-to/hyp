@@ -38,7 +38,7 @@ use hyp_node::delivery::{
     DeliveryUrgency, InboxFilter, InboxItemState, InboxItemView, InboxQuery, InboxQueryResult,
     InboxStateFilter, PackableItem, PackedDeliveryBatch, archive_muted_entry,
     gate_reason_urgency_cap, move_pending_to_muted, muted_count, pack_inbox_digest, query_inbox,
-    record_delivered_receipts,
+    record_delivered_receipts, strictest_urgency_cap, urgency_cap_gate_reason,
 };
 pub use hyp_node::engine::WakeRecoveryConfig;
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
@@ -610,25 +610,6 @@ struct BuiltDigestBatch {
     /// True when produced by RFC 0004 Decision #4 periodic long-turn `PostToolUse` `Queue` reminder
     /// (updates `last_midturn_digest_at_ms` without prematurely stamping `Queue` items `notified = 1`).
     is_midturn_queue_reminder: bool,
-}
-
-fn strictest_urgency_cap(
-    a: Option<DeliveryUrgency>,
-    b: Option<DeliveryUrgency>,
-) -> Option<DeliveryUrgency> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(if x.rank() >= y.rank() { x } else { y }),
-        (Some(x), None) | (None, Some(x)) => Some(x),
-        (None, None) => None,
-    }
-}
-
-const fn urgency_cap_gate_reason(cap: Option<DeliveryUrgency>) -> Option<&'static str> {
-    match cap {
-        Some(DeliveryUrgency::Notify) => Some("downgraded_to_notify"),
-        Some(DeliveryUrgency::Queue) => Some("capped_to_queue"),
-        _ => None,
-    }
 }
 
 /// Delivery drain scope requested by `mailbox.drain`.
@@ -1491,17 +1472,8 @@ impl LocalDaemon {
                 .await
                 .map_err(|e| e.to_string())?;
             match eval.decision {
-                GateDecision::Allow {
-                    downgraded_to_notify,
-                    capped_to_queue,
-                } => {
-                    gate_cap = if downgraded_to_notify {
-                        Some(DeliveryUrgency::Notify)
-                    } else if capped_to_queue {
-                        Some(DeliveryUrgency::Queue)
-                    } else {
-                        None
-                    };
+                GateDecision::Allow { max_urgency } => {
+                    gate_cap = max_urgency;
                     let gate_reason = urgency_cap_gate_reason(gate_cap);
                     gate_approved = true;
                     if let Some(receipt) = eval.receipt {
@@ -1515,7 +1487,7 @@ impl LocalDaemon {
                                 .flatten()
                                 .is_some();
                             if found {
-                                let _ = db.local().mark_mailbox_gate_approved_with_reason(
+                                let _ = db.local().mark_mailbox_gate_approved(
                                     &session_id,
                                     &receipt,
                                     gate_reason,
@@ -1620,7 +1592,7 @@ impl LocalDaemon {
             let db = self.inner.node.db();
             self.inner
                 .delivery
-                .classify_entry_with_cap(&db, &session_id, &temp_entry, sub_mode, gate_cap, now)
+                .classify_entry(&db, &session_id, &temp_entry, sub_mode, gate_cap, now)
                 .map_err(|e| e.to_string())?
         };
 
@@ -1640,7 +1612,7 @@ impl LocalDaemon {
             {
                 MailboxPutResult::Stored { receipt } => {
                     if gate_approved {
-                        let _ = db.local().mark_mailbox_gate_approved_with_reason(
+                        let _ = db.local().mark_mailbox_gate_approved(
                             &session_id,
                             &receipt,
                             urgency_cap_gate_reason(gate_cap),
@@ -2880,7 +2852,7 @@ impl LocalDaemonInner {
                 Ok(MailboxPutResult::Stored { receipt }) => {
                     let _ = db
                         .local()
-                        .mark_mailbox_gate_approved(session_id, &receipt, false, now);
+                        .mark_mailbox_gate_approved(session_id, &receipt, None, now);
                     Some(receipt)
                 }
                 _ => None,
@@ -2937,7 +2909,7 @@ impl LocalDaemonInner {
         );
         let ctx = parsed.as_context();
         if let Ok(policy) = self.delivery.policy(&db, session_id) {
-            if policy.resolve_urgency(&ctx, None, false) == DeliveryUrgency::Mute {
+            if policy.resolve_urgency(&ctx, None, None) == DeliveryUrgency::Mute {
                 return false;
             }
         }
@@ -2981,7 +2953,7 @@ impl LocalDaemonInner {
             Ok(MailboxPutResult::Stored { receipt }) => {
                 let _ = db
                     .local()
-                    .mark_mailbox_gate_approved(session_id, &receipt, false, now);
+                    .mark_mailbox_gate_approved(session_id, &receipt, None, now);
                 true
             }
             _ => false,
@@ -3585,23 +3557,13 @@ impl LocalDaemonInner {
                             .await
                         {
                             Ok(eval) => match eval.decision {
-                                GateDecision::Allow {
-                                    downgraded_to_notify,
-                                    capped_to_queue,
-                                } => {
-                                    let eval_cap = if downgraded_to_notify {
-                                        Some(DeliveryUrgency::Notify)
-                                    } else if capped_to_queue {
-                                        Some(DeliveryUrgency::Queue)
-                                    } else {
-                                        None
-                                    };
-                                    gate_cap = strictest_urgency_cap(gate_cap, eval_cap);
+                                GateDecision::Allow { max_urgency } => {
+                                    gate_cap = strictest_urgency_cap(gate_cap, max_urgency);
                                     let reason_str = urgency_cap_gate_reason(gate_cap);
                                     // Ensure `self.node.db()` records gate approval even if the
                                     // pipeline uses a separate `NodeDb` handle.
                                     let db = self.node.db();
-                                    let _ = db.local().mark_mailbox_gate_approved_with_reason(
+                                    let _ = db.local().mark_mailbox_gate_approved(
                                         session_id,
                                         &entry.receipt,
                                         reason_str,
@@ -3734,7 +3696,7 @@ impl LocalDaemonInner {
         let classification = {
             let db = self.node.db();
             self.delivery
-                .classify_entry_with_cap(&db, session_id, &entry, sub_mode, gate_cap, now)
+                .classify_entry(&db, session_id, &entry, sub_mode, gate_cap, now)
                 .ok()?
         };
 
@@ -4202,7 +4164,7 @@ impl LocalDaemonInner {
                     self.lookup_subscription_urgency(session_id, &entry.origin_node, &entry.source);
                 let gate_cap = gate_reason_urgency_cap(entry.gate_reason.as_deref());
                 let restored_urgency =
-                    policy.resolve_urgency_with_cap(&parsed.as_context(), sub_mode, gate_cap);
+                    policy.resolve_urgency(&parsed.as_context(), sub_mode, gate_cap);
                 if matches!(
                     restored_urgency,
                     DeliveryUrgency::Interrupt | DeliveryUrgency::Queue
@@ -10672,7 +10634,7 @@ async fn fanout_approved_local_ingest(
                                         let _ = db.local().mark_mailbox_gate_approved(
                                             &subscriber,
                                             &sub_rcpt,
-                                            false,
+                                            None,
                                             now,
                                         );
                                         sessions_to_wake.insert(subscriber.clone());
@@ -11550,7 +11512,7 @@ impl LocalDaemonInner {
                                 &item.origin_node,
                                 &item.source,
                             );
-                            policy.resolve_urgency(&parsed.as_context(), sub_mode, false)
+                            policy.resolve_urgency(&parsed.as_context(), sub_mode, None)
                         }
                     };
                     let notified = item.notified || cached.is_some_and(|m| m.notified);

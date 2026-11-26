@@ -420,7 +420,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
             "local.gmail",
             &MailboxPutOptions::default(),
             None,
-            false,
+            None,
             now_ms(),
         )
         .unwrap();

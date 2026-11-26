@@ -686,10 +686,7 @@ pub(crate) fn apply_verdict_with_threshold(
                 }
             } else {
                 FilterOutcome {
-                    decision: GateDecision::Allow {
-                        downgraded_to_notify: false,
-                        capped_to_queue: false,
-                    },
+                    decision: GateDecision::ALLOW,
                     confidence: Some(verdict.confidence),
                     categories: verdict.categories,
                     had_error: false,
