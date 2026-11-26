@@ -464,9 +464,6 @@ pub enum ManifestFetchOutcome {
         manifest: SignedNodeManifest,
         etag: Option<String>,
     },
-    LegacyV1 {
-        keys_endpoint_present: bool,
-    },
 }
 
 // ============================================================================
@@ -671,7 +668,7 @@ impl PeerLink {
     }
 
     /// Fetches `GET /v1/manifest` (with optional RFC 9110 `If-None-Match` ETag),
-    /// transparently detecting legacy v1 routers (`404` -> probe `GET /v1/keys`).
+    /// rejecting missing manifests through the ordinary HTTP error path.
     pub async fn fetch_manifest(
         &self,
         if_none_match: Option<&str>,
@@ -689,21 +686,6 @@ impl PeerLink {
         let (status, headers, bytes) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
         if status == StatusCode::NOT_MODIFIED {
             return Ok(ManifestFetchOutcome::NotModified);
-        }
-        if status == StatusCode::NOT_FOUND {
-            // Legacy v1 TypeScript router fallback (§3.2.1): probe GET /v1/keys.
-            let keys_req = self.build_request(Method::GET, "/v1/keys", None, None)?;
-            let keys_present = match self
-                .client
-                .request_for_endpoint(&self.endpoint, keys_req)
-                .await
-            {
-                Ok(r) => r.status().is_success(),
-                Err(_) => false,
-            };
-            return Ok(ManifestFetchOutcome::LegacyV1 {
-                keys_endpoint_present: keys_present,
-            });
         }
         if !status.is_success() {
             return Err(HttpClient::decode_error_response(status, &bytes));

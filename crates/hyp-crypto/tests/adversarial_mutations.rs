@@ -15,10 +15,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use hyp_crypto::CryptoError;
-use hyp_crypto::compat_v1::{
-    EntryV1, KeyRegistrationV1, SealInputV1, create_key_registration_v1, issue_grant_v1, open_v1,
-    parse_pairing_code_v1, seal_v1, sign_binding_v1, verify_entry_v1, verify_key_registration_v1,
-};
+use hyp_crypto::compat_v1::{derive_pairing_key_v1, issue_grant_v1, parse_pairing_code_v1};
+
 use hyp_crypto::e2ee::{
     ChannelContext, DmContext, EpochMember, EpochScope, KvContext, create_epoch_bundle,
     open_channel_message, open_dm, open_epoch_bundle, open_kv_entry, seal_channel_message, seal_dm,
@@ -27,7 +25,7 @@ use hyp_crypto::e2ee::{
 use hyp_crypto::hpke;
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{
-    Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk, X25519KeyPair, X25519PublicKey,
+    Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk, X25519PublicKey,
 };
 use hyp_crypto::keystore::{SecretBackend, SecretStore, validate_secret_name};
 use hyp_crypto::pairing::{
@@ -36,7 +34,7 @@ use hyp_crypto::pairing::{
     decode_am2, decode_hp2p1, encode_am2, encode_hp2p1, sign_revocation_v2,
     verify_p2p_confirmation, verify_p2p_response, verify_revocation_v2,
 };
-use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
+use hyp_crypto::rfc3339::parse_rfc3339_millis;
 use hyp_crypto::transfer::{
     StreamEncryptParams, TRANSFER_CHUNK_SIZE, TarPackOptions, TarUnpackOptions, decrypt_stream_v2,
     default_stage1_attachment_guard, encrypt_stream_v2, pack_tar_gz_bytes, unpack_tar_gz,
@@ -303,7 +301,7 @@ fn mutation_streaming_transfer_edge_boundaries_and_cross_transfer_chunk_swap() {
 }
 
 #[test]
-fn mutation_all_zero_and_small_order_keys_rejected_everywhere() {
+fn all_zero_public_keys_fail_closed() {
     let zero_b64 = URL_SAFE_NO_PAD.encode([0u8; 32]);
     assert!(matches!(
         X25519PublicKey::from_b64(&zero_b64),
@@ -313,60 +311,6 @@ fn mutation_all_zero_and_small_order_keys_rejected_everywhere() {
         Ed25519PublicKey::from_b64(&zero_b64),
         Err(CryptoError::SmallOrderKey)
     ));
-
-    // v1 verify_key_registration rejects all-zero X25519 key
-    let sign = Ed25519KeyPair::generate().unwrap();
-    let enc = X25519KeyPair::generate().unwrap();
-    let mut reg = create_key_registration_v1("alice", &sign, &enc).unwrap();
-    reg.encryption_key = zero_b64.clone();
-    assert!(matches!(
-        verify_key_registration_v1("alice", &reg),
-        Err(CryptoError::SmallOrderKey)
-    ));
-
-    // v1 verify_key_registration rejects small-order Ed25519 signing key
-    let bad_reg = KeyRegistrationV1 {
-        signing_key: zero_b64.clone(),
-        encryption_key: enc.public_key_b64(),
-        proof: reg.proof,
-    };
-    assert!(matches!(
-        verify_key_registration_v1("alice", &bad_reg),
-        Err(CryptoError::SmallOrderKey)
-    ));
-
-    // v1 seal/open rejects tampered header or ciphertext
-    let now = now_unix_ms();
-    let sealed = seal_v1(
-        &SealInputV1 {
-            id: "11111111-2222-4333-8444-555555555555",
-            transfer_type: "files",
-            from: "alice",
-            to: "bob",
-            to_handle: Some("codex"),
-            ttl_ms: 60_000,
-        },
-        b"payload",
-        &sign,
-        &enc.public_key(),
-        now,
-    )
-    .unwrap();
-    let mut bad_ct = sealed.ciphertext.clone();
-    bad_ct[0] ^= 0x01;
-    assert!(open_v1(&sealed.header, &bad_ct, &sign.public_key(), &enc).is_err());
-
-    // v1 Entry rejects tampered binding selfSig
-    let admin = Ed25519KeyPair::generate().unwrap();
-    let issued = issue_grant_v1(&admin, "alice", &["*"], 60_000, now).unwrap();
-    let code = parse_pairing_code_v1(&issued.code).unwrap();
-    let mut binding = sign_binding_v1(&issued.grant, &code, &sign, &enc, now).unwrap();
-    binding.self_sig = flip_b64_byte(&binding.self_sig, 0, 0x01);
-    let entry = EntryV1 {
-        grant: issued.signed,
-        binding,
-    };
-    assert!(verify_entry_v1(&entry, &admin.public_key()).is_err());
 }
 
 #[test]
@@ -581,14 +525,10 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
         if code.grant_id != issued.grant.id {
             return Err(CryptoError::InvalidPairing("grant_id mismatch".into()));
         }
-        let admin_pk = decoded.admin_jwk.to_ed25519()?;
-        let binding =
-            sign_binding_v1(&issued.grant, &code, &alice.signing, &alice.encryption, now)?;
-        let entry = EntryV1 {
-            grant: issued.signed.clone(),
-            binding,
-        };
-        let _ = verify_entry_v1(&entry, &admin_pk)?;
+        let key = derive_pairing_key_v1(&code.secret, &code.grant_id)?;
+        if key.public_key_b64() != issued.grant.pairing_key {
+            return Err(CryptoError::InvalidPairing("pairing key mismatch".into()));
+        }
         Ok(())
     };
     redeem_am2(&encoded_am2).expect("baseline am2_ redemption must succeed");
@@ -893,7 +833,7 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
     }
 
     // =========================================================================
-    // 4. Signed `KeyRegPayloadV2` (+ `KeyRegistrationV1` parity sweep)
+    // 4. Signed `KeyRegPayloadV2`
     // =========================================================================
     let key_reg_v2 = KeyRegPayloadV2 {
         v: 2,
@@ -937,29 +877,6 @@ fn seeded_1bit_mutation_sweep_am2_hp2p1_revocation_and_key_reg() {
                 .verify_signed::<KeyRegPayloadV2>("key-reg", &mutated)
                 .is_err(),
             "seed=0x{seed:016x} step={step}: KeyRegPayloadV2 1-bit flip (pos={pos}, bit={bit}) was accepted!"
-        );
-    }
-
-    // Also sweep 64 seeded 1-bit flips across `KeyRegistrationV1`.
-    let kr_v1 =
-        create_key_registration_v1("alice@macbook", &alice.signing, &alice.encryption).unwrap();
-    assert!(verify_key_registration_v1("alice@macbook", &kr_v1).is_ok());
-    let orig_v1_sig = URL_SAFE_NO_PAD.decode(&kr_v1.proof.sig).unwrap();
-    let kr_v1_total = kr_v1.proof.payload.len() + orig_v1_sig.len();
-    for step in 0..64usize {
-        let pos = rng.gen_usize(kr_v1_total);
-        let bit = (rng.next_u64() % 8) as u8;
-        let mut mutated = kr_v1.clone();
-        if pos < kr_v1.proof.payload.len() {
-            mutated.proof.payload = flip_ascii_str_bit(&kr_v1.proof.payload, pos, bit % 7);
-        } else {
-            let mut sig = orig_v1_sig.clone();
-            sig[pos - kr_v1.proof.payload.len()] ^= 1u8 << bit;
-            mutated.proof.sig = URL_SAFE_NO_PAD.encode(sig);
-        }
-        assert!(
-            verify_key_registration_v1("alice@macbook", &mutated).is_err(),
-            "seed=0x{seed:016x} step={step}: KeyRegistrationV1 1-bit flip (pos={pos}, bit={bit}) was accepted!"
         );
     }
 }

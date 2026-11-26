@@ -7,10 +7,7 @@
 //!   OKP JWKs, and RFC 7638 JWK Thumbprints
 //! - Small-order Ed25519 curve point rejection table
 //! - All 7 domain-separated `t3-mesh/v1/<kind>\n` Ed25519 signatures
-//! - Signed `Grant`, `t3mp1_` pairing codes, `SignedBinding`, `Entry`, `Revocation`,
-//!   and `KeyRegistration`
-//! - `seal_v1` X25519+HKDF-SHA256+AES-256-GCM ciphertexts & `HYP1` file packs
-//!   (multi-file text, empty file, all-256-byte binary, UTF-8, 64 KiB binary)
+//! - Signed `Grant`, `t3mp1_` pairing codes and derived pairing keys
 //! - Independent Node `node:crypto` RFC 9180 HPKE `DHKEM(X25519, HKDF-SHA256) +
 //!   HKDF-SHA256 + AES-256-GCM` ciphertexts
 //!
@@ -18,13 +15,11 @@
 //! (McKeeman nearby altered cases) and asserts every mutation fails closed!
 
 use std::collections::HashMap;
-use std::fs;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hyp_crypto::compat_v1::{
-    EntryV1, KeyRegistrationV1, SignatureKindV1, SignedV1, open_grant_v1, open_revocation_v1,
-    open_v1, parse_pairing_code_v1, unpack_hyp1, verify_entry_v1, verify_key_registration_v1,
-    verify_payload_v1,
+    GrantV1, SignatureKindV1, SignedV1, derive_pairing_key_v1, format_pairing_code_v1,
+    parse_pairing_code_v1, verify_payload_v1,
 };
 use hyp_crypto::hpke;
 use hyp_crypto::keys::{
@@ -32,8 +27,6 @@ use hyp_crypto::keys::{
     is_small_order_ed25519_point,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use tempfile::TempDir;
 
 const VECTORS_JSON: &str = include_str!("fixtures/v1_crypto_vectors.json");
 
@@ -45,8 +38,6 @@ struct CryptoFixture {
     small_order_checks: Vec<SmallOrderVector>,
     domain_signatures: Vec<DomainSigVector>,
     grants_and_entries: Vec<GrantEntryVector>,
-    key_registrations: Vec<KeyRegVector>,
-    sealed_transfers: Vec<SealedTransferVector>,
     hpke_vectors: Vec<HpkeVector>,
 }
 
@@ -85,47 +76,8 @@ struct DomainSigVector {
 struct GrantEntryVector {
     name: String,
     connector_id: String,
-    signer_key_name: String,
-    enc_key_name: String,
     code: String,
     signed_grant: SignedV1,
-    entry: EntryV1,
-    revocation: SignedV1,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KeyRegVector {
-    connector_id: String,
-    signer_key_name: String,
-    enc_key_name: String,
-    registration: KeyRegistrationV1,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExpectedFile {
-    name: String,
-    content_b64: String,
-    sha256: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SealedTransferVector {
-    name: String,
-    sender_sign_key_name: String,
-    recipient_enc_key_name: String,
-    from: String,
-    to: String,
-    to_handle: Option<String>,
-    from_handle: Option<String>,
-    note: Option<String>,
-    transfer_type: String,
-    packed_payload_b64: String,
-    sealed_header: SignedV1,
-    sealed_ciphertext_b64: String,
-    files: Vec<ExpectedFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,201 +291,33 @@ fn golden_v1_domain_separated_signatures_and_mutations_fail_closed() {
 }
 
 #[test]
-fn golden_v1_grants_t3mp1_bindings_entries_revocations_keyregs_and_mutations() {
+fn golden_v1_pairing_codes_keys_and_signed_grants() {
     let fixture = load_fixture();
-    let (ed_keys, x_keys) = load_key_maps(&fixture);
+    let (ed_keys, _) = load_key_maps(&fixture);
     let admin_pk = ed_keys["admin"].public_key();
-    let wrong_admin_pk = ed_keys["bob-sign"].public_key();
-
     assert_eq!(fixture.grants_and_entries.len(), 4);
-    for gvec in &fixture.grants_and_entries {
-        let signer_kp = &ed_keys[&gvec.signer_key_name];
-        let enc_kp = &x_keys[&gvec.enc_key_name];
-
-        // 1. Grant verification + mutated copies fail closed.
-        let grant = open_grant_v1(&gvec.signed_grant, &admin_pk)
-            .unwrap_or_else(|e| panic!("open_grant_v1 failed on {}: {e}", gvec.name));
-        assert_eq!(grant.connector_id, gvec.connector_id);
-        assert!(open_grant_v1(&gvec.signed_grant, &wrong_admin_pk).is_err());
-
-        let mut bad_grant_sig = gvec.signed_grant.clone();
-        bad_grant_sig.sig = flip_b64url_byte(&bad_grant_sig.sig, 3);
-        assert!(open_grant_v1(&bad_grant_sig, &admin_pk).is_err());
-
-        let mut bad_grant_payload = gvec.signed_grant.clone();
-        bad_grant_payload.payload = bad_grant_payload
-            .payload
-            .replace(&gvec.connector_id, "mallory@evil");
-        assert!(open_grant_v1(&bad_grant_payload, &admin_pk).is_err());
-
-        // 2. `t3mp1_` pairing code parsing + mutated copies fail closed.
-        let code = parse_pairing_code_v1(&gvec.code)
-            .unwrap_or_else(|e| panic!("parse_pairing_code_v1 failed on {}: {e}", gvec.name));
+    for vector in &fixture.grants_and_entries {
+        let code = parse_pairing_code_v1(&vector.code)
+            .unwrap_or_else(|error| panic!("pairing vector {}: {error}", vector.name));
+        let grant: GrantV1 = serde_json::from_str(&vector.signed_grant.payload).unwrap();
+        assert_eq!(grant.connector_id, vector.connector_id);
         assert_eq!(code.grant_id, grant.id);
         assert_eq!(code.admin_fingerprint, admin_pk.fingerprint());
-        assert!(parse_pairing_code_v1(&gvec.code.replacen("t3mp1_", "t3mp2_", 1)).is_err());
-        assert!(parse_pairing_code_v1(&gvec.code[..gvec.code.len() - 4]).is_err());
-
-        // 3. Full Entry (Grant + SignedBinding) verification + mutated copies fail closed.
-        let identity = verify_entry_v1(&gvec.entry, &admin_pk)
-            .unwrap_or_else(|e| panic!("verify_entry_v1 failed on {}: {e}", gvec.name));
-        assert_eq!(identity.connector_id, gvec.connector_id);
-        assert_eq!(identity.signing_key, signer_kp.public_key_b64());
-        assert_eq!(identity.encryption_key, enc_kp.public_key_b64());
-        assert!(verify_entry_v1(&gvec.entry, &wrong_admin_pk).is_err());
-
-        // Mutating binding pairing_sig, self_sig, or grant signature all fail closed!
-        let mut bad_entry_sig = gvec.entry.clone();
-        bad_entry_sig.binding.pairing_sig = flip_b64url_byte(&bad_entry_sig.binding.pairing_sig, 7);
-        assert!(verify_entry_v1(&bad_entry_sig, &admin_pk).is_err());
-
-        let mut bad_entry_self = gvec.entry.clone();
-        bad_entry_self.binding.self_sig = flip_b64url_byte(&bad_entry_self.binding.self_sig, 9);
-        assert!(verify_entry_v1(&bad_entry_self, &admin_pk).is_err());
-
-        let mut bad_entry_grant = gvec.entry.clone();
-        bad_entry_grant.grant.sig = flip_b64url_byte(&bad_entry_grant.grant.sig, 11);
-        assert!(verify_entry_v1(&bad_entry_grant, &admin_pk).is_err());
-
-        // 4. Revocation verification + mutations fail closed.
-        let rev = open_revocation_v1(&gvec.revocation, &admin_pk)
-            .unwrap_or_else(|e| panic!("open_revocation_v1 failed on {}: {e}", gvec.name));
-        assert_eq!(rev.grant_id, grant.id);
-        assert_eq!(rev.connector_id, gvec.connector_id);
-        assert!(open_revocation_v1(&gvec.revocation, &wrong_admin_pk).is_err());
-
-        let mut bad_rev = gvec.revocation.clone();
-        bad_rev.sig = flip_b64url_byte(&bad_rev.sig, 5);
-        assert!(open_revocation_v1(&bad_rev, &admin_pk).is_err());
-    }
-
-    // 5. KeyRegistrations + wrong connectorId + mutated sig fail closed.
-    assert_eq!(fixture.key_registrations.len(), 2);
-    for kr in &fixture.key_registrations {
-        let expected_sign = ed_keys[&kr.signer_key_name].public_key();
-        let expected_enc = x_keys[&kr.enc_key_name].public_key();
-        let (got_sign, got_enc) =
-            verify_key_registration_v1(&kr.connector_id, &kr.registration).unwrap();
-        assert_eq!(got_sign, expected_sign);
-        assert_eq!(got_enc, expected_enc);
-
-        // Wrong connector_id binding MUST fail closed.
-        assert!(verify_key_registration_v1("wrong@node", &kr.registration).is_err());
-
-        // Flipped proof sig MUST fail closed.
-        let mut bad_kr = kr.registration.clone();
-        bad_kr.proof.sig = flip_b64url_byte(&bad_kr.proof.sig, 2);
-        assert!(verify_key_registration_v1(&kr.connector_id, &bad_kr).is_err());
-    }
-}
-
-#[test]
-fn golden_v1_seal_ciphertexts_hyp1_file_packs_and_mutations() {
-    let fixture = load_fixture();
-    let (ed_keys, x_keys) = load_key_maps(&fixture);
-    let tmp = TempDir::new().unwrap();
-
-    assert_eq!(fixture.sealed_transfers.len(), 3);
-    for tv in &fixture.sealed_transfers {
-        let sender_pk = ed_keys[&tv.sender_sign_key_name].public_key();
-        let recipient_kp = &x_keys[&tv.recipient_enc_key_name];
-        let wrong_sender_pk = ed_keys["admin"].public_key();
-        let wrong_recipient_kp = if tv.recipient_enc_key_name == "bob-enc" {
-            &x_keys["carol-enc"]
-        } else {
-            &x_keys["bob-enc"]
-        };
-
-        let ct = URL_SAFE_NO_PAD
-            .decode(&tv.sealed_ciphertext_b64)
-            .expect("decode ciphertext");
-        let expected_pack = URL_SAFE_NO_PAD
-            .decode(&tv.packed_payload_b64)
-            .expect("decode packed payload");
-
-        // 1. Open TS-sealed transfer & assert byte-identical HYP1 plaintext.
-        let (hdr, plaintext) = open_v1(&tv.sealed_header, &ct, &sender_pk, recipient_kp)
-            .unwrap_or_else(|e| panic!("open_v1 failed on {}: {e}", tv.name));
-        assert_eq!(hdr.from, tv.from);
-        assert_eq!(hdr.to, tv.to);
-        assert_eq!(hdr.to_handle, tv.to_handle);
-        assert_eq!(hdr.transfer_type, tv.transfer_type);
-        assert_eq!(&*plaintext, &expected_pack);
-
-        // 2. Unpack TS HYP1 archive & verify metadata + exact file bytes + SHA-256!
-        let unpack_dir = tmp.path().join(&tv.name);
-        let unpacked = unpack_hyp1(&plaintext, &unpack_dir, None, None)
-            .unwrap_or_else(|e| panic!("unpack_hyp1 failed on {}: {e}", tv.name));
-        assert_eq!(unpacked.from_handle, tv.from_handle);
-        assert_eq!(unpacked.note, tv.note);
-        assert_eq!(unpacked.files.len(), tv.files.len());
-        for (got_file, exp_file) in unpacked.files.iter().zip(tv.files.iter()) {
-            assert_eq!(got_file.name, exp_file.name);
-            let got_bytes = fs::read(&got_file.path).unwrap();
-            let exp_bytes = URL_SAFE_NO_PAD.decode(&exp_file.content_b64).unwrap();
-            assert_eq!(
-                got_bytes, exp_bytes,
-                "file content mismatch for {}",
-                exp_file.name
-            );
-            assert_eq!(hex::encode(Sha256::digest(&got_bytes)), exp_file.sha256);
-        }
-
-        // 3. Mutated copies of `seal_v1` MUST ALL fail closed!
-        // 3a. Wrong sender Ed25519 key
-        assert!(open_v1(&tv.sealed_header, &ct, &wrong_sender_pk, recipient_kp).is_err());
-        // 3b. Wrong recipient X25519 key
-        assert!(open_v1(&tv.sealed_header, &ct, &sender_pk, wrong_recipient_kp).is_err());
-        // 3c. Flipped header signature bit
-        let mut bad_hdr = tv.sealed_header.clone();
-        bad_hdr.sig = flip_b64url_byte(&bad_hdr.sig, 0);
-        assert!(open_v1(&bad_hdr, &ct, &sender_pk, recipient_kp).is_err());
-        // 3d. Flipped ciphertext body byte
-        let mut bad_ct_body = ct.clone();
-        bad_ct_body[0] ^= 0x80;
-        assert!(open_v1(&tv.sealed_header, &bad_ct_body, &sender_pk, recipient_kp).is_err());
-        // 3e. Flipped GCM auth tag byte (last byte)
-        let mut bad_ct_tag = ct.clone();
-        let last = bad_ct_tag.len() - 1;
-        bad_ct_tag[last] ^= 0x01;
-        assert!(open_v1(&tv.sealed_header, &bad_ct_tag, &sender_pk, recipient_kp).is_err());
-
-        // 4. Mutated copies of `HYP1` pack MUST ALL fail closed!
-        let mut bad_magic = plaintext.clone();
-        bad_magic[3] = b'2';
-        assert!(
-            unpack_hyp1(
-                &bad_magic,
-                &tmp.path().join(format!("{}_bad_magic", tv.name)),
-                None,
-                None
-            )
-            .is_err()
+        assert_eq!(format_pairing_code_v1(&code).unwrap(), vector.code);
+        assert_eq!(
+            derive_pairing_key_v1(&code.secret, &code.grant_id)
+                .unwrap()
+                .public_key_b64(),
+            grant.pairing_key
         );
-
-        let mut bad_gz = plaintext.clone();
-        let mid = bad_gz.len() / 2;
-        bad_gz[mid] ^= 0xff;
-        assert!(
-            unpack_hyp1(
-                &bad_gz,
-                &tmp.path().join(format!("{}_bad_gz", tv.name)),
-                None,
-                None
-            )
-            .is_err()
-        );
-
-        let truncated = &plaintext[..plaintext.len().saturating_sub(8)];
-        assert!(
-            unpack_hyp1(
-                truncated,
-                &tmp.path().join(format!("{}_trunc", tv.name)),
-                None,
-                None
-            )
-            .is_err()
-        );
+        assert!(verify_payload_v1(
+            SignatureKindV1::Grant,
+            &vector.signed_grant.payload,
+            &vector.signed_grant.sig,
+            &admin_pk
+        ));
+        assert!(parse_pairing_code_v1(&vector.code.replacen("t3mp1_", "t3mp2_", 1)).is_err());
+        assert!(parse_pairing_code_v1(&vector.code[..vector.code.len() - 4]).is_err());
     }
 }
 

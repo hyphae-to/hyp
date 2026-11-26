@@ -1504,7 +1504,6 @@ impl UnifiedNode {
             expires_at: None,
             capabilities: self.effective_capabilities().into_iter().collect(),
             require_e2ee: self.config.e2ee_policy == E2eePolicy::Required,
-            is_legacy_v1: false,
         }
     }
 
@@ -1634,30 +1633,6 @@ impl UnifiedNode {
         }
 
         Ok(negotiated)
-    }
-
-    /// Negotiates capabilities with a legacy v1 router (`GET /v1/manifest` -> `404`),
-    /// failing closed under `E2eePolicy::Required` or after previous E2EE ratcheting.
-    pub fn negotiate_legacy_v1_peer(
-        &self,
-        peer_id: &str,
-        keys_endpoint_present: bool,
-    ) -> Result<NegotiatedSession, NodeError> {
-        let nid = NodeId::new(peer_id)?;
-        let history = self.build_trust_history(peer_id, false)?;
-        let local_view = self.local_capabilities_view();
-        let remote_view = PeerCapabilitiesView::synthesize_legacy_v1(nid, keys_endpoint_present);
-        let now_rfc = format_rfc3339_millis(now_ms());
-        let policy = self.effective_e2ee_policy_for_peer(peer_id);
-
-        Ok(negotiate_capabilities(
-            &local_view,
-            &remote_view,
-            self.config.node_id.as_str(),
-            &now_rfc,
-            policy,
-            &history,
-        )?)
     }
 
     fn build_trust_history(
@@ -3928,9 +3903,6 @@ impl UnifiedNode {
             ManifestFetchOutcome::Signed { manifest, etag } => {
                 self.verify_and_cache_peer_manifest(peer_id, &manifest, etag, false)?
             }
-            ManifestFetchOutcome::LegacyV1 {
-                keys_endpoint_present,
-            } => self.negotiate_legacy_v1_peer(peer_id, keys_endpoint_present)?,
             ManifestFetchOutcome::NotModified => {
                 return Err(NodeError::BadRequest(
                     "unexpected 304 Not Modified without If-None-Match".into(),
@@ -4015,13 +3987,6 @@ impl UnifiedNode {
             ManifestFetchOutcome::Signed { manifest, etag } => {
                 let negotiated =
                     self.verify_and_cache_peer_manifest(peer_id, &manifest, etag, false)?;
-                link.set_negotiated(negotiated.clone());
-                Ok((false, Some(negotiated)))
-            }
-            ManifestFetchOutcome::LegacyV1 {
-                keys_endpoint_present,
-            } => {
-                let negotiated = self.negotiate_legacy_v1_peer(peer_id, keys_endpoint_present)?;
                 link.set_negotiated(negotiated.clone());
                 Ok((false, Some(negotiated)))
             }

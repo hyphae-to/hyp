@@ -1,0 +1,17 @@
+# Abandoned v1 compatibility retirement ledger
+
+Scope: issue #62, base `1b2d5c6`. Retire only abandoned transfer/grant-verification/registration interoperability and the TypeScript-router fallback. Retain active `t3mp1_` parse/format, pairing-key derivation, grant issuance, scope expansion and shared key/signature primitives used by those contracts. No change to legacy configuration-file migration.
+
+| Candidate | Actual contract and callers | Decision and remaining proof |
+| --- | --- | --- |
+| `compat_v1` transfer/HYP1 pack, entry verification, revocation and key registration routines | No production consumers outside this module. Frozen vectors and inline tests are their only callers. | Delete retired routines and their exclusive types/helpers/tests. Keep frozen fixture file intact where shared with retained vectors. Active v2 transfer/archive/signature/key mutation suites remain. |
+| `golden_v1_grants_t3mp1_bindings_entries_revocations_keyregs_and_mutations` | Mixes abandoned entry/registration verification with live pairing-code vector parsing. | Repair to retain independent frozen pairing-code parse/format, key derivation and signed grant material checks; delete only abandoned rows. Do not remove live pairing assertions with the old oracle. |
+| Inline v1 roundtrip suite | Mixed live grant issuance/pairing and retired transfer/entry behavior. | Retain live issuance, scope and malformed-code cases; delete exclusively retired flows. Existing real am2 and pairing-security tests retain network grant claim/security behavior. |
+| `mutation_all_zero_and_small_order_keys_rejected_everywhere` | Common key validation followed by retired key-reg/seal/entry paths. | Retain public key small-order checks, remove retired suffix only. Active DM/channel/KV/HPKE mutation tests remain. |
+| `PeerCapabilitiesView::synthesize_legacy_v1` and legacy negotiation tests | Unsigned fabricated capability fallback after manifest404; no other production caller. | Remove fallback and its special flags/branches. Keep signed-manifest audience/expiry/ratchet/E2EE tests; add real HTTP404 rejection at the current manifest owner if existing coverage does not prove it. |
+
+Validation: focused crypto golden/mutation/pairing tests; signed-manifest negotiation and peer-link HTTP tests; workspace Clippy and isolated full workspace. No builds until the #61 owner releases the shared target, followed by explicit debug and release package cleans.
+
+Additional inventory: `wake_peer_link_e2e` used a fake manifest404 handshake to reach unrelated wake/backoff behavior. Retain both tests with a real signed manifest produced by an isolated `UnifiedNode`; add a real HTTP404 test proving no active link and no `/v1/keys` probe. The seeded am2 mutation sweep also used retired entry verification as its redemption oracle; retain invite validation, grant-ID binding and derived pairing-key checks using active primitives, and delete only the separate abandoned v1 key-registration suffix. Real pairing-security tests retain the network claim/security owner.
+
+Validation: isolated full workspace834/834 across86 suites, zero ignored; selected node/pairing/wake13/13; crypto library/golden/mutations41/41. The full run preceded only unused-import cleanup, one clearer test name and strengthening the issuance scope assertion to an independent explicit list; crypto41/41 reran after that cleanup. Final workspace Clippy and JS lint pass. Fresh release/installer/JS gates are running. No production test export was introduced.
