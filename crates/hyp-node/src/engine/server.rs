@@ -566,7 +566,13 @@ async fn route_request(
             }
             Method::GET => {
                 let filter_node = query.get("nodeId").map(String::as_str);
-                let keys = node.list_directory_keys_for_caller(&caller, filter_node)?;
+                let kv_namespace = query.get("kvNamespace").map(String::as_str);
+                let keys = match kv_namespace {
+                    Some(ns) if filter_node.is_none() => {
+                        node.list_kv_member_keys_for_caller(&caller, ns)?
+                    }
+                    _ => node.list_directory_keys_for_caller(&caller, filter_node)?,
+                };
                 Ok(json_response(StatusCode::OK, &PeerKeysResponse { keys }))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),

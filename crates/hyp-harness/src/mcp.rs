@@ -240,8 +240,10 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
                     "prefix": s,
                     "expectedVersion": {"type": "integer", "minimum": 0},
                     "writeModel": {"type": "string", "enum": ["owner", "shared", "allowlist"]},
+                    "allowlist": {"type": "array", "items": s},
                     "ttlMs": {"type": "integer", "minimum": 1},
-                    "encrypt": {"type": "boolean"}
+                    "encrypt": {"type": "boolean"},
+                    "e2eeMembers": {"type": "array", "items": s}
                 },
                 "required": ["action", "namespace"]
             }

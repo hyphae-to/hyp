@@ -666,6 +666,11 @@ impl PeerLink {
         self.send_json::<(), _>(Method::GET, &path, None, &[]).await
     }
 
+    pub async fn get_kv_member_keys(&self, namespace: &str) -> Result<PeerKeysResponse, NodeError> {
+        let path = format!("/v1/keys?kvNamespace={}", percent_encode(namespace));
+        self.send_json::<(), _>(Method::GET, &path, None, &[]).await
+    }
+
     pub async fn put_handles(&self, handles: Vec<String>) -> Result<HandlesResponse, NodeError> {
         self.put_handles_with_descriptions(&handles, &BTreeMap::new())
             .await

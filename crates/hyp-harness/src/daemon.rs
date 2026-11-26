@@ -5442,6 +5442,12 @@ impl LocalDaemonInner {
                 let expected_version = args.get("expectedVersion").and_then(Value::as_u64);
                 let ttl_ms = args.get("ttlMs").and_then(Value::as_i64);
                 let encrypt = args.get("encrypt").and_then(Value::as_bool).unwrap_or(false);
+                let allowlist = args.get("allowlist").and_then(Value::as_array).map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                });
                 let e2ee_members = args
                     .get("e2eeMembers")
                     .and_then(Value::as_array)
@@ -5461,7 +5467,7 @@ impl LocalDaemonInner {
                         value,
                         write_model,
                         owner_id: None,
-                        allowlist: None,
+                        allowlist,
                         expected_version,
                         ttl_ms,
                         encrypt,

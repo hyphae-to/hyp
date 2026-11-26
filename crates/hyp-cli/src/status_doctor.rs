@@ -27,7 +27,9 @@ use hyp_proto::manifest::{
     CapabilityToken, NodeManifestPayload, ProtocolRange, SignedNodeManifest,
 };
 use hyp_proto::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-use hyp_store::{CURRENT_SCHEMA_VERSION, NodeDb, PeerRecord, TrustTier, now_ms};
+use hyp_store::{
+    CURRENT_SCHEMA_VERSION, KeyUse, NodeDb, PeerProfile, PeerRecord, PeerStatus, TrustTier, now_ms,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -479,10 +481,13 @@ fn run_status_or_doctor(
         .as_ref()
         .and_then(|d| d.kv().list_namespaces("local", now_ms()).ok())
         .unwrap_or_default();
-    let peers = db
+    let peers: Vec<PeerRecord> = db
         .as_ref()
         .and_then(|d| d.peers().list_peers(None).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.status != PeerStatus::Revoked)
+        .collect();
 
     // 1. Peer Capabilities & Version Skew table (§3.3)
     let mut skew_rows = Vec::with_capacity(peers.len() + 1);
@@ -500,7 +505,15 @@ fn run_status_or_doctor(
     });
 
     for peer in &peers {
-        let row = evaluate_peer_skew(peer, require_e2ee);
+        let has_pinned_enc_key = db
+            .as_ref()
+            .and_then(|d| {
+                d.peers()
+                    .list_peer_keys(&peer.peer_id, Some(KeyUse::Encryption), true)
+                    .ok()
+            })
+            .is_some_and(|keys| !keys.is_empty());
+        let row = evaluate_peer_skew(peer, require_e2ee, has_pinned_enc_key);
         let check_name = format!("peer:{}", row.peer);
         match row.status {
             CheckStatus::Ok => checks.push(CliCheck::ok(
@@ -1076,9 +1089,17 @@ fn run_status_or_doctor(
     }
 }
 
-/// Evaluates a paired peer's cached manifest (or legacy v1 fallback) into a `PeerSkewRow`
-/// matching `docs/architecture-v2.md §3.2–§3.3`.
-pub fn evaluate_peer_skew(peer: &PeerRecord, local_require_e2ee: bool) -> PeerSkewRow {
+/// Evaluates a paired peer's capabilities into a `PeerSkewRow` matching
+/// `docs/architecture-v2.md §3.2–§3.3`, additionally accounting for inbound-only Hyphae v2
+/// `--profile local` clients (`endpoint: None`, `profile: Local`) that completed v2 pairing
+/// (`POST /v1/pair`, `POST /v1/guest/pair`, or outbound-only P2P) and have a verified active
+/// X25519 encryption key pinned in `peer_keys` (since local-profile nodes do not serve an
+/// inbound HTTP `/v1/manifest`).
+pub fn evaluate_peer_skew(
+    peer: &PeerRecord,
+    local_require_e2ee: bool,
+    has_pinned_enc_key: bool,
+) -> PeerSkewRow {
     let parsed_manifest = peer.manifest_json.as_deref().and_then(parse_cached_manifest);
 
     // Determine if this peer is a read-only public guest hub (e.g. public.hyphae.to) where DMs/KV are unused.
@@ -1087,6 +1108,11 @@ pub fn evaluate_peer_skew(peer: &PeerRecord, local_require_e2ee: bool) -> PeerSk
             .scopes
             .iter()
             .any(|s| s.starts_with("dm:") || s.starts_with("messages:") || s == "*");
+
+    let is_inbound_local_v2 = parsed_manifest.is_none()
+        && peer.endpoint.is_none()
+        && peer.profile == PeerProfile::Local
+        && has_pinned_enc_key;
 
     let (version, proto_range, caps, is_legacy_v1) = match parsed_manifest {
         Some(m) => {
@@ -1097,6 +1123,28 @@ pub fn evaluate_peer_skew(peer: &PeerRecord, local_require_e2ee: bool) -> PeerSk
                 .collect();
             let legacy = m.protocol_range.max <= 1 || m.hyphae_version == "legacy-v1";
             (m.hyphae_version, m.protocol_range, cap_set, legacy)
+        }
+        None if is_inbound_local_v2 => {
+            let mut cap_set = BTreeSet::new();
+            for tok in [
+                CapabilityToken::DmV1,
+                CapabilityToken::DmE2eeV1,
+                CapabilityToken::ChannelV1,
+                CapabilityToken::ChannelE2eeV1,
+                CapabilityToken::EventsV1,
+                CapabilityToken::SubPushdownV1,
+                CapabilityToken::KvV1,
+                CapabilityToken::KvE2eeV1,
+                CapabilityToken::TransferStreamV2,
+            ] {
+                cap_set.insert(tok.as_str().to_string());
+            }
+            (
+                "v2-client".to_string(),
+                ProtocolRange { min: 2, max: 2 },
+                cap_set,
+                false,
+            )
         }
         None => {
             let mut cap_set = BTreeSet::new();
@@ -1284,7 +1332,13 @@ pub fn evaluate_peer_skew(peer: &PeerRecord, local_require_e2ee: bool) -> PeerSk
         };
     }
 
-    let notes = if is_guest_ro {
+    let notes = if is_inbound_local_v2 {
+        if is_guest_ro {
+            "inbound v2 guest client (read-only)".to_string()
+        } else {
+            "inbound v2 local client (X25519 E2EE key pinned)".to_string()
+        }
+    } else if is_guest_ro {
         "guest read-only hub".to_string()
     } else {
         "full v2 parity".to_string()

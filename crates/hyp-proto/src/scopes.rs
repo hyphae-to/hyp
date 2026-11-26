@@ -383,6 +383,14 @@ impl KvPattern {
             }
         }
     }
+
+    /// Returns true if this KV scope rule covers any key inside `namespace`.
+    pub fn matches_namespace(&self, namespace: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::NamespacePrefix { namespace: ns, .. } => ns == namespace,
+        }
+    }
 }
 
 /// Parsed Hyphae v2 scope rule.
@@ -1113,9 +1121,23 @@ impl ScopeSet {
         })
     }
 
+    pub fn may_kv_read_namespace(&self, namespace: &str) -> bool {
+        self.rules.iter().any(|r| match r {
+            ParsedScopeV2::KvRead(pat) => pat.matches_namespace(namespace),
+            _ => false,
+        })
+    }
+
     pub fn may_kv_write(&self, namespace: &str, key: &str) -> bool {
         self.rules.iter().any(|r| match r {
             ParsedScopeV2::KvWrite(pat) => pat.matches(namespace, key),
+            _ => false,
+        })
+    }
+
+    pub fn may_kv_write_namespace(&self, namespace: &str) -> bool {
+        self.rules.iter().any(|r| match r {
+            ParsedScopeV2::KvWrite(pat) => pat.matches_namespace(namespace),
             _ => false,
         })
     }

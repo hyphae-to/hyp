@@ -722,6 +722,45 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
     let kv_get: Value = serde_json::from_str(&kv_get_txt).unwrap();
     assert_eq!(kv_get["entry"]["value"]["sha"], "abc123");
 
+    // 10b. `hyp_kv` E2EE (`encrypt: true`) WITHOUT explicit `e2eeMembers`: Alice writes, Bob decrypts!
+    let (kv_e2ee_set_txt, kv_e2ee_set_err) = alice_mcp
+        .call_verified_antigravity(
+            &alice_sock,
+            "ag-alice-1",
+            "hyp_kv",
+            json!({
+                "action": "set",
+                "node": "acme-team",
+                "namespace": "deploys",
+                "key": "checkout-secret",
+                "value": { "token": "MCP-E2EE-SHARED-SECRET-777" },
+                "writeModel": "shared",
+                "encrypt": true
+            }),
+        )
+        .await;
+    assert!(!kv_e2ee_set_err, "encrypted kv set failed: {kv_e2ee_set_txt}");
+
+    let (kv_e2ee_get_txt, kv_e2ee_get_err) = bob_mcp
+        .call_verified_claude(
+            &bob_sock,
+            "bob-sess-1",
+            "hyp_kv",
+            json!({
+                "action": "get",
+                "node": "acme-team",
+                "namespace": "deploys",
+                "key": "checkout-secret"
+            }),
+        )
+        .await;
+    assert!(!kv_e2ee_get_err, "encrypted kv get failed: {kv_e2ee_get_txt}");
+    let kv_e2ee_get: Value = serde_json::from_str(&kv_e2ee_get_txt).unwrap();
+    assert_eq!(
+        kv_e2ee_get["entry"]["value"]["token"],
+        "MCP-E2EE-SHARED-SECRET-777"
+    );
+
     // 11. Live `--claude-channel` push end-to-end on Bob's native Rust daemon!
     let mut chan_opts = McpOptions::new(bob_sock.clone());
     chan_opts.channel = true;

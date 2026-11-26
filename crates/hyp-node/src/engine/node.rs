@@ -3981,6 +3981,88 @@ impl UnifiedNode {
         unreachable!()
     }
 
+    /// Lists active key directory entries for peers authorized to read encrypted Shared KV
+    /// entries in `namespace` (`GET /v1/keys?kvNamespace=<ns>`).
+    ///
+    /// Security invariants:
+    /// - Fail-closed: `caller` must hold `kv:read` or `kv:write` covering `namespace`.
+    /// - Anti-recon: `TrustTier::Guest` callers without `kv:write` for `namespace` cannot
+    ///   enumerate org members (returns only `caller.peer_id`).
+    /// - Hub blindness: a `NodeProfile::Router` NEVER includes its own keys in the returned
+    ///   member list so blind routers never receive E2EE KV epoch key wrap slots.
+    pub fn list_kv_member_keys_for_caller(
+        &self,
+        caller: &AuthenticatedPeer,
+        namespace: &str,
+    ) -> Result<Vec<PeerKeyDirectoryEntry>, NodeError> {
+        if !hyp_proto::address::is_valid_kv_namespace(namespace) {
+            return Err(NodeError::BadRequest(format!(
+                "invalid KV namespace '{namespace}'"
+            )));
+        }
+        let can_read = caller.scopes.may_kv_read_namespace(namespace);
+        let can_write = caller.scopes.may_kv_write_namespace(namespace);
+        self.require_scope(
+            caller,
+            can_read || can_write,
+            &format!("kv:read={namespace}/*"),
+        )?;
+
+        let mut node_ids: BTreeSet<String> = BTreeSet::new();
+        node_ids.insert(caller.peer_id.clone());
+
+        let may_enumerate = caller.trust_tier != TrustTier::Guest || can_write;
+        if may_enumerate {
+            let db = self.db();
+            for peer in db.peers().list_peers(Some(PeerStatus::Active))? {
+                let peer_scopes = ScopeSet::from_strings(&peer.scopes);
+                if peer_scopes.may_kv_read_namespace(namespace)
+                    || peer_scopes.may_kv_write_namespace(namespace)
+                {
+                    node_ids.insert(peer.peer_id);
+                }
+            }
+            // Non-router nodes (e.g., direct P2P hosts) participate as real endpoints and may
+            // decrypt KV entries hosted on themselves; blind routers MUST NEVER be wrapped for.
+            if self.config.profile != NodeProfile::Router {
+                node_ids.insert(self.config.node_id.to_string());
+            }
+        }
+
+        let db = self.db();
+        let mut out = Vec::new();
+        for nid in node_ids {
+            if nid == self.config.node_id.as_str() {
+                if self.config.profile != NodeProfile::Router {
+                    out.push(PeerKeyDirectoryEntry {
+                        node_id: nid,
+                        kid: self.identity.signing.public_key().kid(),
+                        signing_jwk: self.identity.signing_jwk(),
+                        encryption_jwk: self.identity.encryption_jwk(),
+                    });
+                }
+                continue;
+            }
+            let signing_recs = db
+                .peers()
+                .list_peer_keys(&nid, Some(KeyUse::Signing), true)?;
+            let enc_recs = db
+                .peers()
+                .list_peer_keys(&nid, Some(KeyUse::Encryption), true)?;
+            if let (Some(sr), Some(er)) = (signing_recs.last(), enc_recs.last()) {
+                let signing_jwk: CryptoOkpJwk = serde_json::from_str(&sr.jwk_json)?;
+                let encryption_jwk: CryptoOkpJwk = serde_json::from_str(&er.jwk_json)?;
+                out.push(PeerKeyDirectoryEntry {
+                    node_id: nid,
+                    kid: sr.kid.clone(),
+                    signing_jwk,
+                    encryption_jwk,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     fn peers_share_authorized_channel(
         &self,
         caller: &AuthenticatedPeer,
@@ -5518,10 +5600,12 @@ impl UnifiedNode {
 
         if let Some(ep) = existing {
             let ep_members: BTreeSet<&str> = ep.members.iter().map(String::as_str).collect();
-            let all_covered = member_nodes
+            let target_members: BTreeSet<&str> = member_nodes
                 .iter()
-                .all(|m| ep_members.contains(m.as_str()));
-            if all_covered {
+                .map(String::as_str)
+                .chain(std::iter::once(self.config.node_id.as_str()))
+                .collect();
+            if ep_members == target_members {
                 let _ = self
                     .unwrap_and_cache_kv_epoch(resolved_host, namespace, &ep, link.as_ref())
                     .await?;
@@ -5540,6 +5624,134 @@ impl UnifiedNode {
 
         self.create_or_rotate_kv_epoch(resolved_host, namespace, None, member_nodes, link.as_ref())
             .await
+    }
+
+    /// Resolves the default set of E2EE KV epoch recipients when `KvWriteRequest.e2ee_members`
+    /// is omitted on an encrypted write:
+    /// - `WriteModel::Allowlist` (non-empty allowlist): `self` + allowlisted node IDs.
+    /// - Remote host (`link.is_some()`): queries `GET /v1/keys?kvNamespace=<ns>` to wrap for all
+    ///   active peers authorized to read `namespace`, caching their verified keys locally while
+    ///   strictly excluding blind `Router` host nodes.
+    /// - Local host (`link.is_none()`): wraps for `self` + active local peers authorized to read
+    ///   `namespace` that have pinned signing + encryption keys.
+    async fn resolve_default_kv_e2ee_members(
+        &self,
+        resolved_host: &str,
+        namespace: &str,
+        write_model: WriteModel,
+        allowlist: Option<&[String]>,
+        link: Option<&Arc<PeerLink>>,
+    ) -> Vec<String> {
+        let mut members: BTreeSet<String> = BTreeSet::new();
+        members.insert(self.config.node_id.to_string());
+
+        if write_model == WriteModel::Allowlist {
+            if let Some(al) = allowlist.filter(|a| !a.is_empty()) {
+                for raw in al {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let nid = parse_address(trimmed)
+                        .map(|(n, _)| n)
+                        .unwrap_or(trimmed);
+                    members.insert(nid.to_string());
+                }
+                return members.into_iter().collect();
+            }
+        }
+
+        if let Some(l) = link {
+            let host_is_router = {
+                let db = self.db();
+                db.peers()
+                    .get_peer(resolved_host)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| {
+                        p.profile == hyp_store::PeerProfile::Router
+                            || p.manifest_json
+                                .as_deref()
+                                .and_then(|raw| serde_json::from_str::<SignedNodeManifest>(raw).ok())
+                                .and_then(|s| {
+                                    serde_json::from_str::<NodeManifestPayload>(&s.payload).ok()
+                                })
+                                .is_some_and(|m| m.profile == hyp_proto::manifest::NodeProfile::Router)
+                    })
+            };
+
+            if let Ok(resp) = l.get_kv_member_keys(namespace).await {
+                let now = now_ms();
+                let db = self.db();
+                for entry in resp.keys {
+                    // Never wrap an E2EE KV epoch key for a blind router (defensive even against
+                    // older hubs that ignore `?kvNamespace=` and include their own node_id).
+                    if entry.node_id == resolved_host && host_is_router {
+                        continue;
+                    }
+                    let Ok(sk) = entry.signing_jwk.to_ed25519() else {
+                        continue;
+                    };
+                    let Ok(ek) = entry.encryption_jwk.to_x25519() else {
+                        continue;
+                    };
+                    if entry.node_id != self.config.node_id.as_str() {
+                        if let Ok(sj) = serde_json::to_string(&entry.signing_jwk) {
+                            let _ = db.peers().upsert_peer_key(
+                                &PeerKeyInput {
+                                    peer_id: entry.node_id.clone(),
+                                    kid: sk.kid(),
+                                    key_use: KeyUse::Signing,
+                                    jwk_json: sj,
+                                    status: KeyStatus::Active,
+                                    expires_at: None,
+                                },
+                                now,
+                            );
+                        }
+                        if let Ok(ej) = serde_json::to_string(&entry.encryption_jwk) {
+                            let _ = db.peers().upsert_peer_key(
+                                &PeerKeyInput {
+                                    peer_id: entry.node_id.clone(),
+                                    kid: ek.kid(),
+                                    key_use: KeyUse::Encryption,
+                                    jwk_json: ej,
+                                    status: KeyStatus::Active,
+                                    expires_at: None,
+                                },
+                                now,
+                            );
+                        }
+                    }
+                    members.insert(entry.node_id);
+                }
+            }
+        } else {
+            let db = self.db();
+            if let Ok(peers) = db.peers().list_peers(Some(PeerStatus::Active)) {
+                for peer in peers {
+                    let scopes = ScopeSet::from_strings(&peer.scopes);
+                    if !scopes.may_kv_read_namespace(namespace)
+                        && !scopes.may_kv_write_namespace(namespace)
+                    {
+                        continue;
+                    }
+                    let has_sign = db
+                        .peers()
+                        .list_peer_keys(&peer.peer_id, Some(KeyUse::Signing), true)
+                        .is_ok_and(|k| !k.is_empty());
+                    let has_enc = db
+                        .peers()
+                        .list_peer_keys(&peer.peer_id, Some(KeyUse::Encryption), true)
+                        .is_ok_and(|k| !k.is_empty());
+                    if has_sign && has_enc {
+                        members.insert(peer.peer_id);
+                    }
+                }
+            }
+        }
+
+        members.into_iter().collect()
     }
 
     async fn create_or_rotate_kv_epoch(
@@ -5776,10 +5988,19 @@ impl UnifiedNode {
             };
             let next_version = cur_version.saturating_add(1);
 
-            let members = req
-                .e2ee_members
-                .clone()
-                .unwrap_or_else(|| vec![self.config.node_id.to_string()]);
+            let members = match req.e2ee_members.clone().filter(|m| !m.is_empty()) {
+                Some(explicit) => explicit,
+                None => {
+                    self.resolve_default_kv_e2ee_members(
+                        &resolved_host,
+                        &req.namespace,
+                        req.write_model,
+                        req.allowlist.as_deref(),
+                        link.as_ref(),
+                    )
+                    .await
+                }
+            };
             let epoch_num = self
                 .ensure_kv_epoch(&resolved_host, &req.namespace, &members)
                 .await?;

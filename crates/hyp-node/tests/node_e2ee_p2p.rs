@@ -1083,3 +1083,221 @@ async fn adversarial_routing_loops_manifest_rollback_e2ee_downgrade_and_required
     alice.shutdown();
     hub.shutdown();
 }
+
+// ============================================================================
+// 4. Shared KV E2EE Auto-Wrapping for Authorized Hub Members + Blindness + Rotation
+// ============================================================================
+
+#[tokio::test]
+async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and_rotates_on_join_or_revoke()
+{
+    let hub_dir = TempDir::new().unwrap();
+    let alice_dir = TempDir::new().unwrap();
+    let bob_dir = TempDir::new().unwrap();
+    let carol_dir = TempDir::new().unwrap();
+    let guest_dir = TempDir::new().unwrap();
+
+    let admin_ca = Ed25519KeyPair::generate().unwrap();
+    let admin_proto_jwk = OkpJwk::new(OkpCurve::Ed25519, &admin_ca.public_key_bytes());
+
+    let mut hub_cfg = NodeConfig::router(NodeId::new("acme-kv-hub").unwrap(), hub_dir.path());
+    hub_cfg.secret_backend = Some(SecretBackend::File);
+    hub_cfg.admin_jwk = Some(admin_proto_jwk);
+    hub_cfg.kv_namespaces.push(KvNamespaceConfig {
+        name: "shared".to_string(),
+        mode: KvMode::E2ee,
+        write_model: KvWriteModel::Shared,
+    });
+    let hub = UnifiedNode::open(hub_cfg).unwrap();
+    let (_hub_addr, _hub_srv) = Arc::clone(&hub).serve(loopback_zero()).await.unwrap();
+
+    let mut alice_cfg = NodeConfig::local(NodeId::new("alice@macbook").unwrap(), alice_dir.path());
+    alice_cfg.secret_backend = Some(SecretBackend::File);
+    let alice = UnifiedNode::open(alice_cfg).unwrap();
+
+    let mut bob_cfg = NodeConfig::local(NodeId::new("bob@laptop").unwrap(), bob_dir.path());
+    bob_cfg.secret_backend = Some(SecretBackend::File);
+    let bob = UnifiedNode::open(bob_cfg).unwrap();
+
+    let mut carol_cfg =
+        NodeConfig::local(NodeId::new("carol@workstation").unwrap(), carol_dir.path());
+    carol_cfg.secret_backend = Some(SecretBackend::File);
+    let carol = UnifiedNode::open(carol_cfg).unwrap();
+
+    let mut guest_cfg = NodeConfig::local(NodeId::new("guest@public").unwrap(), guest_dir.path());
+    guest_cfg.secret_backend = Some(SecretBackend::File);
+    let guest = UnifiedNode::open(guest_cfg).unwrap();
+
+    let member_scopes = [
+        "dm:send=*",
+        "dm:receive",
+        "kv:read=shared/*",
+        "kv:write=shared/*",
+    ];
+    let guest_scopes_owned = ScopePreset::GuestRo.expand();
+    let guest_scopes: Vec<&str> = guest_scopes_owned.iter().map(String::as_str).collect();
+
+    // Pair Alice, Bob, and a non-KV Guest against the hub.
+    let (inv_a, _) = hub
+        .create_admin_invite(&admin_ca, "alice@macbook", &member_scopes, TrustTier::Org, 300_000)
+        .unwrap();
+    alice.accept_am2_invite(&inv_a).await.unwrap();
+
+    let (inv_b, _) = hub
+        .create_admin_invite(&admin_ca, "bob@laptop", &member_scopes, TrustTier::Org, 300_000)
+        .unwrap();
+    bob.accept_am2_invite(&inv_b).await.unwrap();
+
+    let (inv_g, _) = hub
+        .create_admin_invite(
+            &admin_ca,
+            "guest@public",
+            &guest_scopes,
+            TrustTier::Guest,
+            300_000,
+        )
+        .unwrap();
+    guest.accept_am2_invite(&inv_g).await.unwrap();
+
+    // 1. Alice writes encrypted Shared KV WITHOUT specifying `e2ee_members`!
+    let secret_v1 = "AUTO-WRAPPED-SHARED-KV-SECRET-V1";
+    let written_v1 = alice
+        .kv_set(KvWriteRequest {
+            host_node: "acme-kv-hub".to_string(),
+            namespace: "shared".to_string(),
+            key: "config".to_string(),
+            value: json!({ "token": secret_v1 }),
+            write_model: WriteModel::Shared,
+            owner_id: None,
+            allowlist: None,
+            expected_version: Some(0),
+            ttl_ms: None,
+            encrypt: true,
+            e2ee_members: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(written_v1.e2ee_epoch, Some(1));
+
+    // Bob MUST immediately decrypt it via `kv_get`!
+    let bob_v1 = bob
+        .kv_get("acme-kv-hub", "shared", "config")
+        .await
+        .unwrap()
+        .expect("Bob sees encrypted shared/config");
+    assert_eq!(bob_v1.value, json!({ "token": secret_v1 }));
+
+    // Hub blindness + least-privilege epoch member assertions:
+    // - Zero plaintext in hub SQLite
+    // - Epoch 1 members MUST be exactly {alice, bob}: NEVER acme-kv-hub (blind router) and NEVER guest!
+    assert_zero_plaintext_in_sqlite(hub_dir.path(), secret_v1);
+    let ep1 = hub
+        .db()
+        .kv()
+        .latest_epoch("acme-kv-hub", "shared")
+        .unwrap()
+        .expect("epoch 1 stored on hub");
+    assert_eq!(ep1.epoch, 1);
+    assert_eq!(
+        ep1.members,
+        vec!["alice@macbook".to_string(), "bob@laptop".to_string()],
+        "blind router and unauthorized guest must NEVER receive E2EE KV epoch wraps"
+    );
+
+    // Guest attempting `GET /v1/keys?kvNamespace=shared` MUST fail closed (403 not_granted)!
+    let guest_auth = hyp_node::engine::AuthenticatedPeer {
+        peer_id: "guest@public".to_string(),
+        scopes: hyp_proto::scopes::ScopeSet::from_preset(ScopePreset::GuestRo),
+        trust_tier: TrustTier::Guest,
+    };
+    let guest_err = hub
+        .list_kv_member_keys_for_caller(&guest_auth, "shared")
+        .unwrap_err();
+    assert_eq!(guest_err.to_problem_details().status, 403);
+
+    // 2. Carol joins later; next encrypted write auto-rotates to epoch 2 covering {alice, bob, carol}!
+    let (inv_c, _) = hub
+        .create_admin_invite(
+            &admin_ca,
+            "carol@workstation",
+            &member_scopes,
+            TrustTier::Org,
+            300_000,
+        )
+        .unwrap();
+    carol.accept_am2_invite(&inv_c).await.unwrap();
+
+    let secret_v2 = "AUTO-WRAPPED-SHARED-KV-SECRET-V2";
+    let written_v2 = alice
+        .kv_set(KvWriteRequest {
+            host_node: "acme-kv-hub".to_string(),
+            namespace: "shared".to_string(),
+            key: "config2".to_string(),
+            value: json!({ "token": secret_v2 }),
+            write_model: WriteModel::Shared,
+            owner_id: None,
+            allowlist: None,
+            expected_version: Some(0),
+            ttl_ms: None,
+            encrypt: true,
+            e2ee_members: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(written_v2.e2ee_epoch, Some(2));
+    let carol_v2 = carol
+        .kv_get("acme-kv-hub", "shared", "config2")
+        .await
+        .unwrap()
+        .expect("Carol decrypts newly rotated epoch 2 KV entry");
+    assert_eq!(carol_v2.value, json!({ "token": secret_v2 }));
+    assert_zero_plaintext_in_sqlite(hub_dir.path(), secret_v2);
+
+    // 3. Revoke Bob on hub; next encrypted write auto-rotates to epoch 3 evicting Bob!
+    hub.db()
+        .peers()
+        .set_peer_status("bob@laptop", hyp_store::PeerStatus::Revoked, now_ms())
+        .unwrap();
+    let secret_v3 = "AUTO-WRAPPED-SHARED-KV-SECRET-V3";
+    let written_v3 = alice
+        .kv_set(KvWriteRequest {
+            host_node: "acme-kv-hub".to_string(),
+            namespace: "shared".to_string(),
+            key: "config3".to_string(),
+            value: json!({ "token": secret_v3 }),
+            write_model: WriteModel::Shared,
+            owner_id: None,
+            allowlist: None,
+            expected_version: Some(0),
+            ttl_ms: None,
+            encrypt: true,
+            e2ee_members: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(written_v3.e2ee_epoch, Some(3));
+    let ep3 = hub
+        .db()
+        .kv()
+        .latest_epoch("acme-kv-hub", "shared")
+        .unwrap()
+        .expect("epoch 3 stored on hub");
+    assert_eq!(
+        ep3.members,
+        vec!["alice@macbook".to_string(), "carol@workstation".to_string()],
+        "revoked peer bob@laptop must be evicted from new E2EE KV epoch"
+    );
+    let carol_v3 = carol
+        .kv_get("acme-kv-hub", "shared", "config3")
+        .await
+        .unwrap()
+        .expect("Carol decrypts post-revocation epoch 3 KV entry");
+    assert_eq!(carol_v3.value, json!({ "token": secret_v3 }));
+    assert_zero_plaintext_in_sqlite(hub_dir.path(), secret_v3);
+
+    guest.shutdown();
+    carol.shutdown();
+    bob.shutdown();
+    alice.shutdown();
+    hub.shutdown();
+}

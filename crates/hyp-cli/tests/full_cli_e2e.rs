@@ -18,6 +18,7 @@ use common::run_hyp_in_pty;
 use common::{ManagedProcess, hyp_bin as hyp_rs_bin, isolated_cmd, parse_json_stdout};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
+use hyp_crypto::NodeIdentityKeys;
 use hyp_crypto::keys::Ed25519KeyPair;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 #[cfg(windows)]
@@ -31,7 +32,8 @@ use hyp_proto::manifest::{
 #[cfg(unix)]
 use hyp_store::{GateState, MailboxInsert, MailboxKind};
 use hyp_store::{
-    ManifestCacheUpdate, NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, now_ms,
+    KeyStatus, KeyUse, ManifestCacheUpdate, NodeDb, PeerInput, PeerKeyInput, PeerProfile,
+    PeerStatus, TrustTier, now_ms,
 };
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -1185,6 +1187,238 @@ fn status_and_doctor_version_skew_table() {
     let doctor_json = parse_json_stdout(&doctor_out);
     assert_eq!(doctor_json["ok"], false);
     assert!(!doctor_json["next"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn status_and_doctor_classify_inbound_local_v2_peers_and_fail_closed_without_enc_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+
+    // Onboard router node (`policy.requireE2ee = true` by default)
+    let onb = isolated_cmd(&home)
+        .args([
+            "onboard",
+            "--profile",
+            "router",
+            "--node-id",
+            "acme-hub",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(onb.status.code(), Some(0));
+
+    let db = NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+    let now = now_ms();
+
+    // 1. Healthy inbound `--profile local` v2 client (no HTTP endpoint/manifest, pinned X25519 key) -> OK!
+    let client_keys = NodeIdentityKeys::generate().unwrap();
+    db.peers()
+        .upsert_peer(
+            &PeerInput {
+                peer_id: "bowd@great-northern".to_string(),
+                endpoint: None,
+                profile: PeerProfile::Local,
+                trust_tier: TrustTier::Org,
+                status: PeerStatus::Active,
+                scopes: vec!["dm:send=*".to_string(), "kv:read=shared/*".to_string()],
+                auth_credential_ref: None,
+            },
+            now,
+        )
+        .unwrap();
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: "bowd@great-northern".to_string(),
+                kid: client_keys.encryption.public_key().kid(),
+                key_use: KeyUse::Encryption,
+                jwk_json: serde_json::to_string(&client_keys.encryption_jwk()).unwrap(),
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now,
+        )
+        .unwrap();
+
+    // 2. Inbound `--profile local` guest-ro v2 client with pinned X25519 key -> OK (`n/a (ro)`).
+    let guest_keys = NodeIdentityKeys::generate().unwrap();
+    db.peers()
+        .upsert_peer(
+            &PeerInput {
+                peer_id: "guest@reader".to_string(),
+                endpoint: None,
+                profile: PeerProfile::Local,
+                trust_tier: TrustTier::Guest,
+                status: PeerStatus::Active,
+                scopes: vec![
+                    "stream:subscribe=github[require=exact.repo;maxValues=10;maxBatchesPerHour=60]"
+                        .to_string(),
+                ],
+                auth_credential_ref: None,
+            },
+            now,
+        )
+        .unwrap();
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: "guest@reader".to_string(),
+                kid: guest_keys.encryption.public_key().kid(),
+                key_use: KeyUse::Encryption,
+                jwk_json: serde_json::to_string(&guest_keys.encryption_jwk()).unwrap(),
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now,
+        )
+        .unwrap();
+
+    // 3. Revoked peer without manifest -> omitted from active peer skew checks (does NOT fail doctor).
+    db.peers()
+        .upsert_peer(
+            &PeerInput {
+                peer_id: "old@revoked".to_string(),
+                endpoint: None,
+                profile: PeerProfile::Local,
+                trust_tier: TrustTier::Org,
+                status: PeerStatus::Revoked,
+                scopes: vec!["dm:send=*".to_string()],
+                auth_credential_ref: None,
+            },
+            now,
+        )
+        .unwrap();
+    drop(db);
+
+    // Verify `status --json` AND `doctor --json` both pass cleanly!
+    let status_out = isolated_cmd(&home)
+        .args([
+            "status",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(status_out.status.code(), Some(0));
+    let status_json = parse_json_stdout(&status_out);
+    let peers = status_json["data"]["peers"].as_array().unwrap();
+    let find_peer = |id: &str| peers.iter().find(|p| p["peer"] == id);
+    let gn = find_peer("bowd@great-northern").expect("inbound local v2 peer present");
+    assert_eq!(gn["status"], "ok");
+    assert_eq!(gn["proto"], "v2");
+    assert_eq!(gn["version"], "v2-client");
+    assert_eq!(gn["e2ee"], "dm+chan");
+    assert_eq!(gn["kv"], "kv.e2ee.v1");
+    assert!(gn["notes"].as_str().unwrap().contains("inbound v2 local client"));
+
+    let guest = find_peer("guest@reader").expect("inbound local v2 guest present");
+    assert_eq!(guest["status"], "ok");
+    assert_eq!(guest["proto"], "v2");
+    assert_eq!(guest["e2ee"], "n/a (ro)");
+
+    assert!(
+        find_peer("old@revoked").is_none(),
+        "revoked peer must not pollute active peer skew table"
+    );
+
+    let doc_ok = isolated_cmd(&home)
+        .args([
+            "doctor",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(doc_ok.status.code(), Some(0), "doctor should pass for healthy inbound local v2 peers: {}", String::from_utf8_lossy(&doc_ok.stdout));
+
+    // 4. Nearby mutated invalid cases MUST fail closed under `requireE2ee = true`:
+    //    (a) inbound local peer WITHOUT a pinned X25519 encryption key
+    //    (b) outbound HTTP peer WITHOUT a cached manifest (even with an encryption key)
+    let db = NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+    db.peers()
+        .upsert_peer(
+            &PeerInput {
+                peer_id: "unkeyed@local".to_string(),
+                endpoint: None,
+                profile: PeerProfile::Local,
+                trust_tier: TrustTier::Org,
+                status: PeerStatus::Active,
+                scopes: vec!["dm:send=*".to_string()],
+                auth_credential_ref: None,
+            },
+            now,
+        )
+        .unwrap();
+    let out_keys = NodeIdentityKeys::generate().unwrap();
+    db.peers()
+        .upsert_peer(
+            &PeerInput {
+                peer_id: "legacy@router".to_string(),
+                endpoint: Some("https://legacy.example.com".to_string()),
+                profile: PeerProfile::Router,
+                trust_tier: TrustTier::Org,
+                status: PeerStatus::Active,
+                scopes: vec!["dm:send=*".to_string()],
+                auth_credential_ref: None,
+            },
+            now,
+        )
+        .unwrap();
+    db.peers()
+        .upsert_peer_key(
+            &PeerKeyInput {
+                peer_id: "legacy@router".to_string(),
+                kid: out_keys.encryption.public_key().kid(),
+                key_use: KeyUse::Encryption,
+                jwk_json: serde_json::to_string(&out_keys.encryption_jwk()).unwrap(),
+                status: KeyStatus::Active,
+                expires_at: None,
+            },
+            now,
+        )
+        .unwrap();
+    drop(db);
+
+    let status_fail = isolated_cmd(&home)
+        .args([
+            "status",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(status_fail.status.code(), Some(0));
+    let fail_json = parse_json_stdout(&status_fail);
+    let fail_peers = fail_json["data"]["peers"].as_array().unwrap();
+    let unkeyed = fail_peers
+        .iter()
+        .find(|p| p["peer"] == "unkeyed@local")
+        .unwrap();
+    assert_eq!(unkeyed["status"], "fail");
+    assert_eq!(unkeyed["e2ee"], "missing");
+
+    let legacy = fail_peers
+        .iter()
+        .find(|p| p["peer"] == "legacy@router")
+        .unwrap();
+    assert_eq!(legacy["status"], "fail");
+    assert_eq!(legacy["e2ee"], "missing");
 }
 
 // ============================================================================
