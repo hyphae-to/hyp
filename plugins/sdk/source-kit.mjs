@@ -282,7 +282,7 @@ export function startWebhookServer({ prefix, name, defaultPort, defaultPath, max
     try {
       const requestPath = (req.url ?? "").split("?")[0];
       if (requestPath !== path) return reply(res, 404, { error: "not_found" });
-      if (req.method === "OPTIONS") return res.writeHead(204, { "x-hyphae-webhook-receiver": "signed" }).end();
+      if (answerWebhookReadiness(req, res, path, true)) return;
       if (req.method !== "POST") return reply(res, 404, { error: "not_found" });
       const chunks = [];
       let bytes = 0;

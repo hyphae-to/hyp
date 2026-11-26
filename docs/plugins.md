@@ -155,7 +155,7 @@ Use the old source topic as the plugin target to keep subscriptions. Remove the 
 
 Use the migration flags shown above for existing sources. They preserve native event IDs and the generic native CloudEvents pass-through contract. New plugin entries can omit them. Retain signature and timestamp headers when forwarding.
 
-The default loopback targets are `http://127.0.0.1:8795/webhook` and `http://127.0.0.1:8793/alerts`. Set `WEBHOOK_PORT` / `WEBHOOK_PATH` or `PROMETHEUS_PORT` / `PROMETHEUS_PATH` when running multiple receivers. Update the sender or proxy to reach the new listener, preserving the original public path if desired. Send an authenticated test delivery and verify the event reaches the existing topic.
+The default loopback targets are `http://127.0.0.1:8795/webhook` and `http://127.0.0.1:8793/alerts`. Set `WEBHOOK_PORT` / `WEBHOOK_PATH` or `PROMETHEUS_PORT` / `PROMETHEUS_PATH` when running multiple receivers. Update the sender or proxy to reach the new listener. For public callbacks, use [webhook routing setup](operations/deploying.md#public-webhook-routing) to preserve the existing HTTPS path or choose a new one. Send an authenticated test delivery and verify the event reaches the existing topic.
 
 ### C. `localIngest` — Default Socket-Only Local Event Ingest Route (`ingest.sock` & `hyp emit`)
 
