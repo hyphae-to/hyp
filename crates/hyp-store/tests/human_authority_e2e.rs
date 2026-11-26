@@ -975,7 +975,7 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
         .unwrap();
     }
 
-    // 2. Open with NodeDb -> migrates v6 -> v8 cleanly with backup and bit-exact parity with fresh v8!
+    // 2. Open with NodeDb -> migrates v6 to the current schema with a backup and schema parity.
     let db = NodeDb::open(&v6_path).unwrap();
     let fresh = NodeDb::open(&fresh_path).unwrap();
     assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -1013,7 +1013,7 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("node.sqlite.v6-to-v8-")
+            .starts_with(&format!("node.sqlite.v6-to-v{CURRENT_SCHEMA_VERSION}-"))
     );
 
     // Existing v6 peer & directive nonce survive untouched!
@@ -1280,7 +1280,7 @@ fn v6_to_v7_migration_delegation_policy_invite_nonces_and_cascade_peer_revocatio
 fn v7_to_v8_migration_gate_lock_seal_anti_rollback_and_approval_nonces() {
     let dir = TempDir::new().unwrap();
     let v7_path = dir.path().join("from-v7").join("node.sqlite");
-    let fresh_path = dir.path().join("fresh-v8").join("node.sqlite");
+    let fresh_path = dir.path().join("fresh-current").join("node.sqlite");
 
     // 1. Seed a genuine v7 SQLite database with pre-existing human_invite + directive nonces.
     seed_db_at_version(&v7_path, 4);
@@ -1313,7 +1313,7 @@ fn v7_to_v8_migration_gate_lock_seal_anti_rollback_and_approval_nonces() {
         .unwrap();
     }
 
-    // 2. Open with NodeDb -> migrates v7 -> v8 cleanly with backup and bit-exact parity with fresh v8!
+    // 2. Open with NodeDb -> migrates v7 to the current schema with a backup and schema parity.
     let db = NodeDb::open(&v7_path).unwrap();
     let fresh = NodeDb::open(&fresh_path).unwrap();
     assert_eq!(db.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
@@ -1351,7 +1351,7 @@ fn v7_to_v8_migration_gate_lock_seal_anti_rollback_and_approval_nonces() {
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("node.sqlite.v7-to-v8-")
+            .starts_with(&format!("node.sqlite.v7-to-v{CURRENT_SCHEMA_VERSION}-"))
     );
 
     // Pre-existing v7 human_invite nonce survives rebuild of `human_claim_nonces`.
