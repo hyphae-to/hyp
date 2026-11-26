@@ -66,7 +66,7 @@ flowchart LR
 
 Hyphae treats everything arriving from the network — peer messages, channels, webhooks, and bridged chats — as untrusted external data and screens it before your agent sees it. Between nodes, DMs, channels, KV, and file transfers are end-to-end encrypted; hubs relay ciphertext only *(chat bridges send plaintext to external providers like Slack/Telegram, remote Stage 2 classifiers receive decrypted text over HTTPS, and Team Hub directory keys use pin-on-first-use until signed checkpoints ship)*.
 
-Hyphae protects against untrusted network input. It does **not** create an OS sandbox against an agent running with arbitrary shell access as the same OS user — interactive TTY prompts (`hyp gate lock`, `hyp inbox approve`/`reject`, `hyp auth revoke`) stop accidental, scripted, and MCP-driven use until hardware Passkey confirmation ships (`#2`, `#10`). For hard isolation against shell-capable agents today, run untrusted agents under a separate OS user or container without access to `~/.config/hyphae`.
+Hyphae requires a fresh live Passkey Admin approval for gate-policy and human-authority mutations. It does **not** create an OS sandbox against a process with arbitrary same-user shell access or rollback-resistant protection against rewriting its SQLite database. For that boundary, run untrusted agents under a separate OS user or container without access to Hyphae state. See the [threat model](docs/security/threat-model.md).
 
 Read the [Threat Model](docs/security/threat-model.md) and [Hardening Guide](docs/security/hardening.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
 

@@ -162,12 +162,16 @@ impl HumanDropKind {
 /// Security-sensitive action authorized via a Passkey-signed `kind = "approval"` drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HumanApprovalActionKind {
+    #[serde(rename = "gate.apply")]
+    GateApply,
     #[serde(rename = "gate.lock")]
     GateLock,
     #[serde(rename = "gate.unlock")]
     GateUnlock,
     #[serde(rename = "gate.remove")]
     GateRemove,
+    #[serde(rename = "auth.admit")]
+    AuthAdmit,
     #[serde(rename = "auth.add")]
     AuthAdd,
     #[serde(rename = "auth.revoke")]
@@ -177,16 +181,21 @@ pub enum HumanApprovalActionKind {
 impl HumanApprovalActionKind {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::GateApply => "gate.apply",
             Self::GateLock => "gate.lock",
             Self::GateUnlock => "gate.unlock",
             Self::GateRemove => "gate.remove",
+            Self::AuthAdmit => "auth.admit",
             Self::AuthAdd => "auth.add",
             Self::AuthRevoke => "auth.revoke",
         }
     }
 
     const fn is_gate(self) -> bool {
-        matches!(self, Self::GateLock | Self::GateUnlock | Self::GateRemove)
+        matches!(
+            self,
+            Self::GateApply | Self::GateLock | Self::GateUnlock | Self::GateRemove
+        )
     }
 }
 
@@ -225,6 +234,9 @@ pub struct HumanApprovalActionV1 {
     pub bump_epoch: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cascade: Option<bool>,
+    /// Exact public operation parameters, signed and displayed by the approval portal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
 }
 
 /// Target audience bound inside `HumanClaimV1` (defeating surreptitious forwarding).
@@ -1838,7 +1850,9 @@ pub fn validate_approval_action(action: &HumanApprovalActionV1) -> Result<i64, C
     }
 
     match action.action {
-        HumanApprovalActionKind::GateLock if !action.locked => {
+        HumanApprovalActionKind::GateApply | HumanApprovalActionKind::GateLock
+            if !action.locked =>
+        {
             return invalid("gate.lock action requires locked=true".into());
         }
         HumanApprovalActionKind::GateUnlock if action.locked => {
@@ -1865,7 +1879,9 @@ pub fn validate_approval_action(action: &HumanApprovalActionV1) -> Result<i64, C
     }
     if matches!(
         action.action,
-        HumanApprovalActionKind::AuthAdd | HumanApprovalActionKind::AuthRevoke
+        HumanApprovalActionKind::AuthAdmit
+            | HumanApprovalActionKind::AuthAdd
+            | HumanApprovalActionKind::AuthRevoke
     ) {
         if action
             .target_human_id

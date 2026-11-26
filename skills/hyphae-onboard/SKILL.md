@@ -101,11 +101,11 @@ Never place `hp2p1_`, `am2_`, or `t3mp1_` tokens in CLI arguments (they leak to 
   hyp secret list --json              # inspect names & permissions (never prints secret values)
   ```
   Reference secrets in `~/.config/hyphae/node.json` strictly as `{ "secret": "<name>" }`.
-- **Stage a Local Security Gate proposal** (agents should propose; humans review and lock with `hyp gate lock`):
+- **Stage a Local Security Gate proposal** (agents should propose; humans review and approve with `hyp gate apply`):
   ```sh
   hyp gate propose --adapter anthropic --secret anthropic-api-key --json
-  # Human reviews ~/.config/hyphae/gate.proposed.json, then applies & signs gate_policy_sig:
-  # hyp gate init --adapter anthropic --secret anthropic-api-key --lock
+  # Human reviews ~/.config/hyphae/gate.proposed.json, then approves the exact operation with a Passkey:
+  # hyp gate init --adapter anthropic --secret anthropic-api-key
   ```
 
 ## 6. Verify Health & Diagnostics

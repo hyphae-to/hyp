@@ -38,9 +38,11 @@ export const HUMAN_DRAFT_INFO_PREFIX = "hyphae/v2/human-draft\n";
 export const MAX_HUMAN_DRAFT_CHARS = 512;
 export const MAX_HUMAN_DRAFT_CONTEXT_CHARS = 160;
 export const HUMAN_APPROVAL_ACTIONS = Object.freeze([
+  "gate.apply",
   "gate.lock",
   "gate.unlock",
   "gate.remove",
+  "auth.admit",
   "auth.add",
   "auth.revoke",
 ]);
@@ -2001,6 +2003,7 @@ const APPROVAL_OPTIONAL_FIELDS = Object.freeze({
   targetRole: (v) => v === "admin" || v === "signer",
   bumpEpoch: (v) => typeof v === "boolean",
   cascade: (v) => typeof v === "boolean",
+  parameters: (v) => v !== null && typeof v === "object" && !Array.isArray(v),
 });
 
 /**
@@ -2059,7 +2062,7 @@ export function validateApprovalAction(action) {
 
   const kind = out.action;
   const isGate = kind.startsWith("gate.");
-  if (kind === "gate.lock" && !out.locked) {
+  if ((kind === "gate.apply" || kind === "gate.lock") && !out.locked) {
     throw new Error("gate.lock requires locked=true");
   }
   if (kind === "gate.unlock" && out.locked) {

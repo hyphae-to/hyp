@@ -1,7 +1,7 @@
-//! Subprocess E2E tests for live CLI -> Daemon Hot-Reload (`hyp gate lock` -> `gate.reload`
+//! Subprocess E2E tests for live CLI -> Daemon Hot-Reload (`hyp gate apply` -> `gate.reload`
 //! and `hyp inbox approve` / `hyp inbox reject` -> `inbox.wake`) plus offline degradation.
 //!
-//! Uses a real POSIX PTY (`#[cfg(unix)]`) because `hyp gate lock`, `hyp gate init --lock`,
+//! Uses a real POSIX PTY (`#[cfg(unix)]`) because `hyp gate apply`, `hyp gate init --lock`,
 //! `hyp inbox approve`, and `hyp inbox reject` enforce unskippable interactive TTY confirmation.
 
 #![cfg(unix)]
@@ -51,11 +51,11 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
     let passkey = TestPasskeyAdmin::generate("live-admin", "macbook-touchid");
     passkey.enroll_via_web(&home, &state_dir, None);
 
-    // 2. Configure a new filter via `hyp gate init` (unsigned), then lock via Passkey-signed `hyp gate lock --json`!
+    // 2. Configure a new filter via `hyp gate init` (unsigned), then lock via Passkey-signed `hyp gate apply --json`!
     let init_out = isolated_cmd(&home)
         .args([
             "gate",
-            "init",
+            "propose",
             "--adapter",
             "openai-compat",
             "--id",
@@ -72,7 +72,7 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
         &home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--state-dir",
             state_str,
             "--local",
@@ -86,7 +86,7 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
     assert_eq!(lock_json["data"]["gatePolicySig"], "OK");
     assert_eq!(
         lock_json["data"]["daemonReloaded"], true,
-        "live daemon must be hot-reloaded by `hyp gate lock`: {lock_json}"
+        "live daemon must be hot-reloaded by `hyp gate apply`: {lock_json}"
     );
     assert!(
         !lock_json["next"]
@@ -102,7 +102,7 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
         &home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--state-dir",
             state_str,
             "--local",
@@ -147,12 +147,12 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
             .contains("gate_policy_tampered")
     );
 
-    // 5. Re-lock cleanly via Passkey-signed `hyp gate lock` -> live daemon heals immediately!
+    // 5. Re-lock cleanly via Passkey-signed `hyp gate apply` -> live daemon heals immediately!
     let (relock_code, relock_json, relock_stderr, _) = passkey.run_and_approve_json(
         &home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--state-dir",
             state_str,
             "--local",
@@ -172,7 +172,6 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
             "gate",
             "remove",
             "hot-ollama",
-            "--lock",
             "--state-dir",
             state_str,
             "--local",
@@ -380,7 +379,6 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
             "openai-compat",
             "--state-dir",
             state_str,
-            "--lock",
             "--local",
             "--no-open",
             "--json",
@@ -389,15 +387,15 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
     );
     assert_eq!(init_code, 0, "stderr={init_stderr}");
     assert_eq!(init_json["ok"], true);
-    assert_eq!(init_json["data"]["locked"], true);
+    assert_eq!(init_json["data"]["approved"], true);
     assert_eq!(init_json["data"]["daemonReloaded"], false);
 
-    // 2. `hyp gate lock --json` offline: exits 0, `daemonReloaded: false`, recommends restart.
+    // 2. `hyp gate apply --json` offline: exits 0, `daemonReloaded: false`, recommends restart.
     let (lock_code, lock_json, lock_stderr, _) = passkey.run_and_approve_json(
         home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--state-dir",
             state_str,
             "--local",
@@ -418,12 +416,12 @@ fn cli_offline_daemon_degradation_for_gate_lock_and_inbox_approve_reject() {
             .any(|s| s.as_str() == Some("hyp service restart"))
     );
 
-    // 3. `hyp gate lock` human output offline cleanly notes `hyp service restart` / `hyp node start`.
+    // 3. `hyp gate apply` human output offline cleanly notes `hyp service restart` / `hyp node start`.
     let (lock_tty_code, lock_tty_stdout, lock_tty_stderr, _) = passkey.run_and_approve(
         home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--state-dir",
             state_str,
             "--local",

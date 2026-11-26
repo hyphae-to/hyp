@@ -75,7 +75,7 @@ Enabled by default even when omitted (`defaultTopic: "schedule"`, accepting `to.
 - `env`: Map of string values or `{ "secret": "<name>" }` references.
 
 ### Security Gate (`gate`)
-Managed via `hyp gate propose` + `hyp gate lock` (writes `gate_policy_sig` over canonical JCS of `gate` + `human_authorities_digest`). Remote Stage 2 classifier URLs reject non-loopback `http://` fail-closed.
+Managed via `hyp gate propose` + `hyp gate apply` (writes `gate_policy_sig` over canonical JCS of `gate` + `human_authorities_digest`). Remote Stage 2 classifier URLs reject non-loopback `http://` fail-closed.
 
 ### Optional Blocks (`dropRelay`, `t3`, `openclaw`, `revival`)
 - `dropRelay`: `{ "enabled": true, "maxMemoryMb": 256 }` for the in-node strictly RAM-only Blind Drop Relay.

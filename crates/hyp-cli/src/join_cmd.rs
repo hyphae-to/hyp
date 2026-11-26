@@ -16,7 +16,7 @@
 //!    device card JSON for signing on a laptop browser, then reads the signed handoff bundle from
 //!    stdin to complete without the Passkey ever touching the remote host.
 
-use crate::approval::inspect_external_lock_state;
+use crate::approval::inspect_policy_integrity;
 use crate::auth_cmd::admin_secret_name_for_kid;
 use crate::config_file::{
     build_http_client, ct_eq, default_node_id, ensure_dir, ensure_v2_node_json_defaults,
@@ -1513,7 +1513,21 @@ fn finalize_join(
     };
     let _ = db.local().ensure_metadata("node_id", &validated.node_id);
 
-    if let Err(e) = db.human().upsert_authority(
+    match db.human().requires_live_approval() {
+        Ok(false) => {}
+        Ok(true) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "PASSKEY_APPROVAL_REQUIRED",
+                "Joining cannot mutate an existing Passkey-managed authority store; use live hyp auth add.",
+                None,
+            );
+        }
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    }
+    if let Err(e) = db.human().bootstrap_authority(
         &HumanAuthorityInput {
             human_id: validated.human_id.clone(),
             kid: validated.human_kid.clone(),
@@ -1567,9 +1581,9 @@ fn finalize_join(
         );
     }
 
-    if inspect_external_lock_state(config_write, state_dir, secrets).locked {
+    if inspect_policy_integrity(config_write, state_dir, secrets).approved {
         warnings.push(
-            "Security Gate is Passkey-locked; run `hyp gate lock` to approve & re-seal the gate with the updated human_authorities_digest."
+            "Security Gate is Passkey-locked; run `hyp gate apply` to approve & re-seal the gate with the updated human_authorities_digest."
                 .to_string(),
         );
     }

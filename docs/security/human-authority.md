@@ -38,3 +38,9 @@ Verified Human Drops (`human.auth.v1` / `drop.relay.v1`) provide a cryptographic
 | **Self-hosted in-node Rust Drop Relay** (`hyp deploy init drop-relay` / `--enable-drop-relay`) | **Strictly RAM-only** bounded zeroized buffer (`256 MiB` default, zero disk writes). | Zeroized immediately on burn-after-read ack or TTL expiry. | Authenticated paired peers holding explicit `drop:create` scope (excluded from `guest-ro`). |
 
 All relay implementations verify stateless HMAC-SHA256 `hdcap1_` upload and claim capability tokens in constant time **before** reading the HTTP request body, deliver over burn-after-read SSE (`GET /v1/drops/{id}/stream` + `POST /v1/drops/{id}/ack`), and enforce explicit CORS + Chrome Private Network Access (PNA) headers.
+
+## Live administration and migration
+
+After first enrollment via `hyp auth init --web`, use `hyp auth add`, `hyp auth admit`, and `hyp auth revoke` with a fresh live browser Passkey approval for each operation. These commands do not accept offline approval files or offer a TTY-only authorization fallback. `auth admit` signs the exact authority and delegation settings, including scopes, device prefix and device limit. Authority changes also approve the resulting gate policy and authority digest. A revocation must leave an active Passkey Admin at the resulting epoch; enroll a replacement before retiring a key. `auth init` cannot reset an installation with Passkey enrollment history, even if all keys were revoked. No recovery bypass is implied.
+
+On Passkey-managed installations, `auth join`, offline invite claims, remote revocation propagation, and direct cascade APIs cannot change human authorities. Use live local administration instead. Unmanaged legacy hubs retain their existing signed invite/revocation behavior. See [the threat model](threat-model.md) for the initial trust boundary and database rollback limits.

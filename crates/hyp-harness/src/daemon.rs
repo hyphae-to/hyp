@@ -1911,7 +1911,7 @@ impl LocalDaemonInner {
         let candidate = reloader()?;
         if let Some(ref pipeline) = candidate {
             pipeline
-                .verify_policy_integrity()
+                .verify_policy_change_approval()
                 .map_err(|e| format!("gate_policy_tampered: {e}"))?;
             if pipeline.is_policy_tampered() {
                 return Err(
@@ -1922,6 +1922,16 @@ impl LocalDaemonInner {
 
         let (enabled, filter_count, require_signed_policy) = {
             let mut guard = self.gate.write().expect("gate lock poisoned");
+            if candidate.is_none() {
+                if let Some(previous) = guard.as_ref() {
+                    if previous
+                        .requires_live_policy_approval()
+                        .map_err(|e| format!("gate_policy_tampered: {e}"))?
+                    {
+                        return Err("gate_policy_tampered: live Passkey approval required; gate.reload cannot disable a managed policy".into());
+                    }
+                }
+            }
             let prev_locked = guard
                 .as_ref()
                 .is_some_and(|p| p.config().require_signed_policy);

@@ -1456,3 +1456,33 @@ fn v7_to_v8_migration_gate_lock_seal_anti_rollback_and_approval_nonces() {
         "projected digest before update must equal actual post-upsert digest"
     );
 }
+
+#[test]
+fn pending_bootstrap_cannot_inject_after_first_passkey_enrollment_or_revocation() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("node.sqlite");
+    let first = NodeDb::open(&path).unwrap();
+    let pending = NodeDb::open(&path).unwrap();
+    assert!(!first.human().requires_live_approval().unwrap());
+    assert!(!pending.human().requires_live_approval().unwrap());
+    let mut admin = sample_authority("admin", "passkey_key", HumanAuthorityRole::Admin, 1);
+    admin.prf_salt = Some("passkey_salt".into());
+    first.human().bootstrap_authority(&admin, T0).unwrap();
+    let rogue = sample_authority("rogue", "pending_key", HumanAuthorityRole::Admin, 1);
+    assert!(matches!(
+        pending.human().bootstrap_authority(&rogue, T0 + 1),
+        Err(StoreError::InvalidState(_))
+    ));
+    first
+        .human()
+        .revoke_authority_monotonic("admin", "passkey_key", 1, "{}", T0 + 2)
+        .unwrap();
+    assert!(matches!(
+        pending.human().bootstrap_authority(&rogue, T0 + 3),
+        Err(StoreError::InvalidState(_))
+    ));
+    let records = first.human().list_authorities(true).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kid, "passkey_key");
+    assert_eq!(records[0].status, HumanAuthorityStatus::Revoked);
+}

@@ -629,7 +629,7 @@ fn run_status_or_doctor(
             "gate.policy_sig",
             gate_status.detail.clone(),
             Some(format!(
-                "Inspect {} for unauthorized edits, then re-sign via `hyp gate lock --config {} --state-dir {}`.",
+                "Inspect {} for unauthorized edits, then re-sign via `hyp gate apply --config {} --state-dir {}`.",
                 config_path.display(),
                 config_path.display(),
                 state_dir.display()
@@ -641,7 +641,7 @@ fn run_status_or_doctor(
                     "gate.policy_sig",
                     gate_status.detail.clone(),
                     Some(format!(
-                        "hyp gate lock --config {} --state-dir {}",
+                        "hyp gate apply --config {} --state-dir {}",
                         config_path.display(),
                         state_dir.display()
                     )),

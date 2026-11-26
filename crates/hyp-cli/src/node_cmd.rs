@@ -997,7 +997,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             );
             if pipeline.is_policy_tampered() {
                 startup_warnings.push(
-                    "gate_policy_tampered: gate policy signature verification failed; all non-self-host inbound items will fail closed to quarantine until re-locked via `hyp gate lock`."
+                    "gate_policy_tampered: gate policy signature verification failed; all non-self-host inbound items will fail closed to quarantine until re-locked via `hyp gate apply`."
                         .to_string(),
                 );
             }
@@ -1484,7 +1484,7 @@ fn reload_gate_pipeline_from_disk(
     let pipeline = SecurityGatePipeline::new(gate_cfg, gate_db, Some(gate_secrets))
         .map_err(|e| format!("Failed to initialize SecurityGatePipeline: {e}"))?;
     pipeline
-        .verify_policy_integrity()
+        .verify_policy_change_approval()
         .map_err(|e| format!("gate_policy_tampered: {e}"))?;
     if pipeline.is_policy_tampered() {
         return Err("gate_policy_tampered: gate policy signature verification failed".to_string());

@@ -28,7 +28,7 @@ use crate::delivery::{DeliveryUrgency, urgency_cap_gate_reason};
 use crate::gates::plugins::{FilterPlugin, build_filter_plugin};
 use crate::gates::policy::{
     GateDecision, GateError, InboundContext, OutboundContext, SecurityGateConfig, TrustTier,
-    format_quarantine_notice, verify_gate_lock,
+    format_quarantine_notice, verify_gate_policy_integrity,
 };
 use crate::gates::stage1::Stage1Engine;
 use crate::gates::stage2::{FilterOutcome, Stage2Guard};
@@ -161,7 +161,7 @@ impl SecurityGatePipeline {
         Arc::clone(&self.db)
     }
 
-    /// Verifies gate policy integrity fail-closed via [`verify_gate_lock`] (Passkey
+    /// Verifies gate policy integrity fail-closed via [`verify_gate_policy_integrity`] (Passkey
     /// `gate_lock_seal` in `node.sqlite` first, then the legacy `node.json` signature).
     ///
     /// A successful result is cached per `(config_hash, human_authorities_digest, seal)` so
@@ -185,11 +185,38 @@ impl SecurityGatePipeline {
                 return Ok(());
             }
         }
-        let result = verify_gate_lock(&self.config, &db, self.secrets.as_deref());
+        let result = verify_gate_policy_integrity(&self.config, &db, self.secrets.as_deref());
         if let Ok(mut cache) = self.policy_sig_cache.lock() {
             *cache = result.is_ok().then_some(key);
         }
         result.map(|_| ())
+    }
+
+    /// Whether this installation has entered live Passkey administration (including revoked
+    /// enrollment history). This is not an unlocked/locked policy switch.
+    pub fn requires_live_policy_approval(&self) -> Result<bool, GateError> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".into()))?;
+        Ok(db.human().requires_live_approval()?)
+    }
+
+    /// Live replacement must have actual Passkey evidence on managed nodes. Legacy unsigned
+    /// startup and HMAC evidence remain readable for migration, but cannot authorize a reload.
+    pub fn verify_policy_change_approval(&self) -> Result<(), GateError> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".into()))?;
+        let integrity = verify_gate_policy_integrity(&self.config, &db, self.secrets.as_deref())?;
+        if db.human().requires_live_approval()? && !integrity.seal.is_some_and(|seal| seal.approved)
+        {
+            return Err(GateError::PolicySignature(
+                "fresh Passkey approval required before replacing this policy".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Returns `true` if either the external Passkey `gate_lock_seal` in `node.sqlite` OR the

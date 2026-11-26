@@ -616,7 +616,6 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
             "Block prompt injection and exfiltration",
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--lock",
             "--local",
             "--no-open",
             "--json",
@@ -625,7 +624,7 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
     );
     assert_eq!(init_code, 0, "stderr={init_stderr}");
     assert_eq!(init_json["ok"], true);
-    assert_eq!(init_json["data"]["locked"], true);
+    assert_eq!(init_json["data"]["approved"], true);
     assert_eq!(init_json["data"]["gatePolicySig"], "OK");
 
     // `doctor --json` reports `gate_policy_sig: OK`
@@ -686,7 +685,7 @@ fn gate_init_lock_tamper_review_approve_reject_and_audit_log() {
         &home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--local",

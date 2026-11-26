@@ -1006,7 +1006,6 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
             "http://127.0.0.1:1/classify",
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--lock",
             "--local",
             "--no-open",
             "--json",
@@ -1014,7 +1013,7 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
         None,
     );
     assert_eq!(gate_init_code, 0, "stderr={gate_init_stderr}");
-    assert_eq!(init_json["data"]["locked"], true);
+    assert_eq!(init_json["data"]["approved"], true);
     assert_eq!(init_json["data"]["gatePolicySig"], "OK");
 
     // Persist `ext-hub` as an active peer on `sec@box` and register `sec@box` + `ext@peer` on `ext-hub`
@@ -1319,7 +1318,7 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
         "expected policy_integrity tamper audit row: {log_json}"
     );
 
-    // 6. Operator inspects/re-locks policy (`hyp gate lock`), approves quarantined receipt
+    // 6. Operator inspects/re-locks policy (`hyp gate apply`), approves quarantined receipt
     //    (`hyp inbox approve <receipt> --json`), and restarts daemon -> approved message wakes `hyp wait`!
     assert_eq!(mcp.close(Duration::from_secs(5)), Some(0));
     let _ = daemon.shutdown_gracefully();
@@ -1328,7 +1327,7 @@ fn live_tampered_gate_policy_daemon_lockdown_and_human_approve_wakeup() {
         &home,
         &[
             "gate",
-            "lock",
+            "apply",
             "--state-dir",
             state_dir.to_str().unwrap(),
             "--local",

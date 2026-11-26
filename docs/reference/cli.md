@@ -55,8 +55,8 @@ Commands marked **(TTY confirm)** require an interactive human terminal and fail
 
 ```sh
 hyp gate propose --adapter <name> [--secret <name>] [--base-url <url>] [--auth-header x-api-key|bearer] [--model <m>] [--json]
-hyp gate init --adapter <name> [--secret <name>] --lock     # (TTY confirm) + triggers live `gate.reload`
-hyp gate lock                                               # (TTY confirm) applies gate.proposed.json + live `gate.reload`
+hyp gate init --adapter <name> [--secret <name>]     # fresh live Passkey approval + gate.reload
+hyp gate apply                                               # fresh live Passkey approval applies gate.proposed.json + gate.reload
 hyp gate review [--session <id>] [--limit 50] [--json]      # metadata-only in --json (never raw body previews)
 hyp gate log [--decision all|quarantined|blocked|allowed|error] [--limit 50] [--session <id>] [--json]
 
@@ -67,11 +67,12 @@ hyp inbox reject <receipt> [--mute] [--reason <text>]       # (TTY confirm) + tr
 ## Verified Human Drops, Authority & Relay
 
 ```sh
-hyp auth init [--web] [--json]                              # first-time Passkey+PRF enrollment; re-init requires (TTY confirm)
+hyp auth init [--web] [--json]                              # initial enrollment; Passkey history blocks re-init
 hyp auth list [--json]
 hyp auth certify-node [--json]
-hyp auth add [--label <name>]                               # (TTY confirm)
-hyp auth revoke <kid> [--bump-epoch]                        # (TTY confirm)
+hyp auth add --human-id <id> --label <name>                  # fresh live Passkey approval
+hyp auth revoke <kid> [--bump-epoch]                        # fresh live Passkey approval
+hyp auth admit <human> --id <hpub1_>                        # fresh live Passkey approval
 hyp auth sign --kind directive|secret                       # (TTY confirm, reads stdin)
 
 hyp relay set <https://relay-url> [--json]
@@ -132,5 +133,5 @@ hyp mcp [<socket>] [--backend <h>] [--claude-channel] [--thread <uuid>] [--resum
 
 Local CLI state mutations notify a running daemon directly over IPC without requiring manual restarts:
 - **`peers.reload`** — triggered by `hyp pair accept`, `hyp pair join`, and `hyp pair revoke`.
-- **`gate.reload`** — triggered by `hyp gate lock` and locked `hyp gate init`.
+- **`gate.reload`** — triggered by `hyp gate apply` and Passkey-approved `hyp gate init`.
 - **`inbox.wake`** — triggered by `hyp inbox approve` and `hyp inbox reject`.

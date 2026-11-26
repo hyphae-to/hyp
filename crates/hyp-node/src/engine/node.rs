@@ -2841,6 +2841,9 @@ impl UnifiedNode {
         &self,
         req: &AuthClaimRequest,
     ) -> Result<AuthClaimReply, NodeError> {
+        if self.db().human().requires_live_approval()? {
+            return Err(NodeError::Unauthorized("Live Passkey approval required; use hyp auth admit on this node instead of an offline invite".into()));
+        }
         let admin_proto_jwk = self.config.admin_jwk.as_ref().ok_or_else(|| {
             NodeError::BadRequest(
                 "this hub has no configured adminJwk for delegated human invite claims".into(),
@@ -2969,7 +2972,7 @@ impl UnifiedNode {
                 .unwrap_or(min_epoch);
 
             db.human()
-                .upsert_authority(
+                .bootstrap_authority(
                     &HumanAuthorityInput {
                         human_id: invite.human_id.clone(),
                         kid: kid.clone(),
@@ -3299,6 +3302,11 @@ impl UnifiedNode {
         bump_epoch: bool,
         revocation_json: &str,
     ) -> Result<(u64, Vec<String>), NodeError> {
+        if self.db().human().requires_live_approval()? {
+            return Err(NodeError::Unauthorized(
+                "Live Passkey approval required; use hyp auth revoke --cascade".into(),
+            ));
+        }
         let now = now_ms();
         let (effective_min, revoked_peers) = {
             let db = self.db();
@@ -9530,7 +9538,7 @@ impl UnifiedNode {
                     now,
                 );
                 Err(NodeError::BadRequest(
-                    "approval drops cannot be ingested via `hyp drop ingest`; submit via the target ceremony command (e.g. `hyp gate lock --approval-file <path>`)"
+                    "approval drops cannot be ingested via `hyp drop ingest`; submit to the currently waiting live ceremony (e.g. `hyp gate apply`)"
                         .to_string(),
                 ))
             }
@@ -9543,6 +9551,28 @@ impl UnifiedNode {
         &self,
         signed: &SignedHumanRevocationV1,
     ) -> Result<(), NodeError> {
+        if self.db().human().requires_live_approval()? {
+            // A live-approved local revocation may be published back through this node. Permit
+            // only exact idempotent redelivery; this branch must never mutate authority state.
+            let payload: HumanRevocationPayloadV1 = serde_json::from_str(&signed.payload)?;
+            let signed_json = serde_json::to_string(signed)?;
+            let db = self.db();
+            let already_applied = db
+                .human()
+                .list_authorities_for_human(&payload.human_id, true)?
+                .iter()
+                .any(|record| {
+                    record.kid == payload.revoked_kid
+                        && record.status == HumanAuthorityStatus::Revoked
+                        && record.revocation_json.as_deref() == Some(signed_json.as_str())
+                });
+            if already_applied && db.human().min_auth_epoch()? >= payload.new_min_auth_epoch {
+                return Ok(());
+            }
+            return Err(NodeError::Unauthorized(
+                "Live local Passkey approval required for authority revocation".into(),
+            ));
+        }
         let preview: HumanRevocationPayloadV1 = serde_json::from_str(&signed.payload)?;
         let signed_json = serde_json::to_string(signed)?;
         let active_issuer = {

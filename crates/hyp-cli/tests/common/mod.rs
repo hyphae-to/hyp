@@ -941,56 +941,25 @@ impl TestPasskeyAdmin {
         out_json
     }
 
-    /// Enrolls this Passkey Admin via `hyp auth add --role admin` (with `prfSalt` + `encJwk`,
-    /// zero local PKCS#8 secret in `SecretStore`) on an unlocked node that already has a local
-    /// CLI admin key (confirmed via real POSIX PTY).
-    #[cfg(unix)]
-    pub fn enroll_via_auth_add_pty(
-        &self,
-        home: &Path,
-        state_dir: &Path,
-        config_path: Option<&Path>,
-    ) -> Value {
-        let bundle = json!({
-            "v": 1,
-            "humanId": self.human_id,
-            "kid": self.ed_kp.kid(),
-            "authEpoch": self.auth_epoch,
-            "prfSalt": format!("passkey-prf-salt-{}", &self.ed_kp.kid()[..12.min(self.ed_kp.kid().len())]),
-            "jwk": self.ed_kp.to_jwk(),
-            "encJwk": self.enc_kp.to_jwk(),
-        })
-        .to_string();
-
-        let state_str = state_dir.to_str().unwrap();
-        let cfg_str = config_path.map(|p| p.to_str().unwrap().to_string());
-        let mut args: Vec<&str> = vec![
-            "auth",
-            "add",
-            "--human-id",
-            &self.human_id,
-            "--label",
-            &self.label,
-            "--role",
-            "admin",
-            "--state-dir",
-            state_str,
-        ];
-        if let Some(ref c) = cfg_str {
-            args.push("--config");
-            args.push(c.as_str());
-        }
-        args.push("--json");
-
-        let res = run_hyp_in_pty(home, &args, Some(&bundle), Some("y\n"));
-        assert_eq!(
-            res.code, 0,
-            "enroll_via_auth_add_pty failed: stdout={} tty={}",
-            res.stdout, res.tty
-        );
-        let parsed = res.parse_json();
-        assert_eq!(parsed["ok"], true);
-        parsed
+    /// Creates an existing-installation fixture with a Passkey Admin. This deliberately does
+    /// not exercise enrollment; real first enrollment and live auth.add are covered separately.
+    pub fn seed_existing_passkey_fixture(&self, state_dir: &Path) {
+        let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+        db.human()
+            .upsert_authority(
+                &hyp_store::HumanAuthorityInput {
+                    human_id: self.human_id.clone(),
+                    kid: self.kid(),
+                    label: self.label.clone(),
+                    role: hyp_store::HumanAuthorityRole::Admin,
+                    jwk_json: serde_json::to_string(&self.ed_kp.to_jwk()).unwrap(),
+                    enc_jwk_json: Some(serde_json::to_string(&self.enc_kp.to_jwk()).unwrap()),
+                    prf_salt: Some("existing-passkey-fixture".into()),
+                    auth_epoch: self.auth_epoch,
+                },
+                hyp_store::now_ms(),
+            )
+            .unwrap();
     }
 
     /// Parses `#drop=<base64url>` from a printed Passkey approval URL.

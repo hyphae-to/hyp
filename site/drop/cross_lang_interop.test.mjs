@@ -18,6 +18,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -83,168 +84,6 @@ function runHyp(hypBin, env, args, stdinText = undefined) {
   return res;
 }
 
-const PY_PTY_DRIVER = `
-import errno, fcntl, json, os, pty, select, subprocess, sys, termios, time
-
-cfg = json.loads(sys.stdin.read())
-argv = cfg["argv"]
-stdin_data = cfg.get("stdinData")
-tty_reply = cfg.get("ttyReply")
-timeout = float(cfg.get("timeoutSecs", 20.0))
-
-master_fd, slave_fd = pty.openpty()
-
-def setup_child():
-    os.setsid()
-    fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-
-stdin_pipe_r = None
-stdin_pipe_w = None
-if stdin_data is not None:
-    stdin_pipe_r, stdin_pipe_w = os.pipe()
-    child_stdin = stdin_pipe_r
-else:
-    child_stdin = slave_fd
-
-stdout_r, stdout_w = os.pipe()
-
-proc = subprocess.Popen(
-    argv,
-    stdin=child_stdin,
-    stdout=stdout_w,
-    stderr=slave_fd,
-    preexec_fn=setup_child,
-    close_fds=True,
-)
-os.close(slave_fd)
-os.close(stdout_w)
-if stdin_pipe_r is not None:
-    os.close(stdin_pipe_r)
-if stdin_pipe_w is not None:
-    raw = stdin_data.encode("utf-8")
-    view = memoryview(raw)
-    while view:
-        written = os.write(stdin_pipe_w, view)
-        view = view[written:]
-    os.close(stdin_pipe_w)
-
-os.set_blocking(master_fd, False)
-os.set_blocking(stdout_r, False)
-
-tty_buf = bytearray()
-stdout_buf = bytearray()
-replied = False
-deadline = time.monotonic() + timeout
-stdout_open = True
-tty_open = True
-
-def drain_fd(fd, target):
-    try:
-        while True:
-            chunk = os.read(fd, 4096)
-            if not chunk:
-                return False
-            target.extend(chunk)
-    except OSError as e:
-        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-            return True
-        if e.errno == errno.EIO:
-            return False
-        raise
-
-while stdout_open or tty_open or proc.poll() is None:
-    now = time.monotonic()
-    if now >= deadline:
-        proc.kill()
-        proc.wait()
-        sys.stderr.write(
-            f"PTY driver timed out after {timeout}s; tty={tty_buf.decode('utf-8', 'replace')!r}\\n"
-        )
-        sys.exit(124)
-
-    watch = []
-    if tty_open:
-        watch.append(master_fd)
-    if stdout_open:
-        watch.append(stdout_r)
-
-    if watch:
-        rlist, _, _ = select.select(watch, [], [], min(0.05, max(0.005, deadline - now)))
-    else:
-        rlist = []
-        time.sleep(0.01)
-
-    if master_fd in rlist:
-        tty_open = drain_fd(master_fd, tty_buf)
-    if stdout_r in rlist:
-        stdout_open = drain_fd(stdout_r, stdout_buf)
-
-    if not replied and b"[y/N]:" in tty_buf:
-        replied = True
-        if tty_reply is not None:
-            os.write(master_fd, tty_reply.encode("utf-8"))
-        else:
-            os.write(master_fd, b"\\x04")
-
-    if proc.poll() is not None and not rlist:
-        if tty_open:
-            tty_open = drain_fd(master_fd, tty_buf)
-        if stdout_open:
-            stdout_open = drain_fd(stdout_r, stdout_buf)
-        if not tty_open and not stdout_open:
-            break
-        time.sleep(0.01)
-        if tty_open:
-            tty_open = drain_fd(master_fd, tty_buf)
-        if stdout_open:
-            stdout_open = drain_fd(stdout_r, stdout_buf)
-        break
-
-exit_code = proc.wait()
-os.close(master_fd)
-os.close(stdout_r)
-sys.stdout.write(json.dumps({
-    "code": exit_code,
-    "stdout": stdout_buf.decode("utf-8", errors="replace"),
-    "tty": tty_buf.decode("utf-8", errors="replace"),
-}))
-`;
-
-/**
- * Drives a security-sensitive `hyp` subcommand (such as `hyp auth add`, guarded by `#10`/`H1`
- * interactive TTY confirmation) inside a real POSIX PTY via Python 3 stdlib `pty`, piping
- * `stdinText` to stdin while answering `[y/N]:` on the controlling `/dev/tty` and keeping
- * `--json` stdout cleanly separated.
- */
-function runHypInPty(hypBin, env, args, stdinText = undefined, ttyReply = "y\n") {
-  const payload = JSON.stringify({
-    argv: [hypBin, ...args],
-    stdinData: stdinText ?? null,
-    ttyReply: ttyReply ?? null,
-    timeoutSecs: 20.0,
-  });
-  const pyRes = spawnSync("python3", ["-c", PY_PTY_DRIVER], {
-    env,
-    input: payload,
-    encoding: "utf8",
-    timeout: 25_000,
-  });
-  if (pyRes.error) {
-    throw pyRes.error;
-  }
-  assert.equal(
-    pyRes.status,
-    0,
-    `POSIX PTY driver failed (exit=${pyRes.status}):\nstdout=${pyRes.stdout}\nstderr=${pyRes.stderr}`,
-  );
-  const parsed = JSON.parse(pyRes.stdout);
-  return {
-    status: parsed.code,
-    stdout: parsed.stdout,
-    stderr: parsed.tty,
-  };
-}
-
 function parseJsonStdout(res, label) {
   assert.equal(
     res.status,
@@ -278,6 +117,89 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
   let humanEdKp;
   let humanEncKp;
   let jsSignedHcert1;
+
+    // Helper: spawn an async `hyp` command, wait for a stderr marker line, run callback, and collect exit + JSON stdout.
+    function driveAsyncHyp(args, marker, onMarker, stdinText) {
+      return new Promise((resolvePromise, rejectPromise) => {
+        const child = spawn(hypBin, args, {
+          env: { ...isoEnv, HYPHAE_NO_OPEN: "1" },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        child.stdin.end(stdinText ?? "");
+        let stdoutBuf = "";
+        let stderrBuf = "";
+        let lineBuf = "";
+        let triggered = false;
+        const timer = setTimeout(() => {
+          child.kill("SIGKILL");
+          rejectPromise(new Error(`Timed out driving hyp ${args.join(" ")}; stderr=${stderrBuf}`));
+        }, 20_000);
+
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+          stdoutBuf += chunk;
+        });
+        child.stderr.setEncoding("utf8");
+        child.stderr.on("data", (chunk) => {
+          stderrBuf += chunk;
+          lineBuf += chunk;
+          let nl;
+          while ((nl = lineBuf.indexOf("\n")) >= 0) {
+            const line = lineBuf.slice(0, nl);
+            lineBuf = lineBuf.slice(nl + 1);
+            if (!triggered && line.includes(marker)) {
+              triggered = true;
+              Promise.resolve(onMarker(line)).catch((err) => {
+                clearTimeout(timer);
+                child.kill("SIGKILL");
+                rejectPromise(err);
+              });
+            }
+          }
+        });
+        child.on("error", (err) => {
+          clearTimeout(timer);
+          rejectPromise(err);
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolvePromise({ code, stdout: stdoutBuf, stderr: stderrBuf });
+        });
+      });
+    }
+
+  async function seedExistingAdmin(state, config) {
+    if (!existsSync(join(state, "node.sqlite"))) {
+      parseJsonStdout(runHyp(hypBin, isoEnv, ["auth", "init", "--human-id", "fixture-local", "--state-dir", state, "--config", config, "--json"]), "legacy installation fixture");
+    }
+    const id = "fixture-passkey-admin";
+    const prf = randomBytes(32);
+    const seed = await derivePrfEd25519Seed(prf, id, 1);
+    const key = await ed25519KeypairFromSeed(seed);
+    const enc = await derivePrfX25519Keypair(prf, id, 1);
+    const db = new DatabaseSync(join(state, "node.sqlite"));
+    try {
+      db.prepare("INSERT INTO human_authorities (human_id,kid,label,role,jwk_json,enc_jwk_json,prf_salt,auth_epoch,status,created_at) VALUES (?,?,?,'admin',?,?,?,1,'active',?)")
+        .run(id, key.kid, "existing-passkey-fixture", JSON.stringify(key.publicJwk), JSON.stringify(enc.publicJwk), "existing-passkey-fixture", Date.now() - 1);
+    } finally {db.close();}
+    return {id, seed};
+  }
+
+  async function approveOperation(args, signer, stdinText) {
+    const result = await driveAsyncHyp([...args, "--local", "--no-open"], "Hyphae Passkey approval URL: ", async (line) => {
+      const url = line.split("Hyphae Passkey approval URL: ")[1].trim();
+      const {fragment} = parseFragmentString(url.slice(url.indexOf("#")));
+      const sealed = await sealHumanDrop({claim: {
+        v: 1, kind: "approval", humanId: signer.id, authEpoch: 1,
+        issuedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 300_000).toISOString(),
+        dropId: fragment.dropId, audience: {nodeId: fragment.nodeId}, body: toCanonicalJson(fragment.approval),
+      }, humanSeed32: signer.seed, recipientEncJwk: fragment.encJwk});
+      const response = await fetch(`${fragment.relay}/v1/drops/${fragment.dropId}`, {method:"POST",
+        headers: {"Content-Type":"text/plain", Origin:"https://hyphae.to", "X-Hyphae-Drop-Cap":fragment.postCap}, body:sealed.hdrop1});
+      assert.equal(response.status, 201, await response.text());
+    }, stdinText);
+    return {status:result.code, stdout:result.stdout, stderr:result.stderr};
+  }
 
   before(async () => {
     hypBin = resolveHypBinary();
@@ -387,13 +309,13 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
       configPath,
       "--json",
     ];
-    // Confirm non-TTY invocation fails closed (`#10`/`H1`), then enroll via real POSIX PTY.
+    // Initial local-key fixtures cannot enroll through a TTY fallback.
     const nonTtyRes = runHyp(hypBin, isoEnv, addArgs, JSON.stringify(enrollmentBundle));
-    assert.equal(nonTtyRes.status, 2, "non-TTY hyp auth add must fail closed with INTERACTIVE_TTY_REQUIRED");
-    assert.equal(JSON.parse(nonTtyRes.stdout).error.code, "INTERACTIVE_TTY_REQUIRED");
-
-    const addRes = runHypInPty(hypBin, isoEnv, addArgs, JSON.stringify(enrollmentBundle), "y\n");
-    const addJson = parseJsonStdout(addRes, "hyp auth add (JS Passkey bundle + hcert1_)");
+    assert.equal(nonTtyRes.status, 1);
+    assert.equal(JSON.parse(nonTtyRes.stdout).error.code, "PASSKEY_AUTHORITY_REQUIRED");
+    const approvingAdmin = await seedExistingAdmin(stateDir, configPath);
+    const addRes = await approveOperation(addArgs, approvingAdmin, JSON.stringify(enrollmentBundle));
+    const addJson = parseJsonStdout(addRes, "live hyp auth add (JS Passkey bundle + hcert1_)");
     assert.equal(addJson.data.kid, humanEdKp.kid);
     assert.equal(addJson.data.encKid, humanEncKp.kid);
     assert.equal(addJson.data.nodeCertStored, true);
@@ -698,7 +620,8 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
       signingJwk: jsEdKp.publicJwk,
       encJwk: jsEncKp.publicJwk,
     });
-    const admitRes = runHyp(hypBin, isoEnv, [
+    const hubAdmin = await seedExistingAdmin(hubState, hubCfgPath);
+    const admitRes = await approveOperation([
       "auth",
       "admit",
       "philip",
@@ -713,7 +636,7 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
       "--config",
       hubCfgPath,
       "--json",
-    ]);
+    ], hubAdmin);
     const admitJson = parseJsonStdout(admitRes, "hyp auth admit (JS hpub1_)");
     assert.equal(admitJson.data.humanId, "philip");
     assert.equal(admitJson.data.kid, jsEdKp.kid);
@@ -917,7 +840,7 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
     );
   });
 
-  test("Issue #10 Passkey Gate Lock/Unlock E2E cross-language interop (Rust hyp <-> JS crypto.js & drop.js)", async () => {
+  test("Live per-operation Passkey policy approval E2E cross-language interop (Rust hyp <-> JS crypto.js & drop.js)", async () => {
     const pkRoot = join(tmpRoot, "passkey-gate-interop");
     const pkState = join(pkRoot, "state");
     const pkCfgPath = join(pkRoot, "node.json");
@@ -930,55 +853,6 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
     const pkEdSeed = await derivePrfEd25519Seed(pkPrfOut, pkHumanId, 1);
     const pkEdKp = await ed25519KeypairFromSeed(pkEdSeed);
     const pkEncKp = await derivePrfX25519Keypair(pkPrfOut, pkHumanId, 1);
-
-    // Helper: spawn an async `hyp` command, wait for a stderr marker line, run callback, and collect exit + JSON stdout.
-    function driveAsyncHyp(args, marker, onMarker) {
-      return new Promise((resolvePromise, rejectPromise) => {
-        const child = spawn(hypBin, args, {
-          env: { ...isoEnv, HYPHAE_NO_OPEN: "1" },
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        let stdoutBuf = "";
-        let stderrBuf = "";
-        let lineBuf = "";
-        let triggered = false;
-        const timer = setTimeout(() => {
-          child.kill("SIGKILL");
-          rejectPromise(new Error(`Timed out driving hyp ${args.join(" ")}; stderr=${stderrBuf}`));
-        }, 20_000);
-
-        child.stdout.setEncoding("utf8");
-        child.stdout.on("data", (chunk) => {
-          stdoutBuf += chunk;
-        });
-        child.stderr.setEncoding("utf8");
-        child.stderr.on("data", (chunk) => {
-          stderrBuf += chunk;
-          lineBuf += chunk;
-          let nl;
-          while ((nl = lineBuf.indexOf("\n")) >= 0) {
-            const line = lineBuf.slice(0, nl);
-            lineBuf = lineBuf.slice(nl + 1);
-            if (!triggered && line.includes(marker)) {
-              triggered = true;
-              Promise.resolve(onMarker(line)).catch((err) => {
-                clearTimeout(timer);
-                child.kill("SIGKILL");
-                rejectPromise(err);
-              });
-            }
-          }
-        });
-        child.on("error", (err) => {
-          clearTimeout(timer);
-          rejectPromise(err);
-        });
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          resolvePromise({ code, stdout: stdoutBuf, stderr: stderrBuf });
-        });
-      });
-    }
 
     // 1. Enroll Passkey Admin via `hyp auth init --web` -> JS verifies #enroll= & signs NodeCertV1!
     const enrollRes = await driveAsyncHyp(
@@ -1050,10 +924,10 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
     assert.equal(enrollJson.data.passkeyBacked, true);
     assert.equal(enrollJson.data.secretName, null);
 
-    // 2. Stage a filter with a secret ref canary, then run `hyp gate lock --local --no-open`!
+    // 2. Stage a filter with a secret ref canary, then run `hyp gate apply --local --no-open`!
     const gateInitRes = runHyp(hypBin, isoEnv, [
       "gate",
-      "init",
+      "propose",
       "--adapter",
       "anthropic",
       "--id",
@@ -1072,7 +946,7 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
     const lockRes = await driveAsyncHyp(
       [
         "gate",
-        "lock",
+        "apply",
         "--local",
         "--no-open",
         "--state-dir",
@@ -1094,7 +968,7 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
         // The link carries the exact action to sign; the policy is named by hash only.
         const opened = parsed.fragment.approval;
         assert.deepEqual(validateApprovalAction(opened), opened);
-        assert.equal(opened.action, "gate.lock");
+        assert.equal(opened.action, "gate.apply");
         assert.equal(opened.locked, true);
         assert.match(opened.policySha256, /^[0-9a-f]{64}$/);
         assert.equal(opened.summary, undefined);
@@ -1132,7 +1006,7 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
     );
     const lockJson = parseJsonStdout(
       { status: lockRes.code, stdout: lockRes.stdout, stderr: lockRes.stderr },
-      "hyp gate lock (JS Passkey approval)",
+      "hyp gate apply (JS Passkey approval)",
     );
     assert.equal(lockJson.data.gatePolicySig, "OK");
     assert.ok(lockedAction);
@@ -1178,13 +1052,13 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
       () => parseFragmentString(approvalFrag({ ...lockedAction, nodeId: "other@local" })),
       /different node/,
     );
-    assert.equal(parseFragmentString(approvalFrag(lockedAction)).fragment.approval.action, "gate.lock");
+    assert.equal(parseFragmentString(approvalFrag(lockedAction)).fragment.approval.action, "gate.apply");
 
-    // 4. Rust `hyp gate unlock --local --no-open` <-> JS signs `gate.unlock`!
+    // 4. Rust `hyp gate apply --local --no-open` <-> JS signs `gate.unlock`!
     const unlockRes = await driveAsyncHyp(
       [
         "gate",
-        "unlock",
+        "apply",
         "--local",
         "--no-open",
         "--state-dir",
@@ -1198,8 +1072,9 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
         const url = line.split("Hyphae Passkey approval URL: ")[1].trim();
         const parsed = parseFragmentString(url.slice(url.indexOf("#")));
         const opened = parsed.fragment.approval;
-        assert.equal(opened.action, "gate.unlock");
-        assert.equal(opened.locked, false);
+        assert.equal(opened.action, "gate.apply");
+        assert.equal(opened.locked, true);
+        assert.notEqual(opened.nonce, lockedAction.nonce);
 
         const nowMs = Date.now();
         const sealed = await sealHumanDrop({
@@ -1231,15 +1106,15 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
     );
     const unlockJson = parseJsonStdout(
       { status: unlockRes.code, stdout: unlockRes.stdout, stderr: unlockRes.stderr },
-      "hyp gate unlock (JS Passkey approval)",
+      "hyp gate apply (JS Passkey approval)",
     );
-    assert.equal(unlockJson.data.locked, false);
+    assert.equal(unlockJson.data.approved, true);
 
     const docUnlocked = parseJsonStdout(
       runHyp(hypBin, isoEnv, ["doctor", "--state-dir", pkState, "--config", pkCfgPath, "--json"]),
       "hyp doctor (unlocked)",
     );
-    assert.equal(docUnlocked.data.gate.gatePolicySig, "UNSIGNED");
+    assert.equal(docUnlocked.data.gate.gatePolicySig, "OK");
     assert.equal(docUnlocked.data.gate.tampered, false);
 
     // 5. Approval UI markup invariant: `#approvalReviewGroup` & `#approvalConfirmCheck` exist and unchecked by default.
