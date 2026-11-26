@@ -139,7 +139,7 @@ const PLUGIN_SPECS: &[BuildPluginSpec] = &[
             ("claude-code/commands/hyp-focus.md", false),
             ("claude-code/commands/hyp-mute.md", false),
             ("claude-code/commands/hyp-subs.md", false),
-            ("claude-code/skills/hyphae/SKILL.md", false),
+            ("claude-code/skills/hyp-mesh/SKILL.md", false),
             ("claude-code/README.md", false),
         ],
     },

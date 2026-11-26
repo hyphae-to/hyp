@@ -286,8 +286,11 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     // X9: dead/unread herdr/t3 JSON files must NOT be created; skills & node.json "t3" block are written instead.
     assert!(!home.join(".config/herdr/hyphae.json").exists());
     assert!(!home.join(".t3/hyphae.json").exists());
-    assert!(home.join(".config/herdr/skills/hyphae/SKILL.md").is_file());
-    assert!(home.join(".t3/skills/hyphae/SKILL.md").is_file());
+    assert!(
+        home.join(".config/herdr/skills/hyp-mesh/SKILL.md")
+            .is_file()
+    );
+    assert!(home.join(".agents/skills/hyp-mesh/SKILL.md").is_file());
     let mut snapshots: Vec<(PathBuf, String)> = Vec::new();
     for path in &expected_json_files {
         let content = fs::read_to_string(path)

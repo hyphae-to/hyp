@@ -498,8 +498,8 @@ fn release_manifest_with_plugins_artifact_remains_jcs_compatible_with_update_rs(
 fn setup_skill_and_plugins_doc_enforce_verified_plugin_manager_contract() {
     let root = repo_root();
 
-    let skill = fs::read_to_string(root.join("skills/hyphae-setup/SKILL.md"))
-        .expect("read skills/hyphae-setup/SKILL.md");
+    let skill = fs::read_to_string(root.join("skills/hyp-setup/SKILL.md"))
+        .expect("read skills/hyp-setup/SKILL.md");
     assert!(
         skill.contains("hyp plugin install"),
         "SKILL.md must instruct `hyp plugin install`"
@@ -892,7 +892,7 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert!(!offline_home.join(".config/herdr/hyphae.json").exists());
     assert!(
         offline_home
-            .join(".config/herdr/skills/hyphae/SKILL.md")
+            .join(".config/herdr/skills/hyp-mesh/SKILL.md")
             .is_file()
     );
     // Non-Rust UI mods were skipped gracefully with actionable next commands!

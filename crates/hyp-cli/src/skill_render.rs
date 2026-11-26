@@ -1,4 +1,4 @@
-//! Composable 4-layer runtime skill assembler (`hyphae/SKILL.md`) for Hyphae v2 (`hyp`).
+//! Composable 4-layer runtime skill assembler (`hyp-mesh/SKILL.md`) for Hyphae v2 (`hyp`).
 //!
 //! Renders deterministic, contradiction-free, harness-tailored runtime skills from four
 //! orthogonal layers:
@@ -20,6 +20,7 @@ use hyp_node::node_file::NodeFile;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 /// Prefix of the managed metadata comment embedded in every generated runtime `SKILL.md`.
@@ -32,7 +33,7 @@ pub const UNMANAGED_MARKER: &str = "<!-- hyphae:unmanaged -->";
 /// Hard upper bound on estimated tokens (`chars.div_ceil(4)`) for any rendered `SKILL.md`.
 pub const MAX_ESTIMATED_SKILL_TOKENS: usize = 450;
 
-/// Target harness / orchestrator for runtime `hyphae/SKILL.md` rendering.
+/// Target harness / orchestrator for runtime `hyp-mesh/SKILL.md` rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum SkillTargetHarness {
@@ -222,7 +223,7 @@ impl SkillCapabilities {
     }
 }
 
-/// Complete rendering profile for a single runtime `hyphae/SKILL.md`.
+/// Complete rendering profile for a single runtime `hyp-mesh/SKILL.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillProfile {
     pub target: SkillTargetHarness,
@@ -400,7 +401,7 @@ pub const fn resolve_transport_for_harness(
     }
 }
 
-/// Renders a complete, deterministic, compact (`<= 450` estimated tokens) runtime `hyphae/SKILL.md`
+/// Renders a complete, deterministic, compact (`<= 450` estimated tokens) runtime `hyp-mesh/SKILL.md`
 /// from the 4 orthogonal layers.
 pub fn render_runtime_skill(profile: &SkillProfile) -> String {
     let target = profile.target;
@@ -411,7 +412,7 @@ pub fn render_runtime_skill(profile: &SkillProfile) -> String {
     let mut out = String::with_capacity(1700);
 
     // Frontmatter + managed HTML marker
-    out.push_str("---\nname: hyphae\ndescription: ");
+    out.push_str("---\nname: hyp-mesh\ndescription: ");
     out.push_str(frontmatter_description(target));
     out.push_str("\n---\n");
     out.push_str(&format!(
@@ -605,17 +606,15 @@ fn render_capabilities_layer(caps: SkillCapabilities) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// Canonical runtime `hyphae/SKILL.md` path(s) `(primary, extras)` for a harness under `home`.
+/// Canonical runtime `hyp-mesh/SKILL.md` path(s) `(primary, extras)` for a harness under `home`.
 ///
-/// When `codex_present` is `true`, `T3` leaves `~/.agents/skills/hyphae/SKILL.md` to Codex's
-/// dual-push skill (avoiding conflicting overwrites during `hyp setup --harness all`).
+/// Codex and T3 share one user skill in `~/.agents/skills`.
 ///
 /// For `HarnessKind::Claude`, resolves all active `claude_profiles` (`$CLAUDE_CONFIG_DIR` and/or
 /// `~/.claude`) and deduplicates symlinked `skills/` directories by canonical target path.
 pub fn runtime_skill_paths(
     kind: HarnessKind,
     home: &Path,
-    codex_present: bool,
     claude_profiles: &[ClaudeConfigProfile],
 ) -> (PathBuf, Vec<PathBuf>) {
     match kind {
@@ -625,7 +624,7 @@ pub fn runtime_skill_paths(
                 .join("plugins")
                 .join("hyphae")
                 .join("skills")
-                .join("hyphae")
+                .join("hyp-mesh")
                 .join("SKILL.md"),
             Vec::new(),
         ),
@@ -642,7 +641,7 @@ pub fn runtime_skill_paths(
                 (
                     home.join(".claude")
                         .join("skills")
-                        .join("hyphae")
+                        .join("hyp-mesh")
                         .join("SKILL.md"),
                     Vec::new(),
                 )
@@ -651,22 +650,13 @@ pub fn runtime_skill_paths(
                 (primary, paths)
             }
         }
-        HarnessKind::Codex => (
-            home.join(".codex")
-                .join("skills")
-                .join("hyphae")
-                .join("SKILL.md"),
-            vec![
-                home.join(".agents")
-                    .join("skills")
-                    .join("hyphae")
-                    .join("SKILL.md"),
-            ],
-        ),
+        HarnessKind::Codex | HarnessKind::T3 => {
+            (home.join(".agents/skills/hyp-mesh/SKILL.md"), Vec::new())
+        }
         HarnessKind::Cursor => (
             home.join(".cursor")
                 .join("skills")
-                .join("hyphae")
+                .join("hyp-mesh")
                 .join("SKILL.md"),
             Vec::new(),
         ),
@@ -674,21 +664,21 @@ pub fn runtime_skill_paths(
             home.join(".config")
                 .join("opencode")
                 .join("skills")
-                .join("hyphae")
+                .join("hyp-mesh")
                 .join("SKILL.md"),
             Vec::new(),
         ),
         HarnessKind::Gemini => (
             home.join(".gemini")
                 .join("skills")
-                .join("hyphae")
+                .join("hyp-mesh")
                 .join("SKILL.md"),
             Vec::new(),
         ),
         HarnessKind::Openclaw => (
             home.join(".openclaw")
                 .join("skills")
-                .join("hyphae")
+                .join("hyp-mesh")
                 .join("SKILL.md"),
             Vec::new(),
         ),
@@ -696,28 +686,10 @@ pub fn runtime_skill_paths(
             home.join(".config")
                 .join("herdr")
                 .join("skills")
-                .join("hyphae")
+                .join("hyp-mesh")
                 .join("SKILL.md"),
             Vec::new(),
         ),
-        HarnessKind::T3 => {
-            let primary = home
-                .join(".t3")
-                .join("skills")
-                .join("hyphae")
-                .join("SKILL.md");
-            let extras = if codex_present {
-                Vec::new()
-            } else {
-                vec![
-                    home.join(".agents")
-                        .join("skills")
-                        .join("hyphae")
-                        .join("SKILL.md"),
-                ]
-            };
-            (primary, extras)
-        }
     }
 }
 
@@ -839,6 +811,45 @@ pub fn detect_host_orchestrators(
     }
 }
 
+/// Removes a recognized legacy skill while preserving any additional files in its directory.
+pub(crate) fn retire_legacy_skill(
+    installed: &Path,
+    legacy_name: &str,
+    recognized: impl FnOnce(&str) -> bool,
+) -> Result<(), String> {
+    let Some(legacy_dir) = installed
+        .parent()
+        .map(|dir| dir.with_file_name(legacy_name))
+    else {
+        return Ok(());
+    };
+    if !fs::symlink_metadata(&legacy_dir).is_ok_and(|meta| meta.is_dir()) {
+        return Ok(());
+    }
+    let legacy = legacy_dir.join("SKILL.md");
+    if !fs::symlink_metadata(&legacy).is_ok_and(|meta| meta.is_file()) {
+        return Ok(());
+    }
+    const MAX_SKILL_BYTES: u64 = 64 * 1024;
+    let mut bytes = Vec::new();
+    fs::File::open(&legacy)
+        .and_then(|file| file.take(MAX_SKILL_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(|err| format!("could not read {}: {err}", legacy.display()))?;
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(());
+    };
+    if bytes.len() as u64 > MAX_SKILL_BYTES || !recognized(&text.replace("\r\n", "\n")) {
+        return Ok(());
+    }
+    fs::remove_file(&legacy)
+        .map_err(|err| format!("could not retire {}: {err}", legacy.display()))?;
+    match fs::remove_dir(&legacy_dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(err) => Err(format!("could not retire {}: {err}", legacy_dir.display())),
+    }
+}
+
 /// Evaluates whether a managed skill write would write, remain unchanged, or be skipped due to
 /// `<!-- hyphae:unmanaged -->` without mutating the filesystem.
 pub fn inspect_managed_skill(
@@ -921,7 +932,7 @@ mod tests {
 
                         // 2. Agent Skills Standard frontmatter + managed comment marker.
                         assert!(
-                            normalized.starts_with("---\nname: hyphae\ndescription: "),
+                            normalized.starts_with("---\nname: hyp-mesh\ndescription: "),
                             "missing frontmatter for {profile:?}"
                         );
                         assert!(
@@ -1165,14 +1176,17 @@ mod tests {
                 is_default_home: true,
             },
         ];
-        let (primary, extras) = runtime_skill_paths(HarnessKind::Claude, &home, false, &profiles);
-        assert_eq!(primary, work.join("skills").join("hyphae").join("SKILL.md"));
+        let (primary, extras) = runtime_skill_paths(HarnessKind::Claude, &home, &profiles);
+        assert_eq!(
+            primary,
+            work.join("skills").join("hyp-mesh").join("SKILL.md")
+        );
         assert_eq!(
             extras,
             vec![
                 home.join(".claude")
                     .join("skills")
-                    .join("hyphae")
+                    .join("hyp-mesh")
                     .join("SKILL.md")
             ]
         );

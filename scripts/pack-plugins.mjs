@@ -137,7 +137,7 @@ export const PLUGIN_SPECS = [
       { relPath: "claude-code/commands/hyp-focus.md", isBinary: false },
       { relPath: "claude-code/commands/hyp-mute.md", isBinary: false },
       { relPath: "claude-code/commands/hyp-subs.md", isBinary: false },
-      { relPath: "claude-code/skills/hyphae/SKILL.md", isBinary: false },
+      { relPath: "claude-code/skills/hyp-mesh/SKILL.md", isBinary: false },
       { relPath: "claude-code/README.md", isBinary: false },
     ],
   },

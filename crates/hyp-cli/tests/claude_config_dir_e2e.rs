@@ -165,10 +165,11 @@ fn claude_gateway_symlinked_profile_cli_override_env_and_hermetic_isolation() {
             .join("register.tsx")
             .is_file()
     );
-    let runtime_skill = fs::read_to_string(gateway.join("skills").join("hyphae").join("SKILL.md"))
-        .unwrap()
-        .replace("\r\n", "\n");
-    assert!(runtime_skill.starts_with("---\nname: hyphae\n"));
+    let runtime_skill =
+        fs::read_to_string(gateway.join("skills").join("hyp-mesh").join("SKILL.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+    assert!(runtime_skill.starts_with("---\nname: hyp-mesh\n"));
 
     // 5. `hyp doctor --claude-config-dir <gateway>` sees claude configured + statusLine chained OK.
     let doc_a = clean_cmd(&home)
@@ -388,7 +389,7 @@ fn claude_gateway_symlinked_profile_cli_override_env_and_hermetic_isolation() {
     assert!(
         gateway
             .join("skills")
-            .join("hyphae-setup")
+            .join("hyp-setup")
             .join("SKILL.md")
             .is_file()
     );
@@ -531,16 +532,19 @@ fn independent_claude_config_dir_statusline_chain_onboard_and_doctor_all_os() {
 
     // Both independent skills/ directories received runtime hyphae/SKILL.md.
     for skill_path in [
-        work_profile.join("skills").join("hyphae").join("SKILL.md"),
+        work_profile
+            .join("skills")
+            .join("hyp-mesh")
+            .join("SKILL.md"),
         home.join(".claude")
             .join("skills")
-            .join("hyphae")
+            .join("hyp-mesh")
             .join("SKILL.md"),
     ] {
         let text = fs::read_to_string(&skill_path)
             .unwrap_or_else(|e| panic!("missing {}: {e}", skill_path.display()))
             .replace("\r\n", "\n");
-        assert!(text.starts_with("---\nname: hyphae\n"));
+        assert!(text.starts_with("---\nname: hyp-mesh\n"));
     }
 
     // 2. Doctor detects both distinct Claude statusLine profiles cleanly.
@@ -600,7 +604,7 @@ fn independent_claude_config_dir_statusline_chain_onboard_and_doctor_all_os() {
     assert!(!canonical_chain.exists());
     assert!(!per_profile_chain.exists());
 
-    // 4. `hyp onboard --install-skill --harness claude` installs hyphae-setup/SKILL.md into BOTH profiles!
+    // 4. `hyp onboard --install-skill --harness claude` installs hyp-setup/SKILL.md into BOTH profiles!
     let install_skill = clean_cmd(&home)
         .env("CLAUDE_CONFIG_DIR", &work_profile)
         .args([
@@ -618,14 +622,14 @@ fn independent_claude_config_dir_statusline_chain_onboard_and_doctor_all_os() {
     assert!(
         work_profile
             .join("skills")
-            .join("hyphae-setup")
+            .join("hyp-setup")
             .join("SKILL.md")
             .is_file()
     );
     assert!(
         home.join(".claude")
             .join("skills")
-            .join("hyphae-setup")
+            .join("hyp-setup")
             .join("SKILL.md")
             .is_file()
     );
@@ -674,7 +678,7 @@ fn independent_claude_config_dir_statusline_chain_onboard_and_doctor_all_os() {
     );
 
     // 6. `hyp onboard --assist claude` (with empty PATH so it never spawns host `claude`)
-    //    installs `hyphae-setup/SKILL.md` into `$CLAUDE_CONFIG_DIR/skills/hyphae-setup/SKILL.md`
+    //    installs `hyp-setup/SKILL.md` into `$CLAUDE_CONFIG_DIR/skills/hyp-setup/SKILL.md`
     //    and sets `primarySkillPath` accordingly!
     let assist_work = home.join("profiles").join("assist-claude");
     fs::create_dir_all(&assist_work).unwrap();
@@ -699,7 +703,7 @@ fn independent_claude_config_dir_statusline_chain_onboard_and_doctor_all_os() {
     assert_eq!(assist_json["ok"], true);
     let expected_assist_skill = assist_work
         .join("skills")
-        .join("hyphae-setup")
+        .join("hyp-setup")
         .join("SKILL.md");
     assert!(expected_assist_skill.is_file());
     assert_eq!(

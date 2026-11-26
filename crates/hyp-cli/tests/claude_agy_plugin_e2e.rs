@@ -203,10 +203,10 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
     assert!(readme.contains("!hyp ui"));
     assert!(readme.contains("--chain-file"));
 
-    let skill = fs::read_to_string(plugin_dir.join("skills/hyphae/SKILL.md"))
+    let skill = fs::read_to_string(plugin_dir.join("skills/hyp-mesh/SKILL.md"))
         .expect("read plugin SKILL.md")
         .replace("\r\n", "\n");
-    assert!(skill.starts_with("---\nname: hyphae\n"));
+    assert!(skill.starts_with("---\nname: hyp-mesh\n"));
     assert!(skill.to_ascii_lowercase().contains("untrusted"));
 
     if let Some((true, output)) = validate_with_claude(Path::new("claude"), &plugin_dir) {

@@ -159,7 +159,7 @@ The default loopback targets are `http://127.0.0.1:8795/webhook` and `http://127
 
 ### C. `localIngest` — Default Socket-Only Local Event Ingest Route (`ingest.sock` & `hyp emit`)
 
-Compiled directly into `hyp` (`crates/hyp-node/src/engine/local_ingest.rs`) and **enabled by default** with zero extra MCP tools, the socket-only Local Ingest Route lets local scripts and OS schedulers (`systemd-run --user`, `crontab`, `launchd`, `schtasks`) push structured CloudEvents v1.0 (or compact JSON shorthand) onto `local.schedule` (default) or any configured `local.<topic>` — with **zero FIFO pipes**, strict local permissions, declarative route filters, rate limiting, Security Gate screening, and optional Ed25519 signature verification. See [skills/hyphae-schedule/SKILL.md](../skills/hyphae-schedule/SKILL.md) for agent recipes.
+Compiled directly into `hyp` (`crates/hyp-node/src/engine/local_ingest.rs`) and **enabled by default** with zero extra MCP tools, the socket-only Local Ingest Route lets local scripts and OS schedulers (`systemd-run --user`, `crontab`, `launchd`, `schtasks`) push structured CloudEvents v1.0 (or compact JSON shorthand) onto `local.schedule` (default) or any configured `local.<topic>` — with **zero FIFO pipes**, strict local permissions, declarative route filters, rate limiting, Security Gate screening, and optional Ed25519 signature verification. See [skills/hyp-schedule/SKILL.md](../skills/hyp-schedule/SKILL.md) for agent recipes.
 
 - **Socket-only transport & DoS bounds**: Listens on `~/.config/hyphae/state/ingest.sock` (`0600` Unix domain socket inside `0700` dir) on macOS/Linux, or loopback `127.0.0.1` TCP + `0600` `<state_dir>/ingest.addr` protected by a constant-time 32-byte CSPRNG bearer token on Windows. Enforces 64 KiB max NDJSON lines, 5 s read timeout, and 64 max concurrent connections.
 - **Declarative policy (`localIngest` in `node.json`)**: If omitted, Hyphae activates a built-in default route accepting `to.hyphae.scheduled.v1` and `to.hyphae.local.v1` on `["schedule", "local"]` (`maxPerMinute: 30`, `burst: 10`, `onLimit: "drop"`, `maxPayloadBytes: 32768`, `gate: true`, `requireSignature: false`). Override or add stricter routes declaratively:
@@ -295,7 +295,7 @@ You do **not** need to clone the Hyphae git repository to install or update offi
 
 - **Bridges & SDK (`kind: "bridge"`)**: `sdk` (`sdk/client.mjs`, `sdk/client.py`), `telegram`, `slack`, `whatsapp`, `webhook`, `prometheus` -> installed under `~/.config/hyphae/plugins/` (`0700`/`0600`).
 - **Harness UI mods & plugins (`kind: "harness"`)**:
-  - `claude-panel` (`claude-code/hooks/{register.tsx,state.ts}` + minimal UI-only `.claude-plugin/plugin.json` & `hooks/hooks.json`) -> installed into `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/`, symlink-safe).
+  - `claude-panel` (`claude-code/hooks/{register.tsx,state.ts}` + minimal UI-only `.claude-plugin/plugin.json` & `hooks/hooks.json`) -> installed into `~/.claude/skills/hyp-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyp-panel/`, symlink-safe).
   - `claude-code` (full 12-file Claude Code plugin bundle including raw-hashed binary `icon.png`) -> installed under `~/.config/hyphae/plugins/claude-code/`.
   - `herdr-mod` (`hyphae-pane` + `hyphae-panel` GPUI mods, 9 files) -> installed as real directories under `~/.config/herdr-app/mods/` (FSEvents hot-reload friendly; never touches `keys.json` or custom/symlinked layouts unless run via `hyp setup --harness herdr --mod`).
 

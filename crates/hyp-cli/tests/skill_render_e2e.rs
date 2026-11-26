@@ -36,7 +36,7 @@ fn assert_common_skill_invariants(path: &Path, text: &str, expected_profile: &st
         path.display()
     );
     assert!(
-        text.starts_with("---\nname: hyphae\ndescription: "),
+        text.starts_with("---\nname: hyp-mesh\ndescription: "),
         "{} missing Agent Skills frontmatter:\n{text}",
         path.display()
     );
@@ -71,6 +71,25 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
 
+    let legacy_claude = home.join(".claude/skills/hyphae/SKILL.md");
+    let legacy_cursor = home.join(".cursor/skills/hyphae/SKILL.md");
+    let legacy =
+        "---\nname: hyphae\ndescription: Mesh\n---\n<!-- hyphae:managed profile=claude -->\n";
+    let legacy_shared_copies =
+        [".codex", ".agents", ".t3"].map(|root| home.join(root).join("skills/hyphae/SKILL.md"));
+    for path in [&legacy_claude, &legacy_cursor]
+        .into_iter()
+        .chain(&legacy_shared_copies)
+    {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, legacy).unwrap();
+    }
+    fs::write(
+        &legacy_cursor,
+        format!("{legacy}<!-- hyphae:unmanaged -->\n"),
+    )
+    .unwrap();
+
     // 1. `--dry-run` plans all 9 harnesses + skill paths without writing anything.
     let dry_out = isolated_cmd(&home)
         .args([
@@ -91,17 +110,16 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
     let dry_json = parse_json_stdout(&dry_out);
     assert_eq!(dry_json["ok"], true);
     assert_eq!(dry_json["data"]["configuredCount"], 9);
+    assert!(legacy_claude.exists());
     for rel in [
-        ".gemini/config/plugins/hyphae/skills/hyphae/SKILL.md",
-        ".claude/skills/hyphae/SKILL.md",
-        ".codex/skills/hyphae/SKILL.md",
-        ".agents/skills/hyphae/SKILL.md",
-        ".cursor/skills/hyphae/SKILL.md",
-        ".config/opencode/skills/hyphae/SKILL.md",
-        ".gemini/skills/hyphae/SKILL.md",
-        ".openclaw/skills/hyphae/SKILL.md",
-        ".config/herdr/skills/hyphae/SKILL.md",
-        ".t3/skills/hyphae/SKILL.md",
+        ".gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md",
+        ".claude/skills/hyp-mesh/SKILL.md",
+        ".agents/skills/hyp-mesh/SKILL.md",
+        ".cursor/skills/hyp-mesh/SKILL.md",
+        ".config/opencode/skills/hyp-mesh/SKILL.md",
+        ".gemini/skills/hyp-mesh/SKILL.md",
+        ".openclaw/skills/hyp-mesh/SKILL.md",
+        ".config/herdr/skills/hyp-mesh/SKILL.md",
     ] {
         assert!(
             !home.join(rel).exists(),
@@ -134,21 +152,30 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
     let run1_json = parse_json_stdout(&run1);
     assert_eq!(run1_json["ok"], true);
     assert_eq!(run1_json["data"]["configuredCount"], 9);
+    assert!(!legacy_claude.exists(), "retired the managed runtime skill");
+    for old in &legacy_shared_copies {
+        assert!(!old.exists(), "unretired managed skill: {}", old.display());
+    }
+    assert!(!home.join(".codex/skills/hyp-mesh/SKILL.md").exists());
+    assert!(!home.join(".t3/skills/hyp-mesh/SKILL.md").exists());
+    assert!(
+        fs::read_to_string(legacy_cursor)
+            .unwrap()
+            .contains("<!-- hyphae:unmanaged -->")
+    );
 
     let skill_cases: &[(&str, &str)] = &[
         (
-            ".gemini/config/plugins/hyphae/skills/hyphae/SKILL.md",
+            ".gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md",
             "antigravity",
         ),
-        (".claude/skills/hyphae/SKILL.md", "claude"),
-        (".codex/skills/hyphae/SKILL.md", "codex"),
-        (".agents/skills/hyphae/SKILL.md", "codex"),
-        (".cursor/skills/hyphae/SKILL.md", "cursor"),
-        (".config/opencode/skills/hyphae/SKILL.md", "opencode"),
-        (".gemini/skills/hyphae/SKILL.md", "gemini"),
-        (".openclaw/skills/hyphae/SKILL.md", "openclaw"),
-        (".config/herdr/skills/hyphae/SKILL.md", "herdr"),
-        (".t3/skills/hyphae/SKILL.md", "t3"),
+        (".claude/skills/hyp-mesh/SKILL.md", "claude"),
+        (".agents/skills/hyp-mesh/SKILL.md", "codex"),
+        (".cursor/skills/hyp-mesh/SKILL.md", "cursor"),
+        (".config/opencode/skills/hyp-mesh/SKILL.md", "opencode"),
+        (".gemini/skills/hyp-mesh/SKILL.md", "gemini"),
+        (".openclaw/skills/hyp-mesh/SKILL.md", "openclaw"),
+        (".config/herdr/skills/hyp-mesh/SKILL.md", "herdr"),
     ];
 
     let mut first_snapshots: Vec<(PathBuf, String)> = Vec::new();
@@ -208,22 +235,22 @@ fn setup_all_harnesses_installs_tailored_skills_idempotently_and_honors_dry_run(
     }
 
     // Specific orchestrator assertions when `all` includes Herdr & T3:
-    let claude_txt = read_lf(&home.join(".claude/skills/hyphae/SKILL.md"));
+    let claude_txt = read_lf(&home.join(".claude/skills/hyp-mesh/SKILL.md"));
     assert!(claude_txt.contains("transport=claude-or-push"));
     assert!(claude_txt.contains("HC_TERMINAL_ID"));
     assert!(claude_txt.contains("Monitor"));
 
-    let codex_txt = read_lf(&home.join(".codex/skills/hyphae/SKILL.md"));
+    let codex_txt = read_lf(&home.join(".agents/skills/hyp-mesh/SKILL.md"));
     assert!(codex_txt.contains("transport=codex-or-push"));
     assert!(codex_txt.contains("codex queue"));
     assert!(!codex_txt.contains("Monitor"));
 
-    let ag_txt = read_lf(&home.join(".gemini/config/plugins/hyphae/skills/hyphae/SKILL.md"));
+    let ag_txt = read_lf(&home.join(".gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md"));
     assert!(ag_txt.contains("WaitMsBeforeAsync: 500, IsDaemon: false"));
     assert!(ag_txt.contains("PreInvocation"));
     assert!(ag_txt.contains("`schedule`"));
 
-    let oc_txt = read_lf(&home.join(".openclaw/skills/hyphae/SKILL.md"));
+    let oc_txt = read_lf(&home.join(".openclaw/skills/hyp-mesh/SKILL.md"));
     assert!(oc_txt.contains("HEARTBEAT.md"));
     assert!(oc_txt.contains("sessions_send"));
     assert!(!oc_txt.contains("hyp wait"));
@@ -281,14 +308,14 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
         .unwrap();
     assert_eq!(out_standalone.status.code(), Some(0));
 
-    let claude_solo = read_lf(&home.join(".claude/skills/hyphae/SKILL.md"));
+    let claude_solo = read_lf(&home.join(".claude/skills/hyp-mesh/SKILL.md"));
     assert!(
         claude_solo.contains("transport=claude-monitor"),
         "expected claude-monitor when Herdr/T3 absent:\n{claude_solo}"
     );
     assert!(claude_solo.contains("Monitor"));
 
-    let codex_solo = read_lf(&home.join(".codex/skills/hyphae/SKILL.md"));
+    let codex_solo = read_lf(&home.join(".agents/skills/hyp-mesh/SKILL.md"));
     assert!(
         codex_solo.contains("transport=background-wait"),
         "expected background-wait when Herdr/T3 absent:\n{codex_solo}"
@@ -331,7 +358,7 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
     assert_eq!(out_caps.status.code(), Some(0));
 
     // Claude & Codex switched to dual-with-push AND received bridge + kv + local.schedule tip!
-    let claude_dual = read_lf(&home.join(".claude/skills/hyphae/SKILL.md"));
+    let claude_dual = read_lf(&home.join(".claude/skills/hyp-mesh/SKILL.md"));
     assert!(claude_dual.contains("transport=claude-or-push"));
     assert!(claude_dual.contains("caps=bridge,kv"));
     assert!(claude_dual.contains("`hyp_bridge`"));
@@ -341,7 +368,7 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
     assert!(!claude_dual.contains("hyp_wakeup"));
     assert!(estimated_tokens(&claude_dual) <= MAX_TOKENS);
 
-    let codex_dual = read_lf(&home.join(".codex/skills/hyphae/SKILL.md"));
+    let codex_dual = read_lf(&home.join(".agents/skills/hyp-mesh/SKILL.md"));
     assert!(codex_dual.contains("transport=codex-or-push"));
     assert!(codex_dual.contains("caps=bridge,kv"));
     assert!(codex_dual.contains("`hyp_bridge`"));
@@ -354,9 +381,9 @@ fn setup_adapts_transport_to_host_orchestrators_and_node_json_capabilities() {
 
     // OpenClaw & Antigravity receive bridge + kv, and MUST stay free of local OS schedule clutter!
     for (rel, profile) in [
-        (".openclaw/skills/hyphae/SKILL.md", "openclaw"),
+        (".openclaw/skills/hyp-mesh/SKILL.md", "openclaw"),
         (
-            ".gemini/config/plugins/hyphae/skills/hyphae/SKILL.md",
+            ".gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md",
             "antigravity",
         ),
     ] {
@@ -384,9 +411,9 @@ fn setup_preserves_unmanaged_skill_unless_force_skills_is_passed() {
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
 
-    let claude_skill = home.join(".claude/skills/hyphae/SKILL.md");
+    let claude_skill = home.join(".claude/skills/hyp-mesh/SKILL.md");
     fs::create_dir_all(claude_skill.parent().unwrap()).unwrap();
-    let custom_skill = "---\nname: hyphae\ndescription: Custom user skill\n---\n<!-- hyphae:unmanaged -->\n# My Custom Rules\n";
+    let custom_skill = "---\nname: hyp-mesh\ndescription: Custom user skill\n---\n<!-- hyphae:unmanaged -->\n# My Custom Rules\n";
     fs::write(&claude_skill, custom_skill).unwrap();
 
     // 1. Normal `hyp setup --harness claude` preserves the unmanaged skill untouched.
@@ -456,10 +483,10 @@ fn static_repo_skill_is_cross_orchestrator_accurate() {
         .join("..")
         .join("..")
         .join("skills")
-        .join("hyphae")
+        .join("hyp-mesh")
         .join("SKILL.md");
     let text = read_lf(&repo_skill);
-    assert!(text.starts_with("---\nname: hyphae\n"));
+    assert!(text.starts_with("---\nname: hyp-mesh\n"));
     assert!(text.contains("Herdr"));
     assert!(text.contains("T3 Code"));
     assert!(text.contains("--claude-channel"));

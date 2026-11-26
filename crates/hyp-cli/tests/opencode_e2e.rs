@@ -109,7 +109,7 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
         legacy_command.exists(),
         "dry run leaves the legacy command in place"
     );
-    assert!(!config_root.join("skills/hyphae/SKILL.md").exists());
+    assert!(!config_root.join("skills/hyp-mesh/SKILL.md").exists());
 
     // 2. Real setup writes opencode.json (NO --ephemeral!), plugins/hyphae.ts, commands/hyp.md, SKILL.md.
     let run1 = isolated_cmd(&home)
@@ -140,7 +140,7 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     let cfg_path = config_root.join("opencode.json");
     let plugin_path = config_root.join("plugins/hyphae.ts");
     let cmd_path = config_root.join("commands/hyp.md");
-    let skill_path = config_root.join("skills/hyphae/SKILL.md");
+    let skill_path = config_root.join("skills/hyp-mesh/SKILL.md");
 
     let cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
     assert_eq!(cfg["$schema"], "https://opencode.ai/config.json");
@@ -300,7 +300,7 @@ fn setup_opencode_respects_no_commands_and_no_skills_flags() {
     assert!(!home.join(".config/opencode/commands/hyp.md").exists());
     assert!(
         !home
-            .join(".config/opencode/skills/hyphae/SKILL.md")
+            .join(".config/opencode/skills/hyp-mesh/SKILL.md")
             .exists()
     );
 

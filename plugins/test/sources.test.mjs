@@ -875,9 +875,9 @@ test("every event-source plugin ships a valid onboarding tree that follows the g
 });
 
 test("the setup skill's root tree is valid and its plugin catalog matches the shipped trees", () => {
-  const skill = readFileSync(join(PLUGINS, "..", "skills", "hyphae-setup", "SKILL.md"), "utf8");
+  const skill = readFileSync(join(PLUGINS, "..", "skills", "hyp-setup", "SKILL.md"), "utf8");
   const block = skill.match(/### Root tree \(Mode 1\)[\s\S]*?```json\n([\s\S]*?)\n```/);
-  assert.ok(block, "root tree block present in hyphae-setup SKILL.md");
+  assert.ok(block, "root tree block present in hyp-setup SKILL.md");
   const root = JSON.parse(block[1]);
   validateTree(root, "root");
   assert.equal(root.kind, "node");

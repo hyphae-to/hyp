@@ -991,18 +991,20 @@ fn legacy_claude_code_tree_matches(
 ) -> bool {
     let mut entries = Vec::with_capacity(spec.files.len());
     for entry in spec.files {
-        let legacy = entry
+        let current = rel_path_to_disk_path(spec.id, root, entry.rel_path);
+        let rel = if fs::symlink_metadata(&current).is_ok() {
+            entry.rel_path.to_owned()
+        } else if entry.rel_path == "claude-code/skills/hyp-mesh/SKILL.md" {
+            "claude-code/skills/hyphae/SKILL.md".to_owned()
+        } else if let Some(command) = entry
             .rel_path
             .strip_prefix("claude-code/commands/")
             .and_then(|filename| {
                 CLAUDE_SLASH_COMMANDS
                     .iter()
                     .find(|command| command.filename == filename)
-            });
-        let rel = if let Some(command) = legacy {
-            if fs::symlink_metadata(rel_path_to_disk_path(spec.id, root, entry.rel_path)).is_ok() {
-                return false;
-            }
+            })
+        {
             format!("claude-code/commands/{}", command.legacy_name)
         } else {
             entry.rel_path.to_owned()
@@ -1199,7 +1201,17 @@ fn complete_harness_rename(
                 .and_then(|()| migrate_standalone_claude_commands(root)),
             CLAUDE_CODE_ID => CLAUDE_SLASH_COMMANDS
                 .iter()
-                .try_for_each(|command| command.retire_legacy(&root.join("commands"), false)),
+                .try_for_each(|command| command.retire_legacy(&root.join("commands"), false))
+                .and_then(|()| {
+                    let installed = root.join("skills/hyp-mesh/SKILL.md");
+                    crate::skill_render::retire_legacy_skill(&installed, "hyphae", |text| {
+                        const LEGACY_DIGESTS: &[&str] = &[
+                            "866d50fa55e5c0a6c9f7814ba4400cd8f4de69e96ac7fa1f960ea7f53a14d597",
+                            "78242d6f1d0fda4ad91547137353beb874e40cb06643d967f19ac6450fe275e4",
+                        ];
+                        LEGACY_DIGESTS.contains(&hyp_store::sha256_hex(text.as_bytes()).as_str())
+                    })
+                }),
             _ => Ok(()),
         };
         outcome.map_err(|err| PluginInstallError::new("IO_ERROR", err))?;
@@ -1333,7 +1345,7 @@ fn inspect_plugin(
                 .is_some_and(|tree| legacy_claude_code_tree_matches(spec, root, tree))
         {
             if first_detail.is_none() {
-                first_detail = Some("outdated (legacy slash-command filenames)".into());
+                first_detail = Some("outdated (legacy command or skill paths)".into());
             }
             PluginStatus::Outdated
         } else if symlink_or_io_error || missing_in_root > 0 {

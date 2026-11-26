@@ -1395,7 +1395,8 @@ if (-not $KeepHarnesses) {
     $skillSeen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($rootDir in $skillRoots) {
         if (Test-Path -LiteralPath $rootDir -PathType Container) {
-            foreach ($skillName in @("hyphae", "hyphae-setup", "hyphae-schedule", "hyphae-panel", "hyp-panel")) {
+            foreach ($skillName in @("hyphae", "hyphae-setup", "hyphae-schedule", "hyphae-onboard", "hyphae-panel",
+                "hyp-mesh", "hyp-setup", "hyp-schedule", "hyp-onboard", "hyp-panel")) {
                 $s = Join-Path $rootDir $skillName
                 if ((Test-Path -LiteralPath $s) -and (Test-SafeRemovalPath $s)) {
                     Add-UniquePath -List $SkillDirsToRemove -Seen $skillSeen -Path $s

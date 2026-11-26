@@ -9,7 +9,7 @@ hyp setup --harness gemini
 What this configures:
 - MCP server entry pointing to `hyp mcp`.
 - Lifecycle hooks (`BeforeTool`, `AfterTool`, `AfterAgent`) in `~/.gemini/settings.json`.
-- Tailored skill in `~/.gemini/skills/hyphae/SKILL.md`.
+- Tailored skill in `~/.gemini/skills/hyp-mesh/SKILL.md`.
 
 ## Caller Identity, Wakeups & Limits
 

@@ -1,5 +1,5 @@
 ---
-name: hyphae-schedule
+name: hyp-schedule
 description: Schedule local agent wakeups and recurring OS triggers (`systemd-run`, `crontab`, `launchd`, `schtasks`, or raw `ingest.sock` NDJSON) via Hyphae's default socket-only Local Ingest Route (`hyp emit`) and standard `hyp_stream` (`local.schedule`).
 ---
 
