@@ -5,14 +5,14 @@ use std::fs;
 
 use hyp_store::{
     AckOutcome, BridgeLink, CURRENT_SCHEMA_VERSION, ChannelEpochInput, CloudEvent, DeliveryMode,
-    DirectoryCheckpointInput, EnqueueMessage, EventLimits, Filter, GateAuditInput, GateAuditQuery,
-    GateDecision, GateDirection, GateState, GrantDirection, GrantInput, KeyStatus, KeyUse,
-    KvDeleteInput, KvEpochInput, KvSetInput, MailboxInsert, MailboxKind, MailboxPutResult,
-    ManifestCacheUpdate, MessageLimits, MessageState, MuteRuleInput, NodeDb, PeerInput,
-    PeerKeyInput, PeerProfile, PeerStatus, PluginTargetHandoff, PostChannelInput, RevocationInput,
-    StoreConfig, StoreError, SubscriptionSpec, TransferLimits, TransferState, TransferSubmit,
-    TrustTier, UpstreamPushdownInput, WriteModel, check_filters, epoch_ms_to_rfc3339,
-    matches_filters, sha256_hex,
+    EnqueueMessage, EventLimits, Filter, GateAuditInput, GateAuditQuery, GateDecision,
+    GateDirection, GateState, GrantDirection, GrantInput, KeyStatus, KeyUse, KvDeleteInput,
+    KvEpochInput, KvSetInput, MailboxInsert, MailboxKind, MailboxPutResult, ManifestCacheUpdate,
+    MessageLimits, MessageState, MuteRuleInput, NodeDb, PeerInput, PeerKeyInput, PeerProfile,
+    PeerStatus, PluginTargetHandoff, PostChannelInput, RevocationInput, StoreConfig, StoreError,
+    SubscriptionSpec, TransferLimits, TransferState, TransferSubmit, TrustTier,
+    UpstreamPushdownInput, WriteModel, check_filters, epoch_ms_to_rfc3339, matches_filters,
+    sha256_hex,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -89,8 +89,6 @@ fn db_open_pragmas_permissions_and_all_tables() {
         "messages",
         "channel_members",
         "channel_epochs",
-        "publishers",
-        "publisher_grants",
         "events",
         "subscriptions",
         "batches",
@@ -104,7 +102,6 @@ fn db_open_pragmas_permissions_and_all_tables() {
         "grants",
         "revocations",
         "peer_keys",
-        "directory_checkpoints",
         "metadata",
         "sessions",
         "mailbox",
@@ -144,32 +141,6 @@ fn events_idempotency_coalescing_wake_cap_and_retention() {
     };
     let db = NodeDb::open_in_memory_with_config(config).unwrap();
     let t0 = 1_700_000_000_000i64;
-
-    // Publisher CRUD
-    let pub_rec = db
-        .events()
-        .add_publisher("gh-hook", "secret-token-123", &["github", "alerts"], t0)
-        .unwrap();
-    assert_eq!(pub_rec.topics, vec!["alerts", "github"]);
-    assert!(
-        db.events()
-            .authenticate_publisher("secret-token-123")
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        db.events()
-            .authenticate_publisher("wrong-token")
-            .unwrap()
-            .is_none()
-    );
-    assert!(db.events().revoke_publisher("gh-hook", t0 + 1).unwrap());
-    assert!(
-        db.events()
-            .authenticate_publisher("secret-token-123")
-            .unwrap()
-            .is_none()
-    );
 
     // Subscribe to acme-team.github with exact repo filter & 10s coalesce window & 2 wakes/hr cap.
     db.events()
@@ -1539,7 +1510,7 @@ fn peers_manifest_anti_rollback_and_e2ee_anti_downgrade() {
     assert_eq!(p3.manifest_version, 3);
     assert_eq!(p3.observed_e2ee_caps, vec!["dm.e2ee.v1"]);
 
-    // Grants, revocations, peer keys & directory checkpoints anti-rollback.
+    // Grants, revocations, peer keys.
     db.peers()
         .add_grant(
             &GrantInput {
@@ -1596,36 +1567,6 @@ fn peers_manifest_anti_rollback_and_e2ee_anti_downgrade() {
             .len(),
         1
     );
-
-    db.peers()
-        .record_checkpoint(
-            &DirectoryCheckpointInput {
-                authority_id: "org-ca".into(),
-                version: 5,
-                root_hash: "aaaa".into(),
-                signed_json: "{}".into(),
-                issued_at: t0,
-            },
-            t0,
-        )
-        .unwrap();
-    assert!(matches!(
-        db.peers().record_checkpoint(
-            &DirectoryCheckpointInput {
-                authority_id: "org-ca".into(),
-                version: 4,
-                root_hash: "bbbb".into(),
-                signed_json: "{}".into(),
-                issued_at: t0,
-            },
-            t0 + 10,
-        ),
-        Err(StoreError::CheckpointRollback {
-            expected_min: 5,
-            received: 4,
-            ..
-        })
-    ));
 }
 
 #[test]

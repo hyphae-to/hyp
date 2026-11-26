@@ -58,13 +58,6 @@ impl Default for EventLimits {
     }
 }
 
-/// Registered publisher with granted topics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Publisher {
-    pub id: String,
-    pub topics: Vec<String>,
-}
-
 /// Subscription create/update specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionSpec {
@@ -297,112 +290,6 @@ impl<'a> EventStore<'a> {
             .expect("event_cache mutex poisoned");
         guard.by_topic.clear();
         guard.invalidations += 1;
-    }
-
-    // ---- Publishers ----
-
-    /// Registers a publisher and grants it publish rights on `topics`.
-    /// Only the SHA-256 hash of `token` is stored.
-    pub fn add_publisher(
-        &self,
-        id: &str,
-        token: &str,
-        topics: &[&str],
-        now_ms: i64,
-    ) -> StoreResult<Publisher> {
-        if !is_node_id(id) {
-            return Err(StoreError::InvalidInput(format!(
-                "invalid publisher id '{id}'"
-            )));
-        }
-        if token.is_empty() {
-            return Err(StoreError::InvalidInput(
-                "publisher token must be non-empty".to_string(),
-            ));
-        }
-        if topics.is_empty() {
-            return Err(StoreError::InvalidInput(
-                "publisher requires at least one topic".to_string(),
-            ));
-        }
-        let mut unique_topics = Vec::new();
-        let mut seen = HashSet::new();
-        for &topic in topics {
-            if !is_topic(topic) {
-                return Err(StoreError::InvalidInput(format!("invalid topic '{topic}'")));
-            }
-            if seen.insert(topic) {
-                unique_topics.push(topic.to_string());
-            }
-        }
-        unique_topics.sort();
-        let token_hash = sha256_hex(token.as_bytes());
-
-        let tx = self.db.immediate_tx()?;
-        let active: Option<String> = tx
-            .conn()
-            .query_row(
-                "SELECT id FROM publishers WHERE id = ?1 AND revoked_at IS NULL",
-                params![id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if active.is_some() {
-            return Err(StoreError::IdConflict(format!(
-                "publisher '{id}' already exists; revoke it first"
-            )));
-        }
-        tx.conn()
-            .execute("DELETE FROM publishers WHERE id = ?1", params![id])?;
-        tx.conn().execute(
-            "INSERT INTO publishers (id, token_hash, created_at) VALUES (?1, ?2, ?3)",
-            params![id, token_hash, now_ms],
-        )?;
-        for topic in &unique_topics {
-            tx.conn().execute(
-                "INSERT INTO publisher_grants (publisher_id, topic) VALUES (?1, ?2)",
-                params![id, topic],
-            )?;
-        }
-        tx.commit()?;
-        Ok(Publisher {
-            id: id.to_string(),
-            topics: unique_topics,
-        })
-    }
-
-    /// Revokes an active publisher. Returns `true` if a live publisher was revoked.
-    pub fn revoke_publisher(&self, id: &str, now_ms: i64) -> StoreResult<bool> {
-        let changed = self.db.conn().execute(
-            "UPDATE publishers SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
-            params![now_ms, id],
-        )?;
-        Ok(changed > 0)
-    }
-
-    /// Authenticates a bearer token against active (unrevoked) publishers.
-    pub fn authenticate_publisher(&self, token: &str) -> StoreResult<Option<Publisher>> {
-        let token_hash = sha256_hex(token.as_bytes());
-        let id: Option<String> = self
-            .db
-            .conn()
-            .query_row(
-                "SELECT id FROM publishers WHERE token_hash = ?1 AND revoked_at IS NULL",
-                params![token_hash],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(id) = id else {
-            return Ok(None);
-        };
-        let mut stmt = self
-            .db
-            .conn()
-            .prepare("SELECT topic FROM publisher_grants WHERE publisher_id = ?1 ORDER BY topic")?;
-        let topics = stmt
-            .query_map(params![&id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(Publisher { id, topics }))
     }
 
     // ---- Subscriptions ----

@@ -61,15 +61,6 @@ pub enum StoreError {
         missing_capabilities: Vec<String>,
     },
 
-    #[error(
-        "directory checkpoint rollback for authority '{authority_id}': expected version >= {expected_min}, received {received}"
-    )]
-    CheckpointRollback {
-        authority_id: String,
-        expected_min: i64,
-        received: i64,
-    },
-
     #[error("epoch conflict for '{scope}': {message}")]
     EpochConflict { scope: String, message: String },
 

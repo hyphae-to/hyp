@@ -24,7 +24,7 @@ use crate::transfers::{TransferLimits, TransferStore};
 use crate::types::now_ms;
 
 /// Current unified schema version stored in `schema_version`.
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 /// Maximum number of pre-migration `node.sqlite.v*.bak` backups retained per database directory.
 pub const MAX_MIGRATION_BACKUPS: usize = 3;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -122,6 +122,14 @@ pub const MIGRATIONS: &[Migration] = &[
         disable_foreign_keys: false,
         kind: MigrationKind::Sql(include_str!(
             "../migrations/0011_drop_scheduled_wakeups.sql"
+        )),
+    },
+    Migration {
+        version: 12,
+        name: "0012_drop_unused_store_records",
+        disable_foreign_keys: false,
+        kind: MigrationKind::Sql(include_str!(
+            "../migrations/0012_drop_unused_store_records.sql"
         )),
     },
 ];
