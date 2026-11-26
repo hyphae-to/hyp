@@ -252,7 +252,7 @@ External scripts under `plugins/` run as optional child processes managed by the
 - **Scrubbed environment**: Inherits only safe OS runtime paths (`PATH`, `HOME`, `TMPDIR`, `LANG`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, plus Windows OS/temp/profile paths on Windows) plus explicitly configured env vars/secrets and protocol headers (`HYPHAE_FD=3` on Unix or `HYPHAE_PLUGIN_TRANSPORT=tcp` / `HYPHAE_PLUGIN_ADDR` / `HYPHAE_PLUGIN_TOKEN` on Windows, along with `HYPHAE_PLUGIN=<id>` and `HYPHAE_PROTOCOL=2`). Plaintext secret-like values in `plugins[].env` (instead of `{ "secret": "<name>" }`) emit a startup warning without logging the secret.
 - **Local-only bridge topics by default (`exposeTopic: true` opt-in)**: Topics emitted by local chat bridges (`slack`, `telegram`, `whatsapp`, `webhook`) are kept strictly local by default — paired remote peers (even holding `stream:subscribe=*`) never see them in `/v1/manifest` and cannot subscribe to them unless the operator explicitly sets **`"exposeTopic": true`** on that entry in `plugins[]` (or lists the topic explicitly in `topics[]`).
 - **Bounded framing, crash-loop circuit breaker & secret-redacted logs**: Enforces a strict 64 KiB `LineSplitter`, exponential restart backoff (`1s -> 60s`), and clean `SIGTERM -> SIGKILL` shutdown. After **5 consecutive rapid crashes**, the circuit breaker trips into **`CrashLoopBackOff`** (`status: "crash_loop_backoff"` in `node.status.json` and `hyp doctor`), stopping runaway respawns while keeping the rest of the daemon up. Subprocess stderr is captured into **`<state_dir>/logs/plugin-<id>.log`** with user-only **`0600`** permissions and automatic secret redaction (`[REDACTED]`).
-- **Dual wire protocol auto-detection**: Speaks **JSON-RPC 2.0 v2** (`hyphae/hello`, `hyphae/publish`, `hyphae/post`, `hyphae/status`, `hyphae/deliveryFailed`) and automatically detects unmodified **legacy fd-3 v1** plugins (`hello`, `event`, `ack`, `nack`, `request`, `response`, `status`, `delivery_failed`).
+- **One deterministic wire protocol**: Speaks **JSON-RPC 2.0 v2** (`hyphae/hello`, `hyphae/publish`, `hyphae/post`, `hyphae/status`, `hyphae/deliveryFailed`). The host sends its hello immediately after transport authentication. Legacy v1 frames are rejected; migrate custom plugins to the bundled v2 SDKs.
 
 ### Managing Bridges from MCP (`hyp_bridge` + `hyp_send`)
 
@@ -464,21 +464,21 @@ Scopes requested: `gmail.readonly` and `calendar.events.readonly`. Google's devi
 
 ---
 
-## 6. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2 or v1 SDK)
+## 6. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2)
 
 Any language that can read/write newline-delimited JSON (≤ 64 KiB/line) over Unix fd 3 (or authenticated loopback TCP via `HYPHAE_PLUGIN_ADDR` + `HYPHAE_PLUGIN_TOKEN` on Windows) works directly.
 
-### Option A: JSON-RPC 2.0 (`HYPHAE_PROTOCOL=2`, recommended for new plugins)
+### Wire contract: JSON-RPC 2.0 (`HYPHAE_PROTOCOL=2`)
 
 - Host <-> Plugin notifications & requests on the IPC channel:
   - `hyphae/hello` (notification: `{ protocol: 2, plugin, targets }`)
-  - `hyphae/publish` (request from plugin: `{ target, event: <CloudEvent v1.0> }` -> JSON-RPC result `{ status: "stored" | "duplicate" }`)
+  - `hyphae/publish` (request from plugin: `{ to, event: <CloudEvent v1.0> }` -> JSON-RPC result `{ status: "stored" | "duplicate" }`)
   - `hyphae/post` (request from host to plugin: `{ target, params: { text, replyTo?, ... } }` -> JSON-RPC result `{ ... }`)
   - `hyphae/status` & `hyphae/deliveryFailed` (notifications)
 
-### Option B: Bundled Zero-Dependency v1 SDKs
+### Bundled Zero-Dependency v2 SDKs
 
-Use [plugins/sdk/client.mjs](../plugins/sdk/client.mjs) (Node) or [plugins/sdk/client.py](../plugins/sdk/client.py) (Python 3 stdlib) — both automatically handle Unix fd 3 and Windows loopback TCP, and `SubprocessSupervisor` auto-detects v1 framing automatically:
+Use [plugins/sdk/client.mjs](../plugins/sdk/client.mjs) (Node) or [plugins/sdk/client.py](../plugins/sdk/client.py) (Python 3 stdlib) — both automatically handle Unix fd 3 and Windows loopback TCP, and require the host-first JSON-RPC v2 hello:
 
 ```js
 #!/usr/bin/env node

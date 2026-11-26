@@ -3183,9 +3183,7 @@ async fn chaos_webhook_transfer_and_subprocess_adapter_to_gated_node_e2e() {
     // 3. On Unix, wire a live JSON-RPC 2.0 fd-3 `SubprocessSupervisor` bridge into `ops-hub`!
     #[cfg(unix)]
     {
-        use hyp_node::adapters::{
-            AdapterKind, HelloMode, SubprocessConfig, SubprocessSupervisor, WireProtocol,
-        };
+        use hyp_node::adapters::{AdapterKind, SubprocessConfig, SubprocessSupervisor};
         if std::process::Command::new("python3")
             .arg("--version")
             .output()
@@ -3259,8 +3257,7 @@ while True:
                 vec!["-u".to_string(), "-c".to_string(), script.to_string()],
                 vec!["ops".to_string()],
             );
-            sup_cfg.hello_mode = HelloMode::Auto;
-            sup_cfg.auto_hello_grace = Duration::from_millis(500);
+
             sup_cfg.kill_timeout = Duration::from_millis(500);
 
             let sup = SubprocessSupervisor::new(sup_cfg);
@@ -3272,7 +3269,6 @@ while True:
             })
             .await;
             assert!(subproc_batch.text.contains("fd-3 JSON-RPC 2.0"));
-            assert_eq!(sup.detected_protocol(), WireProtocol::JsonRpcV2);
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
             while sup.oversized_frames_rejected() < 1 && tokio::time::Instant::now() < deadline {

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use hyp_crypto::SecretBackend;
 use hyp_node::adapters::{
-    AdapterError, AdapterHealth, AdapterKind, BoxFuture, HelloMode, NodeAdapter, NodeAdapterHost,
+    AdapterError, AdapterHealth, AdapterKind, BoxFuture, NodeAdapter, NodeAdapterHost,
     PublishOutcome, PublishStatus, SubprocessConfig, SubprocessSupervisor,
 };
 use hyp_node::engine::http_util::SseEvent;
@@ -525,7 +525,7 @@ async fn subprocess_supervisor_sends_system_wake_notification_to_plugins() {
         ],
         vec!["ops".to_string()],
     );
-    cfg.hello_mode = HelloMode::LegacyV1;
+
     cfg.env = BTreeMap::from([("SDK_MJS_PATH".to_string(), sdk_path.clone())]);
 
     let host = RecordingHost::new();
@@ -585,7 +585,7 @@ async fn subprocess_supervisor_sends_system_wake_notification_to_plugins() {
         ],
         vec!["ops".to_string()],
     );
-    legacy_cfg.hello_mode = HelloMode::LegacyV1;
+
     legacy_cfg.env = BTreeMap::from([("SDK_MJS_PATH".to_string(), sdk_path)]);
 
     let legacy_host = RecordingHost::new();

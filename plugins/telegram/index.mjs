@@ -13,7 +13,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { MeshPluginClient } from "../sdk/client.mjs";
+import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
 
 function readToken() {
   const file = process.env.TELEGRAM_BOT_TOKEN_FILE;
@@ -321,9 +321,11 @@ while (true) {
               text,
             },
           };
-          const reply = await mesh.send(target, event);
-          if (reply.type === "nack" && reply.error === "unavailable") {
-            throw new Error("Mesh store temporarily unavailable; retrying update");
+          try {
+            await mesh.send(target, event);
+          } catch (error) {
+            if (!(error instanceof PluginRpcError) || error.code === RPC_UNAVAILABLE) throw error;
+            console.error(`telegram event rejected: ${error.message}`);
           }
         }
       }

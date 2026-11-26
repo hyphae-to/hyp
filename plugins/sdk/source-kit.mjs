@@ -11,7 +11,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { dirname, join } from "node:path";
-import { MeshPluginClient } from "./client.mjs";
+import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "./client.mjs";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -193,11 +193,15 @@ export async function connectSource(prefix, name) {
     throw new Error(`Target '${target}' not in configured targets: ${hello.targets.join(", ")}`);
   }
   const publish = async (event) => {
-    const reply = await mesh.send(target, { specversion: "1.0", datacontenttype: "application/json", ...event });
-    if (reply.type === "ack") return reply.status ?? "stored";
-    if (reply.error === "unavailable") throw new Error("Hyphae node temporarily unavailable; will retry");
-    console.error(`${name} plugin event rejected: ${clip(reply.error ?? "unknown", 200)}`);
-    return "rejected";
+    try {
+      const reply = await mesh.send(target, { specversion: "1.0", datacontenttype: "application/json", ...event });
+      return reply.status ?? "stored";
+    } catch (error) {
+      if (error instanceof PluginRpcError && error.code === RPC_UNAVAILABLE) throw new Error("Hyphae node temporarily unavailable; will retry");
+      if (!(error instanceof PluginRpcError)) throw error;
+      console.error(`${name} plugin event rejected: ${clip(error.message, 200)}`);
+      return "rejected";
+    }
   };
   return { mesh, target, publish };
 }

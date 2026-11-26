@@ -68,11 +68,11 @@ function startPlugin(name, pluginEnv) {
   channel.on("error", () => {});
   createInterface({ input: channel }).on("line", (line) => {
     const msg = JSON.parse(line);
-    if (msg.type !== "event") return;
-    events.push(msg.event);
-    channel.write(JSON.stringify({ type: "ack", status: "stored", id: msg.event.id }) + "\n");
+    if (msg.method !== "hyphae/publish") return;
+    events.push(msg.params.event);
+    channel.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { status: "stored" } }) + "\n");
   });
-  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: name, targets: [name] }) + "\n");
+  channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: name, targets: [name] } }) + "\n");
   const stop = () => new Promise((resolve) => {
     if (exit !== null) return resolve();
     child.once("exit", resolve);
