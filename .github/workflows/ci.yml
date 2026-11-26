@@ -205,8 +205,16 @@ jobs:
       - name: Clippy (zero warnings across workspace & all targets)
         run: cargo clippy --workspace --all-targets --keep-going --locked -- -D warnings
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2
+        with:
+          tool: cargo-nextest@0.9.152
+
       - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo nextest run --workspace --locked --no-fail-fast
+
+      - name: Workspace doctests
+        run: cargo test --workspace --locked --doc
 
       - name: Verify live Node.js & Python external plugin E2E (zero skips)
         if: runner.os == 'Linux'
@@ -215,25 +223,28 @@ jobs:
           set -euo pipefail
           node --version
           python3 --version
-          out="$(cargo test --locked -p hyp-node --test real_plugins_e2e -- --nocapture 2>&1)"
+          out="$(cargo nextest run --locked -p hyp-node --test real_plugins_e2e --no-capture 2>&1)" || { printf '%s\n' "$out"; exit 1; }
           printf '%s\n' "$out"
-          if printf '%s\n' "$out" | grep -q 'SKIP '; then
+          if [[ "$out" == *'SKIP '* ]]; then
             echo "ERROR: real_plugins_e2e skipped one or more live plugin tests!" >&2
             exit 1
           fi
 
-      - name: Verify bidirectional JS <-> Rust Verified Human Drops interop (H19)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          node --version
-          cargo build -p hyp-cli --locked
-          node --test site/drop/cross_lang_interop.test.mjs
-
       - name: Build release binary (hyp)
         if: github.event_name != 'workflow_dispatch' || !inputs.skip_release_build
         run: cargo build --release --locked -p hyp-cli
+
+      - name: Verify bidirectional JS <-> Rust Verified Human Drops interop (H19)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          HYPHAE_BIN: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_release_build && './target/debug/hyp' || './target/release/hyp' }}
+        run: |
+          set -euo pipefail
+          node --version
+          export HYPHAE_BIN="$PWD/${HYPHAE_BIN#./}"
+          test -x "$HYPHAE_BIN"
+          node --test site/drop/cross_lang_interop.test.mjs
 
       - name: Smoke-test compiled binary (Unix)
         if: runner.os != 'Windows' && (github.event_name != 'workflow_dispatch' || !inputs.skip_release_build)
