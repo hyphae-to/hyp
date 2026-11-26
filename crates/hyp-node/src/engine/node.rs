@@ -386,6 +386,30 @@ impl UnifiedNode {
             db.local().set_metadata("channel_policies", &json_str)?;
         }
 
+        // Issue #25 (B6): Prune any stale remote-peer subscriptions targeting local-only topics
+        // (e.g. if an operator previously had `exposeTopic: true` and flipped it back to `false`),
+        // preserving all same-node local session subscriptions.
+        if !config.local_only_topics.is_empty() {
+            let my_id = config.node_id.as_str();
+            let remote_peers: HashSet<String> = db
+                .peers()
+                .list_peers(None)?
+                .into_iter()
+                .map(|p| p.peer_id)
+                .filter(|pid| pid != my_id)
+                .collect();
+            if !remote_peers.is_empty() {
+                for sub in db.events().list_subscriptions(None)? {
+                    if sub.origin_node == my_id
+                        && config.local_only_topics.contains(&sub.topic)
+                        && remote_peers.contains(&sub.subscriber)
+                    {
+                        let _ = db.events().delete_subscription(&sub.id);
+                    }
+                }
+            }
+        }
+
         // Persist our own public keys in peer_keys so self-verification works uniformly.
         let now = now_ms();
         let self_sign_jwk = identity.signing_jwk();
@@ -811,6 +835,16 @@ impl UnifiedNode {
 
     pub fn config(&self) -> &NodeConfig {
         &self.config
+    }
+
+    /// Returns `true` iff `topic` is marked local-only (`exposeTopic: false`), blocking
+    /// remote peer advertisement in `/v1/manifest`, remote `PUT /v1/subscriptions` / `POST /v1/events`,
+    /// and SSE batch fan-out to remote peers.
+    pub fn is_local_only_topic(&self, topic: &str) -> bool {
+        let bare = topic
+            .strip_prefix(&format!("{LOCAL_NODE_ID}."))
+            .unwrap_or(topic);
+        self.config.local_only_topics.contains(bare)
     }
 
     pub fn identity(&self) -> &NodeIdentityKeys {
@@ -1338,7 +1372,9 @@ impl UnifiedNode {
             Some(peer) => {
                 let mut topics = Vec::new();
                 for t in &self.config.topics {
-                    if peer_may_see_topic(&peer.scopes, &t.topic) {
+                    if !self.is_local_only_topic(&t.topic)
+                        && peer_may_see_topic(&peer.scopes, &t.topic)
+                    {
                         topics.push(AdvertisedTopic {
                             topic: t.topic.clone(),
                             kind: t.kind.clone(),
@@ -1430,7 +1466,8 @@ impl UnifiedNode {
                 }
                 if self.config.local_ingest.enabled {
                     for ingest_topic in self.config.local_ingest.advertised_topics() {
-                        if !topics.iter().any(|t| t.topic == ingest_topic)
+                        if !self.is_local_only_topic(&ingest_topic)
+                            && !topics.iter().any(|t| t.topic == ingest_topic)
                             && peer_may_see_topic(&peer.scopes, &ingest_topic)
                         {
                             topics.push(AdvertisedTopic {
@@ -7869,7 +7906,11 @@ impl UnifiedNode {
         caller: &AuthenticatedPeer,
         req: PutSubscriptionsRequest,
     ) -> Result<(Vec<Subscription>, Vec<SubscriptionDiagnostic>), NodeError> {
-        let catalog = self.local_topic_catalog();
+        let mut catalog = self.local_topic_catalog();
+        // Issue #25 (B6): Never expose local-only topic names in remote subscription diagnostics.
+        if caller.peer_id != self.config.node_id.as_str() {
+            catalog.retain(|entry| !self.is_local_only_topic(&entry.topic));
+        }
         let gh_adapter = self.github_public_adapter();
         let mut all_diagnostics = Vec::new();
         let mut specs = Vec::with_capacity(req.subscriptions.len());
@@ -7886,6 +7927,18 @@ impl UnifiedNode {
                 .check_stream_subscribe(&sub.topic, &sub.filters)
             {
                 Ok(approval) => {
+                    // Issue #25 (B6): Local-only topics (`exposeTopic: false`, the default for
+                    // subprocess `plugins[]` bridges & sources) MUST fail closed with 403 Forbidden
+                    // for remote peers — EVEN IF the peer holds wildcard `stream:subscribe=*`
+                    // (`member`, `observer`, `full` presets). Checked after scope verification so
+                    // unprivileged peers cannot probe local-only topic names.
+                    if caller.peer_id != self.config.node_id.as_str()
+                        && self.is_local_only_topic(&sub.topic)
+                    {
+                        return Err(NodeError::TopicLocalOnly {
+                            topic: sub.topic.clone(),
+                        });
+                    }
                     if caller.trust_tier == TrustTier::Guest {
                         let Some(confined_repos) =
                             extract_confined_values(&sub.filters, "exact", "repo")
@@ -8172,6 +8225,7 @@ impl UnifiedNode {
                             | "github-webhook"
                             | "prometheus-webhook"
                             | "webhook-stream"
+                            | "source"
                     )
                 )
         })
@@ -8184,6 +8238,13 @@ impl UnifiedNode {
         topic: &str,
         event: &ProtoCloudEvent,
     ) -> Result<IngestResult, NodeError> {
+        // Local-only topic protection (Issue #25 / B6): reject remote peers attempting
+        // `POST /v1/events` onto a local-only topic with `403 topic_local_only`.
+        if caller_node != self.config.node_id.as_str() && self.is_local_only_topic(topic) {
+            return Err(NodeError::TopicLocalOnly {
+                topic: topic.to_string(),
+            });
+        }
         // Adapter-owned topic protection: reject remote peers attempting `POST /v1/events` onto
         // an adapter-owned webhook/source topic with `403 not_granted`.
         if caller_node != self.config.node_id.as_str() && self.is_adapter_owned_topic(topic) {
@@ -8380,7 +8441,7 @@ impl UnifiedNode {
     /// `mailbox` (applying optional TTL / coalesce metadata and attaching `human_auth_json`
     /// when cryptographically verified), acknowledges the delivered `EventStore` batches, and
     /// immediately wakes each matched local session via `local_inbox_tx`.
-    pub(crate) fn deliver_local_topic_batches(
+    pub fn deliver_local_topic_batches(
         &self,
         topic: &str,
         put_opts: &MailboxPutOptions,
@@ -8388,8 +8449,11 @@ impl UnifiedNode {
         gate_downgraded: bool,
         now_ms: i64,
     ) -> Result<usize, NodeError> {
+        let bare_topic = topic
+            .strip_prefix(&format!("{LOCAL_NODE_ID}."))
+            .unwrap_or(topic);
         let (sessions_woken, _batches) = self.deliver_local_topic_batches_inner(
-            topic,
+            bare_topic,
             put_opts,
             human_auth,
             gate_downgraded,

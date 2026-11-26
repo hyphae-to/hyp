@@ -1,7 +1,7 @@
 //! Configuration profiles, policies, error mapping, and cross-crate type adapters
 //! for the Hyphae v2 Unified Rust `Node`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -552,6 +552,12 @@ pub struct NodeConfig {
     pub local_ingest: LocalIngestConfig,
     pub peers: Vec<PeerConfig>,
     pub topics: Vec<TopicConfig>,
+    /// Topics strictly restricted to same-node local sessions (default for subprocess `plugins[]`
+    /// with `exposeTopic: false`): never advertised to remote peers in `/v1/manifest`, rejected
+    /// fail-closed with `403 Forbidden` (`topic_local_only`) on remote `PUT /v1/subscriptions`
+    /// even when the peer holds wildcard `stream:subscribe=*` (`member`/`observer`/`full`), and
+    /// never pushed to remote peers over SSE.
+    pub local_only_topics: BTreeSet<String>,
     pub kv_namespaces: Vec<KvNamespaceConfig>,
     /// Declarative per-channel policies (e.g. `#announcements` -> `ChannelPolicy::announcement(...)`).
     pub channel_policies: BTreeMap<String, ChannelPolicy>,
@@ -592,6 +598,7 @@ impl NodeConfig {
             local_ingest: LocalIngestConfig::default(),
             peers: Vec::new(),
             topics: Vec::new(),
+            local_only_topics: BTreeSet::new(),
             kv_namespaces: Vec::new(),
             channel_policies: BTreeMap::new(),
             expose_a2a_card: false,
@@ -811,6 +818,9 @@ pub enum NodeError {
         escalation_note: Option<String>,
     },
 
+    #[error("topic '{topic}' is local-only (exposeTopic: false)")]
+    TopicLocalOnly { topic: String },
+
     #[error("routing loop detected at '{node_id}'")]
     RoutingLoop { node_id: String, via: Vec<String> },
 
@@ -901,6 +911,17 @@ impl NodeError {
                 }
                 p
             }
+            Self::TopicLocalOnly { topic } => ProblemDetails::new(
+                "topic_local_only",
+                "topic-local-only",
+                "Topic Is Local-Only",
+                403,
+                format!(
+                    "Topic '{topic}' is local-only (exposeTopic: false) and cannot be subscribed to by remote peers."
+                ),
+            )
+            .with_extension("code", serde_json::json!("topic_local_only"))
+            .with_extension("topic", serde_json::json!(topic)),
             Self::RoutingLoop { node_id, via } => ProblemDetails::routing_loop(node_id, via),
             Self::HopLimitExceeded { hops, max_hops } => {
                 ProblemDetails::hop_limit_exceeded(*hops, *max_hops)

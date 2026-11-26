@@ -1929,6 +1929,11 @@ async fn push_due_items_to_sse(
         if !node.is_peer_still_active(peer_id) {
             return false;
         }
+        // Issue #25 (B6) defense-in-depth: never push local-only topic batches to remote peers
+        // over SSE even if a stale subscription or pending batch existed from before `exposeTopic: false`.
+        if batch.origin_node == node.node_id().as_str() && node.is_local_only_topic(&batch.topic) {
+            continue;
+        }
         let key = format!("batch:{}", batch.id);
         if !node.mark_in_flight(peer_id, key.clone()) {
             continue;

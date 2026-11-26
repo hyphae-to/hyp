@@ -607,17 +607,17 @@ while True:
             let manifest_resp = client.request(manifest_req).await.unwrap();
             assert_eq!(manifest_resp.status(), StatusCode::OK);
             let manifest_bytes = manifest_resp.into_body().collect().await.unwrap().to_bytes();
-            let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
-            let topics = manifest["advertised"]["topics"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+            let signed_manifest: hyp_proto::manifest::SignedNodeManifest =
+                serde_json::from_slice(&manifest_bytes).unwrap();
+            let manifest_payload = signed_manifest.decode_payload().unwrap();
+            let topics = &manifest_payload.advertised.topics;
             assert!(
-                !topics.iter().any(|t| t["topic"] == "webhook"),
+                !topics.iter().any(|t| t.topic == "webhook"),
                 "private bridge topic 'webhook' MUST NOT be advertised in remote manifest: {topics:?}"
             );
 
-            // 2. Even if the remote peer guesses topic `"webhook"` and subscribes via PUT /v1/subscriptions...
+            // 2. Even if the remote peer guesses topic `"webhook"` and tries to subscribe via
+            //    PUT /v1/subscriptions, it MUST fail closed with 403 `topic_local_only`!
             let sub_body = serde_json::to_vec(&json!({
                 "subscriptions": [{
                     "id": "snoop-bridge",
@@ -636,7 +636,17 @@ while True:
                 .body(Full::new(Bytes::from(sub_body)))
                 .unwrap();
             let sub_resp = client.request(sub_req).await.unwrap();
-            assert_eq!(sub_resp.status(), StatusCode::OK);
+            assert_eq!(
+                sub_resp.status(),
+                StatusCode::FORBIDDEN,
+                "local-only bridge topic must reject remote PUT /v1/subscriptions with 403"
+            );
+            let sub_err_bytes = sub_resp.into_body().collect().await.unwrap().to_bytes();
+            let sub_err: Value = serde_json::from_slice(&sub_err_bytes).unwrap();
+            assert_eq!(
+                sub_err["error"], "topic_local_only",
+                "expected topic_local_only problem payload: {sub_err}"
+            );
 
             // 3a. BR1: Before any local session is linked to `webhook:personal`, delivering an
             //     inbound bridge message MUST fail closed with 503 Unavailable (NEVER 202 Stored)
@@ -743,5 +753,726 @@ while True:
         }
 
         daemon.shutdown();
+    }
+
+    /// Minimal cross-platform Python3 subprocess `kind: "source"` plugin using the real Hyphae
+    /// plugin SDK (`plugins/sdk/client.py`, supporting both Unix fd-3 and Windows loopback-TCP).
+    /// Exposes a loopback-only HTTP trigger (`GET /health`, `POST /emit`) so E2E tests can emit
+    /// arbitrary CloudEvents (omitting or spoofing `hyphaesourcekind`) on demand.
+    const CROSS_PLATFORM_SOURCE_TRIGGER_PLUGIN_PY: &str = r#"import http.server, json, os, sys, threading
+sys.path.insert(0, os.environ["SDK_PY_DIR"])
+from client import MeshPluginClient
+
+client = MeshPluginClient()
+port = int(os.environ["TRIGGER_PORT"])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+    def do_GET(self):
+        if self.path == "/health":
+            body = json.dumps({"ok": True, "targets": client.targets}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def do_POST(self):
+        if self.path != "/emit":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        payload = json.loads(raw.decode("utf-8"))
+        try:
+            ack = client.send(payload["to"], payload["event"], retry_unavailable=False)
+            body = json.dumps({"ok": True, "ack": ack}).encode("utf-8")
+            self.send_response(200)
+        except Exception as e:
+            body = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
+            self.send_response(500)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+srv.daemon_threads = True
+t = threading.Thread(target=srv.serve_forever, daemon=True)
+t.start()
+client._dead.wait()
+srv.shutdown()
+"#;
+
+    #[test]
+    fn source_plugin_stamps_external_webhook_flushes_immediately_and_blocks_remote_until_exposed() {
+        let Some(python_bin) = find_python3_binary() else {
+            eprintln!(
+                "SKIP source_plugin_stamps_external_webhook_flushes_immediately_and_blocks_remote_until_exposed: python3 missing"
+            );
+            return;
+        };
+
+        use hyp_harness::sock::daemon_rpc_sync;
+        use hyp_proto::scopes::ScopePreset;
+        use hyp_store::{
+            DeliveryMode, GateAuditQuery, GateDecision as StoreGateDecision, SubscriptionSpec,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let plugin_script = tmp.path().join("trigger_source_plugin.py");
+        fs::write(&plugin_script, CROSS_PLATFORM_SOURCE_TRIGGER_PLUGIN_PY).unwrap();
+        let sdk_py_dir = repo_root().join("plugins/sdk");
+
+        let alloc_port = || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let peer_http_port = alloc_port();
+        let trigger_port_phase1 = alloc_port();
+        let trigger_port_phase2 = alloc_port();
+
+        // Pre-seed three paired remote peers covering ALL wildcard-stream presets (`member`,
+        // `observer`, `full` — every one grants `stream:subscribe=*`) plus a same-node local
+        // session subscribed to `personal-mail` with `coalesceSeconds: 0`!
+        let peer_presets = [
+            ("member@remote", "tok_member_src_b6", ScopePreset::Member),
+            (
+                "observer@remote",
+                "tok_observer_src_b6",
+                ScopePreset::Observer,
+            ),
+            ("full@remote", "tok_full_src_b6", ScopePreset::Full),
+        ];
+        {
+            let mut ncfg = hyp_node::engine::NodeConfig::p2p(
+                hyp_proto::address::NodeId::new("alice@laptop").unwrap(),
+                &state_dir,
+            );
+            ncfg.secret_backend = Some(SecretBackend::File);
+            let node = UnifiedNode::open(ncfg).unwrap();
+            let now = hyp_store::now_ms();
+            {
+                let db = node.db();
+                for (peer_id, tok, preset) in &peer_presets {
+                    let token_hash = {
+                        use sha2::{Digest, Sha256};
+                        hex::encode(Sha256::digest(tok.as_bytes()))
+                    };
+                    db.peers()
+                        .upsert_peer(
+                            &hyp_store::PeerInput {
+                                peer_id: (*peer_id).to_string(),
+                                profile: hyp_store::PeerProfile::Local,
+                                endpoint: None,
+                                status: hyp_store::PeerStatus::Active,
+                                trust_tier: match preset {
+                                    ScopePreset::GuestRo | ScopePreset::Guest => {
+                                        hyp_store::TrustTier::Guest
+                                    }
+                                    ScopePreset::Observer => hyp_store::TrustTier::Peer,
+                                    ScopePreset::Member | ScopePreset::Full => {
+                                        hyp_store::TrustTier::Org
+                                    }
+                                },
+                                scopes: preset.expand(),
+                                auth_credential_ref: None,
+                            },
+                            now,
+                        )
+                        .unwrap();
+                    db.local()
+                        .set_metadata(&format!("auth_token:{token_hash}"), peer_id)
+                        .unwrap();
+                }
+
+                db.local()
+                    .register_session("sess-local-src", "{}", now)
+                    .unwrap();
+                db.events()
+                    .upsert_subscription(
+                        &SubscriptionSpec {
+                            id: "local-src-sub-0".to_string(),
+                            origin_node: "alice@laptop".to_string(),
+                            topic: "personal-mail".to_string(),
+                            subscriber: "sess-local-src".to_string(),
+                            filters: vec![],
+                            coalesce_seconds: 0,
+                            max_batch_age_ms: None,
+                            max_wakes_per_hour: None,
+                            mode: DeliveryMode::Full,
+                        },
+                        now,
+                    )
+                    .unwrap();
+            }
+            node.shutdown();
+        }
+
+        let write_node_cfg = |cfg_path: &Path, trigger_port: u16, expose_topic: Option<bool>| {
+            let mut plugin_entry = json!({
+                "id": "mailfeed",
+                "kind": "source",
+                "command": python_bin,
+                "args": ["-u", plugin_script.to_str().unwrap()],
+                "targets": ["personal-mail"],
+                "env": {
+                    "SDK_PY_DIR": sdk_py_dir.to_str().unwrap(),
+                    "TRIGGER_PORT": trigger_port.to_string(),
+                }
+            });
+            if let Some(exp) = expose_topic {
+                plugin_entry["exposeTopic"] = json!(exp);
+            }
+            let mut gate_cfg = hyp_node::gates::SecurityGateConfig::default();
+            gate_cfg
+                .stage1
+                .inbound_regex_denylist
+                .push("FORBIDDEN_SOURCE_CANARY".to_string());
+            gate_cfg.stage1.regex_deny_action = hyp_node::gates::Stage1DenyAction::Quarantine;
+            fs::write(
+                cfg_path,
+                serde_json::to_string_pretty(&json!({
+                    "v": 2,
+                    "nodeId": "alice@laptop",
+                    "profile": "p2p",
+                    "bind": format!("127.0.0.1:{peer_http_port}"),
+                    "stateDir": state_dir.to_str().unwrap(),
+                    "gate": serde_json::to_value(&gate_cfg).unwrap(),
+                    "plugins": [plugin_entry]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        let cfg_path = state_dir.join("node.json");
+
+        // =====================================================================
+        // PHASE 1: Default `exposeTopic` (omitted -> `false`, strictly local-only)
+        // =====================================================================
+        write_node_cfg(&cfg_path, trigger_port_phase1, None);
+        let mut cmd1 = isolated_cmd(&home);
+        cmd1.args(["daemon", "--config", cfg_path.to_str().unwrap(), "--json"]);
+        let mut daemon1 = ManagedDaemon::spawn(&mut cmd1);
+        let startup1 = daemon1.read_json_line(Duration::from_secs(15));
+        assert_eq!(
+            startup1["ok"], true,
+            "phase 1 daemon startup failed: {startup1}"
+        );
+        let sock_path = PathBuf::from(startup1["data"]["socketPath"].as_str().unwrap());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let wait_plugin_ready = |port: u16| {
+            rt.block_on(async {
+                let client: Client<_, Full<Bytes>> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    let req = Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("http://127.0.0.1:{port}/health"))
+                        .body(Full::new(Bytes::new()))
+                        .unwrap();
+                    if let Ok(resp) = client.request(req).await {
+                        if resp.status() == StatusCode::OK {
+                            return;
+                        }
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for source plugin health on port {port}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+        };
+
+        let emit_source_event = |port: u16, event: Value| -> Value {
+            rt.block_on(async {
+                let client: Client<_, Full<Bytes>> =
+                    Client::builder(TokioExecutor::new()).build_http();
+                let body = serde_json::to_vec(&json!({
+                    "to": "personal-mail",
+                    "event": event,
+                }))
+                .unwrap();
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://127.0.0.1:{port}/emit"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap();
+                let resp = client.request(req).await.unwrap();
+                let st = resp.status();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                let val: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(st, StatusCode::OK, "emit failed ({st}): {val}");
+                assert_eq!(val["ok"], true, "emit returned error: {val}");
+                val
+            })
+        };
+
+        wait_plugin_ready(trigger_port_phase1);
+
+        // 1A. Issue #25 (B6): ALL three wildcard-stream presets (`member`, `observer`, `full`)
+        //     MUST NOT see `personal-mail` in `/v1/manifest` AND MUST get `403 topic_local_only`
+        //     on `PUT /v1/subscriptions`!
+        rt.block_on(async {
+            let client: Client<_, Full<Bytes>> =
+                Client::builder(TokioExecutor::new()).build_http();
+            for (peer_id, tok, _preset) in &peer_presets {
+                let m_req = Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("http://127.0.0.1:{peer_http_port}/v1/manifest"))
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                let m_resp = client.request(m_req).await.unwrap();
+                assert_eq!(m_resp.status(), StatusCode::OK);
+                let m_bytes = m_resp.into_body().collect().await.unwrap().to_bytes();
+                let signed_manifest: hyp_proto::manifest::SignedNodeManifest =
+                    serde_json::from_slice(&m_bytes).unwrap();
+                let manifest_payload = signed_manifest.decode_payload().unwrap();
+                let topics = &manifest_payload.advertised.topics;
+                assert!(
+                    !topics.iter().any(|t| t.topic == "personal-mail"),
+                    "{peer_id}: local-only source topic MUST NOT appear in /v1/manifest: {topics:?}"
+                );
+
+                let sub_body = serde_json::to_vec(&json!({
+                    "subscriptions": [{
+                        "id": format!("snoop-{peer_id}"),
+                        "topic": "personal-mail",
+                        "filters": [],
+                        "coalesceSeconds": 0,
+                        "mode": "full"
+                    }]
+                }))
+                .unwrap();
+                let s_req = Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!(
+                        "http://127.0.0.1:{peer_http_port}/v1/subscriptions"
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(sub_body)))
+                    .unwrap();
+                let s_resp = client.request(s_req).await.unwrap();
+                assert_eq!(
+                    s_resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "{peer_id} (stream:subscribe=*) MUST fail closed with 403 on local-only source topic"
+                );
+                let s_bytes = s_resp.into_body().collect().await.unwrap().to_bytes();
+                let prob: Value = serde_json::from_slice(&s_bytes).unwrap();
+                assert_eq!(
+                    prob["error"], "topic_local_only",
+                    "{peer_id}: expected topic_local_only error: {prob}"
+                );
+            }
+        });
+
+        // 1B. Issue #39 (B1) + Issue #38: Attach a live `hyp wait` on same-node `sess-local-src`
+        //     (`coalesceSeconds: 0`) BEFORE publishing Event 1 (omitting `hyphaesourcekind`), and
+        //     assert immediate wakeup (< 3s, no tick wait or restart) + server-stamped
+        //     `hyphaesourcekind == "external-webhook"`!
+        let mut wait_cmd = isolated_cmd(&home);
+        wait_cmd
+            .args([
+                "wait",
+                "--session",
+                "sess-local-src",
+                "--socket",
+                sock_path.to_str().unwrap(),
+                "--timeout",
+                "8",
+                "--json",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let wait_child = wait_cmd.spawn().expect("spawn hyp wait");
+        let (wait_tx, wait_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let out = wait_child.wait_with_output();
+            let _ = wait_tx.send(out);
+        });
+
+        let attach_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let sum = daemon_rpc_sync(
+                &sock_path,
+                &json!({ "type": "session.summary", "sessionId": "sess-local-src", "detail": "compact" }),
+                Duration::from_secs(2),
+            );
+            if sum.ok
+                && sum
+                    .result
+                    .as_ref()
+                    .is_some_and(|r| r["session"]["hasLiveTransport"] == true)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < attach_deadline,
+                "timed out waiting for hyp wait to attach"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let t_emit = Instant::now();
+        let ack1 = emit_source_event(
+            trigger_port_phase1,
+            json!({
+                "specversion": "1.0",
+                "id": "src-ev-1-omitted",
+                "source": "mailfeed/gmail",
+                "type": "to.hyphae.mail.received",
+                "datacontenttype": "application/json",
+                "data": { "subject": "INSTANT_B1_PAYLOAD_1" }
+            }),
+        );
+        assert_eq!(ack1["ack"]["status"], "stored");
+
+        let wait_output = wait_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("Issue #39 (B1): coalesceSeconds: 0 hyp wait timed out instead of waking immediately")
+            .expect("hyp wait output");
+        let elapsed = t_emit.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Issue #39 (B1): coalesceSeconds: 0 subscriber must wake immediately, took {elapsed:?}"
+        );
+        let wait_stdout = String::from_utf8_lossy(&wait_output.stdout);
+        let wait_out: Value = serde_json::from_str(&wait_stdout)
+            .unwrap_or_else(|e| panic!("invalid hyp wait --json output ({e}): {wait_stdout}"));
+        assert_eq!(
+            wait_out["ok"], true,
+            "hyp wait should wake cleanly with Event 1: {wait_out}"
+        );
+        let wait_items = wait_out["data"]["items"]
+            .as_array()
+            .expect("hyp wait items array");
+        assert!(
+            !wait_items.is_empty(),
+            "Issue #39 (B1): hyp wait must deliver wake item immediately: {wait_out}"
+        );
+        // Issue #38: ExternalWebhook trust tier defaults to `DowngradeToNotify`, so `hyp wait`
+        // wakes immediately with a `notifyOnly: true` digest for `local.personal-mail` while
+        // storing the full CloudEvent (stamped `hyphaesourcekind = "external-webhook"`) in mailbox!
+        assert_eq!(
+            wait_items[0]["notifyOnly"], true,
+            "Issue #38: subprocess source event must enforce ExternalWebhook DowngradeToNotify: {wait_out}"
+        );
+        assert!(
+            wait_items[0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("local.personal-mail"),
+            "hyp wait wake notice missing topic local.personal-mail: {wait_out}"
+        );
+        {
+            let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+            let mailbox_items = db.local().peek_inbox("sess-local-src", 20).unwrap();
+            let ev1_row = mailbox_items
+                .iter()
+                .find(|m| m.text.contains("INSTANT_B1_PAYLOAD_1"))
+                .expect("Event 1 must be materialized immediately in local mailbox");
+            let ev1_json: Value = serde_json::from_str(&ev1_row.text).unwrap();
+            assert_eq!(
+                ev1_json["events"][0]["hyphaesourcekind"], "external-webhook",
+                "Issue #38: Event 1 (omitted hyphaesourcekind) MUST be stamped external-webhook: {ev1_json}"
+            );
+        }
+
+        // 1C. Issue #38 Spoofing & Security Gate Enforcement:
+        //     - Event 2 tries to spoof `"hyphaesourcekind": "self-host"` with Stage 1 denylist
+        //       canary `"FORBIDDEN_SOURCE_CANARY"`: MUST be overwritten to `"external-webhook"`
+        //       AND quarantined by Security Gate with `trust_tier == "external-webhook"`!
+        //     - Event 3 tries to spoof `"hyphaesourcekind": "human-verified"` with clean payload:
+        //       MUST be overwritten to `"external-webhook"` and delivered cleanly!
+        let _ = emit_source_event(
+            trigger_port_phase1,
+            json!({
+                "specversion": "1.0",
+                "id": "src-ev-2-spoof-self",
+                "source": "mailfeed/gmail",
+                "type": "to.hyphae.mail.received",
+                "datacontenttype": "application/json",
+                "hyphaesourcekind": "self-host",
+                "data": { "body": "FORBIDDEN_SOURCE_CANARY spoof attempt" }
+            }),
+        );
+        let _ = emit_source_event(
+            trigger_port_phase1,
+            json!({
+                "specversion": "1.0",
+                "id": "src-ev-3-spoof-human",
+                "source": "mailfeed/gmail",
+                "type": "to.hyphae.mail.received",
+                "datacontenttype": "application/json",
+                "hyphaesourcekind": "human-verified",
+                "data": { "subject": "SPOOF_HUMAN_OVERRIDDEN_3" }
+            }),
+        );
+
+        // Trigger Security Gate evaluation via live LocalDaemon `mailbox.drain`, waiting briefly
+        // until Event 2 is quarantined and Event 3 is present in local mailbox!
+        let drain_deadline = Instant::now() + Duration::from_secs(3);
+        let mut drained_items: Vec<Value> = Vec::new();
+        loop {
+            let drain = daemon_rpc_sync(
+                &sock_path,
+                &json!({ "type": "mailbox.drain", "sessionId": "sess-local-src" }),
+                Duration::from_secs(2),
+            );
+            assert!(drain.ok, "mailbox.drain failed: {drain:?}");
+            let batch = drain.result.unwrap()["items"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            drained_items.extend(batch);
+
+            let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+            let q = db
+                .local()
+                .list_quarantined(Some("sess-local-src"), 20)
+                .unwrap();
+            let inbox = db.local().peek_inbox("sess-local-src", 20).unwrap();
+            if q.iter().any(|m| m.text.contains("FORBIDDEN_SOURCE_CANARY"))
+                && inbox
+                    .iter()
+                    .any(|m| m.text.contains("SPOOF_HUMAN_OVERRIDDEN_3"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < drain_deadline,
+                "timed out waiting for Events 2 & 3 gate evaluation: q={q:?} inbox={inbox:?}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        // Event 2 MUST NOT have leaked into drained output (quarantined by Security Gate!).
+        assert!(
+            !drained_items.iter().any(|it| it["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("FORBIDDEN_SOURCE_CANARY")),
+            "Event 2 with denylist canary must be quarantined by Security Gate: {drained_items:?}"
+        );
+
+        // Inspect SQLite `mailbox` (Event 3 delivered + Event 2 quarantined), `gate_audit`
+        // (`trust_tier == "external-webhook"`), AND `EventStore` (ZERO batches for any remote peer!).
+        {
+            let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+            let inbox = db.local().peek_inbox("sess-local-src", 20).unwrap();
+            let ev3_row = inbox
+                .iter()
+                .find(|m| m.text.contains("SPOOF_HUMAN_OVERRIDDEN_3"))
+                .expect("Event 3 must be in local mailbox immediately");
+            let ev3_parsed: Value = serde_json::from_str(&ev3_row.text).unwrap();
+            assert_eq!(
+                ev3_parsed["events"][0]["hyphaesourcekind"], "external-webhook",
+                "Issue #38: spoofed 'human-verified' must be overwritten to 'external-webhook': {ev3_parsed}"
+            );
+
+            let quarantined = db
+                .local()
+                .list_quarantined(Some("sess-local-src"), 20)
+                .unwrap();
+            let q_ev2 = quarantined
+                .iter()
+                .find(|m| m.text.contains("FORBIDDEN_SOURCE_CANARY"))
+                .expect("Event 2 must be parked in quarantine");
+            let q_ev2_json: Value = serde_json::from_str(&q_ev2.text).unwrap();
+            assert_eq!(
+                q_ev2_json["events"][0]["hyphaesourcekind"], "external-webhook",
+                "Issue #38: spoofed 'self-host' must be overwritten to 'external-webhook' in stored event: {q_ev2_json}"
+            );
+
+            let audits = db
+                .local()
+                .query_gate_audit(&GateAuditQuery {
+                    session_id: Some("sess-local-src".to_string()),
+                    limit: Some(50),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(
+                audits.iter().any(|a| {
+                    a.decision == StoreGateDecision::Quarantine
+                        && a.trust_tier.as_deref() == Some("external-webhook")
+                }),
+                "Issue #38: Security Gate audit must record Quarantine at ExternalWebhook trust tier: {audits:?}"
+            );
+
+            let now = hyp_store::now_ms();
+            let _ = db.events().tick(now);
+            for (peer_id, _, _) in &peer_presets {
+                let remote_batches = db.events().claim_due_batches(peer_id, now).unwrap();
+                assert!(
+                    remote_batches.is_empty(),
+                    "Issue #25 (B6): remote peer {peer_id} MUST receive ZERO events from local-only source plugin: {remote_batches:?}"
+                );
+            }
+        }
+
+        daemon1.shutdown();
+
+        // =====================================================================
+        // PHASE 2: Flip `"exposeTopic": true` -> authorized remote peer gets 200 & events!
+        // =====================================================================
+        write_node_cfg(&cfg_path, trigger_port_phase2, Some(true));
+        let mut cmd2 = isolated_cmd(&home);
+        cmd2.args(["daemon", "--config", cfg_path.to_str().unwrap(), "--json"]);
+        let mut daemon2 = ManagedDaemon::spawn(&mut cmd2);
+        let startup2 = daemon2.read_json_line(Duration::from_secs(15));
+        assert_eq!(
+            startup2["ok"], true,
+            "phase 2 daemon startup failed: {startup2}"
+        );
+        let _sock_path2 = PathBuf::from(startup2["data"]["socketPath"].as_str().unwrap());
+
+        wait_plugin_ready(trigger_port_phase2);
+
+        // 2A. Observer's `/v1/manifest` NOW advertises `personal-mail`, and `PUT /v1/subscriptions`
+        //     succeeds with `200 OK`!
+        let obs_token = peer_presets[1].1;
+        rt.block_on(async {
+            let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+            let m_req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://127.0.0.1:{peer_http_port}/v1/manifest"))
+                .header(header::AUTHORIZATION, format!("Bearer {obs_token}"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let m_resp = client.request(m_req).await.unwrap();
+            assert_eq!(m_resp.status(), StatusCode::OK);
+            let m_bytes = m_resp.into_body().collect().await.unwrap().to_bytes();
+            let signed_manifest: hyp_proto::manifest::SignedNodeManifest =
+                serde_json::from_slice(&m_bytes).unwrap();
+            let manifest_payload = signed_manifest.decode_payload().unwrap();
+            let topics = &manifest_payload.advertised.topics;
+            assert!(
+                topics.iter().any(|t| t.topic == "personal-mail"),
+                "exposeTopic: true source topic MUST be advertised in /v1/manifest: {topics:?}"
+            );
+
+            let sub_body = serde_json::to_vec(&json!({
+                "subscriptions": [{
+                    "id": "obs-exposed-mail",
+                    "topic": "personal-mail",
+                    "filters": [],
+                    "coalesceSeconds": 0,
+                    "mode": "full"
+                }]
+            }))
+            .unwrap();
+            let s_req = Request::builder()
+                .method(Method::PUT)
+                .uri(format!(
+                    "http://127.0.0.1:{peer_http_port}/v1/subscriptions"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {obs_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from(sub_body)))
+                .unwrap();
+            let s_resp = client.request(s_req).await.unwrap();
+            assert_eq!(
+                s_resp.status(),
+                StatusCode::OK,
+                "exposeTopic: true must allow authorized remote peer subscription with 200 OK"
+            );
+        });
+
+        // 2B. Publish Event 4 (spoofing `"hyphaesourcekind": "org"`) -> BOTH local session AND
+        //     remote `observer@remote` receive it carrying `"hyphaesourcekind": "external-webhook"`!
+        let ack4 = emit_source_event(
+            trigger_port_phase2,
+            json!({
+                "specversion": "1.0",
+                "id": "src-ev-4-exposed-spoof-org",
+                "source": "mailfeed/gmail",
+                "type": "to.hyphae.mail.received",
+                "datacontenttype": "application/json",
+                "hyphaesourcekind": "org",
+                "data": { "subject": "EXPOSED_REMOTE_OK_4" }
+            }),
+        );
+        assert_eq!(ack4["ack"]["status"], "stored");
+
+        // Same-node local session receives Event 4 immediately in its mailbox.
+        let local4_deadline = Instant::now() + Duration::from_secs(3);
+        let mut found_local_ev4 = false;
+        while Instant::now() < local4_deadline {
+            let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+            let inbox = db.local().peek_inbox("sess-local-src", 30).unwrap();
+            if let Some(ev4_row) = inbox
+                .iter()
+                .find(|m| m.text.contains("EXPOSED_REMOTE_OK_4"))
+            {
+                let parsed: Value = serde_json::from_str(&ev4_row.text).unwrap();
+                assert_eq!(
+                    parsed["events"][0]["hyphaesourcekind"], "external-webhook",
+                    "Event 4 local copy must carry external-webhook: {parsed}"
+                );
+                found_local_ev4 = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            found_local_ev4,
+            "local session must receive Event 4 immediately when exposeTopic: true"
+        );
+
+        // Authorized remote peer receives Event 4 cleanly with `hyphaesourcekind == "external-webhook"`!
+        {
+            let db = hyp_store::NodeDb::open(state_dir.join("node.sqlite")).unwrap();
+            let now = hyp_store::now_ms();
+            let _ = db.events().tick(now);
+            let remote_batches = db
+                .events()
+                .claim_due_batches("observer@remote", now)
+                .unwrap();
+            assert_eq!(
+                remote_batches.len(),
+                1,
+                "exposed source topic must queue Event 4 for subscribed remote peer: {remote_batches:?}"
+            );
+            assert_eq!(remote_batches[0].topic, "personal-mail");
+            assert_eq!(remote_batches[0].events.len(), 1);
+            assert_eq!(
+                remote_batches[0].events[0].data["subject"],
+                "EXPOSED_REMOTE_OK_4"
+            );
+            assert_eq!(
+                remote_batches[0].events[0]
+                    .extensions
+                    .get("hyphaesourcekind")
+                    .map(String::as_str),
+                Some("external-webhook"),
+                "Issue #38: remote-fanned source CloudEvent MUST carry hyphaesourcekind=external-webhook: {:?}",
+                remote_batches[0].events[0]
+            );
+        }
+
+        daemon2.shutdown();
     }
 }
