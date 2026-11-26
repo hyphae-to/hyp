@@ -292,9 +292,15 @@ async fn missing_manifest_rejects_peer_without_legacy_key_probe() {
     let server = tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = [0u8; 8192];
-            let count = socket.read(&mut bytes).await.unwrap();
-            let request = String::from_utf8_lossy(&bytes[..count]);
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut chunk = [0u8; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "request ended before its headers");
+                bytes.extend_from_slice(&chunk[..count]);
+                assert!(bytes.len() <= 8192, "unexpectedly large fixture request");
+            }
+            let request = String::from_utf8_lossy(&bytes);
             observed.lock().unwrap().push(
                 request
                     .split_whitespace()
