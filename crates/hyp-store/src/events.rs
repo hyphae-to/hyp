@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{ImmediateTx, NodeDb};
 use crate::error::{StoreError, StoreResult};
+use crate::types::string_enum;
 use crate::types::{
     AckOutcome, CloudEvent, DeliveryMode, Filter, check_filters, is_node_id, is_topic,
     matches_filters, parse_and_check_filters, sha256_hex, uuid_v4,
@@ -132,40 +133,17 @@ pub(crate) struct CompiledSubscription {
     pub max_batch_age_ms: Option<i64>,
 }
 
-/// Batch lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BatchState {
-    Open,
-    Pending,
-    Delivered,
-    Rejected,
-    Dropped,
-}
-
-impl BatchState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Pending => "pending",
-            Self::Delivered => "delivered",
-            Self::Rejected => "rejected",
-            Self::Dropped => "dropped",
-        }
+string_enum! {
+    /// Batch lifecycle state.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum BatchState {
+        Open => "open",
+        Pending => "pending",
+        Delivered => "delivered",
+        Rejected => "rejected",
+        Dropped => "dropped",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "open" => Ok(Self::Open),
-            "pending" => Ok(Self::Pending),
-            "delivered" => Ok(Self::Delivered),
-            "rejected" => Ok(Self::Rejected),
-            "dropped" => Ok(Self::Dropped),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid batch state '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "batch state";
 }
 
 /// Persisted coalesced event batch metadata.

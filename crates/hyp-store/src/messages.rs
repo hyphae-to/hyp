@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::NodeDb;
 use crate::error::{StoreError, StoreResult};
+use crate::types::string_enum;
 use crate::types::{
     AckOutcome, format_address, is_channel_name, is_handle, is_node_id, parse_address, sha256_hex,
 };
@@ -105,37 +106,16 @@ pub struct HandleRecord {
     pub last_heartbeat_at: i64,
 }
 
-/// Lifecycle state of a message row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MessageState {
-    Pending,
-    Delivered,
-    Rejected,
-    Expired,
-}
-
-impl MessageState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Delivered => "delivered",
-            Self::Rejected => "rejected",
-            Self::Expired => "expired",
-        }
+string_enum! {
+    /// Lifecycle state of a message row.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum MessageState {
+        Pending => "pending",
+        Delivered => "delivered",
+        Rejected => "rejected",
+        Expired => "expired",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "delivered" => Ok(Self::Delivered),
-            "rejected" => Ok(Self::Rejected),
-            "expired" => Ok(Self::Expired),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid message state '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "message state";
 }
 
 /// Input to enqueue a direct or channel-scoped message.

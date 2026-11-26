@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{NodeDb, ensure_dir_0700, ensure_file_0600};
 use crate::error::{StoreError, StoreResult};
+use crate::types::string_enum;
 use crate::types::{AckOutcome, is_node_id, is_safe_transfer_id, sha256_hex, uuid_v4};
 
 /// Fail-closed size and queue quotas for pending encrypted transfers.
@@ -45,37 +46,16 @@ impl Default for TransferLimits {
     }
 }
 
-/// Lifecycle state of a transfer row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TransferState {
-    Pending,
-    Delivered,
-    Rejected,
-    Expired,
-}
-
-impl TransferState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Delivered => "delivered",
-            Self::Rejected => "rejected",
-            Self::Expired => "expired",
-        }
+string_enum! {
+    /// Lifecycle state of a transfer row.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum TransferState {
+        Pending => "pending",
+        Delivered => "delivered",
+        Rejected => "rejected",
+        Expired => "expired",
     }
-
-    pub fn parse(s: &str) -> StoreResult<Self> {
-        match s {
-            "pending" => Ok(Self::Pending),
-            "delivered" => Ok(Self::Delivered),
-            "rejected" => Ok(Self::Rejected),
-            "expired" => Ok(Self::Expired),
-            other => Err(StoreError::InvalidInput(format!(
-                "invalid transfer state '{other}'"
-            ))),
-        }
-    }
+    InvalidInput: "transfer state";
 }
 
 /// Transfer submission metadata.
