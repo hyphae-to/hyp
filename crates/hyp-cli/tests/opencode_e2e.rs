@@ -516,7 +516,7 @@ async fn opencode_real_plugin_verifies_caller_drains_messages_and_feeds_tui_agai
         "replayed _meshCall token must fail closed: {replay_resp}"
     );
 
-    // Step 5: Verify `hyp_mesh` channel join (translated to `hyp_channel` via `resolve_v1_daemon_tool`)
+    // Step 5: Verify canonical `hyp_mesh` channel join
     // also passes through `tool.execute.before` -> `_meshCall` -> `CallRegistry` cleanly!
     let before_chan = run_plugin_step(
         r##"

@@ -558,7 +558,7 @@ test("Real OpenClaw + Shim API (Prompt Injection ON): Gateway wake nudge -> befo
       openclawSessionKey: ocSessionKey,
       openclawSessionId: ocSessionUuid,
       openclawAgentId: "main",
-      tool: toolName === "hyp_mesh" ? "hyp_session" : toolName,
+      tool: toolName,
       callId,
     });
     assert.equal(startRes.ok, true, JSON.stringify(startRes));
@@ -691,7 +691,7 @@ test("Real OpenClaw + Shim API (Prompt Injection OFF): zero prompt mutation, mes
       openclawSessionKey: ocSessionKey,
       openclawSessionId: ocSessionUuid,
       openclawAgentId: "main",
-      tool: toolName === "hyp_mesh" ? "hyp_session" : toolName,
+      tool: toolName,
       callId,
     });
     assert.equal(startRes.ok, true, JSON.stringify(startRes));
@@ -786,7 +786,7 @@ test("Real OpenClaw + Shim API (Adversarial & Offline): spoofed human-verified s
       openclawSessionKey: ocSessionKey,
       openclawSessionId: ocSessionUuid,
       openclawAgentId: "main",
-      tool: toolName === "hyp_mesh" ? "hyp_session" : toolName,
+      tool: toolName,
       callId,
     });
     assert.equal(startRes.ok, true, JSON.stringify(startRes));

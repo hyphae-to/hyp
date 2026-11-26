@@ -2,7 +2,7 @@
 //!
 //! Exposes the lean **Rust v2 4-tool core catalog** (`hyp_send`, `hyp_inbox`, `hyp_mesh`,
 //! `hyp_stream`) plus conditional `hyp_bridge` (included ONLY when `hasPlugins == true` — 0 tokens
-//! otherwise!), and translates seamlessly to the live v1 TypeScript `connector.sock` protocol.
+//! otherwise!), and forwards canonical tool calls to the local Rust daemon.
 //!
 //! Also supports:
 //! - `_meta` callId extraction (`claudecode/toolUseId`, `callId`, `toolUseId`, `tool_use_id`,
@@ -10,9 +10,7 @@
 //! - `--claude-channel` live push notifications (`notifications/claude/channel`) with
 //!   `channel.ready` / `channel.deliver` / `channel.ack` and automatic 1 s reconnect.
 
-use crate::protocol::{
-    HarnessKind, is_bridge_destination, is_valid_router_name, normalize_mesh_tool_name,
-};
+use crate::protocol::{HarnessKind, normalize_mesh_tool_name};
 use crate::sock::{
     DaemonReadHalf, DaemonWriteHalf, MAX_SOCKET_LINE_BYTES, connect_daemon_async,
     read_bounded_line_async, write_ndjson_line_async,
@@ -265,246 +263,6 @@ pub fn select_tools_for_list(has_plugins: bool) -> Vec<Value> {
 }
 
 /// Translated daemon tool call `(daemon_tool_name, daemon_args)`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TranslatedCall {
-    pub name: String,
-    pub args: Map<String, Value>,
-}
-
-/// Translates v2 4+1 MCP tool calls (and passes through direct v1 daemon calls)
-/// into the live v1 TypeScript `connector.sock` RPC format.
-pub fn translate_tool_call(
-    raw_name: &str,
-    mut args: Map<String, Value>,
-) -> Result<TranslatedCall, String> {
-    let canonical = normalize_mesh_tool_name(raw_name).unwrap_or(raw_name);
-
-    match canonical {
-        "hyp_send" => {
-            let is_bridge = args
-                .get("to")
-                .and_then(Value::as_str)
-                .is_some_and(is_bridge_destination);
-            if is_bridge && !args.contains_key("threadTs") {
-                if let Some(reply_to) = args.get("replyTo").and_then(Value::as_str) {
-                    args.insert("threadTs".into(), Value::String(reply_to.to_string()));
-                }
-            }
-            Ok(TranslatedCall {
-                name: "hyp_send".into(),
-                args,
-            })
-        }
-        "hyp_inbox" => {
-            // Check session-control shortcuts: `mode`, `mute`, `unmute`.
-            if let Some(mode) = args.get("mode").and_then(Value::as_str) {
-                let mut out = Map::new();
-                out.insert("action".into(), json!("mode"));
-                out.insert("mode".into(), json!(mode));
-                if let Some(rules) = args.get("rules") {
-                    out.insert("rules".into(), rules.clone());
-                }
-                if let Some(vips) = args.get("focusAllowInterruptVips") {
-                    out.insert("focusAllowInterruptVips".into(), vips.clone());
-                }
-                return Ok(TranslatedCall {
-                    name: "hyp_session".into(),
-                    args: out,
-                });
-            }
-            if let Some(target) = args.get("mute").and_then(Value::as_str) {
-                let mut out = Map::new();
-                out.insert("action".into(), json!("mute"));
-                out.insert("target".into(), json!(target));
-                if let Some(scope) = args.get("scope") {
-                    out.insert("scope".into(), scope.clone());
-                }
-                return Ok(TranslatedCall {
-                    name: "hyp_session".into(),
-                    args: out,
-                });
-            }
-            if let Some(target) = args.get("unmute").and_then(Value::as_str) {
-                let mut out = Map::new();
-                out.insert("action".into(), json!("unmute"));
-                out.insert("target".into(), json!(target));
-                if let Some(scope) = args.get("scope") {
-                    out.insert("scope".into(), scope.clone());
-                }
-                return Ok(TranslatedCall {
-                    name: "hyp_session".into(),
-                    args: out,
-                });
-            }
-
-            // Standard inbox read/ack: map `ids` -> `acknowledge` and `summary` -> `summaryOnly`.
-            if !args.contains_key("acknowledge") {
-                if let Some(ids) = args.remove("ids") {
-                    args.insert("acknowledge".into(), ids);
-                }
-            } else {
-                args.remove("ids");
-            }
-            if !args.contains_key("summaryOnly") {
-                if let Some(summary) = args.remove("summary") {
-                    args.insert("summaryOnly".into(), summary);
-                }
-            } else {
-                args.remove("summary");
-            }
-            Ok(TranslatedCall {
-                name: "hyp_inbox".into(),
-                args,
-            })
-        }
-        "hyp_mesh" => {
-            let action = args.get("action").and_then(Value::as_str).ok_or_else(|| {
-                "Expected action: join | leave | peers | channels | status | drop_link".to_string()
-            })?;
-            let channel = args
-                .get("channel")
-                .and_then(Value::as_str)
-                .filter(|c| !c.is_empty());
-
-            match action {
-                "drop_link" => Ok(TranslatedCall {
-                    name: "hyp_mesh".into(),
-                    args,
-                }),
-                "channels" => {
-                    let mut out = Map::new();
-                    out.insert("action".into(), json!("list"));
-                    if let Some(ch) = channel {
-                        out.insert("channel".into(), json!(ch));
-                    }
-                    Ok(TranslatedCall {
-                        name: "hyp_channel".into(),
-                        args: out,
-                    })
-                }
-                "join" if channel.is_some() => {
-                    let mut out = Map::new();
-                    out.insert("action".into(), json!("join"));
-                    out.insert("channel".into(), json!(channel.unwrap()));
-                    Ok(TranslatedCall {
-                        name: "hyp_channel".into(),
-                        args: out,
-                    })
-                }
-                "leave" if channel.is_some() => {
-                    let mut out = Map::new();
-                    out.insert("action".into(), json!("leave"));
-                    out.insert("channel".into(), json!(channel.unwrap()));
-                    Ok(TranslatedCall {
-                        name: "hyp_channel".into(),
-                        args: out,
-                    })
-                }
-                "join" | "leave" | "peers" | "status" => {
-                    let mut out = Map::new();
-                    out.insert("action".into(), json!(action));
-                    if let Some(handle) = args.get("handle") {
-                        out.insert("handle".into(), handle.clone());
-                    }
-                    if action == "join" {
-                        if let Some(description) = args.get("description") {
-                            out.insert("description".into(), description.clone());
-                        }
-                    }
-                    if let Some(include) = args.get("include") {
-                        out.insert("include".into(), include.clone());
-                    }
-                    Ok(TranslatedCall {
-                        name: "hyp_session".into(),
-                        args: out,
-                    })
-                }
-                other => Err(format!(
-                    "Invalid hyp_mesh action '{other}'. Expected: join | leave | peers | channels | status | drop_link"
-                )),
-            }
-        }
-        "hyp_stream" => {
-            let action = args.get("action").and_then(Value::as_str);
-            match action {
-                Some("subscribe") => {
-                    // Support `<node>.<topic>` shorthand when explicit `router` is omitted.
-                    if !args.contains_key("router") {
-                        if let Some(raw_topic) = args
-                            .get("topic")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string)
-                        {
-                            if let Some((router, rest)) = raw_topic.split_once('.') {
-                                if is_valid_router_name(router) && !rest.is_empty() {
-                                    args.insert("router".into(), json!(router));
-                                    args.insert("topic".into(), json!(rest));
-                                }
-                            }
-                        }
-                    }
-                }
-                Some("topics") => {
-                    // Allow `topic: "<router>"` or `topic: "<router>.<topic>"` as router filter.
-                    if !args.contains_key("router") {
-                        if let Some(raw_topic) = args.remove("topic") {
-                            if let Some(s) = raw_topic.as_str() {
-                                let router = s.split_once('.').map(|(r, _)| r).unwrap_or(s);
-                                if is_valid_router_name(router) {
-                                    args.insert("router".into(), json!(router));
-                                }
-                            }
-                        }
-                    }
-                }
-                Some("unsubscribe") => {
-                    // `key` maps to `key` if it contains ':' (`<prefix>:<name>`), else `id` (UUID).
-                    if !args.contains_key("id") {
-                        if let Some(raw_key) = args
-                            .get("key")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string)
-                        {
-                            if !raw_key.contains(':') {
-                                args.remove("key");
-                                args.insert("id".into(), json!(raw_key));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            Ok(TranslatedCall {
-                name: "hyp_stream".into(),
-                args,
-            })
-        }
-        "hyp_bridge" => {
-            // Also accept `target: "plugin:target"` shorthand if `plugin` wasn't supplied separately.
-            if !args.contains_key("plugin") {
-                if let Some(raw_target) = args
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-                {
-                    if let Some((plugin, target)) = raw_target.split_once(':') {
-                        args.insert("plugin".into(), json!(plugin));
-                        args.insert("target".into(), json!(target));
-                    }
-                }
-            }
-            Ok(TranslatedCall {
-                name: "hyp_bridge".into(),
-                args,
-            })
-        }
-        other => Ok(TranslatedCall {
-            name: other.to_string(),
-            args,
-        }),
-    }
-}
-
 #[cfg(unix)]
 fn fill_os_random(bytes: &mut [u8; 16]) -> bool {
     std::fs::File::open("/dev/urandom")
@@ -1192,16 +950,19 @@ where
                         let meta = params.get("_meta").and_then(Value::as_object);
                         let call_id = extract_meta_call_id(meta);
 
-                        let translated = match translate_tool_call(raw_name, raw_args) {
-                            Ok(t) => t,
-                            Err(msg) => {
-                                write_stdout_json(
-                                    &mut stdout,
-                                    &tool_call_result(jsonrpc_id, Value::String(msg), true),
-                                )
-                                .await?;
-                                continue;
-                            }
+                        let Some(canonical) = normalize_mesh_tool_name(raw_name) else {
+                            write_stdout_json(
+                                &mut stdout,
+                                &tool_call_result(
+                                    jsonrpc_id,
+                                    Value::String(format!(
+                                        "unknown_tool: Unknown Hyphae tool '{raw_name}'"
+                                    )),
+                                    true,
+                                ),
+                            )
+                            .await?;
+                            continue;
                         };
 
                         if conn.is_none() {
@@ -1231,8 +992,8 @@ where
                         let mut pkt = Map::new();
                         pkt.insert("type".into(), json!("tool.call"));
                         pkt.insert("id".into(), json!(local_id));
-                        pkt.insert("name".into(), json!(translated.name));
-                        pkt.insert("args".into(), Value::Object(translated.args));
+                        pkt.insert("name".into(), json!(canonical));
+                        pkt.insert("args".into(), Value::Object(raw_args));
                         if let Some(cid) = call_id {
                             pkt.insert("callId".into(), json!(cid));
                         }
@@ -1408,223 +1169,6 @@ mod tests {
     }
 
     #[test]
-    fn translates_v2_four_plus_one_tools_to_v1_daemon_rpcs() {
-        // hyp_mesh join handle + optional description -> hyp_session
-        let join = translate_tool_call(
-            "hyp_mesh",
-            json!({
-                "action": "join",
-                "handle": "alice",
-                "description": "Rust backend engineer",
-                "include": ["peers", "topics"]
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        )
-        .unwrap();
-        assert_eq!(join.name, "hyp_session");
-        assert_eq!(
-            Value::Object(join.args),
-            json!({
-                "action": "join",
-                "handle": "alice",
-                "description": "Rust backend engineer",
-                "include": ["peers", "topics"]
-            })
-        );
-
-        // hyp_mesh join channel -> hyp_channel
-        let ch_join = translate_tool_call(
-            "hyp_mesh",
-            json!({"action": "join", "channel": "#ops"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        assert_eq!(ch_join.name, "hyp_channel");
-        assert_eq!(
-            Value::Object(ch_join.args),
-            json!({"action": "join", "channel": "#ops"})
-        );
-
-        // hyp_mesh leave channel -> hyp_channel; leave without channel -> hyp_session
-        let ch_leave = translate_tool_call(
-            "hyp_mesh",
-            json!({"action": "leave", "channel": "#ops"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        assert_eq!(ch_leave.name, "hyp_channel");
-        assert_eq!(
-            Value::Object(ch_leave.args),
-            json!({"action": "leave", "channel": "#ops"})
-        );
-        let mesh_leave = translate_tool_call(
-            "hyp_mesh",
-            json!({"action": "leave"}).as_object().unwrap().clone(),
-        )
-        .unwrap();
-        assert_eq!(mesh_leave.name, "hyp_session");
-        assert_eq!(Value::Object(mesh_leave.args), json!({"action": "leave"}));
-
-        // hyp_mesh channels -> hyp_channel(list)
-        let ch_list = translate_tool_call(
-            "hyp_mesh",
-            json!({"action": "channels"}).as_object().unwrap().clone(),
-        )
-        .unwrap();
-        assert_eq!(ch_list.name, "hyp_channel");
-        assert_eq!(Value::Object(ch_list.args), json!({"action": "list"}));
-
-        // hyp_mesh drop_link -> passes through to hyp_mesh with all drop parameters preserved
-        let drop_call = translate_tool_call(
-            "hyp_mesh",
-            json!({
-                "action": "drop_link",
-                "kind": "directive",
-                "draft": "Approve deploy v2.4.1",
-                "context": "PR #412",
-                "ttlSeconds": 300,
-                "relay": "https://public.hyphae.to"
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        )
-        .unwrap();
-        assert_eq!(drop_call.name, "hyp_mesh");
-        assert_eq!(drop_call.args["action"], "drop_link");
-        assert_eq!(drop_call.args["kind"], "directive");
-        assert_eq!(drop_call.args["draft"], "Approve deploy v2.4.1");
-        assert_eq!(drop_call.args["context"], "PR #412");
-        assert_eq!(drop_call.args["ttlSeconds"], 300);
-        assert_eq!(drop_call.args["relay"], "https://public.hyphae.to");
-
-        // hyp_inbox mode/mute/unmute -> hyp_session
-        let mode = translate_tool_call(
-            "hyp_inbox",
-            json!({"mode": "notify"}).as_object().unwrap().clone(),
-        )
-        .unwrap();
-        assert_eq!(mode.name, "hyp_session");
-        assert_eq!(
-            Value::Object(mode.args),
-            json!({"action": "mode", "mode": "notify"})
-        );
-
-        let mute = translate_tool_call(
-            "hyp_inbox",
-            json!({"mute": "#noisy", "scope": "session"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        assert_eq!(mute.name, "hyp_session");
-        assert_eq!(
-            Value::Object(mute.args),
-            json!({"action": "mute", "target": "#noisy", "scope": "session"})
-        );
-
-        let unmute = translate_tool_call(
-            "hyp_inbox",
-            json!({"unmute": "#noisy", "scope": "connector"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        assert_eq!(unmute.name, "hyp_session");
-        assert_eq!(
-            Value::Object(unmute.args),
-            json!({"action": "unmute", "target": "#noisy", "scope": "connector"})
-        );
-
-        // hyp_inbox read/ack maps ids -> acknowledge, summary -> summaryOnly
-        let inbox = translate_tool_call(
-            "hyp_inbox",
-            json!({"ack": true, "ids": ["r1"], "summary": true, "limit": 5})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        assert_eq!(inbox.name, "hyp_inbox");
-        assert_eq!(
-            Value::Object(inbox.args),
-            json!({"ack": true, "acknowledge": ["r1"], "summaryOnly": true, "limit": 5})
-        );
-
-        // hyp_stream subscribe splits `<router>.<topic>` and unsub distinguishes key vs UUID
-        let sub = translate_tool_call(
-            "hyp_stream",
-            json!({
-                "action": "subscribe",
-                "topic": "team.github",
-                "key": "gh:pr",
-                "filters": [{"exact": {"repo": "hyphae-to/hyp"}}],
-                "coalesceSeconds": 10
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        )
-        .unwrap();
-        assert_eq!(sub.name, "hyp_stream");
-        assert_eq!(sub.args["router"], "team");
-        assert_eq!(sub.args["topic"], "github");
-
-        let unsub_uuid = translate_tool_call(
-            "hyp_stream",
-            json!({"action": "unsubscribe", "key": "550e8400-e29b-41d4-a716-446655440000"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            Value::Object(unsub_uuid.args),
-            json!({"action": "unsubscribe", "id": "550e8400-e29b-41d4-a716-446655440000"})
-        );
-
-        // hyp_send maps replyTo -> threadTs for bridge targets and preserves reaction + chatId
-        let send_br = translate_tool_call(
-            "hyp_send",
-            json!({"to": "slack:ops", "text": "ack", "replyTo": "1700.123"})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        assert_eq!(send_br.name, "hyp_send");
-        assert_eq!(send_br.args["threadTs"], "1700.123");
-        assert_eq!(send_br.args["replyTo"], "1700.123");
-
-        let send_rxn = translate_tool_call(
-            "hyp_send",
-            json!({
-                "to": "telegram:personal",
-                "reaction": "👍",
-                "replyTo": "42",
-                "chatId": "12345"
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        )
-        .unwrap();
-        assert_eq!(send_rxn.name, "hyp_send");
-        assert_eq!(send_rxn.args["reaction"], "👍");
-        assert_eq!(send_rxn.args["replyTo"], "42");
-        assert_eq!(send_rxn.args["threadTs"], "42");
-        assert_eq!(send_rxn.args["chatId"], "12345");
-    }
-
-    #[test]
     fn extracts_all_meta_call_id_keys() {
         assert_eq!(
             extract_meta_call_id(json!({"claudecode/toolUseId": "t1"}).as_object()).as_deref(),
@@ -1687,10 +1231,10 @@ mod tests {
         .await
         .unwrap();
 
-        // 5. Handle tool.call -> assert callId + callToken + translated name
+        // 5. Handle tool.call -> assert callId + callToken + canonical name
         let call: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(call["type"], "tool.call");
-        assert_eq!(call["name"], "hyp_session");
+        assert_eq!(call["name"], "hyp_mesh");
         assert_eq!(call["callId"], "toolu_99");
         assert_eq!(call["callToken"], "tok_xyz");
         assert_eq!(call["args"]["action"], "join");

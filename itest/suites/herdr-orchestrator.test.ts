@@ -6,7 +6,7 @@
  *
  *  1. Identity pinning (`created_ms`, `pid`, `app`) verified via `hc get --json` + `hyp inspect`.
  *  2. Bare-shell fail-closed check (#36): `hc run --bg --name bare-sh /bin/sh` (`status == null`) ->
- *     explicit `hyp mcp --backend herdr` (and `session.register`/`session.start` RPCs) fail closed
+ *     explicit `hyp mcp --backend herdr` (and `session.start` RPC) fail closed
  *     with `herdr_bare_shell_rejected`, enrolling ZERO handle and pasting ZERO bytes into `/bin/sh`!
  *  3. Live `hc send` (`queue`) vs `hc interrupt` (`interrupt`) using deterministic `llm-shim`
  *     `pauseMidStream(gate)` latches:
@@ -112,12 +112,12 @@ test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-st
     // Issue #36: Explicit `--backend herdr` inside a bare shell MUST fail closed with
     // `herdr_bare_shell_rejected`, enrolling ZERO handle and pasting ZERO bytes!
     const bareRegRpc = await daemonRpc(hyp.socketPath, {
-      type: "session.register",
+      type: "session.start",
       sessionId: "herdr:bare-rpc-probe",
       backend: "herdr",
       herdrTerminalId: bareAddr,
     });
-    assert.equal(bareRegRpc.ok, false, `session.register(--backend herdr) on bare shell must fail closed: ${JSON.stringify(bareRegRpc)}`);
+    assert.equal(bareRegRpc.ok, false, `session.start(--backend herdr) on bare shell must fail closed: ${JSON.stringify(bareRegRpc)}`);
     assert.equal(bareRegRpc.code, "herdr_bare_shell_rejected", `expected herdr_bare_shell_rejected code: ${JSON.stringify(bareRegRpc)}`);
 
     const bareMcpProc = sandbox.reaper.spawn(

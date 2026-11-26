@@ -1,6 +1,5 @@
-//! Shared v1/v2 harness protocol constants, tool-name normalization, and v1 daemon routing.
+//! Shared harness protocol constants and canonical MCP tool-name normalization.
 
-use serde_json::{Map, Value};
 use std::str::FromStr;
 
 /// Untrusted external data provenance header (must match `src/protocol.ts` byte-for-byte).
@@ -79,7 +78,7 @@ pub const V2_CORE_MCP_TOOLS: &[&str] = &["hyp_send", "hyp_inbox", "hyp_mesh", "h
 /// Conditional bridge tool (included in `tools/list` ONLY when `hasPlugins == true`).
 pub const BRIDGE_MCP_TOOL: &str = "hyp_bridge";
 
-/// Known Hyphae tool names recognized by PreToolUse hook normalization (v2 4+1 tools plus v1 daemon tools).
+/// Documented Hyphae tools recognized by PreToolUse hook normalization.
 const KNOWN_MESH_TOOLS: &[&str] = &[
     // Rust v2 4 core + conditional tools (`hyp_bridge`, `hyp_kv`)
     "hyp_send",
@@ -88,30 +87,6 @@ const KNOWN_MESH_TOOLS: &[&str] = &[
     "hyp_stream",
     "hyp_bridge",
     "hyp_kv",
-    // Live v1 daemon tool names (for interop with existing hook setups)
-    "hyp_session",
-    "hyp_channel",
-    "hyp_capabilities",
-    "hyp_join",
-    "hyp_leave",
-    "hyp_peers",
-    "hyp_subscribe",
-    "hyp_unsubscribe",
-    "hyp_subscriptions",
-    "hyp_topics",
-    "hyp_channel_join",
-    "hyp_channel_leave",
-    "hyp_channel_post",
-    "hyp_channels",
-    "hyp_mode",
-    "hyp_mute",
-    "hyp_unmute",
-    "hyp_mutes",
-    "hyp_plugin_targets",
-    "hyp_plugin_handoff",
-    "hyp_plugin_post",
-    "hyp_bridge_link",
-    "hyp_bridge_unlink",
 ];
 
 fn exact_known_tool(name: &str) -> Option<&'static str> {
@@ -130,8 +105,7 @@ pub fn normalize_mesh_tool_name(raw: &str) -> Option<&'static str> {
 
     // Match `(?:^|__|[./:_])(hyp_[a-z_]+)$` against known Hyphae tool names.
     let bytes = raw.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
+    for (i, _) in raw.char_indices() {
         if raw[i..].starts_with("hyp_") {
             let valid_boundary = if i == 0 {
                 true
@@ -151,47 +125,9 @@ pub fn normalize_mesh_tool_name(raw: &str) -> Option<&'static str> {
                 }
             }
         }
-        i += 1;
     }
 
     None
-}
-
-/// Resolves the live v1 TypeScript `connector.sock` tool name for any v2 MCP tool call
-/// so both PreToolUse `call.start` and MCP `tool.call` register and verify against the
-/// exact same tool name in the v1 daemon's `CallRegistry`.
-pub fn resolve_v1_daemon_tool<'a>(
-    canonical_tool: &'a str,
-    args: Option<&Map<String, Value>>,
-) -> &'a str {
-    match canonical_tool {
-        "hyp_mesh" => {
-            let action = args.and_then(|a| a.get("action")).and_then(Value::as_str);
-            let has_channel = args
-                .and_then(|a| a.get("channel"))
-                .and_then(Value::as_str)
-                .is_some_and(|c| !c.is_empty());
-            match action {
-                Some("channels") => "hyp_channel",
-                Some("join" | "leave") if has_channel => "hyp_channel",
-                Some("drop_link") => "hyp_mesh",
-                _ => "hyp_session",
-            }
-        }
-        "hyp_inbox" => {
-            let is_session_op = args.is_some_and(|a| {
-                a.get("mode").and_then(Value::as_str).is_some()
-                    || a.get("mute").and_then(Value::as_str).is_some()
-                    || a.get("unmute").and_then(Value::as_str).is_some()
-            });
-            if is_session_op {
-                "hyp_session"
-            } else {
-                "hyp_inbox"
-            }
-        }
-        other => other,
-    }
 }
 
 /// Returns true if `to` looks like a local bridge target (`<plugin>:<target>` without `/`).
@@ -231,10 +167,15 @@ fn is_valid_slug(s: &str, max_len: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn normalizes_all_harness_prefixed_v2_and_v1_names() {
+    fn unicode_tool_names_never_split_a_utf8_character() {
+        assert_eq!(normalize_mesh_tool_name("工具.hyp_send"), Some("hyp_send"));
+        assert_eq!(normalize_mesh_tool_name("工具"), None);
+    }
+
+    #[test]
+    fn normalizes_supported_harness_prefixes_and_rejects_retired_names() {
         assert_eq!(normalize_mesh_tool_name("hyp_mesh"), Some("hyp_mesh"));
         assert_eq!(
             normalize_mesh_tool_name("mcp__hyphae__hyp_mesh"),
@@ -258,75 +199,9 @@ mod tests {
         );
         assert_eq!(normalize_mesh_tool_name("hyp_wakeup"), None);
         assert_eq!(normalize_mesh_tool_name("mcp__hyphae__hyp_wakeup"), None);
-        assert_eq!(
-            normalize_mesh_tool_name("hyphae/hyp_peers"),
-            Some("hyp_peers")
-        );
-        assert_eq!(
-            normalize_mesh_tool_name("hyphae:hyp_session"),
-            Some("hyp_session")
-        );
+        assert_eq!(normalize_mesh_tool_name("hyphae/hyp_peers"), None);
+        assert_eq!(normalize_mesh_tool_name("hyphae:hyp_session"), None);
         assert_eq!(normalize_mesh_tool_name("run_command"), None);
         assert_eq!(normalize_mesh_tool_name("mcp__other__foo"), None);
-    }
-
-    #[test]
-    fn resolves_v2_tools_to_matching_v1_daemon_tools() {
-        assert_eq!(
-            resolve_v1_daemon_tool(
-                "hyp_mesh",
-                json!({"action": "join", "handle": "alice"}).as_object()
-            ),
-            "hyp_session"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool(
-                "hyp_mesh",
-                json!({"action": "join", "channel": "#ops"}).as_object()
-            ),
-            "hyp_channel"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool(
-                "hyp_mesh",
-                json!({"action": "leave", "channel": "#ops"}).as_object()
-            ),
-            "hyp_channel"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool("hyp_mesh", json!({"action": "leave"}).as_object()),
-            "hyp_session"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool("hyp_mesh", json!({"action": "channels"}).as_object()),
-            "hyp_channel"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool(
-                "hyp_mesh",
-                json!({"action": "drop_link", "kind": "secret", "secretName": "prod-key"})
-                    .as_object()
-            ),
-            "hyp_mesh"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool("hyp_inbox", json!({"ack": true}).as_object()),
-            "hyp_inbox"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool("hyp_inbox", json!({"mode": "notify"}).as_object()),
-            "hyp_session"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool("hyp_inbox", json!({"mute": "#noisy"}).as_object()),
-            "hyp_session"
-        );
-        assert_eq!(
-            resolve_v1_daemon_tool("hyp_inbox", json!({"unmute": "#noisy"}).as_object()),
-            "hyp_session"
-        );
-        assert_eq!(resolve_v1_daemon_tool("hyp_stream", None), "hyp_stream");
-        assert_eq!(resolve_v1_daemon_tool("hyp_send", None), "hyp_send");
-        assert_eq!(resolve_v1_daemon_tool("hyp_bridge", None), "hyp_bridge");
     }
 }

@@ -2,7 +2,7 @@
 /**
  * Built-in zero-dependency WhatsApp Business Cloud API plugin for Hyphae (Node 24+).
  * Receives Meta Cloud API webhooks (GET verification + signed POST messages) and supports
- * outbound replies via `mesh.onPost` (`hyp_plugin_post`).
+ * outbound replies via `mesh.onPost` (`hyp_send`).
  *
  * Configuration via env:
  *   WHATSAPP_HOST                                       - Bind host (default 127.0.0.1)
