@@ -29,7 +29,7 @@ use hyp_harness::daemon::{
 use hyp_harness::mcp::McpOptions;
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::daemon_rpc_async;
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::engine::http_util::SseEvent;
 use hyp_node::engine::{NodeConfig, UnifiedNode};
 use hyp_node::gates::TrustTier as GateTrustTier;
@@ -110,8 +110,12 @@ impl PushTransport for RecordingTransport {
         true
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        let text = text.to_string();
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let text = text.as_str().to_string();
         Box::pin(async move {
             self.delivered.lock().unwrap().push((text, mode));
             self.notify.notify_waiters();
@@ -157,8 +161,12 @@ impl PushTransport for FlakyHoldTransport {
         true
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        let text = text.to_string();
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let text = text.as_str().to_string();
         Box::pin(async move {
             if self.should_hold.load(Ordering::SeqCst) {
                 self.hold_attempts.fetch_add(1, Ordering::SeqCst);

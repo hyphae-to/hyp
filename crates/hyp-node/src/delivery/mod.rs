@@ -19,7 +19,7 @@ pub use inbox_query::{
     archive_muted_entry, load_session_policy, move_pending_to_muted, muted_count, query_inbox,
     record_delivered_receipts, save_session_policy,
 };
-pub use packer::{PackableItem, PackedDeliveryBatch, pack_inbox_digest};
+pub use packer::{InboxDigest, PackableItem, PackedDeliveryBatch, pack_inbox_digest};
 pub use policy::{
     BurstProtectionConfig, DEFAULT_BURST_MAX_EVENTS_PER_WINDOW,
     DEFAULT_BURST_MIN_DELIVERY_INTERVAL_SECS, DEFAULT_BURST_NOISY_COOLDOWN_SECS,

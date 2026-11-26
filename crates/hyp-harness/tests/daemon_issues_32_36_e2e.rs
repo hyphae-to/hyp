@@ -23,7 +23,7 @@ use hyp_harness::hooks::HookEvent;
 use hyp_harness::mcp::McpOptions;
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::daemon_rpc_async;
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::engine::{NodeConfig, UnifiedNode};
 use hyp_node::gates::TrustTier as GateTrustTier;
 use hyp_proto::address::NodeId;
@@ -97,10 +97,14 @@ impl PushTransport for RecordingNudgeTransport {
         true
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
         let extract_attr = |attr: &str| -> Option<String> {
             let needle = format!("{attr}=\"");
-            let rest = text.split_once(&needle)?.1;
+            let rest = text.as_str().split_once(&needle)?.1;
             Some(rest.split_once('"')?.0.to_string())
         };
         let count = extract_attr("unread")

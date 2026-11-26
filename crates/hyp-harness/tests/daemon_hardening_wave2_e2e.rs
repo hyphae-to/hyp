@@ -25,7 +25,7 @@ use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_async};
 use hyp_harness::transport::t3::{
     DEFAULT_T3_TOKEN_SECRET, T3Target, T3Transport, t3_state_db_path,
 };
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::delivery::{DeliveryError, InboxQuery, InboxStateFilter, query_inbox};
 use hyp_node::engine::{LocalIngestServer, NodeConfig, UnifiedNode, send_local_ingest_event};
 use hyp_node::gates::SecurityGatePipeline;
@@ -127,8 +127,12 @@ impl PushTransport for ScriptedTransport {
         true
     }
 
-    fn deliver<'a>(&'a self, prompt: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        let text = prompt.to_string();
+    fn deliver<'a>(
+        &'a self,
+        prompt: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let text = prompt.as_str().to_string();
         Box::pin(async move {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             let outcome = self

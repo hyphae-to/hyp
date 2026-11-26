@@ -149,7 +149,7 @@ fn muted_items_never_wake_alone_and_piggyback_on_next_delivery() {
     assert_eq!(batch.receipt_ids, vec!["r-dm"]);
     assert_eq!(batch.muted_count, 12);
     assert_eq!(
-        batch.rendered,
+        batch.rendered.as_str(),
         concat!(
             "<hyphae-inbox unread=\"1\" urgency=\"queue\">\n",
             "  <dm from=\"alice@macbook/claude\" count=\"1\"/>\n",

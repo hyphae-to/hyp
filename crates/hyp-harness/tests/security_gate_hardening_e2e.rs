@@ -25,7 +25,7 @@ use hyp_crypto::{SecretBackend, SecretStore};
 use hyp_harness::daemon::{InboundItem, LocalDaemon, LocalDaemonConfig};
 use hyp_harness::mcp::McpOptions;
 use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_async};
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::engine::{NodeConfig, UnifiedNode};
 use hyp_node::gates::SecurityGatePipeline;
 use hyp_node::gates::plugins::{BoxFuture, FilterPlugin};
@@ -104,12 +104,16 @@ impl PushTransport for RecordingTransport {
         true
     }
 
-    fn deliver<'a>(&'a self, prompt: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
+    fn deliver<'a>(
+        &'a self,
+        prompt: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
         Box::pin(async move {
             self.delivered
                 .lock()
                 .unwrap()
-                .push((prompt.to_string(), mode));
+                .push((prompt.as_str().to_string(), mode));
             self.notify.notify_waiters();
             PushOutcome::Delivered
         })
