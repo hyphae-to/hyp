@@ -2122,3 +2122,265 @@ fn node_start_legacy_v1_and_http_manifest_probe() {
     // Graceful shutdown (also guaranteed via ManagedProcess::drop on panic)
     let _ = child.shutdown_gracefully();
 }
+
+// ============================================================================
+// 8. Gemini CLI setup writes millisecond timeouts (10000ms) and upgrades legacy 10s configs
+// ============================================================================
+
+#[test]
+fn setup_gemini_writes_millisecond_timeouts_and_upgrades_legacy_seconds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let fake_bin = "/opt/hyphae/bin/hyp";
+    let settings_path = home.join(".gemini/settings.json");
+
+    let assert_all_gemini_hooks_10000ms = |settings: &Value, expected_groups_per_event: usize| {
+        for (event, hook_name, subcmd) in [
+            ("BeforeAgent", "hyphae-before-agent", "before-agent"),
+            ("BeforeTool", "hyphae-before-tool", "pre-tool-use"),
+            ("AfterTool", "hyphae-after-tool", "post-tool-use"),
+            ("AfterAgent", "hyphae-after-agent", "stop"),
+        ] {
+            let groups = settings["hooks"][event]
+                .as_array()
+                .unwrap_or_else(|| panic!("missing hooks.{event} array: {settings}"));
+            assert_eq!(
+                groups.len(),
+                expected_groups_per_event,
+                "unexpected group count for hooks.{event}: {groups:?}"
+            );
+            let hyphae_groups: Vec<&Value> = groups
+                .iter()
+                .filter(|g| {
+                    g["hooks"]
+                        .as_array()
+                        .is_some_and(|hs| hs.iter().any(|h| h["name"] == hook_name))
+                })
+                .collect();
+            assert_eq!(
+                hyphae_groups.len(),
+                1,
+                "expected exactly one {hook_name} group in hooks.{event}: {groups:?}"
+            );
+            let hook = &hyphae_groups[0]["hooks"][0];
+            assert_eq!(hook["type"], "command");
+            assert_eq!(
+                hook["command"],
+                format!("{fake_bin} hook gemini {subcmd}"),
+                "unexpected command for hooks.{event}"
+            );
+            assert_eq!(
+                hook["timeout"], 10000,
+                "Gemini CLI interprets hook timeout in milliseconds; hooks.{event} must be 10000ms"
+            );
+        }
+    };
+
+    // 1. Fresh `hyp setup --harness gemini` writes 10000ms on all 4 hooks.
+    let fresh = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "gemini",
+            "--bin",
+            fake_bin,
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        fresh.status.code(),
+        Some(0),
+        "fresh gemini setup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&fresh.stdout),
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    let fresh_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(fresh_settings["tools"]["enableHooks"], true);
+    assert_all_gemini_hooks_10000ms(&fresh_settings, 1);
+
+    // 2. Legacy `~/.gemini/settings.json` with `"timeout": 10` (seconds bug) + unrelated user hooks & MCP server.
+    let legacy_settings = json!({
+        "theme": "ocean",
+        "mcpServers": {
+            "custom-gemini": { "command": "/usr/local/bin/my-mcp", "args": ["--stdio"] },
+            "hyphae": { "command": "/old/bin/hyp", "args": ["mcp"] }
+        },
+        "tools": { "enableHooks": true },
+        "hooks": {
+            "BeforeAgent": [
+                {
+                    "matcher": "*",
+                    "hooks": [{
+                        "name": "user-before-agent",
+                        "type": "command",
+                        "command": "/usr/local/bin/user-before-agent",
+                        "timeout": 5000
+                    }]
+                },
+                {
+                    "matcher": "*",
+                    "hooks": [{
+                        "name": "hyphae-before-agent",
+                        "type": "command",
+                        "command": "/old/bin/hyp hook gemini before-agent",
+                        "timeout": 10
+                    }]
+                }
+            ],
+            "BeforeTool": [
+                {
+                    "matcher": ".*",
+                    "hooks": [{
+                        "name": "user-guard",
+                        "type": "command",
+                        "command": "/usr/local/bin/user-guard",
+                        "timeout": 3000
+                    }]
+                },
+                {
+                    "matcher": ".*hyp_.*",
+                    "hooks": [{
+                        "name": "hyphae-before-tool",
+                        "type": "command",
+                        "command": "/old/bin/hyp hook gemini pre-tool-use",
+                        "timeout": 10
+                    }]
+                }
+            ],
+            "AfterTool": [
+                {
+                    "matcher": ".*",
+                    "hooks": [{
+                        "name": "user-after-tool",
+                        "type": "command",
+                        "command": "/usr/local/bin/user-after-tool",
+                        "timeout": 4000
+                    }]
+                },
+                {
+                    "matcher": ".*",
+                    "hooks": [{
+                        "name": "hyphae-after-tool",
+                        "type": "command",
+                        "command": "/old/bin/hyp hook gemini post-tool-use",
+                        "timeout": 10
+                    }]
+                }
+            ],
+            "AfterAgent": [
+                {
+                    "matcher": "*",
+                    "hooks": [{
+                        "name": "user-after-agent",
+                        "type": "command",
+                        "command": "/usr/local/bin/user-after-agent",
+                        "timeout": 6000
+                    }]
+                },
+                {
+                    "matcher": "*",
+                    "hooks": [{
+                        "name": "hyphae-after-agent",
+                        "type": "command",
+                        "command": "/old/bin/hyp hook gemini stop",
+                        "timeout": 10
+                    }]
+                }
+            ]
+        }
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&legacy_settings).unwrap(),
+    )
+    .unwrap();
+
+    let upgraded = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "gemini",
+            "--bin",
+            fake_bin,
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(upgraded.status.code(), Some(0));
+    let upgraded_raw = fs::read_to_string(&settings_path).unwrap();
+    let upgraded_settings: Value = serde_json::from_str(&upgraded_raw).unwrap();
+
+    // All 4 legacy timeout:10 Hyphae hooks upgraded cleanly to 10000ms with zero duplication!
+    assert_all_gemini_hooks_10000ms(&upgraded_settings, 2);
+
+    // Unrelated user hooks, settings, and MCP servers preserved untouched!
+    assert_eq!(upgraded_settings["theme"], "ocean");
+    assert_eq!(
+        upgraded_settings["mcpServers"]["custom-gemini"]["command"],
+        "/usr/local/bin/my-mcp"
+    );
+    assert_eq!(
+        upgraded_settings["hooks"]["BeforeAgent"][0]["hooks"][0]["name"],
+        "user-before-agent"
+    );
+    assert_eq!(
+        upgraded_settings["hooks"]["BeforeAgent"][0]["hooks"][0]["timeout"],
+        5000
+    );
+    assert_eq!(
+        upgraded_settings["hooks"]["BeforeTool"][0]["hooks"][0]["name"],
+        "user-guard"
+    );
+    assert_eq!(
+        upgraded_settings["hooks"]["BeforeTool"][0]["hooks"][0]["timeout"],
+        3000
+    );
+    assert_eq!(
+        upgraded_settings["hooks"]["AfterTool"][0]["hooks"][0]["name"],
+        "user-after-tool"
+    );
+    assert_eq!(
+        upgraded_settings["hooks"]["AfterTool"][0]["hooks"][0]["timeout"],
+        4000
+    );
+    assert_eq!(
+        upgraded_settings["hooks"]["AfterAgent"][0]["hooks"][0]["name"],
+        "user-after-agent"
+    );
+    assert_eq!(
+        upgraded_settings["hooks"]["AfterAgent"][0]["hooks"][0]["timeout"],
+        6000
+    );
+
+    // 3. Re-running again is strictly byte-for-byte idempotent.
+    let rerun = isolated_cmd(&home)
+        .args([
+            "setup",
+            "--harness",
+            "gemini",
+            "--bin",
+            fake_bin,
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(rerun.status.code(), Some(0));
+    assert_eq!(fs::read_to_string(&settings_path).unwrap(), upgraded_raw);
+}

@@ -3828,7 +3828,7 @@ fn setup_gemini(
                     "name": "hyphae-before-agent",
                     "type": "command",
                     "command": hook_command(bin, "gemini", "before-agent", socket),
-                    "timeout": 10
+                    "timeout": 10000
                 }]
             }),
         ),
@@ -3843,7 +3843,7 @@ fn setup_gemini(
                     "name": "hyphae-before-tool",
                     "type": "command",
                     "command": hook_command(bin, "gemini", "pre-tool-use", socket),
-                    "timeout": 10
+                    "timeout": 10000
                 }]
             }),
         ),
@@ -3858,7 +3858,7 @@ fn setup_gemini(
                     "name": "hyphae-after-tool",
                     "type": "command",
                     "command": hook_command(bin, "gemini", "post-tool-use", socket),
-                    "timeout": 10
+                    "timeout": 10000
                 }]
             }),
         ),
@@ -3873,7 +3873,7 @@ fn setup_gemini(
                     "name": "hyphae-after-agent",
                     "type": "command",
                     "command": hook_command(bin, "gemini", "stop", socket),
-                    "timeout": 10
+                    "timeout": 10000
                 }]
             }),
         ),
