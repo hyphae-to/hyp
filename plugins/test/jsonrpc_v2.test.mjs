@@ -155,7 +155,7 @@ for (const runtime of ["node", "python"]) {
 const {MeshPluginClient} = await import(process.env.SDK_URL);
 const mesh = new MeshPluginClient({handleFatalErrors:false,onError:()=>{}});
 try {await mesh.ready;await mesh.send("ops",{...${JSON.stringify(event)},data:{body:process.env.MODE==="outbound-limit"?"x".repeat(70000):"ok"}},{timeoutMs:25});process.exitCode=2;}
-catch {console.log("rejected");}finally{mesh.close();}
+catch (error) {console.log(process.env.MODE === "outbound-limit" ? "rejected:"+error.code : "rejected");}finally{mesh.close();}
 ` : `
 import os,sys
 sys.path.insert(0,os.environ["SDK_DIR"])
@@ -164,7 +164,7 @@ try:
     client = MeshPluginClient()
     client.send("ops",{"specversion":"1.0","id":"pending","source":"test","type":"test","data":{"body":"x"*70000 if os.environ["MODE"]=="outbound-limit" else "ok"}},retry_unavailable=False,timeout=0.025)
     sys.exit(2)
-except Exception:print("rejected",flush=True)
+except Exception as error:print("rejected:"+str(getattr(error,"code",None)) if os.environ["MODE"]=="outbound-limit" else "rejected",flush=True)
 finally:
     if "client" in locals():client.close()
 `;
@@ -181,7 +181,7 @@ finally:
       const exit = await new Promise((resolve, reject) => {child.once("exit", resolve);child.once("error", reject);});
       assert.equal(exit, 0, stderr);
       assert.deepEqual(errors, []);
-      assert.equal(stdout.trim(), "rejected");
+      assert.equal(stdout.trim(), mode === "outbound-limit" ? "rejected:-32001" : "rejected");
       assert.equal(published, ["v1-hello", "outbound-limit"].includes(mode) ? 0 : 1);
       assert.equal(stderr.includes(token), false);
     });

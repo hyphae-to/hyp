@@ -222,7 +222,7 @@ export class MeshPluginClient {
   #writeFrame(frame, onError) {
     if (this.#closed) throw new Error("Mesh plugin channel closed");
     const json = JSON.stringify(frame);
-    if (Buffer.byteLength(json, "utf8") > MAX_FRAME_BYTES) throw new Error("Plugin frame exceeds 64 KiB");
+    if (Buffer.byteLength(json, "utf8") > MAX_FRAME_BYTES) throw new PluginRpcError({ code: -32001, message: "Plugin frame exceeds 64 KiB" });
     this.#out.write(json + "\n", (error) => { if (error) onError?.(error); });
   }
 

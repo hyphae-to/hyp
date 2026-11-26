@@ -126,7 +126,7 @@ class MeshPluginClient:
     def _write_frame(self, frame: dict[str, Any]) -> None:
         payload = json.dumps(frame, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if len(payload) > MAX_FRAME_BYTES:
-            raise RuntimeError("Plugin frame exceeds 64 KiB")
+            raise PluginRpcError(-32001, "Plugin frame exceeds 64 KiB")
         if self._dead.is_set():
             raise RuntimeError("Mesh plugin channel closed")
         try:
