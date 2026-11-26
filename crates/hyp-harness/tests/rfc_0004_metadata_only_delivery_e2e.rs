@@ -33,7 +33,7 @@ use hyp_harness::hooks::HookEvent;
 use hyp_harness::mcp::McpOptions;
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::daemon_rpc_async;
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::delivery::inbox_query::UNTRUSTED_INBOX_PROVENANCE;
 use hyp_node::delivery::{DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryRule, DeliveryUrgency};
 use hyp_node::engine::{NodeConfig, UnifiedNode};
@@ -179,8 +179,12 @@ impl PushTransport for DigestCaptureTransport {
         self.supports_int
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        let msg = text.to_string();
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let msg = text.as_str().to_string();
         Box::pin(async move {
             self.delivered.lock().unwrap().push((mode, msg));
             self.notify.notify_waiters();

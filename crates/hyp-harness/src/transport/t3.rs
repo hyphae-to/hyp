@@ -36,7 +36,7 @@ use tokio::time::Instant;
 
 use crate::call_registry::CallerErrorCode;
 use crate::protocol::normalize_mesh_tool_name;
-use crate::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use crate::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 
 /// Default loopback T3 Code server origin.
 pub const DEFAULT_T3_URL: &str = "http://127.0.0.1:3773";
@@ -1638,7 +1638,7 @@ impl T3Transport {
     /// Executes the full T3 orchestration v2 delivery flow (`getThreadProjection` +
     /// `dispatchCommand` `message.dispatch`), returning both the [`PushOutcome`] and
     /// detailed dispatch mode / interrupt metadata.
-    pub async fn deliver_detailed(&self, text: &str, mode: PushMode) -> T3DeliveryDetail {
+    pub async fn deliver_detailed(&self, digest: &InboxDigest, mode: PushMode) -> T3DeliveryDetail {
         let origin =
             match normalize_t3_server_url_with_remote(&self.target.server_url, self.allow_remote) {
                 Ok(o) => o,
@@ -1670,7 +1670,9 @@ impl T3Transport {
             }
         };
 
-        let detail = self.execute_rpc_delivery(&mut client, text, mode).await;
+        let detail = self
+            .execute_rpc_delivery(&mut client, digest.as_str(), mode)
+            .await;
         client.close().await;
         detail
     }
@@ -1895,8 +1897,12 @@ impl PushTransport for T3Transport {
         Value::Object(obj)
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        Box::pin(async move { self.deliver_detailed(text, mode).await.outcome })
+    fn deliver<'a>(
+        &'a self,
+        digest: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        Box::pin(async move { self.deliver_detailed(digest, mode).await.outcome })
     }
 }
 
@@ -2188,7 +2194,7 @@ mod tests {
         let mut remote_target = T3Target::new("thr-1", "https://evil.example.com");
         remote_target.token_override = Some("auth-ok".into());
         let outcome = T3Transport::new(remote_target)
-            .deliver("should never leave loopback", PushMode::Queue)
+            .deliver(&crate::transport::test_digest(), PushMode::Queue)
             .await;
         assert_eq!(outcome, PushOutcome::reject("t3_invalid_server_url"));
     }

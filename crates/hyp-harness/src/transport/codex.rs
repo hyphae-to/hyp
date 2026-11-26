@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use super::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use super::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 
 /// Default Codex CLI command name.
 pub const DEFAULT_CODEX_BIN: &str = "codex";
@@ -169,8 +169,8 @@ impl CodexQueueTransport {
         self.timeout
     }
 
-    async fn deliver_inner(&self, text: &str) -> PushOutcome {
-        let args = match build_codex_queue_args(&self.target, text) {
+    async fn deliver_inner(&self, digest: &InboxDigest) -> PushOutcome {
+        let args = match build_codex_queue_args(&self.target, digest.as_str()) {
             Ok(args) => args,
             Err(outcome) => return outcome,
         };
@@ -273,8 +273,12 @@ impl PushTransport for CodexQueueTransport {
         Value::Object(obj)
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, _mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        Box::pin(self.deliver_inner(text))
+    fn deliver<'a>(
+        &'a self,
+        digest: &'a InboxDigest,
+        _mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        Box::pin(self.deliver_inner(digest))
     }
 }
 

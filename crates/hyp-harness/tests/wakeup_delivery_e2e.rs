@@ -33,7 +33,7 @@ use hyp_harness::hooks::{HandleHookOptions, HookEvent, HookTransportHints, handl
 use hyp_harness::mcp::{McpOptions, run_mcp_io};
 use hyp_harness::protocol::{HarnessKind, UNTRUSTED_PROVENANCE};
 use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_async};
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_node::engine::http_util::{HttpClient, full_body};
 use hyp_node::engine::{
     DROP_CAP_HEADER, DropRelayConfig, LocalIngestServer, NodeConfig, UnifiedNode,
@@ -270,8 +270,12 @@ impl PushTransport for ScriptedPushTransport {
         true
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        let text_owned = text.to_string();
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        let text_owned = text.as_str().to_string();
         Box::pin(async move {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             let outcome = self
@@ -1828,9 +1832,13 @@ impl PushTransport for NudgeRecordingTransport {
         self.supports_interrupt
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
         let nudges = Arc::clone(&self.nudges);
-        let msg = text.to_string();
+        let msg = text.as_str().to_string();
         Box::pin(async move {
             nudges.lock().unwrap().push((mode, msg));
             PushOutcome::delivered()

@@ -4651,7 +4651,7 @@ impl LocalDaemonInner {
                 if tx
                     .send(ChannelDeliverCommand {
                         delivery_id,
-                        text: batch.rendered.clone(),
+                        text: batch.rendered.as_str().to_owned(),
                         ack_tx,
                     })
                     .is_ok()
@@ -4721,7 +4721,7 @@ impl LocalDaemonInner {
                     }
 
                     let batch_id = compute_batch_idempotency_id(session_id, &batch);
-                    let digest_xml = batch.rendered.clone();
+                    let digest_xml = batch.rendered.as_str().to_owned();
                     let delivery_id = self.next_seq();
                     let (ack_tx, ack_rx) = oneshot::channel();
                     let sent = tx
@@ -5017,7 +5017,7 @@ impl LocalDaemonInner {
                     {
                         let spawn_key = format!("herdr-cold:{session_id}:{template}");
                         if self
-                            .try_herdr_cold_spawn(&spawn_key, &template, &batch.rendered)
+                            .try_herdr_cold_spawn(&spawn_key, &template, batch.rendered.as_str())
                             .await
                             .is_delivered()
                         {

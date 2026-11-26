@@ -31,7 +31,7 @@ use hyp_harness::sock::{
     MAX_SOCKET_LINE_BYTES, connect_daemon_async, daemon_rpc_async, read_bounded_line_async,
     write_ndjson_line_async,
 };
-use hyp_harness::transport::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_harness::wait::{WaitMode, WaitOptions, run_wait_to_writer};
 use hyp_node::engine::{NodeConfig, UnifiedNode};
 use hyp_node::gates::{
@@ -3276,12 +3276,16 @@ impl PushTransport for RecordingPushTransport {
         self.interruptible
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
+    fn deliver<'a>(
+        &'a self,
+        text: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
         let outcome = self.next_outcome.lock().unwrap().clone();
         self.delivered
             .lock()
             .unwrap()
-            .push((mode, text.to_string()));
+            .push((mode, text.as_str().to_string()));
         Box::pin(async move { outcome })
     }
 }

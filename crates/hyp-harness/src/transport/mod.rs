@@ -12,6 +12,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+pub use hyp_node::delivery::InboxDigest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -88,7 +89,7 @@ impl PushOutcome {
     }
 }
 
-/// Trait implemented by native external wakeup transports (Herdr, Codex Queue, T3 Code).
+/// Trait implemented by Herdr, Codex Queue, T3 Code, and OpenClaw wakeup transports.
 pub trait PushTransport: Send + Sync {
     /// Stable short transport name (`"herdr"`, `"codex_queue"`, `"t3"`).
     fn kind(&self) -> &'static str;
@@ -114,24 +115,35 @@ pub trait PushTransport: Send + Sync {
         Value::Null
     }
 
-    /// Attempts to deliver `text` to the session bound to this transport.
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome>;
+    /// Attempts to wake the bound session with a metadata-only inbox digest.
+    ///
+    /// Even a string that looks like a digest cannot be sent through this API.
+    /// ```compile_fail
+    /// use hyp_harness::transport::{PushMode, PushTransport};
+    ///
+    /// fn send(transport: &dyn PushTransport) {
+    ///     let _ = transport.deliver("<hyphae-inbox>message body</hyphae-inbox>", PushMode::Queue);
+    /// }
+    /// ```
+    fn deliver<'a>(
+        &'a self,
+        digest: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome>;
 
     /// Delivers a unified RFC 0004 metadata-only `<hyphae-inbox ...>` XML digest with idempotency
-    /// `batch_id`. Defaults to forwarding `digest_xml` to [`Self::deliver`].
+    /// `batch_id`. Defaults to forwarding `digest` to [`Self::deliver`].
     fn deliver_digest<'a>(
         &'a self,
-        digest_xml: &'a str,
+        digest: &'a InboxDigest,
         _batch_id: &'a str,
         mode: PushMode,
     ) -> TransportFuture<'a, PushOutcome> {
-        self.deliver(digest_xml, mode)
+        self.deliver(digest, mode)
     }
 }
 
-/// Returns `true` iff `text` is a daemon-rendered metadata-only `<hyphae-inbox ...>` XML digest.
-pub(crate) fn is_metadata_only_inbox_digest(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.starts_with("<hyphae-inbox")
-        && (trimmed.ends_with("</hyphae-inbox>") || trimmed.ends_with("/>"))
+#[cfg(test)]
+fn test_digest() -> InboxDigest {
+    InboxDigest::count_only(1, hyp_node::delivery::DeliveryUrgency::Queue).unwrap()
 }

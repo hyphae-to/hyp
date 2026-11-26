@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use super::{PushMode, PushOutcome, PushTransport, TransportFuture};
+use super::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 
 /// Default `hc` binary name resolved via `PATH`.
 pub const DEFAULT_HERDR_BIN: &str = "hc";
@@ -185,7 +185,7 @@ impl HerdrTransport {
     async fn deliver_with_runner<R: CommandRunner + ?Sized>(
         &self,
         runner: &R,
-        text: &str,
+        digest: &InboxDigest,
         mode: PushMode,
     ) -> PushOutcome {
         if self.target.bin.is_empty() {
@@ -250,11 +250,16 @@ impl HerdrTransport {
                 "--if",
                 "idle",
                 self.target.terminal_id.as_str(),
-                text,
+                digest.as_str(),
             ];
             runner.run(&self.target.bin, &args, self.send_timeout).await
         } else {
-            let args = ["send", "--json", self.target.terminal_id.as_str(), text];
+            let args = [
+                "send",
+                "--json",
+                self.target.terminal_id.as_str(),
+                digest.as_str(),
+            ];
             runner.run(&self.target.bin, &args, self.send_timeout).await
         };
 
@@ -333,8 +338,12 @@ impl PushTransport for HerdrTransport {
         Value::Object(map)
     }
 
-    fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
-        Box::pin(async move { self.deliver_with_runner(&ProcessRunner, text, mode).await })
+    fn deliver<'a>(
+        &'a self,
+        digest: &'a InboxDigest,
+        mode: PushMode,
+    ) -> TransportFuture<'a, PushOutcome> {
+        Box::pin(async move { self.deliver_with_runner(&ProcessRunner, digest, mode).await })
     }
 }
 
@@ -807,6 +816,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::transport::test_digest;
 
     #[derive(Debug, Default)]
     struct MockRunner {
@@ -1280,8 +1290,9 @@ mod tests {
                             });
 
                             let runner = MockRunner::with_responses(responses);
-                            let actual =
-                                transport.deliver_with_runner(&runner, "hello", mode).await;
+                            let actual = transport
+                                .deliver_with_runner(&runner, &test_digest(), mode)
+                                .await;
                             let expected =
                                 oracle_deliver(Some(Ok(initial)), mode, int_ok, recheck, send_code);
                             assert_eq!(
@@ -1303,10 +1314,20 @@ mod tests {
                                 if expected_state == "idle" {
                                     assert_eq!(
                                         send_args,
-                                        &["send", "--json", "--if", "idle", "t3", "hello"]
+                                        &[
+                                            "send",
+                                            "--json",
+                                            "--if",
+                                            "idle",
+                                            "t3",
+                                            test_digest().as_str()
+                                        ]
                                     );
                                 } else {
-                                    assert_eq!(send_args, &["send", "--json", "t3", "hello"]);
+                                    assert_eq!(
+                                        send_args,
+                                        &["send", "--json", "t3", test_digest().as_str()]
+                                    );
                                 }
                             }
                         }
@@ -1323,7 +1344,7 @@ mod tests {
         let missing = MockRunner::with_responses(vec![CommandOutcome::MissingBinary]);
         assert_eq!(
             transport
-                .deliver_with_runner(&missing, "hi", PushMode::Queue)
+                .deliver_with_runner(&missing, &test_digest(), PushMode::Queue)
                 .await,
             oracle_deliver(None, PushMode::Queue, false, None, None)
         );
@@ -1332,7 +1353,7 @@ mod tests {
         let timeout = MockRunner::with_responses(vec![CommandOutcome::TimedOut]);
         assert_eq!(
             transport
-                .deliver_with_runner(&timeout, "hi", PushMode::Interrupt)
+                .deliver_with_runner(&timeout, &test_digest(), PushMode::Interrupt)
                 .await,
             oracle_deliver(
                 Some(Err("herdr_target_unavailable")),
