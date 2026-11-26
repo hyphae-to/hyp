@@ -240,7 +240,7 @@ for (const fromVersion of [5, 6] as const) {
       const db = new DatabaseSync(dbPath, { readOnly: true });
       try {
         const verRow = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
-        assert.equal(verRow.v, 8, "Schema version must be upgraded to 8");
+        assert.equal(verRow.v, CURRENT_SCHEMA_VERSION, "Storage must reach the current schema");
 
         const sess = db
           .prepare("SELECT id, handle FROM sessions WHERE id = ?")
