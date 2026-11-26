@@ -1,4 +1,4 @@
-//! `hyp gate` (`init`, `propose`, `lock`, `review`, `log`) & `hyp inbox` (`approve`, `reject`).
+//! `hyp gate` (`init`, `propose`, `lock`, `remove`, `review`, `show`, `log`) & `hyp inbox` (`approve`, `reject`).
 //!
 //! Human-CLI-only Local Security Gate management:
 //! - Never writes plaintext API keys (`{ "secret": "<name>" }` / `api_key_secret` references only!).
@@ -66,6 +66,18 @@ pub(crate) fn is_interactive_tty() -> bool {
 /// `U+2066..=U+2069`, `U+200E`, `U+200F`, `U+061C`) from untrusted or config strings before
 /// rendering them on a human interactive terminal.
 pub(crate) fn sanitize_tty_display(input: &str) -> String {
+    sanitize_tty_impl(input, false)
+}
+
+/// Multi-line variant of [`sanitize_tty_display`] for quarantined body review (`--full` / `show`):
+/// strips every ANSI CSI/OSC/DCS/ESC escape sequence (including multi-line OSC/DCS sequences),
+/// bare CR (`\r`), C0/C1 control characters, Unicode LS/PS, and BiDi override/isolate/mark
+/// codepoints, while normalizing `\r\n`/`\n` to `\n` and expanding `\t` to 4 spaces.
+pub(crate) fn sanitize_tty_multiline(input: &str) -> String {
+    sanitize_tty_impl(input, true)
+}
+
+fn sanitize_tty_impl(input: &str, preserve_newlines: bool) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
@@ -131,6 +143,18 @@ pub(crate) fn sanitize_tty_display(input: &str) -> String {
             }
             '\u{009D}' | '\u{0090}' | '\u{0098}' | '\u{009E}' | '\u{009F}' => {
                 consume_st_or_bel(&mut chars);
+            }
+            '\r' if preserve_newlines => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                    out.push('\n');
+                }
+            }
+            '\n' if preserve_newlines => {
+                out.push('\n');
+            }
+            '\t' if preserve_newlines => {
+                out.push_str("    ");
             }
             '\u{0000}'..='\u{001F}'
             | '\u{007F}'..='\u{009F}'
@@ -1447,8 +1471,28 @@ pub enum GateCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Remove a configured Security Gate filter adapter from node.json (interactive TTY confirmation required!)
+    #[command(alias = "rm")]
+    Remove {
+        /// Filter ID to remove (e.g. anthropic-guard, openai-compat-guard)
+        filter_id: String,
+        /// Explicit node.json path
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Explicit state directory for SecretStore and node.json
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Immediately re-sign gate_policy_sig and keep tamper-evident require_signed_policy enabled
+        #[arg(long)]
+        lock: bool,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
     /// List quarantined mailbox items awaiting human CLI disposition (human CLI only!)
     Review {
+        /// Optional quarantined mailbox receipt ID to inspect
+        receipt: Option<String>,
         /// Optional filter by session ID
         #[arg(long)]
         session: Option<String>,
@@ -1458,6 +1502,20 @@ pub enum GateCommand {
         /// Show bounded sanitized body snippets (strictly interactive TTY only; forbidden with --json)
         #[arg(long)]
         show_body: bool,
+        /// Show full un-truncated sanitized body with untrusted-data framing (strictly interactive TTY only; forbidden with --json)
+        #[arg(long)]
+        full: bool,
+        /// Explicit state directory containing node.sqlite
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Output structured JSON envelope (strictly metadata-only; never includes body text)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a single quarantined mailbox item in full (interactive TTY only; --json is strictly metadata-only)
+    Show {
+        /// Quarantined mailbox receipt ID
+        receipt: String,
         /// Explicit state directory containing node.sqlite
         #[arg(long)]
         state_dir: Option<PathBuf>,
@@ -1765,13 +1823,27 @@ pub fn run_gate(command: GateCommand) -> ExitCode {
             state_dir,
             json,
         } => run_gate_lock(config, state_dir, json),
+        GateCommand::Remove {
+            filter_id,
+            config,
+            state_dir,
+            lock,
+            json,
+        } => run_gate_remove(filter_id, config, state_dir, lock, json),
         GateCommand::Review {
+            receipt,
             session,
             limit,
             show_body,
+            full,
             state_dir,
             json,
-        } => run_gate_review(session, limit, show_body, state_dir, json),
+        } => run_gate_review(receipt, session, limit, show_body, full, state_dir, json),
+        GateCommand::Show {
+            receipt,
+            state_dir,
+            json,
+        } => run_gate_show(receipt, state_dir, json),
         GateCommand::Log {
             decision,
             limit,
@@ -2688,35 +2760,607 @@ fn run_gate_lock(config: Option<PathBuf>, state_dir: Option<PathBuf>, as_json: b
     ExitCode::from(EXIT_OK)
 }
 
+fn format_gate_remove_summary(
+    before: &SecurityGateConfig,
+    after: &SecurityGateConfig,
+    removed: &FilterPluginConfig,
+    was_locked: bool,
+    will_lock: bool,
+    config_path: &Path,
+    existing_tampered: Option<&str>,
+) -> Vec<String> {
+    if will_lock {
+        let mut lines =
+            format_gate_lock_summary(Some(before), after, false, config_path, existing_tampered);
+        if was_locked && existing_tampered.is_none() {
+            lines.insert(
+                0,
+                format!(
+                    "WARNING: Security Gate is currently LOCKED. Removing filter '{}' and re-signing will replace the locked policy.",
+                    sanitize_tty_display(&removed.id)
+                ),
+            );
+        }
+        return lines;
+    }
+
+    let snap = FilterSnapshot::from_config(removed);
+    let mut lines = Vec::new();
+    if let Some(tamper_detail) = existing_tampered {
+        lines.push(
+            "========================================================================".to_string(),
+        );
+        lines.push("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE".to_string());
+        lines.push(format!(
+            "  Existing node.json failed gate_policy_sig verification: {}",
+            sanitize_tty_display(tamper_detail)
+        ));
+        lines.push(
+            "  Do NOT modify unless you have personally inspected EVERY field below!".to_string(),
+        );
+        lines.push(
+            "========================================================================".to_string(),
+        );
+    }
+
+    lines.push(format!(
+        "Security Gate Filter Removal (config: {})",
+        sanitize_tty_display(&config_path.display().to_string())
+    ));
+    lines.push(
+        "  Signing:   unlocked (pass --lock to keep tamper-evident gate_policy_sig active)"
+            .to_string(),
+    );
+    lines.push(format!("  Removing:  {} [REMOVED] [WEAKENING]", snap.id));
+    lines.push(format!(
+        "    details: enabled={}, adapter={}, model={}, base_url={}, auth_header={}, secret_name={}, on_error={}, {}, max_input_chars={}",
+        snap.enabled,
+        snap.adapter,
+        snap.model,
+        snap.base_url,
+        snap.auth_header,
+        snap.secret_name,
+        snap.on_error,
+        snap.threshold_summary(),
+        snap.max_input_chars,
+    ));
+    lines.push(format!(
+        "    matchers: {}",
+        format_matchers_display(&snap.matchers)
+    ));
+    let remaining_names: Vec<String> = after
+        .filters
+        .iter()
+        .map(|f| sanitize_tty_display(&f.id))
+        .collect();
+    if remaining_names.is_empty() {
+        lines.push(
+            "  Remaining: 0 filters configured (Stage 1 deterministic defaults only)".to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "  Remaining: {} filter(s) [{}]",
+            remaining_names.len(),
+            remaining_names.join(", ")
+        ));
+    }
+    lines.push("  WARNING — WEAKENING POLICY CHANGES DETECTED:".to_string());
+    lines.push(format!("    ! Filter '{}' removed", snap.id));
+    if was_locked {
+        lines.push(
+            "  WARNING:   Security Gate is currently LOCKED. Removing without --lock will disable tamper protection until re-locked."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+fn run_gate_remove(
+    filter_id: String,
+    config: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    lock: bool,
+    as_json: bool,
+) -> ExitCode {
+    let cmd = "gate remove";
+    let trimmed_id = filter_id.trim();
+    if trimmed_id.is_empty() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_USAGE,
+            "INVALID_FILTER_ID",
+            "Filter ID cannot be empty",
+            None,
+        );
+    }
+
+    // Removing a Security Gate filter ALWAYS weakens inspection coverage and therefore ALWAYS
+    // requires an unskippable interactive human TTY confirmation (zero --yes / --force bypass).
+    if !is_interactive_tty() {
+        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
+    }
+
+    let dir = resolve_state_dir(state_dir.as_deref(), config.as_deref(), None);
+    let config_path = resolve_config_path_for_read(config.as_deref(), state_dir.as_deref(), None);
+    if !config_path.exists() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "CONFIG_NOT_FOUND",
+            format!("Config file not found: {}", config_path.display()),
+            Some("Run `hyp gate init --adapter ...` first.".to_string()),
+        );
+    }
+
+    let mut cfg_map = match read_json_object_or_empty(&config_path) {
+        Ok(m) => m,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
+    };
+
+    let Some(raw_gate_val) = cfg_map.get("gate") else {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "FILTER_NOT_FOUND",
+            format!(
+                "No Security Gate policy configured in {}; filter '{trimmed_id}' not found",
+                config_path.display()
+            ),
+            None,
+        );
+    };
+    if let Err(e) = check_raw_gate_json_signing_secret(raw_gate_val, "node.json") {
+        return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e, None);
+    }
+
+    let existing_gate: SecurityGateConfig = match serde_json::from_value(raw_gate_val.clone()) {
+        Ok(g) => g,
+        Err(e) => {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "INVALID_GATE_CONFIG",
+                format!("Malformed gate config in {}: {e}", config_path.display()),
+                None,
+            );
+        }
+    };
+
+    let was_locked = existing_gate.require_signed_policy
+        || raw_gate_val
+            .get("require_signed_policy")
+            .and_then(Value::as_bool)
+            == Some(true);
+
+    let Some(removed_pos) = existing_gate
+        .filters
+        .iter()
+        .position(|f| f.id == trimmed_id)
+    else {
+        let configured: Vec<&str> = existing_gate
+            .filters
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        let detail = if configured.is_empty() {
+            format!(
+                "Security Gate filter '{trimmed_id}' not found (no filters configured in {})",
+                config_path.display()
+            )
+        } else {
+            format!(
+                "Security Gate filter '{trimmed_id}' not found in {} (configured: {})",
+                config_path.display(),
+                configured.join(", ")
+            )
+        };
+        return emit_error(cmd, as_json, EXIT_ERROR, "FILTER_NOT_FOUND", detail, None);
+    };
+
+    let mut after_gate = existing_gate.clone();
+    let removed_filter = after_gate.filters.remove(removed_pos);
+
+    if let Err(e) = after_gate.validate() {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "INVALID_GATE_CONFIG",
+            e.to_string(),
+            None,
+        );
+    }
+    if lock {
+        if after_gate.stage2.enabled {
+            if let Err(e) = validate_stage2_endpoint_urls(&after_gate.stage2) {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "INVALID_GATE_CONFIG",
+                    e.to_string(),
+                    None,
+                );
+            }
+        }
+        for f in &after_gate.filters {
+            if f.enabled {
+                if let Err(e) = validate_filter_plugin_endpoint_url(f) {
+                    return emit_error(
+                        cmd,
+                        as_json,
+                        EXIT_ERROR,
+                        "INVALID_GATE_CONFIG",
+                        e.to_string(),
+                        None,
+                    );
+                }
+            }
+        }
+    }
+
+    let secrets = open_secret_store(&dir, state_dir.is_some());
+    let existing_tampered = check_existing_gate_tampered(Some(&existing_gate), &dir, &secrets);
+    after_gate.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
+
+    let summary = format_gate_remove_summary(
+        &existing_gate,
+        &after_gate,
+        &removed_filter,
+        was_locked,
+        lock,
+        &config_path,
+        existing_tampered.as_deref(),
+    );
+    let safe_id = sanitize_tty_display(&removed_filter.id);
+    let prompt = if lock {
+        if was_locked {
+            format!("Remove filter '{safe_id}' and re-lock Security Gate policy? [y/N]: ")
+        } else {
+            format!("Remove filter '{safe_id}' and lock/sign Security Gate policy? [y/N]: ")
+        }
+    } else if was_locked {
+        format!(
+            "WARNING: Security Gate is currently LOCKED. Remove filter '{safe_id}' and unlock tamper protection? [y/N]: "
+        )
+    } else {
+        format!("Remove filter '{safe_id}' from Security Gate policy? [y/N]: ")
+    };
+
+    if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
+        return emit_confirm_error(cmd, as_json, err);
+    }
+
+    if lock {
+        if let Err(e) = bind_human_authorities_digest_if_present(&dir, &mut after_gate) {
+            return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
+        }
+        after_gate.require_signed_policy = true;
+        after_gate.policy_signature = None;
+        let sig = match sign_gate_policy(&after_gate, &secrets) {
+            Ok(s) => s,
+            Err(e) => {
+                return emit_error(
+                    cmd,
+                    as_json,
+                    EXIT_ERROR,
+                    "POLICY_SIGN_FAILED",
+                    format!("Failed to sign gate policy: {e}"),
+                    None,
+                );
+            }
+        };
+        if let Err(e) = verify_gate_policy_sig(&after_gate, &sig, &secrets) {
+            return emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "POLICY_VERIFY_FAILED",
+                format!("Self-verification of signed gate policy failed: {e}"),
+                None,
+            );
+        }
+        after_gate.policy_signature = Some(sig);
+    } else {
+        // Clear any stale signature because the policy was modified without `--lock`.
+        after_gate.policy_signature = None;
+        after_gate.require_signed_policy = false;
+    }
+
+    let gate_val = match serde_json::to_value(&after_gate) {
+        Ok(v) => v,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
+    };
+    cfg_map.insert("gate".to_string(), gate_val);
+    if let Err(e) = write_atomic_json(&config_path, &Value::Object(cfg_map), true) {
+        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
+    }
+
+    let mut daemon_reloaded = false;
+    let mut daemon_reload_error: Option<String> = None;
+    let mut warnings: Vec<String> = Vec::new();
+    if lock {
+        let reload_res = try_live_gate_reload(state_dir.is_some(), config.is_some(), &dir);
+        daemon_reloaded = reload_res.ok
+            && reload_res
+                .result
+                .as_ref()
+                .and_then(|r| r.get("reloaded"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        if !daemon_reloaded {
+            if let Some(err) = reload_res.error {
+                warnings.push(format!("Live daemon gate.reload failed: {err}"));
+                daemon_reload_error = Some(err);
+            }
+        }
+    }
+
+    let removed_summary = summarize_filter_plugin(&removed_filter);
+    let remaining_summaries: Vec<GateFilterSummary> = after_gate
+        .filters
+        .iter()
+        .map(summarize_filter_plugin)
+        .collect();
+
+    let mut next = Vec::new();
+    if !lock {
+        next.push(format!(
+            "Lock tamper-evident signature: hyp gate lock --config {} --state-dir {}",
+            config_path.display(),
+            dir.display()
+        ));
+    } else if !daemon_reloaded {
+        next.push("hyp service restart".to_string());
+    }
+    next.push(format!(
+        "hyp doctor --config {} --state-dir {}",
+        config_path.display(),
+        dir.display()
+    ));
+
+    if as_json {
+        let mut data = json!({
+            "configPath": config_path.display().to_string(),
+            "stateDir": dir.display().to_string(),
+            "removedFilter": removed_summary,
+            "remainingFilters": remaining_summaries,
+            "filterCount": after_gate.filters.len(),
+            "locked": lock,
+            "requireSignedPolicy": after_gate.require_signed_policy,
+            "gatePolicySig": if lock { "OK" } else { "UNSIGNED" },
+            "daemonReloaded": daemon_reloaded,
+        });
+        if let Some(ref err) = daemon_reload_error {
+            data["daemonReloadError"] = json!(err);
+        }
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Removed Security Gate filter '{}' ({}) from {}{}",
+                removed_summary.id,
+                removed_summary.adapter_type,
+                config_path.display(),
+                if lock { " [LOCKED]" } else { "" }
+            )),
+            data: Some(data),
+            warnings,
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!(
+            "OK    Removed Security Gate filter '{}' ({}){}",
+            sanitize_tty_display(&removed_summary.id),
+            removed_summary.adapter_type,
+            if lock {
+                " · gate_policy_sig LOCKED"
+            } else {
+                ""
+            }
+        );
+        println!("      Config:    {}", config_path.display());
+        println!("      Remaining: {} filter(s)", after_gate.filters.len());
+        if let Some(ref sec) = removed_summary.api_key_secret {
+            println!(
+                "      Secret:    '{}' left untouched in SecretStore",
+                sanitize_tty_display(sec)
+            );
+        }
+        if lock {
+            if daemon_reloaded {
+                println!(
+                    "      Live daemon reloaded — updated Security Gate policy active immediately (no restart needed)."
+                );
+            } else if let Some(ref err) = daemon_reload_error {
+                println!(
+                    "WARN  Live daemon reload failed ({err}); run `hyp service restart` or `hyp node start` to apply."
+                );
+            } else {
+                println!(
+                    "      Daemon offline — run `hyp service restart` or `hyp node start` to apply."
+                );
+            }
+        }
+        print_next_steps(&next);
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewBodyMode {
+    Hidden,
+    Snippet,
+    Full,
+}
+
+fn quarantined_item_metadata_json(entry: &MailboxEntry, trust_tier: &str) -> Value {
+    // G6/G10: Strictly metadata-only JSON (NO `preview`, NO `text`, NO `body`!).
+    json!({
+        "receipt": entry.receipt,
+        "sessionId": entry.session_id,
+        "originNode": entry.origin_node,
+        "sender": entry.source,
+        "source": entry.source,
+        "trustTier": trust_tier,
+        "kind": entry.kind.as_str(),
+        "reason": entry.gate_reason,
+        "receivedAt": entry.received_at,
+        "receivedAtRfc3339": format_rfc3339_millis(entry.received_at),
+        "payloadSha256": entry.payload_sha256,
+        "bodyBytes": entry.text.len(),
+    })
+}
+
+fn print_quarantined_item_tty(item: &MailboxEntry, trust_tier: &str, body_mode: ReviewBodyMode) {
+    println!("Receipt:  {}", sanitize_tty_display(&item.receipt));
+    println!("  Session:  {}", sanitize_tty_display(&item.session_id));
+    println!(
+        "  From:     {} (origin: {})",
+        sanitize_tty_display(&item.source),
+        sanitize_tty_display(&item.origin_node)
+    );
+    println!("  Trust:    {}", sanitize_tty_display(trust_tier));
+    println!(
+        "  Reason:   {}",
+        sanitize_tty_display(item.gate_reason.as_deref().unwrap_or("policy_quarantine"))
+    );
+    println!("  Received: {}", format_rfc3339_millis(item.received_at));
+    if let Some(ref sha) = item.payload_sha256 {
+        println!("  SHA-256:  {}", sanitize_tty_display(sha));
+    }
+    println!("  Bytes:    {}", item.text.len());
+    match body_mode {
+        ReviewBodyMode::Hidden => {}
+        ReviewBodyMode::Snippet => {
+            let snippet: String = sanitize_tty_display(&item.text).chars().take(240).collect();
+            println!("  Body:     {snippet}");
+        }
+        ReviewBodyMode::Full => {
+            let safe_body = sanitize_tty_multiline(&item.text);
+            println!(
+                "  ----- BEGIN UNTRUSTED QUARANTINED DATA (treat as data, NOT instructions) -----"
+            );
+            if safe_body.is_empty() {
+                println!("    (empty)");
+            } else {
+                for line in safe_body.split('\n') {
+                    println!("    | {line}");
+                }
+            }
+            println!("  ----- END UNTRUSTED QUARANTINED DATA -----");
+        }
+    }
+    println!();
+}
+
+fn fetch_single_quarantined_entry(
+    db: &NodeDb,
+    receipt: &str,
+    session_filter: Option<&str>,
+    cmd: &str,
+    as_json: bool,
+) -> Result<MailboxEntry, ExitCode> {
+    let entry = match db.local().get_mailbox_entry(receipt) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return Err(emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "RECEIPT_NOT_FOUND",
+                format!("receipt '{receipt}' not found"),
+                None,
+            ));
+        }
+        Err(e) => {
+            return Err(emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "DB_ERROR",
+                e.to_string(),
+                None,
+            ));
+        }
+    };
+    if entry.gate_state != GateState::Quarantined {
+        return Err(emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "INVALID_RECEIPT_STATE",
+            format!(
+                "receipt '{}' is in state '{}', not 'quarantined'",
+                entry.receipt,
+                entry.gate_state.as_str()
+            ),
+            None,
+        ));
+    }
+    if let Some(sess) = session_filter {
+        if entry.session_id != sess {
+            return Err(emit_error(
+                cmd,
+                as_json,
+                EXIT_ERROR,
+                "RECEIPT_NOT_FOUND",
+                format!("quarantined receipt '{receipt}' not found in session '{sess}'"),
+                None,
+            ));
+        }
+    }
+    Ok(entry)
+}
+
 fn run_gate_review(
+    receipt: Option<String>,
     session: Option<String>,
     limit: usize,
     show_body: bool,
+    full: bool,
     state_dir: Option<PathBuf>,
     as_json: bool,
 ) -> ExitCode {
     let cmd = "gate review";
 
-    // G6/G10: Quarantined plaintext is NEVER emitted in `--json`, and `--show-body` requires a
-    // real interactive human terminal so agents cannot exfiltrate quarantined prompts via CLI.
-    if show_body {
+    // G6/G10: Quarantined plaintext is NEVER emitted in `--json`, and `--show-body` / `--full`
+    // require a real interactive human terminal so agents cannot exfiltrate quarantined prompts via CLI.
+    if show_body || full {
         if as_json {
-            return emit_error(
-                cmd,
-                true,
-                EXIT_USAGE,
-                "SHOW_BODY_FORBIDDEN_WITH_JSON",
-                "`--show-body` cannot be combined with `--json`; `hyp gate review --json` is strictly metadata-only.",
-                Some(
-                    "Run `hyp gate review --show-body` directly in an interactive human terminal."
-                        .to_string(),
-                ),
-            );
+            let (code, msg, fix) = if full && !show_body {
+                (
+                    "FULL_BODY_FORBIDDEN_WITH_JSON",
+                    "`--full` cannot be combined with `--json`; `hyp gate review --json` is strictly metadata-only.",
+                    "Run `hyp gate review --full` directly in an interactive human terminal.",
+                )
+            } else {
+                (
+                    "SHOW_BODY_FORBIDDEN_WITH_JSON",
+                    "`--show-body` cannot be combined with `--json`; `hyp gate review --json` is strictly metadata-only.",
+                    "Run `hyp gate review --show-body` directly in an interactive human terminal.",
+                )
+            };
+            return emit_error(cmd, true, EXIT_USAGE, code, msg, Some(fix.to_string()));
         }
         if !is_interactive_tty() {
             return emit_confirm_error(cmd, false, ConfirmError::NotInteractiveTty);
         }
     }
+
+    let body_mode = if full {
+        ReviewBodyMode::Full
+    } else if show_body {
+        ReviewBodyMode::Snippet
+    } else {
+        ReviewBodyMode::Hidden
+    };
 
     let dir = resolve_state_dir(state_dir.as_deref(), None, None);
     let db_path = dir.join("node.sqlite");
@@ -2725,9 +3369,18 @@ fn run_gate_review(
         Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
     };
 
-    let items = match db.local().list_quarantined(session.as_deref(), limit) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    let items = if let Some(ref rcpt) = receipt {
+        match fetch_single_quarantined_entry(&db, rcpt, session.as_deref(), cmd, as_json) {
+            Ok(entry) => vec![entry],
+            Err(code) => return code,
+        }
+    } else {
+        match db.local().list_quarantined(session.as_deref(), limit) {
+            Ok(v) => v,
+            Err(e) => {
+                return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None);
+            }
+        }
     };
 
     let trust_tiers: Vec<String> = items
@@ -2735,26 +3388,10 @@ fn run_gate_review(
         .map(|entry| lookup_quarantined_trust_tier(&db, &entry.receipt, &entry.session_id))
         .collect();
 
-    // G6/G10: Strictly metadata-only JSON (NO `preview`, NO `text`, NO `body`!).
     let rows: Vec<Value> = items
         .iter()
         .zip(trust_tiers.iter())
-        .map(|(entry, trust_tier)| {
-            json!({
-                "receipt": entry.receipt,
-                "sessionId": entry.session_id,
-                "originNode": entry.origin_node,
-                "sender": entry.source,
-                "source": entry.source,
-                "trustTier": trust_tier,
-                "kind": entry.kind.as_str(),
-                "reason": entry.gate_reason,
-                "receivedAt": entry.received_at,
-                "receivedAtRfc3339": format_rfc3339_millis(entry.received_at),
-                "payloadSha256": entry.payload_sha256,
-                "bodyBytes": entry.text.len(),
-            })
-        })
+        .map(|(entry, trust_tier)| quarantined_item_metadata_json(entry, trust_tier))
         .collect();
 
     let next: Vec<String> = if let Some(first) = items.first() {
@@ -2798,40 +3435,74 @@ fn run_gate_review(
         } else {
             println!();
             for (item, trust_tier) in items.iter().zip(trust_tiers.iter()) {
-                println!("Receipt:  {}", sanitize_tty_display(&item.receipt));
-                println!("  Session:  {}", sanitize_tty_display(&item.session_id));
-                println!(
-                    "  From:     {} (origin: {})",
-                    sanitize_tty_display(&item.source),
-                    sanitize_tty_display(&item.origin_node)
-                );
-                println!("  Trust:    {}", sanitize_tty_display(trust_tier));
-                println!(
-                    "  Reason:   {}",
-                    sanitize_tty_display(
-                        item.gate_reason.as_deref().unwrap_or("policy_quarantine")
-                    )
-                );
-                println!("  Received: {}", format_rfc3339_millis(item.received_at));
-                if let Some(ref sha) = item.payload_sha256 {
-                    println!("  SHA-256:  {}", sanitize_tty_display(sha));
-                }
-                println!("  Bytes:    {}", item.text.len());
-                if show_body {
-                    let snippet: String =
-                        sanitize_tty_display(&item.text).chars().take(240).collect();
-                    println!("  Body:     {snippet}");
-                }
-                println!();
+                print_quarantined_item_tty(item, trust_tier, body_mode);
             }
-            if !show_body {
+            if body_mode == ReviewBodyMode::Hidden {
                 println!(
-                    "  (Body text hidden by default; pass --show-body in an interactive terminal to inspect sanitized snippets.)"
+                    "  (Body text hidden by default; pass --show-body, --full, or run `hyp gate show <receipt>` in an interactive terminal to inspect sanitized content.)"
                 );
                 println!();
             }
             print_next_steps(&next);
         }
+    }
+    ExitCode::from(EXIT_OK)
+}
+
+fn run_gate_show(receipt: String, state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
+    let cmd = "gate show";
+
+    // G6/G10: Human-only full body inspection requires an interactive terminal.
+    // `--json` is allowed strictly as metadata-only (zero body/text/preview fields!).
+    if !as_json && !is_interactive_tty() {
+        return emit_confirm_error(cmd, false, ConfirmError::NotInteractiveTty);
+    }
+
+    let dir = resolve_state_dir(state_dir.as_deref(), None, None);
+    let db_path = dir.join("node.sqlite");
+    let db = match NodeDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    };
+
+    let entry = match fetch_single_quarantined_entry(&db, &receipt, None, cmd, as_json) {
+        Ok(e) => e,
+        Err(code) => return code,
+    };
+    let trust_tier = lookup_quarantined_trust_tier(&db, &entry.receipt, &entry.session_id);
+    let next = vec![
+        format!(
+            "Approve: hyp inbox approve {} --state-dir {}",
+            sanitize_tty_display(&entry.receipt),
+            dir.display()
+        ),
+        format!(
+            "Reject & mute sender: hyp inbox reject {} --mute --state-dir {}",
+            sanitize_tty_display(&entry.receipt),
+            dir.display()
+        ),
+    ];
+
+    if as_json {
+        let meta = quarantined_item_metadata_json(&entry, &trust_tier);
+        let envelope = JsonEnvelope {
+            ok: true,
+            command: cmd.to_string(),
+            summary: Some(format!(
+                "Quarantined receipt '{}' metadata (body omitted in --json)",
+                entry.receipt
+            )),
+            data: Some(json!({ "item": meta })),
+            warnings: Vec::new(),
+            next,
+            error: None,
+        };
+        print_json(&envelope);
+    } else {
+        println!("Hyphae Quarantine Item");
+        println!();
+        print_quarantined_item_tty(&entry, &trust_tier, ReviewBodyMode::Full);
+        print_next_steps(&next);
     }
     ExitCode::from(EXIT_OK)
 }
@@ -3554,5 +4225,81 @@ mod tests {
             !text.contains('\x1b'),
             "ANSI escape must be stripped: {text}"
         );
+    }
+
+    #[test]
+    fn sanitize_tty_multiline_preserves_lines_while_stripping_ansi_osc_cr_and_bidi() {
+        let hostile = "line1\r\n\x1b[31mred\x1b[0m\tindented\n\x1b]0;multi\nline-osc\x07after\rOVERWRITE\n\u{202E}bidi\u{2066}iso\u{2069}\x00\x07\u{009B}2Jend";
+        let safe = sanitize_tty_multiline(hostile);
+        assert_eq!(safe, "line1\nred    indented\nafterOVERWRITE\nbidiisoend");
+        assert!(!safe.contains('\x1b'));
+        assert!(!safe.contains('\r'));
+        assert!(!safe.contains('\u{202E}'));
+        assert!(!safe.contains('\u{2066}'));
+        assert!(!safe.contains('\u{009B}'));
+        assert!(!safe.contains('\x00'));
+        assert!(!safe.contains('\x07'));
+    }
+
+    #[test]
+    fn format_gate_remove_summary_shows_weakening_locked_and_tamper_warnings() {
+        let f1 =
+            build_filter_plugin_from_args(&base_args(CliGateAdapter::Anthropic, None)).unwrap();
+        let mut f2_args = base_args(CliGateAdapter::OpenAiCompat, None);
+        f2_args.id = Some("local-ollama".to_string());
+        f2_args.base_url = Some("http://127.0.0.1:11434/v1".to_string());
+        let f2 = build_filter_plugin_from_args(&f2_args).unwrap();
+
+        let mut before = SecurityGateConfig::default();
+        before.filters.push(f1.clone());
+        before.filters.push(f2.clone());
+
+        let mut after = SecurityGateConfig::default();
+        after.filters.push(f2);
+
+        // Unlocked removal summary
+        let unlocked_text = format_gate_remove_summary(
+            &before,
+            &after,
+            &f1,
+            false,
+            false,
+            Path::new("/tmp/node.json"),
+            None,
+        )
+        .join("\n");
+        assert!(unlocked_text.contains("anthropic-guard [REMOVED] [WEAKENING]"));
+        assert!(unlocked_text.contains("Remaining: 1 filter(s) [local-ollama]"));
+        assert!(unlocked_text.contains("Filter 'anthropic-guard' removed"));
+        assert!(!unlocked_text.contains("require_signed_policy=true"));
+
+        // Locked removal WITH --lock + tampered banner
+        let locked_text = format_gate_remove_summary(
+            &before,
+            &after,
+            &f1,
+            true,
+            true,
+            Path::new("/tmp/node.json"),
+            Some("signature mismatch"),
+        )
+        .join("\n");
+        assert!(locked_text.contains("WARNING: POLICY TAMPERED SINCE LAST SIGNATURE"));
+        assert!(locked_text.contains("anthropic-guard [REMOVED] [WEAKENING]"));
+        assert!(locked_text.contains("require_signed_policy=true"));
+
+        // Locked removal WITHOUT --lock warns loudly about unlocking
+        let unlock_warn_text = format_gate_remove_summary(
+            &before,
+            &after,
+            &f1,
+            true,
+            false,
+            Path::new("/tmp/node.json"),
+            None,
+        )
+        .join("\n");
+        assert!(unlock_warn_text.contains("Security Gate is currently LOCKED"));
+        assert!(unlock_warn_text.contains("disable tamper protection until re-locked"));
     }
 }

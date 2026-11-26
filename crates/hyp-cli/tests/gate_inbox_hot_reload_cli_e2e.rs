@@ -146,6 +146,37 @@ fn cli_gate_lock_and_inbox_approve_live_hot_reload_without_restart() {
     assert_eq!(relock_out.code, 0, "tty={}", relock_out.tty);
     assert_eq!(relock_out.parse_json()["data"]["daemonReloaded"], true);
 
+    // 5b. `hyp gate remove hot-ollama --lock --json` removes the filter, keeps policy locked,
+    //     and hot-reloads the live daemon without restart!
+    let rem_out = run_hyp_in_pty(
+        &home,
+        &[
+            "gate",
+            "remove",
+            "hot-ollama",
+            "--lock",
+            "--state-dir",
+            state_str,
+            "--json",
+        ],
+        None,
+        Some("y\n"),
+    );
+    assert_eq!(
+        rem_out.code, 0,
+        "stdout={} tty={}",
+        rem_out.stdout, rem_out.tty
+    );
+    let rem_json = rem_out.parse_json();
+    assert_eq!(rem_json["ok"], true);
+    assert_eq!(rem_json["data"]["removedFilter"]["id"], "hot-ollama");
+    assert_eq!(rem_json["data"]["filterCount"], 0);
+    assert_eq!(rem_json["data"]["gatePolicySig"], "OK");
+    assert_eq!(
+        rem_json["data"]["daemonReloaded"], true,
+        "live daemon must hot-reload after `hyp gate remove --lock`: {rem_json}"
+    );
+
     // 6. Register session + seed 2 quarantined items in `node.sqlite`, then start live `hyp wait`!
     let (r_approve, r_reject) = {
         let db = NodeDb::open(state_dir.join("node.sqlite")).unwrap();
