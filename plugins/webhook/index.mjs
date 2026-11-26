@@ -17,7 +17,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { MeshPluginClient } from "../sdk/client.mjs";
+import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
 
 const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 
@@ -178,13 +178,10 @@ const server = createServer(async (req, res) => {
   };
   try {
     const reply = await mesh.send(target, event);
-    if (reply.type === "ack") {
-      res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ status: reply.status, id }));
-    } else {
-      res.writeHead(reply.error === "unavailable" ? 503 : 400, { "content-type": "application/json" }).end(JSON.stringify(reply));
-    }
+    res.writeHead(202, { "content-type": "application/json" }).end(JSON.stringify({ status: reply.status, id }));
   } catch (error) {
-    res.writeHead(503, { "content-type": "application/json" }).end(JSON.stringify({ error: String(error) }));
+    const status = error instanceof PluginRpcError && error.code !== RPC_UNAVAILABLE ? 400 : 503;
+    res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify({ error: error.message, ...(error instanceof PluginRpcError ? { code: error.code } : {}) }));
   }
 });
 

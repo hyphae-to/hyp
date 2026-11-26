@@ -1,6 +1,6 @@
 //! Unified `NodeAdapter` trait, cross-platform fd-3/loopback-TCP `SubprocessSupervisor`,
 //! native in-process webhook source adapters, and the demand-driven `github-public`
-//! ETag poller + GitHub App push adapter powering `public.hyphae.to` and `local.github-public`.
+//! ETag poller powering `public.hyphae.to` and `local.github-public`.
 
 pub mod github_public;
 pub mod supervisor;
@@ -11,8 +11,7 @@ pub use github_public::{
     GitHubPublicAdapter, GitHubPublicConfig, GitHubPublicStats, normalize_github_api_event,
 };
 pub use supervisor::{
-    HelloMode, PluginTransportMode, SubprocessConfig, SubprocessSupervisor, WireProtocol,
-    build_isolated_env,
+    PluginTransportMode, SubprocessConfig, SubprocessSupervisor, build_isolated_env,
 };
 pub use trait_def::{
     AdapterError, AdapterHealth, AdapterKind, BoxFuture, CompiledSubscription, NodeAdapter,

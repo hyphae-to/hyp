@@ -71,7 +71,7 @@ function spawnFd3Script(code, { plugin = "test-plugin", targets = ["ops"], env =
   });
   channel.on("error", () => {});
   if (sendHello) {
-    channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin, targets }) + "\n");
+    channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin, targets } }) + "\n");
   }
   cleanups.push(
     () =>
@@ -133,11 +133,11 @@ async function startPrometheusPlugin(env, { targets = ["alerts"] } = {}) {
   createInterface({ input: channel }).on("line", (line) => {
     if (!line.trim()) return;
     const msg = JSON.parse(line);
-    if (msg.type !== "event") return;
-    events.push({ to: msg.to, event: msg.event });
-    channel.write(JSON.stringify({ type: "ack", status: "stored", id: msg.event.id }) + "\n");
+    if (msg.method !== "hyphae/publish") return;
+    events.push({ to: msg.params.to, event: msg.params.event });
+    channel.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { status: "stored" } }) + "\n");
   });
-  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: "prometheus", targets }) + "\n");
+  channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: "prometheus", targets } }) + "\n");
 
   const stop = () =>
     new Promise((resolve) => {
@@ -271,7 +271,7 @@ test("Issue #40: real prometheus plugin with mismatched PROMETHEUS_TOPIC exits n
     });
   });
   channel.on("error", () => {});
-  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: "prometheus", targets: ["alerts"] }) + "\n");
+  channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: "prometheus", targets: ["alerts"] } }) + "\n");
   cleanups.push(
     () =>
       new Promise((resolve) => {
@@ -321,7 +321,7 @@ test("Issue #40: real telegram plugin with mismatched TELEGRAM_TARGET exits non-
     });
   });
   channel.on("error", () => {});
-  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: "telegram", targets: ["ops"] }) + "\n");
+  channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: "telegram", targets: ["ops"] } }) + "\n");
   cleanups.push(
     () =>
       new Promise((resolve) => {
@@ -368,7 +368,7 @@ test("Issue #40: LoopbackTcp fatal error redacts HYPHAE_PLUGIN_TOKEN from stderr
   const server = net.createServer((socket) => {
     const rl = createInterface({ input: socket });
     rl.once("line", () => {
-      socket.write(JSON.stringify({ type: "hello", protocol: 1, plugin: "tcp-demo", targets: ["ops"] }) + "\n");
+      socket.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: "tcp-demo", targets: ["ops"] } }) + "\n");
     });
     socket.on("error", () => {});
   });
@@ -866,8 +866,8 @@ test("Issue #29: MeshPluginClient safely ignores system.wake when no onWake hand
   createInterface({ input: proc.channel }).on("line", (line) => {
     if (!line.trim()) return;
     const msg = JSON.parse(line);
-    if (msg.type === "event") {
-      proc.channel.write(JSON.stringify({ type: "ack", id: msg.event.id, status: "stored" }) + "\n");
+    if (msg.method === "hyphae/publish") {
+      proc.channel.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { status: "stored" } }) + "\n");
     }
   });
 
@@ -959,12 +959,12 @@ test("Issue #29: telegram plugin aborts stalled getUpdates long-poll immediately
   createInterface({ input: channel }).on("line", (line) => {
     if (!line.trim()) return;
     const msg = JSON.parse(line);
-    if (msg.type === "event") {
-      events.push(msg.event);
-      channel.write(JSON.stringify({ type: "ack", id: msg.event.id, status: "stored" }) + "\n");
+    if (msg.method === "hyphae/publish") {
+      events.push(msg.params.event);
+      channel.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { status: "stored" } }) + "\n");
     }
   });
-  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: "telegram", targets: ["ops"] }) + "\n");
+  channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: "telegram", targets: ["ops"] } }) + "\n");
   cleanups.push(
     () =>
       new Promise((resolve) => {
@@ -1105,12 +1105,12 @@ test("Issue #29: slack plugin aborts stalled Socket Mode WebSocket immediately o
   createInterface({ input: channel }).on("line", (line) => {
     if (!line.trim()) return;
     const msg = JSON.parse(line);
-    if (msg.type === "event") {
-      events.push(msg.event);
-      channel.write(JSON.stringify({ type: "ack", id: msg.event.id, status: "stored" }) + "\n");
+    if (msg.method === "hyphae/publish") {
+      events.push(msg.params.event);
+      channel.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { status: "stored" } }) + "\n");
     }
   });
-  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: "slack", targets: ["ops"] }) + "\n");
+  channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: "slack", targets: ["ops"] } }) + "\n");
   cleanups.push(
     () =>
       new Promise((resolve) => {

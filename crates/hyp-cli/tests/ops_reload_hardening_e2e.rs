@@ -23,9 +23,8 @@ use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
 use hyp_crypto::transfer::{TarInputEntry, TarPackOptions, pack_tar_gz};
 #[cfg(unix)]
 use hyp_node::adapters::{
-    AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, HelloMode,
-    NodeAdapter, NodeAdapterHost, PublishOutcome, PublishStatus, SubprocessConfig,
-    SubprocessSupervisor,
+    AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, NodeAdapter,
+    NodeAdapterHost, PublishOutcome, PublishStatus, SubprocessConfig, SubprocessSupervisor,
 };
 #[cfg(unix)]
 use hyp_node::engine::{NodeConfig, NodeProfile, UnifiedNode};
@@ -626,7 +625,7 @@ fn r3_supervisor_invokes_fresh_env_resolver_on_respawn_and_redacts_rotated_secre
             vec![script_path.display().to_string()],
             vec!["ops".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.initial_backoff = Duration::from_millis(80);
         cfg.max_backoff = Duration::from_millis(120);
         cfg.max_rapid_crashes = 0;

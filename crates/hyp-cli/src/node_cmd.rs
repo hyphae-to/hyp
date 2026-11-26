@@ -25,8 +25,8 @@ use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 use hyp_node::adapters::supervisor::is_secret_like_env_key;
 use hyp_node::adapters::{
     AdapterKind, GenericWebhookAdapter, GenericWebhookConfig, GitHubPublicAdapter,
-    GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, HelloMode,
-    PrometheusWebhookAdapter, PrometheusWebhookConfig, SubprocessConfig,
+    GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, PrometheusWebhookAdapter,
+    PrometheusWebhookConfig, SubprocessConfig,
 };
 use hyp_node::engine::config::{ForwardingPolicy, validate_trusted_proxy_cidr};
 use hyp_node::engine::{
@@ -2482,26 +2482,6 @@ fn parse_github_public_source(
             }
         }
 
-        if let Some(app_sec_val) = obj.get("appWebhookSecret") {
-            if let Some(secret_name) =
-                parse_secret_ref_name(app_sec_val, "sources[].appWebhookSecret")?
-            {
-                match secrets.get(&secret_name) {
-                    Ok(secret) => cfg.app_webhook_secret = Some(secret),
-                    Err(CryptoError::SecretNotFound(_)) => {
-                        warnings.push(format!(
-                            "Secret '{secret_name}' is not set; POST /v1/webhooks/github-app disabled until `hyp secret set {secret_name}` is configured."
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "failed to load GitHub App webhook secret '{secret_name}': {e}"
-                        ));
-                    }
-                }
-            }
-        }
-
         active_cfg = Some(cfg);
     }
 
@@ -3187,7 +3167,7 @@ fn parse_plugins_config(
                 Ok(resolved)
             }));
         }
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.stderr_log_path = Some(state_dir.join("logs").join(format!("plugin-{id}.log")));
         cfg.redacted_values = redacted_values;
         configs.push(ParsedPlugin {
