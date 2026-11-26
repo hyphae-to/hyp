@@ -360,7 +360,12 @@ async fn wake_recovery_flushes_interrupted_active_and_held_idle_without_spamming
             && !combined_a.contains("Host woke"),
         "Session A must receive a metadata-only digest counting its DM + wake notice: {combined_a:?}"
     );
-    let unread_a = unread_texts(&node, sid_a);
+    let mut inbox = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+    inbox.initialize().await;
+    let (unread_a, is_error) = inbox
+        .call_verified_claude(&sock, "wake-a", "hyp_inbox", json!({ "ack": false }))
+        .await;
+    assert!(!is_error, "wake notice inbox read failed: {unread_a}");
     assert!(
         unread_a.contains("queued-dm-for-session-a")
             && unread_a.contains(
@@ -368,6 +373,8 @@ async fn wake_recovery_flushes_interrupted_active_and_held_idle_without_spamming
             ),
         "Session A must hold its queued DM + concise wake notice unread: {unread_a:?}"
     );
+
+    inbox.close().await;
 
     // 2. Session C: transient `hold_retries` cleared -> pending DM flushed immediately!
     let got_c = transport_c.snapshot();

@@ -39,13 +39,14 @@ A digest sent while a turn is active is the same digest the wake nudge would hav
 
 - `urgency` is the highest tier among the counted items.
 - DMs, channels and bridges are grouped by source; stream events by subscription key (falling back to topic when the subscription has no key).
+- Daemon wake notices appear as `<system from="hyphae:system" count="N"/>`. Read the notice text with `hyp_inbox`.
 - Attribute values are node-generated identifiers. Sender display names, subjects and bodies never appear.
 - `human-verified` items get `verified="true"` on their element so an agent can prioritise them without reading them.
 
 ## Reading
 
 - `hyp_inbox` is the only way content reaches an agent. It already supports filters, limits, summaries and ack.
-- Every returned item states its trust tier, so untrusted content is labelled at the moment it is read.
+- Each returned item states its `trustTier` and flags untrusted payloads with `untrusted: true`. The tool description and skills carry the external-data warning once.
 - Target: a filtered `hyp_inbox` read returns in well under 100 ms locally, since every message now costs one call.
 
 ## Security Gate changes
@@ -74,3 +75,6 @@ A digest sent while a turn is active is the same digest the wake nudge would hav
 2. ~~Does a digest list every subscription, or only those with unread items?~~ **Decided 2026-11-26 (Bogdan): only subscriptions and sources with unread items are listed.**
 3. ~~Should reading with `hyp_inbox` ack by default?~~ **Decided 2026-11-26 (Bogdan): yes. Reading acknowledges by default; passing `ack: false` peeks without acknowledging.**
 4. **Long-turn mid-turn `queue` digest reminder (Decided 2026-11-26, Bogdan):** During long active turns where `Stop` has not fired yet, inject a periodic `<hyphae-inbox>` digest on `PostToolUse` when unread `queue` items are waiting, gated by a tuneable interval (default **30 minutes** since the oldest un-reminded `queue` item arrived / last mid-turn reminder; configurable per node via `delivery.midturnQueueDigestSeconds` in `node.json`, `0` to disable). Items stay `unread` until read via `hyp_inbox` and never re-inject between intervals.
+
+5. **Daemon wake notices (#88, decided 2026-11-26 by Bogdan):** Keep daemon wake notices count-only. Use `hyp_inbox` to read the text.
+6. **Inbox trust fields (#89, decided 2026-11-26 by Bogdan):** Keep `trustTier` and `untrusted`. Put the warning in the tool description and skills instead of repeating it on every item.

@@ -28,7 +28,6 @@ import { extractSessionsFromInspect } from "../lib/harnesses/types.ts";
 import { HypCli } from "../lib/hyp-cli.ts";
 import {
   LlmShimServer,
-  UNTRUSTED_PROVENANCE_HEADER,
   callTool,
   createGate,
   emitText,
@@ -183,7 +182,9 @@ test("Real Codex CLI: hyp setup, rollout JSONL verification, codex exec no auto-
           assert: (req) => {
             const inboxJson = req.lastToolResult("hyp_inbox")?.json;
             assert.equal(inboxJson?.acked, 1, "hyp_inbox must ack by default");
-            assert.equal(inboxJson?.items?.[0]?.provenance, UNTRUSTED_PROVENANCE_HEADER);
+            assert.equal(inboxJson?.items?.[0]?.untrusted, true);
+            assert.equal(typeof inboxJson?.items?.[0]?.trustTier, "string");
+            assert.equal(inboxJson?.items?.[0]?.provenance, undefined);
           },
           do: () => emitText("CODEX_END_TURN_TO_TRIGGER_STOP"),
         },

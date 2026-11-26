@@ -5,7 +5,7 @@
 //!   DM, `#channel`, bridge, stream with/without subscription key, muted, quarantined) — with ZERO
 //!   untrusted body text, display names, subjects, or previews EVER emitted outside `hyp_inbox`.
 //! - Decision #3: `hyp_inbox` acknowledges unread items by default (`ack: true`), supports
-//!   `ack: false` peek, stamps structured `trustTier` / `humanVerified` / `untrusted` / `provenance`,
+//!   `ack: false` peek, stamps structured `trustTier` / `humanVerified` / `untrusted`,
 //!   and preserves Focus Mode VIP isolation (#32).
 //! - Decision #4: Tuneable long-turn `PostToolUse` `Queue` reminder (`midturn_queue_digest_seconds`,
 //!   default 1800s, `0` = disabled, node-level only, `max(last_midturn_digest_at_ms,
@@ -34,7 +34,6 @@ use hyp_harness::mcp::McpOptions;
 use hyp_harness::protocol::HarnessKind;
 use hyp_harness::sock::daemon_rpc_async;
 use hyp_harness::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
-use hyp_node::delivery::inbox_query::UNTRUSTED_INBOX_PROVENANCE;
 use hyp_node::delivery::{DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryRule, DeliveryUrgency};
 use hyp_node::engine::{NodeConfig, UnifiedNode};
 use hyp_node::gates::{
@@ -745,7 +744,7 @@ async fn rfc0004_decision3_hyp_inbox_acks_by_default_peek_provenance_and_focus_v
         .expect("peer item");
     assert_eq!(peer_item["trustTier"], "peer");
     assert_eq!(peer_item["untrusted"], true);
-    assert_eq!(peer_item["provenance"], UNTRUSTED_INBOX_PROVENANCE);
+    assert!(items.iter().all(|item| item.get("provenance").is_none()));
 
     // 3. Focus Mode VIP isolation (#32) with default `ack: true`:
     //    Enable Focus Mode with VIP interrupt rule; send buffered non-VIP + VIP; unfiltered
@@ -1525,12 +1524,11 @@ async fn digest_and_inbox_require_stored_daemon_notice_provenance() {
     ] {
         let item = items.iter().find(|item| item["itemId"] == item_id).unwrap();
         assert_eq!(item["trustTier"], tier, "{item}");
+        assert!(item.get("provenance").is_none(), "{item}");
         if tier == "self" {
             assert!(item.get("untrusted").is_none(), "{item}");
-            assert!(item.get("provenance").is_none(), "{item}");
         } else {
             assert_eq!(item["untrusted"], true, "{item}");
-            assert_eq!(item["provenance"], UNTRUSTED_INBOX_PROVENANCE, "{item}");
         }
     }
 }

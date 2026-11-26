@@ -10,7 +10,7 @@
  *     (plus compact 4-tool MCP schema audit).
  *  2. Deterministic tool-boundary latch (`pauseUntil(gate)`) proving:
  *     - `PostToolUse` HOLDS `queue` DMs mid-turn (never leaks mid-turn!)
- *     - `PostToolUse` IMMEDIATELY injects `interrupt` DMs mid-turn with untrusted provenance framing!
+ *     - `PostToolUse` IMMEDIATELY injects an `interrupt` digest mid-turn.
  *     - `Stop` hook flushes the held `queue` DM cleanly on TurnEnd with ZERO duplicates!
  *  3. Multi-session isolation (`claude` Session A vs Session B sharing one `hyp daemon`,
  *     strict per-session routing and zero cross-session bleed).
@@ -25,7 +25,6 @@ import { HypCli } from "../lib/hyp-cli.ts";
 import { ClaudeHarness, resolveClaudeBin } from "../lib/harnesses/claude.ts";
 import {
   LlmShimServer,
-  UNTRUSTED_PROVENANCE_HEADER,
   callTool,
   createGate,
   emitText,
@@ -183,7 +182,8 @@ test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil
           const inboxJson = req.lastToolResult("hyp_inbox")?.json;
           assert.equal(inboxJson?.acked, 1, "hyp_inbox must ack by default (RFC 0004 Decision #3)");
           assert.equal(inboxJson?.items?.[0]?.untrusted, true);
-          assert.equal(inboxJson?.items?.[0]?.provenance, UNTRUSTED_PROVENANCE_HEADER);
+          assert.equal(typeof inboxJson?.items?.[0]?.trustTier, "string");
+          assert.equal(inboxJson?.items?.[0]?.provenance, undefined);
         },
         do: () => emitText("MID_TURN_DONE_TRIGGERING_STOP"),
       },

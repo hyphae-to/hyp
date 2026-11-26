@@ -29,7 +29,6 @@ import {
 } from "../lib/harnesses/replay-cursor-agy.ts";
 import { extractSessionsFromInspect } from "../lib/harnesses/types.ts";
 import { HypCli } from "../lib/hyp-cli.ts";
-import { UNTRUSTED_PROVENANCE_HEADER } from "../lib/llm-shim/index.ts";
 import { waitUntil } from "../lib/mocks/helpers.ts";
 import { withSandbox } from "../lib/sandbox.ts";
 
@@ -128,7 +127,7 @@ test("IDE Replay — Cursor: setup preservation, verified call_id, spoof rejecti
     //     Configure receiver-side `interrupt` rule for `peer-vip` (while `peer-a` stays default `queue`).
     //     Send a `queue` DM while turn is active -> `afterMCPExecution` MUST hold it!
     //     Send an `interrupt` DM from `peer-vip` -> `afterMCPExecution` MUST drain it immediately with UNTRUSTED_PROVENANCE!
-    //     Then `stop` (TurnEnd) MUST flush the held `queue` DM with `followup_message` + UNTRUSTED_PROVENANCE!
+    //     Then `stop` (TurnEnd) must count the held `queue` DM in `followup_message`.
     await hyp.session(["--session", cur.sessionId, "rule", "cursor-itest@local/peer-vip", "interrupt"]);
 
     const queueMarker = "CURSOR_QUEUE_HELD_FOR_STOP_111";
@@ -164,8 +163,11 @@ test("IDE Replay — Cursor: setup preservation, verified call_id, spoof rejecti
     const vipInbox = await cur.callVerifiedTool("hyp_inbox", {
       filter: { from: "cursor-itest@local/peer-vip" },
     });
-    assert.ok(vipInbox.tool.text.includes(interruptMarker));
-    assert.ok(vipInbox.tool.text.includes(UNTRUSTED_PROVENANCE_HEADER));
+    const [vipInboxItem] = JSON.parse(vipInbox.tool.text).items;
+    assert.equal(vipInboxItem.text, interruptMarker);
+    assert.equal(vipInboxItem.untrusted, true);
+    assert.equal(typeof vipInboxItem.trustTier, "string");
+    assert.equal(vipInboxItem.provenance, undefined);
 
     // TurnEnd (`stop`) emits metadata-only XML digest for held `queue` DM into `followup_message`!
     const stopDrain = await cur.stop({ loopCount: 0 });
@@ -182,8 +184,11 @@ test("IDE Replay — Cursor: setup preservation, verified call_id, spoof rejecti
       "RFC 0004: Cursor stop followup_message MUST NEVER include raw queue body",
     );
     const queueInbox = await cur.callVerifiedTool("hyp_inbox", {});
-    assert.ok(queueInbox.tool.text.includes(queueMarker));
-    assert.ok(queueInbox.tool.text.includes(UNTRUSTED_PROVENANCE_HEADER));
+    const [queueInboxItem] = JSON.parse(queueInbox.tool.text).items;
+    assert.equal(queueInboxItem.text, queueMarker);
+    assert.equal(queueInboxItem.untrusted, true);
+    assert.equal(typeof queueInboxItem.trustTier, "string");
+    assert.equal(queueInboxItem.provenance, undefined);
 
     // Next `stop` (mailbox empty, no waiter armed) emits waiter-arm `followup_message` once;
     // `loop_count: 1` returns `{}` (anti-loop guard!).
@@ -435,8 +440,11 @@ test("IDE Replay — Antigravity: setup, stacked statusline preservation & resto
     );
     assert.equal(injectedText.includes(preInvMarker), false, "RFC 0004: PreInvocation must not leak body");
     const agyPreInbox = await agy.callVerifiedTool("hyp_inbox", {}, { mode: "direct" });
-    assert.ok(agyPreInbox.tool.text.includes(preInvMarker));
-    assert.ok(agyPreInbox.tool.text.includes(UNTRUSTED_PROVENANCE_HEADER));
+    const [agyPreInboxItem] = JSON.parse(agyPreInbox.tool.text).items;
+    assert.equal(agyPreInboxItem.text, preInvMarker);
+    assert.equal(agyPreInboxItem.untrusted, true);
+    assert.equal(typeof agyPreInboxItem.trustTier, "string");
+    assert.equal(agyPreInboxItem.provenance, undefined);
 
     // 2g. `Stop` semantics: `NO_TOOL_CALL` arms `hyp wait` with WaitMsBeforeAsync hint;
     //     `continuationActive: true` never loops; `USER_CANCELED` does not arm!

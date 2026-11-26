@@ -580,7 +580,7 @@ struct ClassifiedItemMeta {
     is_announcement: bool,
     notified: bool,
     /// True only for trusted daemon-generated host sleep/wake notices.
-    /// Renders directly as `[hyphae notice] ...` and NEVER triggers Tier 4 Herdr cold spawns.
+    /// Counted in the digest and excluded from Tier 4 Herdr cold-spawn triggers.
     is_wake_notice: bool,
 }
 
