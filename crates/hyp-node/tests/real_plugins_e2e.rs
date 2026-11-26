@@ -20,13 +20,12 @@ mod unix_tests {
 
     use bytes::Bytes;
     use http::header::{AUTHORIZATION, CONTENT_TYPE};
-    use http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
+    use http::{HeaderMap, Method, Request, StatusCode};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
-    use zeroize::Zeroizing;
 
     use crate::common::{MockHttpServer, MockRequest, MockResponse, UnifiedNodeAdapterHost};
     use hyp_crypto::SecretBackend;
@@ -426,6 +425,10 @@ mod unix_tests {
         sub_cfg
             .env
             .insert("PROMETHEUS_LEGACY_NATIVE".into(), "1".into());
+        sub_cfg.env.insert(
+            "PROMETHEUS_BASIC_AUTH".into(),
+            "alertmanager:fixture".into(),
+        );
         sub_cfg
             .env
             .insert("PROMETHEUS_HOST".into(), "127.0.0.1".into());

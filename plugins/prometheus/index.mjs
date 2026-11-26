@@ -19,7 +19,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
-import { envInt } from "../sdk/source-kit.mjs";
+import { answerWebhookReadiness, envInt } from "../sdk/source-kit.mjs";
 
 const maxBodyBytes = envInt("PROMETHEUS_MAX_BODY_BYTES", 1024 * 1024, { min: 1 });
 const nativeCompat = process.env.PROMETHEUS_LEGACY_NATIVE === "1";
@@ -165,6 +165,7 @@ if (!topic || !hello.targets.includes(topic)) {
 }
 
 const server = createServer(async (req, res) => {
+  if (answerWebhookReadiness(req, res, expectedPath, (bearerToken || basicAuth || webhookSecret) && isLoopbackHost(host))) return;
   const url = new URL(req.url ?? "/", "http://localhost");
 
   if (req.method === "GET" && url.pathname === "/health") {

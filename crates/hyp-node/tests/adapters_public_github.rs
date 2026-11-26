@@ -27,10 +27,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
 
 // ============================================================================
 // Shared Recording Host & Fanout Bus

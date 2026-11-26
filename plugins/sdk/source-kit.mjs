@@ -19,6 +19,13 @@ export function isLoopbackHost(host) {
   return LOOPBACK_HOSTS.has(String(host ?? "").trim().toLowerCase());
 }
 
+/** Advertise only an authenticated receiver, at its exact listener path. */
+export function answerWebhookReadiness(req, res, path, hasAuth) {
+  if (!hasAuth || req.method !== "OPTIONS" || (req.url ?? "").split("?")[0] !== path) return false;
+  res.writeHead(204, { "x-hyphae-webhook-receiver": "signed" }).end();
+  return true;
+}
+
 /** Reads `<NAME>_FILE` (trimmed file content) or `<NAME>`; returns "" when neither is set. */
 export function readSecretEnv(name) {
   const file = process.env[`${name}_FILE`]?.trim();

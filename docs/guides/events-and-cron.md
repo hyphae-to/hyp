@@ -108,31 +108,11 @@ Restart the service (`hyp service restart`). Tokens resolve strictly by specific
 
 ---
 
-## 3. Compiled-In Pure-Rust Webhooks (`github-webhook`, `prometheus-webhook`, `webhook-stream`)
+## 3. Repository, Alertmanager, and generic webhooks
 
-All three webhook adapters compile directly into `hyp` and wire into `hyp node start` via `sources[]` in `node.json` — zero Node.js or Python subprocess required. They verify HMAC-SHA256 / bearer / basic auth in constant time (`ring::hmac`), deduplicate on raw-body SHA-256, and cap hub-relayed events at `ExternalWebhook` trust tier.
+Add a native [GitHub repository webhook source](../plugins.md#repository-webhook-setup) for signed deliveries from repositories you manage. On a hub with guest pairing, grant access to the private `github-webhooks` topic separately from public GitHub polling.
 
-```json
-{
-  "sources": [
-    {
-      "id": "org-github",
-      "kind": "github-webhook",
-      "topic": "github-webhooks",
-      "secret": { "secret": "github-webhook-secret" },
-      "allowedOrgs": ["acme"]
-    },
-    {
-      "id": "prom-alerts",
-      "kind": "prometheus-webhook",
-      "topic": "alerts",
-      "bearerToken": { "secret": "prometheus-bearer-token" }
-    }
-  ]
-}
-```
-
-> **Hub isolation tip:** On hubs that also enable `guest-ro` pairing (which grants `stream:subscribe=github[...]`), set **`"topic": "github-webhooks"`** on your private `github-webhook` source so internal repo webhooks stay isolated from the public `"github"` topic.
+Use the [Prometheus or generic webhook plugins](../plugins.md#webhook-plugin-migration) for Alertmanager and signed HTTP event streams.
 
 ---
 

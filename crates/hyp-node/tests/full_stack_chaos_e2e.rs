@@ -39,7 +39,6 @@ use tokio::net::TcpListener;
 use tokio::sync::{Barrier, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use zeroize::Zeroizing;
 
 use hyp_crypto::e2ee::{EpochScope, SignedEpochKeyBundle, open_epoch_bundle};
 use hyp_crypto::rfc3339::format_rfc3339_millis;
@@ -3174,7 +3173,6 @@ while True:
     }
 
     gh_wh.stop().await.unwrap();
-    prom_wh.stop().await.unwrap();
     alice.shutdown();
     hub.shutdown();
 }

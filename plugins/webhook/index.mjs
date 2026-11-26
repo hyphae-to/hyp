@@ -21,7 +21,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
-import { envInt } from "../sdk/source-kit.mjs";
+import { answerWebhookReadiness, envInt } from "../sdk/source-kit.mjs";
 
 const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 
@@ -110,6 +110,7 @@ if (!target || !hello.targets.includes(target)) {
 }
 
 const server = createServer(async (req, res) => {
+  if (answerWebhookReadiness(req, res, expectedPath, secret && isLoopbackHost(host))) return;
   if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== expectedPath) {
     res.writeHead(404).end();
     return;

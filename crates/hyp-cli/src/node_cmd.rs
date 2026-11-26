@@ -689,7 +689,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }
 
-        // Parse `sources` entries (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`).
+        // Parse GitHub polling and repository webhook sources.
         if let Some(sources_val) = cfg.raw.get("sources") {
             let public_read_only = cfg
                 .raw
@@ -733,7 +733,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 }
             }
 
-            match parse_webhook_sources(sources_val, &secrets) {
+            match parse_webhook_sources(sources_val, &secrets, &mut startup_warnings) {
                 Ok(mut parsed) => {
                     filter_colliding_webhook_sources(
                         &mut parsed,
@@ -761,10 +761,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                         EXIT_ERROR,
                         "CONFIG_ERROR",
                         format!("Invalid webhook source in {}: {e}", cfg.path.display()),
-                        Some(
-                            "Verify webhook sources[] in node.json use { \"secret\": \"<name>\" } references stored via `hyp secret set <name>`, never plaintext secrets."
-                                .to_string(),
-                        ),
+                        Some("Use SecretStore references for GitHub webhook sources.".to_string()),
                     );
                 }
             }
@@ -1985,6 +1982,7 @@ fn parse_optional_string_vec(
 fn parse_webhook_sources(
     sources_val: &Value,
     secrets: &hyp_crypto::SecretStore,
+    warnings: &mut Vec<String>,
 ) -> Result<ParsedWebhookSources, String> {
     let arr = sources_val
         .as_array()
@@ -2075,8 +2073,8 @@ fn parse_webhook_sources(
                 } else {
                     "webhook"
                 };
-                return Err(format!(
-                    "sources kind '{kind}' has moved to the '{plugin}' plugin. Run `hyp plugin install {plugin} --json` and migrate the source to plugins[] before restarting."
+                warnings.push(format!(
+                    "Skipping retired source kind '{kind}'. Run `hyp plugin install {plugin} --json` and migrate this source to plugins[]. See https://github.com/hyphae-to/hyp/blob/main/docs/plugins.md#webhook-plugin-migration."
                 ));
             }
             _ => {}
@@ -3496,7 +3494,9 @@ mod tests {
                 "allowedRepos": ["acme/app"]
             }
         ]);
-        let parsed = parse_webhook_sources(&sources, &secrets).expect("valid webhook sources");
+        let mut warnings = Vec::new();
+        let parsed = parse_webhook_sources(&sources, &secrets, &mut warnings)
+            .expect("valid webhook sources");
         assert_eq!(parsed.github.len(), 1);
         assert_eq!(parsed.github[0].id, "gh-main");
         assert_eq!(parsed.github[0].allowed_repos, vec!["acme/app"]);
@@ -3509,20 +3509,26 @@ mod tests {
                 "secret": "hardcoded-plaintext-secret"
             }
         ]);
-        assert!(parse_webhook_sources(&plaintext, &secrets).is_err());
+        assert!(parse_webhook_sources(&plaintext, &secrets, &mut warnings).is_err());
 
         for (kind, plugin) in [
             ("prometheus-webhook", "prometheus"),
             ("webhook-stream", "webhook"),
         ] {
             let enabled = json!([{ "kind": kind, "id": "configured" }]);
-            let error = parse_webhook_sources(&enabled, &secrets).err().unwrap();
+            warnings.clear();
             assert!(
-                error.contains(&format!("hyp plugin install {plugin} --json")),
-                "{error}"
+                parse_webhook_sources(&enabled, &secrets, &mut warnings)
+                    .unwrap()
+                    .github
+                    .is_empty()
             );
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains(&format!("hyp plugin install {plugin} --json")));
             let disabled = json!([{ "kind": kind, "id": "configured", "enabled": false }]);
-            assert!(parse_webhook_sources(&disabled, &secrets).is_ok());
+            warnings.clear();
+            assert!(parse_webhook_sources(&disabled, &secrets, &mut warnings).is_ok());
+            assert!(warnings.is_empty());
         }
     }
 
@@ -4034,6 +4040,8 @@ mod tests {
             "slack-app-token",
             "slack-bot-token",
             "sentry-auth-token",
+            "ci-webhook-secret",
+            "prometheus-bearer-token",
             "google-client-secret",
             "google-refresh-token",
         ] {

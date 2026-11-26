@@ -73,7 +73,7 @@ Read the [Threat Model](docs/security/threat-model.md) and [Hardening Guide](doc
 ## Status (`v0.7.0`)
 
 - **Solid:** Local multi-agent mesh (Claude Code, Antigravity, Herdr, Codex, OpenCode), `hyp emit` + OS cron triggers, public GitHub poller, Direct P2P pairing, Verified Human Drops + `hyp exec --env`, signed local `hyp update`
-- **Beta:** Team Hubs (`am2_` Admin-CA), external chat bridges (Telegram, Slack, WhatsApp), compiled-in hub webhooks
+- **Beta:** Team Hubs (`am2_` Admin-CA), external chat bridges (Telegram, Slack, WhatsApp), signed hub webhooks
 - **Experimental:** OpenClaw, T3 Code, Windows native service
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.

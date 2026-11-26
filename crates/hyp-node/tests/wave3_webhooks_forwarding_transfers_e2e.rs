@@ -9,11 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
-use hyp_crypto::rfc3339::now_unix_ms;
 use hyp_crypto::transfer::TarInputEntry;
 use hyp_crypto::{Ed25519KeyPair, SecretBackend};
 use hyp_node::adapters::{GitHubWebhookAdapter, GitHubWebhookConfig, compute_hmac_sha256_header};
@@ -36,7 +33,6 @@ use hyp_store::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use zeroize::Zeroizing;
 
 fn admin_proto_jwk(key: &Ed25519KeyPair) -> hyp_proto::manifest::OkpJwk {
     serde_json::from_value(serde_json::to_value(key.to_jwk()).expect("jwk value"))
