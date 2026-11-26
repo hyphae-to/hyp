@@ -1,18 +1,22 @@
-//! `hyp kv` — Direct CLI access to `NodeDb::kv()` (Shared KV / Blackboard).
+//! `hyp kv` — Shared KV via the local daemon, with offline SQLite access.
 //!
 //! Supports `get`, `set`, `delete`, and `list` across all three write models (`owner`, `shared`
 //! optimistic CAS with clean exit `1` conflict reporting, and `allowlist`).
 
 use crate::config_file::{
-    load_node_or_legacy_config, resolve_config_path_for_read, resolve_effective_node_id,
-    resolve_state_dir,
+    load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read,
+    resolve_effective_node_id, resolve_state_dir,
 };
 use crate::ui::{CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
 use clap::{Subcommand, ValueEnum};
-use hyp_store::{KvDeleteInput, KvSetInput, NodeDb, StoreError, WriteModel, now_ms};
+use hyp_harness::local_kv::{LocalKvAction, LocalKvError, LocalKvRequest, LocalKvResponse};
+use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_local_kv_rpc, default_socket_path};
+use hyp_store::{NodeDb, WriteModel};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliWriteModel {
@@ -41,7 +45,7 @@ pub enum KvCommand {
         /// Key within namespace (e.g. status, plan/step1)
         #[arg(long)]
         key: String,
-        /// Host node ID (defaults to "local")
+        /// Host node ID (defaults to this node)
         #[arg(long, default_value = "local")]
         node: String,
         /// Explicit state directory containing node.sqlite
@@ -80,7 +84,7 @@ pub enum KvCommand {
         /// Optional TTL in seconds
         #[arg(long)]
         ttl_seconds: Option<i64>,
-        /// Host node ID (defaults to "local")
+        /// Host node ID (defaults to this node)
         #[arg(long, default_value = "local")]
         node: String,
         /// Explicit state directory containing node.sqlite
@@ -104,7 +108,7 @@ pub enum KvCommand {
         /// Writer identity (defaults to nodeId or "local")
         #[arg(long)]
         writer: Option<String>,
-        /// Host node ID (defaults to "local")
+        /// Host node ID (defaults to this node)
         #[arg(long, default_value = "local")]
         node: String,
         /// Explicit state directory containing node.sqlite
@@ -122,7 +126,7 @@ pub enum KvCommand {
         /// Optional key prefix filter
         #[arg(long)]
         prefix: Option<String>,
-        /// Host node ID (defaults to "local")
+        /// Host node ID (defaults to this node)
         #[arg(long, default_value = "local")]
         node: String,
         /// Explicit state directory containing node.sqlite
@@ -189,18 +193,119 @@ pub fn run_kv(command: KvCommand) -> ExitCode {
     }
 }
 
-fn open_db(state_dir: Option<&PathBuf>) -> Result<(PathBuf, NodeDb), String> {
-    let dir = resolve_state_dir(state_dir.map(PathBuf::as_path), None, None);
-    let db_path = dir.join("node.sqlite");
-    let db =
-        NodeDb::open(&db_path).map_err(|e| format!("failed to open {}: {e}", db_path.display()))?;
-    Ok((dir, db))
+#[derive(Debug)]
+enum KvCommandError {
+    Config(String),
+    Db(String),
+    Daemon(String),
+    Operation(LocalKvError),
 }
 
-fn default_writer_id(state_dir: Option<&PathBuf>, db: &NodeDb) -> String {
-    let cfg_path = resolve_config_path_for_read(None, state_dir.map(PathBuf::as_path), None);
-    let loaded = load_node_or_legacy_config(&cfg_path).ok();
-    resolve_effective_node_id(loaded.as_ref(), Some(db))
+fn execute_kv(
+    node: &str,
+    namespace: &str,
+    action: LocalKvAction,
+    state_dir_arg: Option<&Path>,
+) -> Result<LocalKvResponse, KvCommandError> {
+    let config_path = resolve_config_path_for_read(None, state_dir_arg, None);
+    let loaded = if config_path.exists() {
+        Some(load_node_or_legacy_config(&config_path).map_err(KvCommandError::Config)?)
+    } else {
+        None
+    };
+    let mut dir = resolve_state_dir(
+        state_dir_arg.or(loaded.as_ref().and_then(|cfg| cfg.state_dir.as_deref())),
+        loaded.as_ref().map(|cfg| cfg.path.as_path()),
+        None,
+    );
+    let explicit_socket = state_dir_arg.is_none()
+        && ["HYPHAE_SOCKET", "AGENTS_MESH_SOCKET"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    let socket = if explicit_socket {
+        default_socket_path()
+    } else {
+        dir.join(DEFAULT_SOCKET_FILENAME)
+    };
+    let request = LocalKvRequest {
+        host_node: node.to_owned(),
+        namespace: namespace.to_owned(),
+        action,
+    };
+    let keystore = open_secret_store(&dir, state_dir_arg.is_some());
+    let daemon_node =
+        match daemon_local_kv_rpc(&socket, &json!(request), &keystore, Duration::from_secs(10)) {
+            Ok(rpc) => {
+                let response = rpc
+                    .result
+                    .and_then(|mut result| result.remove("response"))
+                    .ok_or_else(|| {
+                        KvCommandError::Daemon(
+                            rpc.error
+                                .unwrap_or_else(|| "The daemon did not return a KV result.".into()),
+                        )
+                    })?;
+                let response =
+                    serde_json::from_value::<Result<LocalKvResponse, LocalKvError>>(response)
+                        .map_err(|err| KvCommandError::Daemon(err.to_string()))?;
+                // Large lists can exceed the RPC frame limit. This response permits a
+                // read-only fall back to the specific daemon's database, including custom sockets.
+                match (&request.action, response) {
+                    (
+                        LocalKvAction::List { .. },
+                        Err(LocalKvError::ListTooLarge { state_dir, node_id }),
+                    ) => {
+                        dir = state_dir;
+                        Some(node_id)
+                    }
+                    (_, response) => return response.map_err(KvCommandError::Operation),
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                ) =>
+            {
+                None
+            }
+            Err(err) => return Err(KvCommandError::Daemon(err.to_string())),
+        };
+
+    let db_path = dir.join("node.sqlite");
+    let db = NodeDb::open(&db_path).map_err(|err| {
+        KvCommandError::Db(format!("failed to open {}: {err}", db_path.display()))
+    })?;
+    let local_node =
+        daemon_node.unwrap_or_else(|| resolve_effective_node_id(loaded.as_ref(), Some(&db)));
+    request
+        .execute(&db, &local_node)
+        .map_err(KvCommandError::Operation)
+}
+
+fn emit_kv_error(cmd: &str, as_json: bool, error: KvCommandError) -> ExitCode {
+    let (exit, code, message) = match error {
+        KvCommandError::Config(msg) => (EXIT_ERROR, "CONFIG_ERROR", msg),
+        KvCommandError::Db(msg) => (EXIT_ERROR, "DB_ERROR", msg),
+        KvCommandError::Daemon(msg) => (EXIT_ERROR, "DAEMON_ERROR", msg),
+        KvCommandError::Operation(LocalKvError::Unauthorized(msg)) => {
+            (EXIT_ERROR, "UNAUTHORIZED", msg)
+        }
+        KvCommandError::Operation(LocalKvError::InvalidInput(msg)) => {
+            (EXIT_USAGE, "INVALID_INPUT", msg)
+        }
+        KvCommandError::Operation(LocalKvError::Other(msg)) => (EXIT_ERROR, "KV_ERROR", msg),
+        KvCommandError::Operation(other) => (EXIT_ERROR, "KV_ERROR", format!("{other:?}")),
+    };
+    emit_error(cmd, as_json, exit, code, message, None)
+}
+
+fn unexpected_kv_response(cmd: &str, as_json: bool) -> ExitCode {
+    emit_kv_error(
+        cmd,
+        as_json,
+        KvCommandError::Daemon("Unexpected KV response".into()),
+    )
 }
 
 fn emit_version_conflict(
@@ -253,13 +358,9 @@ fn run_kv_get(
     as_json: bool,
 ) -> ExitCode {
     let cmd = "kv get";
-    let (_dir, db) = match open_db(state_dir.as_ref()) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
-    };
-
-    match db.kv().get(&node, &ns, &key, now_ms()) {
-        Ok(Some(entry)) => {
+    let action = LocalKvAction::Get { key: key.clone() };
+    match execute_kv(&node, &ns, action, state_dir.as_deref()) {
+        Ok(LocalKvResponse::Get(Some(entry))) => {
             if as_json {
                 let envelope = JsonEnvelope {
                     ok: true,
@@ -300,7 +401,7 @@ fn run_kv_get(
             }
             ExitCode::from(EXIT_OK)
         }
-        Ok(None) => emit_error(
+        Ok(LocalKvResponse::Get(None)) => emit_error(
             cmd,
             as_json,
             EXIT_ERROR,
@@ -308,7 +409,8 @@ fn run_kv_get(
             format!("KV entry '{node}/{ns}/{key}' not found"),
             Some(format!("List keys with `hyp kv list --ns {ns}`.")),
         ),
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "KV_ERROR", e.to_string(), None),
+        Err(err) => emit_kv_error(cmd, as_json, err),
+        Ok(_) => unexpected_kv_response(cmd, as_json),
     }
 }
 
@@ -356,34 +458,18 @@ fn run_kv_set(
         None => None,
     };
 
-    let (_dir, db) = match open_db(state_dir.as_ref()) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
+    let action = LocalKvAction::Set {
+        key: key.clone(),
+        value,
+        write_model: write_model.to_store(),
+        owner,
+        allowlist,
+        writer,
+        expected_version,
+        ttl_ms,
     };
-    let writer_id = writer.unwrap_or_else(|| default_writer_id(state_dir.as_ref(), &db));
-
-    let res = db.kv().set(
-        &KvSetInput {
-            host_node: node,
-            namespace: ns.clone(),
-            key: key.clone(),
-            value,
-            content_type: Some("application/json".to_string()),
-            write_model: write_model.to_store(),
-            owner_id: owner,
-            allowlist,
-            writer_id,
-            expected_version,
-            e2ee_epoch: None,
-            signature: None,
-            ttl_ms,
-        },
-        now_ms(),
-    );
-
-    match res {
-        Ok(saved) => {
-            let entry = saved.entry;
+    match execute_kv(&node, &ns, action, state_dir.as_deref()) {
+        Ok(LocalKvResponse::Set(entry)) => {
             if as_json {
                 let envelope = JsonEnvelope {
                     ok: true,
@@ -425,16 +511,11 @@ fn run_kv_set(
             }
             ExitCode::from(EXIT_OK)
         }
-        Err(StoreError::VersionConflict { current_version }) => {
+        Err(KvCommandError::Operation(LocalKvError::VersionConflict(current_version))) => {
             emit_version_conflict(cmd, as_json, &ns, &key, expected_version, current_version)
         }
-        Err(StoreError::Unauthorized(msg)) => {
-            emit_error(cmd, as_json, EXIT_ERROR, "UNAUTHORIZED", msg, None)
-        }
-        Err(StoreError::InvalidInput(msg)) => {
-            emit_error(cmd, as_json, EXIT_USAGE, "INVALID_INPUT", msg, None)
-        }
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "KV_ERROR", e.to_string(), None),
+        Err(err) => emit_kv_error(cmd, as_json, err),
+        Ok(_) => unexpected_kv_response(cmd, as_json),
     }
 }
 
@@ -448,28 +529,21 @@ fn run_kv_delete(
     as_json: bool,
 ) -> ExitCode {
     let cmd = "kv delete";
-    let (_dir, db) = match open_db(state_dir.as_ref()) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
+    let action = LocalKvAction::Delete {
+        key: key.clone(),
+        writer,
+        expected_version,
     };
-    let writer_id = writer.unwrap_or_else(|| default_writer_id(state_dir.as_ref(), &db));
-
-    match db.kv().delete(
-        &KvDeleteInput {
-            host_node: node,
-            namespace: ns.clone(),
-            key: key.clone(),
-            writer_id,
-            expected_version,
-        },
-        now_ms(),
-    ) {
-        Ok(res) => {
+    match execute_kv(&node, &ns, action, state_dir.as_deref()) {
+        Ok(LocalKvResponse::Delete {
+            deleted,
+            previous_version,
+        }) => {
             if as_json {
                 let envelope = JsonEnvelope {
                     ok: true,
                     command: cmd.to_string(),
-                    summary: Some(if res.deleted {
+                    summary: Some(if deleted {
                         format!("Deleted {ns}/{key}")
                     } else {
                         format!("KV entry {ns}/{key} did not exist")
@@ -477,31 +551,29 @@ fn run_kv_delete(
                     data: Some(json!({
                         "namespace": ns,
                         "key": key,
-                        "deleted": res.deleted,
-                        "previousVersion": res.previous_version,
+                        "deleted": deleted,
+                        "previousVersion": previous_version,
                     })),
                     warnings: Vec::new(),
                     next: Vec::new(),
                     error: None,
                 };
                 print_json(&envelope);
-            } else if res.deleted {
+            } else if deleted {
                 println!(
                     "OK    Deleted {ns}/{key} (previous v{})",
-                    res.previous_version.unwrap_or(0)
+                    previous_version.unwrap_or(0)
                 );
             } else {
                 println!("OK    KV entry {ns}/{key} was already absent");
             }
             ExitCode::from(EXIT_OK)
         }
-        Err(StoreError::VersionConflict { current_version }) => {
+        Err(KvCommandError::Operation(LocalKvError::VersionConflict(current_version))) => {
             emit_version_conflict(cmd, as_json, &ns, &key, expected_version, current_version)
         }
-        Err(StoreError::Unauthorized(msg)) => {
-            emit_error(cmd, as_json, EXIT_ERROR, "UNAUTHORIZED", msg, None)
-        }
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "KV_ERROR", e.to_string(), None),
+        Err(err) => emit_kv_error(cmd, as_json, err),
+        Ok(_) => unexpected_kv_response(cmd, as_json),
     }
 }
 
@@ -513,13 +585,14 @@ fn run_kv_list(
     as_json: bool,
 ) -> ExitCode {
     let cmd = "kv list";
-    let (_dir, db) = match open_db(state_dir.as_ref()) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
+    let action = LocalKvAction::List {
+        prefix: prefix.clone(),
     };
-
-    match db.kv().list(&node, &ns, prefix.as_deref(), now_ms()) {
-        Ok(entries) => {
+    match execute_kv(&node, &ns, action, state_dir.as_deref()) {
+        Ok(LocalKvResponse::List {
+            host_node: node,
+            entries,
+        }) => {
             if as_json {
                 let items: Vec<Value> = entries
                     .iter()
@@ -577,6 +650,7 @@ fn run_kv_list(
             }
             ExitCode::from(EXIT_OK)
         }
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "KV_ERROR", e.to_string(), None),
+        Err(err) => emit_kv_error(cmd, as_json, err),
+        Ok(_) => unexpected_kv_response(cmd, as_json),
     }
 }

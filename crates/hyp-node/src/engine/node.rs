@@ -6898,8 +6898,7 @@ impl UnifiedNode {
                     now_ms(),
                 )?
             };
-            self.notify_all_inbox_subscribers();
-            self.notify_scheduler();
+            self.notify_local_kv_change();
             res.entry
         };
 
@@ -6971,11 +6970,20 @@ impl UnifiedNode {
                     now_ms(),
                 )?
             };
-            self.notify_all_inbox_subscribers();
+            if res.deleted {
+                self.notify_local_kv_change();
+            }
             return Ok(res);
         }
         let link = self.require_peer_link(&resolved_host).await?;
         link.kv_delete(namespace, key, expected_version).await
+    }
+
+    /// Materializes locally subscribed KV change batches after their write transaction commits.
+    pub fn notify_local_kv_change(&self) {
+        let _ = crate::adapters::deliver_source_topic_to_local_sessions(self, "kv");
+        self.notify_all_inbox_subscribers();
+        self.notify_scheduler();
     }
 
     pub async fn kv_list(
@@ -9754,13 +9762,7 @@ impl NodeAdapterHost for UnifiedNodeAdapterHost {
                 PublishStatus::Duplicate
             } else {
                 if res.matched > 0 {
-                    let _ = node.deliver_local_topic_batches(
-                        topic,
-                        &MailboxPutOptions::default(),
-                        None,
-                        None,
-                        now_ms(),
-                    );
+                    let _ = crate::adapters::deliver_source_topic_to_local_sessions(&node, topic);
                 }
                 PublishStatus::Stored
             };

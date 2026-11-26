@@ -89,7 +89,7 @@ hyp drop ingest [--json]                                    # reads offline hdro
 hyp emit [--label <label>] [--note <text>] [--topic <t>] [--type <ce>] [--json]
 hyp emit --sign --label <label> --note <text>               # (TTY confirm) attaches Ed25519 hyphaesig
 
-hyp kv [get | set | delete | list] --ns <ns> [--key <k>] [--node <id>] [--expected-version <v>] [--encrypt] [--json]
+hyp kv [get | set | delete | list] --ns <ns> [--key <k>] [--node <id>] [--expected-version <v>] [--state-dir <path>] [--json]
 
 hyp plugin list [--json]
 hyp plugin install <name|all> [--archive <tar.gz> | --from-dir <dir>] [--force] [--json]
@@ -97,6 +97,8 @@ hyp plugin update [<name>|--all] [--dry-run] [--force] [--json]
 hyp plugin verify [<name>] [--json]
 hyp plugin remove <name|all> [--keep-config] [--json]       # cleans matching node.json plugins[] unless --keep-config
 ```
+
+For `hyp kv`, omitting `--node` or using `--node local` selects the configured node ID. The CLI uses the local daemon when it is reachable and opens SQLite when it is offline. Online writes wake subscribers to `local.kv` according to their coalescing settings.
 
 ## Live Session Inspector, TUI, StatusLine & Waiters
 

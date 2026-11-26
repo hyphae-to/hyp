@@ -833,7 +833,7 @@ impl LocalDaemon {
                 let conn_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     let (r, w) = stream.into_split();
-                    handle_connection(conn_inner, r, w, conn_shutdown).await;
+                    handle_connection(conn_inner, r, w, conn_shutdown, None).await;
                 });
             }
         });
@@ -942,7 +942,7 @@ impl LocalDaemon {
                 let conn_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     let (r, w) = stream.into_split();
-                    handle_connection(conn_inner, r, w, conn_shutdown).await;
+                    handle_connection(conn_inner, r, w, conn_shutdown, Some(local_addr)).await;
                 });
             }
         });
@@ -7563,6 +7563,7 @@ async fn handle_connection<R, W>(
     read_half: R,
     mut write_half: W,
     mut shutdown_rx: watch::Receiver<bool>,
+    tcp_endpoint: Option<SocketAddr>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -7785,6 +7786,32 @@ async fn handle_connection<R, W>(
                     }
                     "session.leave_channel" => {
                         let resp = handle_session_leave_channel(&daemon, &packet).await;
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "kv.local.challenge" => {
+                        let resp = match tcp_endpoint {
+                            Some(endpoint) => {
+                                authenticate_tcp_kv(
+                                    &daemon,
+                                    &packet,
+                                    endpoint,
+                                    &mut reader,
+                                    &mut write_half,
+                                )
+                                .await
+                            }
+                            None => kv_auth_required(),
+                        };
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
+                    "kv.local" => {
+                        let resp = if tcp_endpoint.is_none() {
+                            handle_local_kv(&daemon, packet.get("request"))
+                        } else {
+                            kv_auth_required()
+                        };
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
@@ -8557,20 +8584,23 @@ fn generate_random_key_32() -> [u8; 32] {
     buf
 }
 
+pub(crate) fn read_session_token_key(store: &hyp_crypto::SecretStore) -> Option<[u8; 32]> {
+    let existing = store.get(DAEMON_SESSION_TOKEN_KEY_SECRET).ok()?;
+    let mut key = [0; 32];
+    let written = URL_SAFE_NO_PAD
+        .decode_slice(existing.trim(), &mut key)
+        .ok()?;
+    (written == key.len()).then_some(key)
+}
+
 fn load_or_init_session_token_key(node: &UnifiedNode) -> [u8; 32] {
     let cfg = node.config();
     let store = match cfg.secret_backend {
         Some(backend) => hyp_crypto::SecretStore::new(cfg.state_dir.clone(), backend),
         None => hyp_crypto::SecretStore::from_env(cfg.state_dir.clone()),
     };
-    if let Ok(existing) = store.get(DAEMON_SESSION_TOKEN_KEY_SECRET) {
-        if let Ok(decoded) = URL_SAFE_NO_PAD.decode(existing.trim().as_bytes()) {
-            if decoded.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&decoded);
-                return key;
-            }
-        }
+    if let Some(key) = read_session_token_key(&store) {
+        return key;
     }
     let key = generate_random_key_32();
     let encoded = URL_SAFE_NO_PAD.encode(key);
@@ -9586,6 +9616,90 @@ async fn handle_session_status(
             "transportKind": transport_kind,
         }
     })
+}
+
+fn kv_auth_required() -> Value {
+    json!({ "ok": false, "error": "Local KV authentication failed." })
+}
+
+async fn authenticate_tcp_kv<R, W>(
+    daemon: &LocalDaemonInner,
+    packet: &Map<String, Value>,
+    endpoint: SocketAddr,
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+) -> Value
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use crate::local_kv::tcp_auth;
+
+    let exchange = async {
+        let client_nonce = packet.get("clientNonce")?.as_str()?;
+        let server_nonce = tcp_auth::nonce()?;
+        let key = tcp_auth::key(&daemon.session_token_key);
+        let server_proof = tcp_auth::sign(&key, endpoint, client_nonce, &server_nonce, None)?;
+        let challenge = tcp_auth::Challenge {
+            server_nonce,
+            server_proof,
+        };
+        write_ndjson_line_async(writer, &json!(challenge))
+            .await
+            .ok()?;
+        let line = read_bounded_line_async(reader, MAX_SOCKET_LINE_BYTES)
+            .await
+            .ok()??;
+        let response: Value = serde_json::from_str(&line).ok()?;
+        let request = response.get("request")?;
+        let client_proof = response.get("clientProof")?.as_str()?;
+        tcp_auth::verify(
+            &key,
+            endpoint,
+            client_nonce,
+            &challenge.server_nonce,
+            Some(request),
+            client_proof,
+        )
+        .then(|| handle_local_kv(daemon, Some(request)))
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(kv_auth_required)
+}
+
+fn handle_local_kv(daemon: &LocalDaemonInner, request: Option<&Value>) -> Value {
+    use crate::local_kv::{LocalKvError, LocalKvRequest, LocalKvResponse};
+
+    let Some(request) = request else {
+        return json!({ "ok": false, "error": "Missing local KV request" });
+    };
+    let request = match serde_json::from_value::<LocalKvRequest>(request.clone()) {
+        Ok(request) => request,
+        Err(err) => return json!({ "ok": false, "error": err.to_string() }),
+    };
+    let result = request.execute(&daemon.node.db(), daemon.node.node_id().as_str());
+    if matches!(
+        result,
+        Ok(LocalKvResponse::Set(_) | LocalKvResponse::Delete { deleted: true, .. })
+    ) {
+        daemon.node.notify_local_kv_change();
+    }
+    let response = json!({ "ok": true, "result": { "response": result } });
+    if matches!(result, Ok(LocalKvResponse::List { .. }))
+        && serde_json::to_vec(&response)
+            .is_ok_and(|bytes| bytes.len() > crate::sock::MAX_SOCKET_LINE_BYTES)
+    {
+        let result = Err::<LocalKvResponse, _>(LocalKvError::ListTooLarge {
+            state_dir: daemon.node.config().state_dir.clone(),
+            node_id: daemon.node.node_id().to_string(),
+        });
+        return json!({ "ok": true, "result": { "response": result } });
+    }
+    response
 }
 
 async fn handle_daemon_status(daemon: &Arc<LocalDaemonInner>) -> Value {

@@ -499,46 +499,119 @@ fn daemon_rpc_sync_on_stream<S: Read + Write>(mut stream: S, packet: &Value) -> 
     }
 }
 
-/// Ultra-fast synchronous single-shot daemon RPC for hooks (zero Tokio overhead!).
-/// Uses `std::os::unix::net::UnixStream` or loopback `std::net::TcpStream` (`connector.addr` /
-/// `tcp://127.0.0.1:<port>`) on Unix, and loopback `std::net::TcpStream` on Windows.
-/// Always fails closed on non-loopback IPs and fails open (`ok: false`) when daemon is offline,
-/// timed out, or returns malformed data.
-#[cfg(unix)]
+enum DaemonSyncStream {
+    #[cfg(unix)]
+    Unix(StdUnixStream),
+    Tcp(std::net::TcpStream),
+}
+
+fn connect_daemon_sync(socket_path: &Path, timeout: Duration) -> io::Result<DaemonSyncStream> {
+    #[cfg(unix)]
+    let addr = match detect_loopback_tcp_target(socket_path)? {
+        Some(addr) => addr,
+        None => {
+            let stream = StdUnixStream::connect(socket_path)?;
+            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_write_timeout(Some(timeout));
+            return Ok(DaemonSyncStream::Unix(stream));
+        }
+    };
+    #[cfg(not(unix))]
+    let addr = resolve_loopback_addr(socket_path)?;
+
+    let stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    Ok(DaemonSyncStream::Tcp(stream))
+}
+
+/// Synchronous single-shot daemon RPC for hooks. Treats connection and protocol errors
+/// as a failed RPC so hooks can continue if the daemon is offline.
 pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
-    match detect_loopback_tcp_target(socket_path) {
-        Ok(Some(addr)) => {
-            let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
-                return DaemonRpcResult::fail();
-            };
-            let _ = stream.set_read_timeout(Some(timeout));
-            let _ = stream.set_write_timeout(Some(timeout));
-            daemon_rpc_sync_on_stream(stream, packet)
-        }
-        Ok(None) => {
-            let Ok(stream) = StdUnixStream::connect(socket_path) else {
-                return DaemonRpcResult::fail();
-            };
-            let _ = stream.set_read_timeout(Some(timeout));
-            let _ = stream.set_write_timeout(Some(timeout));
-            daemon_rpc_sync_on_stream(stream, packet)
-        }
+    match connect_daemon_sync(socket_path, timeout) {
+        #[cfg(unix)]
+        Ok(DaemonSyncStream::Unix(stream)) => daemon_rpc_sync_on_stream(stream, packet),
+        Ok(DaemonSyncStream::Tcp(stream)) => daemon_rpc_sync_on_stream(stream, packet),
         Err(_) => DaemonRpcResult::fail(),
     }
 }
 
-/// Ultra-fast synchronous single-shot loopback TCP RPC for hooks on Windows (zero Tokio overhead!).
-#[cfg(not(unix))]
-pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
-    let Ok(addr) = resolve_loopback_addr(socket_path) else {
-        return DaemonRpcResult::fail();
+/// Privileged local KV RPC. Only connection establishment can return a transport
+/// error. After connecting, allow for a possibly completed mutation even if the
+/// daemon fails to reply, so the caller never retries that operation offline.
+pub fn daemon_local_kv_rpc(
+    socket_path: &Path,
+    request: &Value,
+    keystore: &hyp_crypto::SecretStore,
+    timeout: Duration,
+) -> io::Result<DaemonRpcResult> {
+    let rpc = match connect_daemon_sync(socket_path, timeout)? {
+        #[cfg(unix)]
+        DaemonSyncStream::Unix(stream) => daemon_rpc_sync_on_stream(
+            stream,
+            &serde_json::json!({ "type": "kv.local", "request": request }),
+        ),
+        DaemonSyncStream::Tcp(stream) => {
+            let Some(mut peer) = authenticate_daemon_local_kv(stream, keystore, request) else {
+                return Ok(DaemonRpcResult::err(
+                    "Local KV authentication or request failed.",
+                ));
+            };
+            match read_bounded_line_sync(&mut peer, MAX_SOCKET_LINE_BYTES) {
+                Ok(Some(line)) => parse_rpc_response_line(&line),
+                _ => DaemonRpcResult::fail(),
+            }
+        }
     };
-    let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
-        return DaemonRpcResult::fail();
-    };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    daemon_rpc_sync_on_stream(stream, packet)
+    Ok(rpc)
+}
+
+fn authenticate_daemon_local_kv(
+    stream: std::net::TcpStream,
+    keystore: &hyp_crypto::SecretStore,
+    request: &Value,
+) -> Option<BufReader<std::net::TcpStream>> {
+    use crate::local_kv::tcp_auth;
+    use serde_json::json;
+
+    fn send(stream: &mut std::net::TcpStream, packet: &Value) -> Option<()> {
+        let mut bytes = serde_json::to_vec(packet).ok()?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).ok()
+    }
+
+    let endpoint = stream.peer_addr().ok()?;
+    let mut peer = BufReader::new(stream);
+    let key = tcp_auth::key(&crate::daemon::read_session_token_key(keystore)?);
+    let client_nonce = tcp_auth::nonce()?;
+    send(
+        peer.get_mut(),
+        &json!({ "type": "kv.local.challenge", "clientNonce": client_nonce }),
+    )?;
+    let line = read_bounded_line_sync(&mut peer, MAX_SOCKET_LINE_BYTES).ok()??;
+    let challenge: tcp_auth::Challenge = serde_json::from_str(&line).ok()?;
+    if !tcp_auth::verify(
+        &key,
+        endpoint,
+        &client_nonce,
+        &challenge.server_nonce,
+        None,
+        &challenge.server_proof,
+    ) {
+        return None;
+    }
+    let client_proof = tcp_auth::sign(
+        &key,
+        endpoint,
+        &client_nonce,
+        &challenge.server_nonce,
+        Some(request),
+    )?;
+    send(
+        peer.get_mut(),
+        &json!({ "clientProof": client_proof, "request": request }),
+    )?;
+    Some(peer)
 }
 
 /// Async single-shot daemon RPC (Unix domain socket on Unix, loopback TCP on Windows).

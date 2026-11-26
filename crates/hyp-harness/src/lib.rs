@@ -9,6 +9,7 @@
 pub mod call_registry;
 pub mod daemon;
 pub mod hooks;
+pub mod local_kv;
 pub mod mcp;
 pub mod protocol;
 pub mod sock;
