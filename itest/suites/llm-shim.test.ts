@@ -607,3 +607,308 @@ test("llm-shim all 5 invariant auditors catch mutated negative violations", asyn
     assert.throws(() => shim.assertAllClean(), /llm-shim Auditor FAILED/);
   });
 });
+
+test("llm-shim Google Gemini protocol: JSON, SSE alt=sse, JSON-array stream, tool calls, latches, fault injection, and secret-leak/provenance auditors", async () => {
+  await withSandbox("llm-shim-gemini-full", async (sandbox) => {
+    const shim = await LlmShimServer.start({
+      sandbox,
+      auditors: {
+        allowBridge: false,
+        allowKv: false,
+        nudgeOnlyRoles: ["gem-nudge"],
+        allowedRoles: ["gem-flow", "gem-latch", "gem-fault", "gem-audit", "gem-nudge"],
+      },
+    });
+
+    sandbox.registerSecret("gemini-test-secret", "GEM_SECRET_VALUE_8842");
+    shim.auditors.registerUntrustedPayload("gem-dm-1", "GEM_UNTRUSTED_BODY_5519");
+
+    // 1. Models & countTokens discovery endpoints
+    const modelsRes = await fetch(`${shim.roleBaseUrl("gem-flow")}/v1beta/models`);
+    assert.equal(modelsRes.status, 200);
+    const modelsJson: any = await modelsRes.json();
+    assert.ok(Array.isArray(modelsJson.models) && modelsJson.models.length > 0);
+
+    const ctRes = await fetch(`${shim.roleBaseUrl("gem-flow")}/v1beta/models/gemini-2.5-pro:countTokens`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": "itest-gemini" },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "count me" }] }] }),
+    });
+    assert.equal(ctRes.status, 200);
+    const ctJson: any = await ctRes.json();
+    assert.ok(ctJson.totalTokens > 0);
+
+    // 2. Full tool-calling roundtrip across JSON (`:generateContent`), JSON-array stream (`:streamGenerateContent`),
+    //    and SSE (`:streamGenerateContent?alt=sse`), including Gemini `<untrusted_context>` unwrapping & `systemInstruction`!
+    shim.script("gem-flow", [
+      {
+        name: "gem-join",
+        when: (req) => req.turnIndex === 0 && req.systemPrompt.includes("SYSTEM_RULES_GEM"),
+        do: (req) => callTool(req, "hyp_mesh", { action: "join", handle: "gem-bot" }),
+      },
+      {
+        name: "gem-after-untrusted-tool-result",
+        when: (req) => req.lastToolResult("hyp_mesh")?.json?.handle === "gem-bot",
+        do: () => emitText("GEMINI_FLOW_COMPLETE"),
+      },
+      {
+        name: "gem-json-array-stream",
+        when: (req) => req.lastUserText.includes("ARRAY_STREAM"),
+        do: () => emitText("GEMINI_ARRAY_STREAM_OK"),
+      },
+    ]);
+
+    const r1 = await fetch(`${shim.roleBaseUrl("gem-flow")}/v1beta/models/gemini-2.5-pro:generateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": "itest-gemini" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: "SYSTEM_RULES_GEM" }] },
+        tools: [
+          {
+            functionDeclarations: [
+              { name: "mcp_hyphae_hyp_mesh", parameters: { type: "object" } },
+              { name: "mcp_hyphae_hyp_send", parameters: { type: "object" } },
+              { name: "mcp_hyphae_hyp_inbox", parameters: { type: "object" } },
+              { name: "mcp_hyphae_hyp_stream", parameters: { type: "object" } },
+            ],
+          },
+        ],
+        contents: [{ role: "user", parts: [{ text: "Enroll please" }] }],
+      }),
+    });
+    assert.equal(r1.status, 200);
+    const j1: any = await r1.json();
+    assert.equal(j1.candidates[0].content.parts[0].functionCall.name, "mcp_hyphae_hyp_mesh");
+    assert.deepEqual(j1.candidates[0].content.parts[0].functionCall.args, { action: "join", handle: "gem-bot" });
+
+    // SSE response with Gemini CLI's `<untrusted_context>` functionResponse wrapping
+    const r2 = await fetch(
+      `${shim.roleBaseUrl("gem-flow")}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": "itest-gemini" },
+        body: JSON.stringify({
+          contents: [
+            { role: "user", parts: [{ text: "Enroll please" }] },
+            { role: "model", parts: [{ functionCall: { name: "mcp_hyphae_hyp_mesh", args: { action: "join", handle: "gem-bot" } } }] },
+            {
+              role: "user",
+              parts: [
+                {
+                  functionResponse: {
+                    name: "mcp_hyphae_hyp_mesh",
+                    response: {
+                      output: '<untrusted_context>\n{"handle":"gem-bot","enrolled":true}\n</untrusted_context>\n',
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      },
+    );
+    assert.equal(r2.status, 200);
+    assert.ok(r2.headers.get("content-type")?.includes("text/event-stream"));
+    const sse2 = await r2.text();
+    assert.ok(sse2.includes("GEMINI_FLOW_COMPLETE"));
+    assert.ok(sse2.includes('"finishReason":"STOP"'));
+
+    // Non-SSE JSON-array stream (`:streamGenerateContent` without `?alt=sse`)
+    const r3 = await fetch(
+      `${shim.roleBaseUrl("gem-flow")}/v1beta/models/gemini-2.5-pro:streamGenerateContent`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": "itest-gemini" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: "ARRAY_STREAM" }] }],
+        }),
+      },
+    );
+    assert.equal(r3.status, 200);
+    assert.ok(r3.headers.get("content-type")?.includes("application/json"));
+    const arr3: any = await r3.json();
+    assert.ok(Array.isArray(arr3) && arr3.length >= 2);
+    assert.equal(arr3[0].candidates[0].content.parts[0].text, "GEMINI_ARRAY_STREAM_OK");
+
+    // 3. Gemini latches: `pauseUntil` + `pauseMidStream` + abort tracking + `failOnceWith(429)`
+    const gemPreGate = createGate("gem-pre");
+    const gemMidGate = createGate("gem-mid");
+    shim.script("gem-latch", [
+      {
+        name: "gem-hold-headers",
+        once: true,
+        when: (req) => req.lastUserText.includes("PRE_GATE"),
+        do: () => pauseUntil(gemPreGate, emitText("GEM_PRE_RELEASED")),
+      },
+      {
+        name: "gem-hold-mid",
+        once: true,
+        when: (req) => req.lastUserText.includes("MID_GATE"),
+        do: () => pauseMidStream(gemMidGate, "GEM_HEAD_", "GEM_TAIL"),
+      },
+    ]);
+
+    let preDone = false;
+    const preReq = fetch(`${shim.roleBaseUrl("gem-latch")}/v1beta/models/gemini-2.5-pro:generateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "PRE_GATE" }] }] }),
+    }).then(async (r) => {
+      preDone = true;
+      return r.json();
+    });
+    await gemPreGate.waitForWaiters(1, 5_000);
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(preDone, false);
+    gemPreGate.release();
+    const preJson: any = await preReq;
+    assert.equal(preJson.candidates[0].content.parts[0].text, "GEM_PRE_RELEASED");
+
+    const midAbort = new AbortController();
+    const midRes = await fetch(
+      `${shim.roleBaseUrl("gem-latch")}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: midAbort.signal,
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "MID_GATE" }] }] }),
+      },
+    );
+    const reader = midRes.body!.getReader();
+    const chunk = await reader.read();
+    assert.ok(new TextDecoder().decode(chunk.value).includes("GEM_HEAD_"));
+    await gemMidGate.waitForWaiters(1, 5_000);
+    midAbort.abort();
+    const aborted = await shim.awaitAbort("gem-latch", 5_000);
+    assert.equal(aborted.aborted, true);
+
+    shim.script("gem-fault", [
+      {
+        name: "gem-429",
+        when: () => true,
+        do: () => failOnceWith(429, { retryAfter: 1, key: "gem-rl", then: emitText("GEM_RECOVERED") }),
+      },
+    ]);
+    const f1 = await fetch(`${shim.roleBaseUrl("gem-fault")}/v1beta/models/gemini-2.5-pro:generateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "retry" }] }] }),
+    });
+    assert.equal(f1.status, 429);
+    const f1Json: any = await f1.json();
+    assert.equal(f1Json.error.status, "RESOURCE_EXHAUSTED");
+
+    const f2 = await fetch(`${shim.roleBaseUrl("gem-fault")}/v1beta/models/gemini-2.5-pro:generateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "retry" }] }] }),
+    });
+    assert.equal(f2.status, 200);
+    const f2Json: any = await f2.json();
+    assert.equal(f2Json.candidates[0].content.parts[0].text, "GEM_RECOVERED");
+
+    shim.assertAllClean();
+
+    // 4. Gemini invariant auditors: secret leak + untrusted provenance + metadata-only wake + schema bloat
+    await fetch(`${shim.roleBaseUrl("gem-audit")}/v1beta/models/gemini-2.5-pro:generateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: "Leaked GEM_UNTRUSTED_BODY_5519" }] },
+        tools: [{ functionDeclarations: [{ name: "mcp_hyphae_hyp_bridge" }] }],
+        contents: [{ role: "user", parts: [{ text: "Leaked GEM_SECRET_VALUE_8842 and GEM_UNTRUSTED_BODY_5519" }] }],
+      }),
+    });
+    const violations = shim.auditors.getViolations();
+    assert.ok(violations.some((v) => v.auditor === "secret-leak"), "Gemini request must catch secret leak");
+    assert.ok(violations.some((v) => v.auditor === "untrusted-provenance"), "Gemini request must catch missing provenance");
+    assert.ok(violations.some((v) => v.auditor === "mcp-schema-footprint"), "Gemini request must catch schema bloat");
+    shim.auditors.resetViolations();
+
+    await fetch(`${shim.roleBaseUrl("gem-nudge")}/v1beta/models/gemini-2.5-pro:generateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: `${UNTRUSTED_PROVENANCE_HEADER}\n<hyphae-wake count="1">GEM_UNTRUSTED_BODY_5519</hyphae-wake>` }],
+          },
+        ],
+      }),
+    });
+    assert.ok(
+      shim.auditors.getViolations().some((v) => v.auditor === "metadata-only-wake"),
+      "Gemini nudge-only wake must catch leaked raw payload",
+    );
+  });
+});
+
+test("llm-shim OpenAI Responses supports Codex 0.172+ namespaced MCP tools and array function_call_output", async () => {
+  await withSandbox("llm-shim-codex-namespace", async (sandbox) => {
+    const shim = await LlmShimServer.start({ sandbox });
+
+    shim.script("codex-ns", [
+      {
+        name: "call-namespaced-mesh",
+        when: (req) => req.turnIndex === 0,
+        do: (req) => callTool(req, "hyp_mesh", { action: "join", handle: "cx-test" }),
+      },
+      {
+        name: "after-array-output",
+        when: (req) => req.lastToolResult("hyp_mesh")?.json?.handle === "cx-test",
+        do: () => emitText("CODEX_NS_OK"),
+      },
+    ]);
+
+    const r1 = await fetch(`${shim.roleBaseUrl("codex-ns")}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5-shim",
+        stream: true,
+        tools: [
+          {
+            type: "namespace",
+            name: "mcp__hyphae",
+            tools: [
+              { type: "function", name: "hyp_mesh", parameters: {} },
+              { type: "function", name: "hyp_send", parameters: {} },
+              { type: "function", name: "hyp_inbox", parameters: {} },
+              { type: "function", name: "hyp_stream", parameters: {} },
+            ],
+          },
+        ],
+        input: [{ role: "user", content: "Join" }],
+      }),
+    });
+    const sse1 = await r1.text();
+    assert.ok(sse1.includes('"namespace":"mcp__hyphae"'), `must include namespace in SSE function_call: ${sse1}`);
+    assert.ok(sse1.includes('"name":"hyp_mesh"'));
+
+    const r2 = await fetch(`${shim.roleBaseUrl("codex-ns")}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5-shim",
+        stream: false,
+        input: [
+          { role: "user", content: "Join" },
+          { type: "function_call", call_id: "c1", namespace: "mcp__hyphae", name: "hyp_mesh", arguments: '{"action":"join","handle":"cx-test"}' },
+          {
+            type: "function_call_output",
+            call_id: "c1",
+            output: [
+              { type: "input_text", text: "Wall time: 0.002 seconds\nOutput:" },
+              { type: "input_text", text: '{"handle":"cx-test","enrolled":true}' },
+            ],
+          },
+        ],
+      }),
+    });
+    const j2: any = await r2.json();
+    assert.equal(j2.output[0].content[0].text, "CODEX_NS_OK");
+    shim.assertAllClean();
+  });
+});

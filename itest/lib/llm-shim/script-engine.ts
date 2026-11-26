@@ -137,6 +137,21 @@ export function callTool(
       ],
     };
   }
+  const hasExecute = req.advertisedTools.some((t) => t.name === "execute");
+  if (matchedTool?.deferred && matchedTool.deferredVia === "opencode_execute" && hasExecute) {
+    return {
+      kind: "tool_calls",
+      preambleText: options.preambleText,
+      calls: [
+        {
+          logicalName: "execute",
+          wireName: "execute",
+          args: { code: `return await ${wireName}(${JSON.stringify(args)});` },
+          callId: options.callId,
+        },
+      ],
+    };
+  }
   return {
     kind: "tool_calls",
     preambleText: options.preambleText,
@@ -144,6 +159,7 @@ export function callTool(
       {
         logicalName: logicalToolName,
         wireName,
+        namespace: matchedTool?.namespace,
         args,
         callId: options.callId,
       },
@@ -159,12 +175,17 @@ export function callTools(
   return {
     kind: "tool_calls",
     preambleText: options.preambleText,
-    calls: specs.map((s) => ({
-      logicalName: s.name,
-      wireName: req.resolveTool(s.name),
-      args: s.args ?? {},
-      callId: s.callId,
-    })),
+    calls: specs.map((s) => {
+      const wireName = req.resolveTool(s.name);
+      const matched = req.advertisedTools.find((t) => t.name === wireName);
+      return {
+        logicalName: s.name,
+        wireName,
+        namespace: matched?.namespace,
+        args: s.args ?? {},
+        callId: s.callId,
+      };
+    }),
   };
 }
 

@@ -9,6 +9,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { runInteractivePtyCommand } from "./pty.ts";
 import { REPO_ROOT } from "./sandbox.ts";
 import type { Sandbox, TrackedProcess } from "./sandbox.ts";
 
@@ -294,8 +295,14 @@ export class HypCli {
           resolve(result);
         },
       );
-      if (options.input !== undefined && child.stdin) {
-        child.stdin.end(options.input);
+      if (child.stdin) {
+        if (options.input !== undefined) {
+          child.stdin.end(options.input);
+        } else {
+          // Close stdin immediately so commands that inspect optional piped stdin
+          // (such as `hyp emit`) do not block forever waiting for EOF.
+          child.stdin.end();
+        }
       }
     });
   }
@@ -459,6 +466,13 @@ export class HypCli {
     }
   }
 
+  async restartDaemon(): Promise<void> {
+    if (!this.activeDaemon) {
+      throw new Error("restartDaemon() called when no active daemon controller exists");
+    }
+    await this.activeDaemon.restart();
+  }
+
   /** Stores a secret strictly over stdin (never argv) and registers it with the Sandbox leak scanner. */
   async secretSet(name: string, value: string): Promise<ExecResult> {
     this.sandbox.registerSecret(name, value);
@@ -512,9 +526,58 @@ export class HypCli {
     );
   }
 
+  /**
+   * Executes human-CLI-only `hyp gate init ...` inside a real POSIX PTY and confirms
+   * any interactive `[y/N]` prompt cleanly.
+   */
+  async gateInitPty(
+    subArgs: string[],
+    options: { timeoutMs?: number } = {},
+  ): Promise<{ exitCode: number | null; output: string }> {
+    const args = ["gate", "init", ...subArgs, "--state-dir", this.sandbox.paths.hyphaeStateDir];
+    return runInteractivePtyCommand(this.sandbox, "hyp-gate-init", this.bin, args, {
+      env: this.sandbox.env,
+      promptPattern: /\[y\/N\]|confirm|proceed|lock/i,
+      inputOnMatch: "y\n",
+      timeoutMs: options.timeoutMs ?? 15_000,
+    });
+  }
+
   async inboxCli(subArgs: string[], options: { allowFailure?: boolean } = {}): Promise<ExecResult> {
     return this.exec(
       ["inbox", ...subArgs, "--state-dir", this.sandbox.paths.hyphaeStateDir, "--json"],
+      { allowFailure: options.allowFailure },
+    );
+  }
+
+  /**
+   * Executes human-CLI-only `hyp inbox approve <receipt>` inside a real POSIX PTY and
+   * confirms the interactive `[y/N]` prompt, proving both fail-closed non-TTY guard and live wake.
+   */
+  async approveQuarantinedPty(
+    receipt: string,
+    options: { reviewer?: string; timeoutMs?: number } = {},
+  ): Promise<{ exitCode: number | null; output: string }> {
+    const args = [
+      "inbox",
+      "approve",
+      receipt,
+      "--state-dir",
+      this.sandbox.paths.hyphaeStateDir,
+      "--reviewer",
+      options.reviewer ?? "itest-human",
+    ];
+    return runInteractivePtyCommand(this.sandbox, "hyp-inbox-approve", this.bin, args, {
+      env: this.sandbox.env,
+      promptPattern: /\[y\/N\]|Approve quarantined item/i,
+      inputOnMatch: "y\n",
+      timeoutMs: options.timeoutMs ?? 15_000,
+    });
+  }
+
+  async emit(subArgs: string[], options: { allowFailure?: boolean } = {}): Promise<ExecResult> {
+    return this.exec(
+      ["emit", ...subArgs, "--state-dir", this.sandbox.paths.hyphaeStateDir, "--json"],
       { allowFailure: options.allowFailure },
     );
   }

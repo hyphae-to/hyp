@@ -84,6 +84,9 @@ const DEFAULT_HOST_CANARY_RELPATHS = [
   ".codex/config.toml",
   ".codex/hooks.json",
   ".config/opencode/opencode.json",
+  ".config/herdr-core/config.toml",
+  ".config/herdr-app/keys.json",
+  ".gemini/settings.json",
 ];
 
 /** Exact safe system environment keys allowed through the allowlist scrubber. */

@@ -7,12 +7,14 @@ export type LlmProtocol = "anthropic" | "openai-chat" | "openai-responses" | "ge
 export interface AdvertisedTool {
   /** Exact wire tool name sent by the harness (e.g., `mcp__hyphae__hyp_mesh`, `hyphae__hyp_mesh`, `hyp_mesh`, or `mcp:hyphae:hyphae__hyp_mesh`). */
   name: string;
+  /** Optional OpenAI Responses namespace containing this tool (e.g., `mcp__hyphae` in Codex 0.172+). */
+  namespace?: string;
   /** Canonical normalized Hyphae tool name if this is a Hyphae tool (e.g., `hyp_mesh`), else undefined. */
   canonicalHyphaeName?: string;
-  /** If true, tool is deferred (e.g., OpenClaw `dispatch_action` or Claude Code `ToolSearch`). */
+  /** If true, tool is deferred (e.g., OpenClaw `dispatch_action`, Claude Code `ToolSearch`, or OpenCode `execute`). */
   deferred?: boolean;
-  /** Mechanism required for a deferred tool (`"dispatch_action"` in OpenClaw, `"tool_search"` in Claude Code). */
-  deferredVia?: "dispatch_action" | "tool_search";
+  /** Mechanism required for a deferred tool (`"dispatch_action"` in OpenClaw, `"tool_search"` in Claude Code, `"opencode_execute"` in OpenCode v2 Code Mode). */
+  deferredVia?: "dispatch_action" | "tool_search" | "opencode_execute";
   description?: string;
   inputSchema?: unknown;
 }
@@ -84,6 +86,7 @@ export interface Gate {
 export interface ToolCallSpec {
   logicalName: string;
   wireName?: string;
+  namespace?: string;
   args: Record<string, unknown>;
   callId?: string;
 }

@@ -11,8 +11,16 @@
     "itest:unit": "node --test suites/llm-shim.test.ts",
     "itest:openclaw": "node --test suites/openclaw.test.ts",
     "itest:claude": "node --test suites/claude.test.ts",
+    "itest:codex": "node --test suites/codex.test.ts",
+    "itest:herdr": "node --test suites/herdr-orchestrator.test.ts",
+    "itest:opencode": "node --test suites/opencode.test.ts",
+    "itest:gemini": "node --test suites/gemini.test.ts",
+    "itest:parity": "node --test suites/parity-matrix.test.ts",
     "itest:phase1": "node --test suites/llm-shim.test.ts suites/openclaw.test.ts suites/claude.test.ts",
+    "itest:phase2": "node --test suites/llm-shim.test.ts suites/codex.test.ts suites/herdr-orchestrator.test.ts suites/opencode.test.ts suites/gemini.test.ts suites/parity-matrix.test.ts",
+    "itest:all": "node --test suites/llm-shim.test.ts suites/openclaw.test.ts suites/claude.test.ts suites/codex.test.ts suites/herdr-orchestrator.test.ts suites/opencode.test.ts suites/gemini.test.ts suites/parity-matrix.test.ts",
     "provision": "node scripts/provision.mjs",
-    "provision:host": "node scripts/provision.mjs --use-host-bins --json"
+    "provision:host": "node scripts/provision.mjs --use-host-bins --json",
+    "provision:gemini": "node scripts/provision.mjs --tools gemini"
   }
 }

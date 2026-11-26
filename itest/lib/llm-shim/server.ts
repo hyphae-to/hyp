@@ -63,7 +63,26 @@ function parseToolResultJson(text: string): any {
       const innerJson = tryParseJson(innerText);
       if (innerJson !== null) return innerJson;
     }
+    // Unwrap Gemini CLI `{ output: "<untrusted_context>\n{...}\n</untrusted_context>..." }` wrapper.
+    if (direct && typeof direct === "object" && typeof direct.output === "string") {
+      const inner = parseToolResultJson(direct.output);
+      if (inner !== null) return inner;
+    }
     return direct;
+  }
+
+  // Unwrap Gemini CLI `<untrusted_context>...</untrusted_context>` wrapper.
+  const untrustedMatch = /<untrusted_context>\s*([\s\S]*?)\s*<\/untrusted_context>/.exec(text);
+  if (untrustedMatch) {
+    const inner = tryParseJson(untrustedMatch[1]);
+    if (inner !== null) return inner;
+  }
+
+  // Strip Codex CLI `"Wall time: 0.0019 seconds\nOutput:\n{...}"` prefix.
+  const codexOutMatch = /(?:^|\n)Output:\s*\n?([\s\S]+)$/.exec(text);
+  if (codexOutMatch) {
+    const inner = tryParseJson(codexOutMatch[1]);
+    if (inner !== null) return inner;
   }
 
   // Strip Claude Code `<system-reminder>...</system-reminder>` blocks appended to tool_result text.
@@ -128,8 +147,14 @@ function extractRoleAndPath(
     role = roleMatch[1];
     pathname = roleMatch[2] || "/";
   } else {
-    const auth = String(headers.authorization || headers["x-api-key"] || headers["x-goog-api-key"] || "");
-    const tokMatch = /sk-(?:ant-)?itest-([A-Za-z0-9._-]+)/.exec(auth);
+    const auth = String(
+      headers.authorization ||
+        headers["x-api-key"] ||
+        headers["x-goog-api-key"] ||
+        parsed.searchParams.get("key") ||
+        "",
+    );
+    const tokMatch = /(?:sk-(?:ant-)?itest-|itest-gemini-)([A-Za-z0-9._-]+)/.exec(auth);
     if (tokMatch) {
       role = tokMatch[1];
     }
@@ -254,6 +279,7 @@ function parseAnthropicRequest(
 function extractDeferredToolsFromCatalog(
   advertisedTools: AdvertisedTool[],
   messages: CanonicalMessage[] = [],
+  systemPrompt = "",
 ): void {
   const existing = new Set(advertisedTools.map((t) => t.name));
 
@@ -300,6 +326,24 @@ function extractDeferredToolsFromCatalog(
           });
         }
       }
+    }
+  }
+
+  // 3. OpenCode v2.3+ exposes MCP tools inside the Code Mode catalog (`tools.hyphae.hyp_*`) invoked via `execute`.
+  const hasExecute = advertisedTools.some((t) => t.name === "execute");
+  if (hasExecute && systemPrompt) {
+    const ocToolRe = /\b(tools\.hyphae\.(hyp_[a-z0-9_]+))\s*\(/g;
+    let match: RegExpExecArray | null;
+    while ((match = ocToolRe.exec(systemPrompt)) !== null) {
+      const fullPath = match[1];
+      if (!fullPath || existing.has(fullPath)) continue;
+      existing.add(fullPath);
+      advertisedTools.push({
+        name: fullPath,
+        canonicalHyphaeName: extractCanonicalHyphaeToolName(fullPath),
+        deferred: true,
+        deferredVia: "opencode_execute",
+      });
     }
   }
 }
@@ -455,17 +499,32 @@ function parseOpenAiResponsesRequest(
     systemParts.push(body.instructions);
   }
 
-  const advertisedTools: AdvertisedTool[] = (Array.isArray(body?.tools) ? body.tools : []).map(
-    (t: any) => {
-      const name = String(t?.name ?? t?.function?.name ?? "");
-      return {
-        name,
-        canonicalHyphaeName: extractCanonicalHyphaeToolName(name),
-        description: t?.description ?? t?.function?.description,
-        inputSchema: t?.parameters ?? t?.function?.parameters,
-      };
-    },
-  );
+  const advertisedTools: AdvertisedTool[] = [];
+  for (const t of Array.isArray(body?.tools) ? body.tools : []) {
+    if (t?.type === "namespace" && Array.isArray(t?.tools)) {
+      const ns = String(t.name ?? "");
+      for (const inner of t.tools) {
+        const innerName = String(inner?.name ?? inner?.function?.name ?? "");
+        if (!innerName) continue;
+        advertisedTools.push({
+          name: innerName,
+          namespace: ns || undefined,
+          canonicalHyphaeName: extractCanonicalHyphaeToolName(innerName),
+          description: inner?.description ?? inner?.function?.description,
+          inputSchema: inner?.parameters ?? inner?.function?.parameters,
+        });
+      }
+      continue;
+    }
+    const name = String(t?.name ?? t?.function?.name ?? "");
+    if (!name) continue;
+    advertisedTools.push({
+      name,
+      canonicalHyphaeName: extractCanonicalHyphaeToolName(name),
+      description: t?.description ?? t?.function?.description,
+      inputSchema: t?.parameters ?? t?.function?.parameters,
+    });
+  }
 
   const toolNameByCallId = new Map<string, string>();
   const messages: CanonicalMessage[] = [];
@@ -481,19 +540,26 @@ function parseOpenAiResponsesRequest(
     if (item.type === "function_call") {
       const id = String(item.call_id ?? item.id ?? "");
       const name = String(item.name ?? "");
-      if (id && name) toolNameByCallId.set(id, name);
       const args =
         typeof item.arguments === "string"
           ? tryParseJson(item.arguments) ?? {}
           : item.arguments ?? {};
+      // Unwrap OpenCode v2 `execute({ code: "return await tools.hyphae.hyp_mesh(...)" })`
+      // so `lastToolResult("hyp_mesh")` resolves cleanly!
+      let effectiveName = name;
+      if (name === "execute" && typeof args?.code === "string") {
+        const m = /\b(tools\.hyphae\.hyp_[a-z0-9_]+)\s*\(/.exec(args.code);
+        if (m) effectiveName = m[1];
+      }
+      if (id && effectiveName) toolNameByCallId.set(id, effectiveName);
       messages.push({
         role: "assistant",
         text: "",
         toolCalls: [
           {
             id,
-            name,
-            canonicalName: extractCanonicalHyphaeToolName(name),
+            name: effectiveName,
+            canonicalName: extractCanonicalHyphaeToolName(effectiveName),
             arguments: args,
           },
         ],
@@ -503,7 +569,11 @@ function parseOpenAiResponsesRequest(
       const callId = String(item.call_id ?? "");
       const rawToolName = toolNameByCallId.get(callId);
       const text =
-        typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
+        typeof item.output === "string"
+          ? item.output
+          : Array.isArray(item.output)
+            ? flattenContentBlocks(item.output)
+            : JSON.stringify(item.output ?? "");
       messages.push({
         role: "tool",
         text: "",
@@ -515,7 +585,7 @@ function parseOpenAiResponsesRequest(
               ? extractCanonicalHyphaeToolName(rawToolName)
               : undefined,
             text,
-            json: tryParseJson(text),
+            json: parseToolResultJson(text),
           },
         ],
         raw: item,
@@ -528,6 +598,9 @@ function parseOpenAiResponsesRequest(
     }
   }
 
+  const systemPrompt = systemParts.join("\n");
+  extractDeferredToolsFromCatalog(advertisedTools, messages, systemPrompt);
+
   const lastToolResults: CanonicalToolResult[] = [];
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     if (messages[i].role === "tool" && messages[i].toolResults) {
@@ -537,13 +610,7 @@ function parseOpenAiResponsesRequest(
     }
   }
 
-  let lastUserText = "";
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i].role === "user" && messages[i].text) {
-      lastUserText = messages[i].text;
-      break;
-    }
-  }
+  const lastUserText = collectTrailingUserText(messages);
 
   return createCanonicalRequest({
     role,
@@ -551,7 +618,7 @@ function parseOpenAiResponsesRequest(
     turnIndex,
     model: String(body?.model ?? "gpt-5-shim"),
     stream: Boolean(body?.stream),
-    systemPrompt: systemParts.join("\n"),
+    systemPrompt,
     messages,
     lastUserText,
     lastToolResults,
@@ -574,21 +641,28 @@ function parseGeminiRequest(
   url: string,
   headers: IncomingMessage["headers"],
 ): CanonicalLlmRequest {
-  const sysParts = body?.systemInstruction?.parts ?? body?.system_instruction?.parts ?? [];
-  const systemPrompt = Array.isArray(sysParts)
-    ? sysParts.map((p: any) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("\n")
-    : "";
+  const sysObj = body?.systemInstruction ?? body?.system_instruction;
+  let systemPrompt = "";
+  if (typeof sysObj === "string") {
+    systemPrompt = sysObj;
+  } else if (Array.isArray(sysObj?.parts)) {
+    systemPrompt = sysObj.parts
+      .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
 
   const advertisedTools: AdvertisedTool[] = [];
   for (const group of Array.isArray(body?.tools) ? body.tools : []) {
     const decls = group?.functionDeclarations ?? group?.function_declarations ?? [];
     for (const d of Array.isArray(decls) ? decls : []) {
       const name = String(d?.name ?? "");
+      if (!name) continue;
       advertisedTools.push({
         name,
         canonicalHyphaeName: extractCanonicalHyphaeToolName(name),
         description: d?.description,
-        inputSchema: d?.parameters,
+        inputSchema: d?.parameters ?? d?.parametersJsonSchema,
       });
     }
   }
@@ -604,22 +678,35 @@ function parseGeminiRequest(
         textParts.push(part.text);
       } else if (part?.functionCall) {
         const name = String(part.functionCall.name ?? "");
+        const callId = typeof part.functionCall.id === "string" && part.functionCall.id
+          ? part.functionCall.id
+          : makeCallId("gem");
         toolCalls.push({
-          id: makeCallId("gem"),
+          id: callId,
           name,
           canonicalName: extractCanonicalHyphaeToolName(name),
           arguments: (part.functionCall.args ?? {}) as Record<string, unknown>,
         });
       } else if (part?.functionResponse) {
         const name = String(part.functionResponse.name ?? "");
+        const callId = typeof part.functionResponse.id === "string" && part.functionResponse.id
+          ? part.functionResponse.id
+          : name;
         const resp = part.functionResponse.response;
         const text = typeof resp === "string" ? resp : JSON.stringify(resp ?? {});
+        const unwrappedJson =
+          resp && typeof resp === "object" && typeof resp.output === "string"
+            ? (parseToolResultJson(resp.output) ?? resp)
+            : typeof resp === "object" && resp !== null
+              ? resp
+              : parseToolResultJson(text);
         toolResults.push({
-          callId: name,
+          callId,
           rawToolName: name,
           canonicalToolName: extractCanonicalHyphaeToolName(name),
           text,
-          json: typeof resp === "object" ? resp : tryParseJson(text),
+          json: unwrappedJson,
+          isError: Boolean(resp?.error),
         });
       }
     }
@@ -632,15 +719,16 @@ function parseGeminiRequest(
     });
   }
 
-  const lastMsg = messages[messages.length - 1];
-  const lastToolResults = lastMsg?.toolResults ?? [];
-  let lastUserText = "";
+  const lastToolResults: CanonicalToolResult[] = [];
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i].role === "user" && messages[i].text) {
-      lastUserText = messages[i].text;
+    if (messages[i].toolResults && messages[i].toolResults!.length > 0) {
+      lastToolResults.unshift(...messages[i].toolResults!);
+      if (messages[i].role !== "tool") break;
+    } else {
       break;
     }
   }
+  const lastUserText = collectTrailingUserText(messages);
 
   return createCanonicalRequest({
     role,
@@ -857,6 +945,27 @@ export class LlmShimServer {
       return;
     }
 
+    if (method === "GET" && subPath === "/v1beta/models") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          models: [
+            {
+              name: "models/gemini-2.5-pro",
+              displayName: "FakeBrain Gemini 2.5 Pro",
+              supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"],
+            },
+            {
+              name: "models/gemini-2.5-flash",
+              displayName: "FakeBrain Gemini 2.5 Flash",
+              supportedGenerationMethods: ["generateContent", "streamGenerateContent", "countTokens"],
+            },
+          ],
+        }),
+      );
+      return;
+    }
+
     const rawBody = await this.readBody(req);
     const parsedBody = tryParseJson(rawBody) ?? {};
 
@@ -868,10 +977,19 @@ export class LlmShimServer {
       return;
     }
 
+    // Google Gemini token counting helper endpoint (`:countTokens`).
+    if (method === "POST" && /^\/v1beta\/models\/([^/:]+):countTokens$/.test(subPath)) {
+      const approxTokens = Math.max(10, Math.ceil(rawBody.length / 4));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ totalTokens: approxTokens }));
+      return;
+    }
+
     // Match supported model generation endpoints.
     let protocol: LlmProtocol | null = null;
     let geminiModel = "gemini-2.5-pro";
     let geminiStream = false;
+    let geminiUseSse = false;
 
     if (method === "POST" && (subPath === "/v1/messages" || subPath === "/messages")) {
       protocol = "anthropic";
@@ -887,6 +1005,7 @@ export class LlmShimServer {
         protocol = "gemini";
         geminiModel = gemMatch[1];
         geminiStream = gemMatch[2] === "streamGenerateContent";
+        geminiUseSse = query.get("alt") === "sse";
       }
     }
 
@@ -973,10 +1092,19 @@ export class LlmShimServer {
     });
 
     try {
-      await this.executeAction(canonical, action, record, res, () => clientAborted, (cb) => {
-        if (clientAborted) cb();
-        else abortCallbacks.push(cb);
-      });
+      await this.executeAction(
+        canonical,
+        action,
+        record,
+        res,
+        () => clientAborted,
+        (cb) => {
+          if (clientAborted) cb();
+          else abortCallbacks.push(cb);
+        },
+        0,
+        protocol === "gemini" && geminiStream && !geminiUseSse,
+      );
     } finally {
       record.durationMs = Date.now() - startedMs;
     }
@@ -990,16 +1118,35 @@ export class LlmShimServer {
     isAborted: () => boolean,
     onAbort: (cb: () => void) => void,
     chunkDelay = 0,
+    geminiJsonArrayStream = false,
   ): Promise<void> {
     // Unwrap combinators before writing headers.
     if (action.kind === "delay_before_headers") {
       await sleep(action.ms);
       if (isAborted()) return;
-      return this.executeAction(req, action.next, record, res, isAborted, onAbort, chunkDelay);
+      return this.executeAction(
+        req,
+        action.next,
+        record,
+        res,
+        isAborted,
+        onAbort,
+        chunkDelay,
+        geminiJsonArrayStream,
+      );
     }
 
     if (action.kind === "chunk_delay") {
-      return this.executeAction(req, action.next, record, res, isAborted, onAbort, action.ms);
+      return this.executeAction(
+        req,
+        action.next,
+        record,
+        res,
+        isAborted,
+        onAbort,
+        action.ms,
+        geminiJsonArrayStream,
+      );
     }
 
     if (action.kind === "pause_until") {
@@ -1008,7 +1155,16 @@ export class LlmShimServer {
         new Promise<void>((resolve) => onAbort(resolve)),
       ]);
       if (isAborted()) return;
-      return this.executeAction(req, action.next, record, res, isAborted, onAbort, chunkDelay);
+      return this.executeAction(
+        req,
+        action.next,
+        record,
+        res,
+        isAborted,
+        onAbort,
+        chunkDelay,
+        geminiJsonArrayStream,
+      );
     }
 
     if (action.kind === "fail_once") {
@@ -1028,19 +1184,36 @@ export class LlmShimServer {
                   message: `Simulated HTTP ${action.status}`,
                 },
               }
-            : {
-                error: {
-                  message: `Simulated HTTP ${action.status}`,
-                  type: "simulated_error",
-                  code: String(action.status),
-                },
-              });
+            : req.protocol === "gemini"
+              ? {
+                  error: {
+                    code: action.status,
+                    message: `Simulated HTTP ${action.status}`,
+                    status: action.status === 429 ? "RESOURCE_EXHAUSTED" : "INTERNAL",
+                  },
+                }
+              : {
+                  error: {
+                    message: `Simulated HTTP ${action.status}`,
+                    type: "simulated_error",
+                    code: String(action.status),
+                  },
+                });
         record.responseSummary = errBody;
         res.writeHead(action.status, headers);
         res.end(JSON.stringify(errBody));
         return;
       }
-      return this.executeAction(req, action.fallback, record, res, isAborted, onAbort, chunkDelay);
+      return this.executeAction(
+        req,
+        action.fallback,
+        record,
+        res,
+        isAborted,
+        onAbort,
+        chunkDelay,
+        geminiJsonArrayStream,
+      );
     }
 
     if (action.kind === "abort_mid_stream") {
@@ -1055,6 +1228,7 @@ export class LlmShimServer {
         isAborted,
         onAbort,
         chunkDelay,
+        geminiJsonArrayStream,
       );
       return;
     }
@@ -1073,6 +1247,7 @@ export class LlmShimServer {
         isAborted,
         onAbort,
         chunkDelay,
+        geminiJsonArrayStream,
       );
       return;
     }
@@ -1087,6 +1262,7 @@ export class LlmShimServer {
         isAborted,
         onAbort,
         chunkDelay,
+        geminiJsonArrayStream,
       );
     } else {
       this.writeProtocolJson(req, action, record, res);
@@ -1177,12 +1353,16 @@ export class LlmShimServer {
         }
         for (const c of action.calls) {
           const cid = c.callId ?? makeCallId("call");
+          const wireName = c.wireName ?? req.resolveTool(c.logicalName);
+          const ns =
+            c.namespace ?? req.advertisedTools.find((t) => t.name === wireName)?.namespace;
           output.push({
             id: `fc_${crypto.randomBytes(6).toString("hex")}`,
             type: "function_call",
             status: "completed",
             call_id: cid,
-            name: c.wireName ?? req.resolveTool(c.logicalName),
+            ...(ns ? { namespace: ns } : {}),
+            name: wireName,
             arguments: JSON.stringify(c.args),
           });
         }
@@ -1206,6 +1386,7 @@ export class LlmShimServer {
         for (const c of action.calls) {
           parts.push({
             functionCall: {
+              ...(c.callId ? { id: c.callId } : {}),
               name: c.wireName ?? req.resolveTool(c.logicalName),
               args: c.args,
             },
@@ -1244,12 +1425,20 @@ export class LlmShimServer {
     isAborted: () => boolean,
     onAbort: (cb: () => void) => void,
     chunkDelay: number,
+    geminiJsonArrayStream = false,
   ): Promise<void> {
-    res.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    });
+    if (req.protocol === "gemini" && geminiJsonArrayStream) {
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-cache",
+      });
+    } else {
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+    }
     res.flushHeaders?.();
 
     const delayIf = async () => {
@@ -1537,6 +1726,8 @@ export class LlmShimServer {
         const fcId = `fc_${crypto.randomBytes(6).toString("hex")}`;
         const callId = call.callId ?? makeCallId("call");
         const wireName = call.wireName ?? req.resolveTool(call.logicalName);
+        const ns =
+          call.namespace ?? req.advertisedTools.find((t) => t.name === wireName)?.namespace;
         const argsJson = JSON.stringify(call.args);
         writeSseEvent(res, "response.output_item.added", {
           type: "response.output_item.added",
@@ -1546,6 +1737,7 @@ export class LlmShimServer {
             type: "function_call",
             status: "in_progress",
             call_id: callId,
+            ...(ns ? { namespace: ns } : {}),
             name: wireName,
             arguments: "",
           },
@@ -1562,6 +1754,7 @@ export class LlmShimServer {
           type: "function_call",
           status: "completed",
           call_id: callId,
+          ...(ns ? { namespace: ns } : {}),
           name: wireName,
           arguments: argsJson,
         };
@@ -1590,13 +1783,24 @@ export class LlmShimServer {
       return;
     }
 
-    // Google Gemini SSE stream (`:streamGenerateContent?alt=sse`).
+    // Google Gemini streaming (`:streamGenerateContent?alt=sse` or JSON-array stream without `alt=sse`).
+    let jsonArrayChunkCount = 0;
+    const emitGeminiChunk = (chunk: unknown) => {
+      if (res.writableEnded || res.destroyed) return;
+      if (geminiJsonArrayStream) {
+        res.write(jsonArrayChunkCount === 0 ? `[${JSON.stringify(chunk)}` : `,${JSON.stringify(chunk)}`);
+        jsonArrayChunkCount += 1;
+      } else {
+        writeSseEvent(res, null, chunk);
+      }
+    };
+
     const firstText =
       plan.initialText ??
       (plan.leafAction?.kind === "text" ? plan.leafAction.text : plan.leafAction?.preambleText);
 
     if (firstText !== undefined) {
-      writeSseEvent(res, null, {
+      emitGeminiChunk({
         candidates: [{ content: { role: "model", parts: [{ text: firstText }] }, index: 0 }],
       });
       await delayIf();
@@ -1613,7 +1817,7 @@ export class LlmShimServer {
         }
         const tail = finalTextFromPlan();
         if (tail) {
-          writeSseEvent(res, null, {
+          emitGeminiChunk({
             candidates: [{ content: { role: "model", parts: [{ text: tail }] }, index: 0 }],
           });
         }
@@ -1622,13 +1826,14 @@ export class LlmShimServer {
 
     const calls = finalToolCallsFromPlan();
     if (calls.length > 0) {
-      writeSseEvent(res, null, {
+      emitGeminiChunk({
         candidates: [
           {
             content: {
               role: "model",
               parts: calls.map((c) => ({
                 functionCall: {
+                  ...(c.callId ? { id: c.callId } : {}),
                   name: c.wireName ?? req.resolveTool(c.logicalName),
                   args: c.args,
                 },
@@ -1641,14 +1846,17 @@ export class LlmShimServer {
         usageMetadata: { promptTokenCount: 24, candidatesTokenCount: 16, totalTokenCount: 40 },
       });
     } else {
-      writeSseEvent(res, null, {
+      emitGeminiChunk({
         candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP", index: 0 }],
         usageMetadata: { promptTokenCount: 24, candidatesTokenCount: 16, totalTokenCount: 40 },
       });
     }
 
+    if (geminiJsonArrayStream && !res.writableEnded && !res.destroyed) {
+      res.write("]");
+    }
     record.responseSummary = {
-      protocol: "gemini-sse",
+      protocol: geminiJsonArrayStream ? "gemini-json-stream" : "gemini-sse",
       text: `${plan.initialText ?? ""}${finalTextFromPlan() ?? ""}`,
       toolCalls: calls.map((c) => ({ name: c.wireName ?? c.logicalName, args: c.args })),
     };

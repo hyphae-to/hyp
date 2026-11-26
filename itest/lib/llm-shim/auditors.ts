@@ -197,7 +197,14 @@ export class AuditEngine {
       const sysIdx = req.systemPrompt.indexOf(marker);
       if (sysIdx !== -1) {
         const provIdx = req.systemPrompt.indexOf(UNTRUSTED_PROVENANCE_HEADER);
-        if (provIdx === -1 || provIdx > sysIdx) {
+        const hasExplicitSysProv = provIdx !== -1 && provIdx < sysIdx;
+        // ISSUE #23: Codex CLI injects PostToolUse `additionalContext` into a `developer`-role
+        // message (folded into `systemPrompt`) with v2 packer framing (`Incoming hyphae message(s):`).
+        const packerSysIdx = this.config.acceptV2PackerHookFraming
+          ? req.systemPrompt.search(/Incoming hyphae message\(s\):[\s\S]{0,120}\[hyphae(?: interrupt)? · /i)
+          : -1;
+        const hasV2PackerSysFraming = packerSysIdx !== -1 && packerSysIdx < sysIdx;
+        if (!hasExplicitSysProv && !hasV2PackerSysFraming) {
           this.record(
             out,
             req,

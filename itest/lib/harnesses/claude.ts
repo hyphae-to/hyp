@@ -13,6 +13,12 @@ import { resolveToolBinary } from "../../scripts/provision.mjs";
 import type { HypCli } from "../hyp-cli.ts";
 import type { LlmShimServer } from "../llm-shim/index.ts";
 import type { Sandbox, TrackedProcess } from "../sandbox.ts";
+import type {
+  AdapterSessionHandle,
+  HarnessBootOptions,
+  HarnessRuntime,
+  RealHarnessAdapter,
+} from "./types.ts";
 
 export function resolveClaudeBin(): string | null {
   const info = resolveToolBinary("claude", { useHostBins: true, probeVersion: false });
@@ -260,3 +266,120 @@ export class ClaudeHarness {
     return { ...res, sessionId };
   }
 }
+
+export const claudeAdapter: RealHarnessAdapter = {
+  id: "claude",
+  displayName: "Claude Code CLI",
+  capabilities: {
+    nativePushWake: false,
+    nudgeOnlyWake: false,
+    midStreamInterrupt: false,
+    hookToolBoundaries: true,
+    // ISSUE #23: `crates/hyp-harness/src/hooks.rs` uses v2 packer framing on non-OpenClaw hooks.
+    explicitHookProvenance: false,
+    supportsMultiTurnSession: true,
+  },
+
+  checkAvailability(): string | null {
+    return resolveClaudeBin() ? null : "claude binary not found (set CLAUDE_BIN)";
+  },
+
+  async boot(options: HarnessBootOptions): Promise<HarnessRuntime> {
+    await options.hyp.onboard({ nodeId: options.nodeId, noSkills: true, noCommands: true });
+    await options.hyp.startDaemon();
+
+    const harnessesByRole = new Map<string, ClaudeHarness>();
+    const getOrCreateHarness = async (role: string): Promise<ClaudeHarness> => {
+      let inst = harnessesByRole.get(role);
+      if (!inst) {
+        inst = await ClaudeHarness.create({
+          sandbox: options.sandbox,
+          hyp: options.hyp,
+          shim: options.shim,
+          role,
+          profileName: `claude-${role}`,
+        });
+        harnessesByRole.set(role, inst);
+      }
+      return inst;
+    };
+
+    const runtime: HarnessRuntime = {
+      adapter: claudeAdapter,
+      sandbox: options.sandbox,
+      hyp: options.hyp,
+      shim: options.shim,
+
+      async enrollSession(opts) {
+        const claude = await getOrCreateHarness(opts.role);
+        const uuid = crypto.randomUUID();
+        const tag = opts.tag ?? `SESSION_${opts.handle.toUpperCase()}`;
+        const res = await claude.runPrint(`${tag} enroll in mesh as ${opts.handle}`, {
+          sessionId: uuid,
+          maxTurns: 8,
+        });
+        if (res.exitCode !== 0) {
+          throw new Error(`Claude enrollSession(${opts.handle}) failed (exit=${res.exitCode}): ${res.stderr}`);
+        }
+        return {
+          role: opts.role,
+          handle: opts.handle,
+          sessionId: `claude:${uuid}`,
+          nativeId: uuid,
+          tag,
+        };
+      },
+
+      async runTurn(session, prompt, opts) {
+        const claude = await getOrCreateHarness(session.role);
+        const res = await claude.runPrint(prompt, {
+          sessionId: session.nativeId,
+          resume: true,
+          maxTurns: opts?.maxTurns ?? 10,
+          timeoutMs: opts?.timeoutMs ?? 60_000,
+        });
+        return {
+          ok: res.exitCode === 0,
+          exitCode: res.exitCode,
+          finalText: res.finalText,
+          stdout: res.stdout,
+          stderr: res.stderr,
+        };
+      },
+
+      startTurn(session, prompt, opts) {
+        const done = (async () => {
+          const claude = await getOrCreateHarness(session.role);
+          const run = claude.spawnPrint(prompt, {
+            sessionId: session.nativeId,
+            resume: true,
+            maxTurns: opts?.maxTurns ?? 10,
+            timeoutMs: opts?.timeoutMs ?? 60_000,
+          });
+          const res = await run.done;
+          return {
+            ok: res.exitCode === 0,
+            exitCode: res.exitCode,
+            finalText: res.finalText,
+            stdout: res.stdout,
+            stderr: res.stderr,
+          };
+        })();
+        return { done };
+      },
+
+      async deliverPending(session, opts) {
+        await runtime.runTurn(session, opts?.prompt ?? `${session.tag} check pending inbox`, {
+          maxTurns: 8,
+          timeoutMs: opts?.timeoutMs ?? 45_000,
+        });
+      },
+
+      async close() {
+        // Per-turn CLI processes already exited cleanly.
+      },
+    };
+
+    return runtime;
+  },
+};

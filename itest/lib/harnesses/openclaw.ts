@@ -14,6 +14,13 @@ import { resolveToolBinary } from "../../scripts/provision.mjs";
 import type { HypCli } from "../hyp-cli.ts";
 import type { LlmShimServer } from "../llm-shim/index.ts";
 import type { Sandbox, TrackedProcess } from "../sandbox.ts";
+import {
+  extractSessionsFromInspect,
+  type AdapterSessionHandle,
+  type HarnessBootOptions,
+  type HarnessRuntime,
+  type RealHarnessAdapter,
+} from "./types.ts";
 
 export interface OpenClawExecResult {
   exitCode: number;
@@ -396,3 +403,105 @@ export class OpenClawHarness {
     }
   }
 }
+
+export const openClawAdapter: RealHarnessAdapter = {
+  id: "openclaw",
+  displayName: "OpenClaw Gateway",
+  capabilities: {
+    nativePushWake: true,
+    nudgeOnlyWake: true,
+    midStreamInterrupt: false,
+    hookToolBoundaries: false,
+    explicitHookProvenance: true,
+    supportsMultiTurnSession: true,
+  },
+
+  checkAvailability(): string | null {
+    return resolveOpenClawBin() ? null : "openclaw binary not found (set OPENCLAW_BIN)";
+  },
+
+  async boot(options: HarnessBootOptions): Promise<HarnessRuntime> {
+    const oc = await OpenClawHarness.create({
+      sandbox: options.sandbox,
+      hyp: options.hyp,
+      shim: options.shim,
+      role: options.role,
+      nodeId: options.nodeId,
+      deliveryMode: "gateway",
+      promptInjection: false,
+    });
+    await options.hyp.startDaemon();
+    await oc.startGateway();
+
+    const runtime: HarnessRuntime = {
+      adapter: openClawAdapter,
+      sandbox: options.sandbox,
+      hyp: options.hyp,
+      shim: options.shim,
+
+      async enrollSession(opts) {
+        const key = `agent:main:${opts.handle}`;
+        const tag = opts.tag ?? `SESSION_${opts.handle.toUpperCase()}`;
+        const res = await oc.runAgentTurn(key, `${tag} enroll in mesh as ${opts.handle}`);
+        if (!res.ok) {
+          throw new Error(`OpenClaw enrollSession(${opts.handle}) failed: ${JSON.stringify(res)}`);
+        }
+        return {
+          role: opts.role,
+          handle: opts.handle,
+          sessionId: `openclaw:${key}`,
+          nativeId: key,
+          tag,
+        };
+      },
+
+      async runTurn(session, prompt, opts) {
+        const res = await oc.runAgentTurn(session.nativeId, prompt, {
+          timeoutSec: opts?.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : 45,
+        });
+        return {
+          ok: res.ok,
+          exitCode: res.ok ? 0 : 1,
+          finalText: res.final,
+          stdout: res.stdout,
+          stderr: res.stderr,
+        };
+      },
+
+      startTurn(session, prompt, opts) {
+        return {
+          done: runtime.runTurn(session, prompt, opts),
+        };
+      },
+
+      async deliverPending(_session, _opts) {
+        // OpenClaw wakes natively via `hyphae-wake` Gateway push.
+      },
+
+      async afterDaemonRestart(sessions) {
+        const deadline = Date.now() + 12_000;
+        while (Date.now() < deadline) {
+          const ins = await options.hyp.inspect({ all: true, allowFailure: true });
+          const list = extractSessionsFromInspect(ins.json);
+          const allReady = sessions.every((s) =>
+            list.some(
+              (row) =>
+                row.handle === s.handle &&
+                row.transportKind === "openclaw_plugin" &&
+                row.hasLiveTransport,
+            ),
+          );
+          if (allReady) return;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        throw new Error("Timed out waiting for OpenClaw hyphae-wake reconnect after daemon restart");
+      },
+
+      async close() {
+        await oc.stopGateway();
+      },
+    };
+
+    return runtime;
+  },
+};

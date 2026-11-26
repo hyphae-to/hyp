@@ -30,7 +30,7 @@
     "gemini": {
       "kind": "npm",
       "package": "@google/gemini-cli",
-      "version": "0.1.22",
+      "version": "0.71.1",
       "bin": "gemini",
       "versionArgs": ["--version"],
       "tier": 2
