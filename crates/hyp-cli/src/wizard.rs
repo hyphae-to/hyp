@@ -4132,6 +4132,7 @@ fn write_setup_skill(home: &Path, path: &Path) -> Result<(), String> {
         "e1b75a2e02e7b7835459460034c75839f9fd137b6ab4c93be1ba014f8d4b228e",
         "7945d93e4909b8e422ee18e18beca0555497a5c945634f9938acf7ab2aefe767",
         "ad2850fc1eff8fe439e8772156539b090ca2b81f3edcd2ffb31863b088d22959",
+        "5eb5ad185bb59180311acdbf88e8db27bd98c8e86cb73250279e292c1f37a297",
     ];
     crate::skill_render::write_managed_skill(path, HYPHAE_SETUP_SKILL_MD, true)?;
     let stock =
