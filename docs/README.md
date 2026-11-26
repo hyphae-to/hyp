@@ -25,7 +25,7 @@ Pick the path that matches what you are doing.
 
 - **[Deploying Nodes](operations/deploying.md)** — Tailscale, Linux VPS (Caddy + systemd), Docker Compose, Cloudflare Tunnel, Fly.io, and Drop Relays.
 - **[Team Hub Guide (Beta)](guides/team-hub.md)** — Offline Admin-CA key provisioning (`hyphae-admin-pubkey`), member invites, and live revocation (`hyp pair revoke`).
-- **[Hosting a Public Read-Only Node](guides/public-node.md)** — Run a `guest-ro` GitHub event hub with `trustedProxies` and optional GitHub App push.
+- **[Hosting a Public Read-Only Node](guides/public-node.md)** — Run a `guest-ro` GitHub event hub with `trustedProxies`.
 - **[Upgrading & Backup](operations/upgrading-and-backup.md)** — Signed `hyp update`, plugin sync, backups, and uninstall.
 - **[Windows Operations](operations/windows.md)** — Native `schtasks` service, authenticated loopback-TCP chat bridges, and `uninstall.ps1`.
 

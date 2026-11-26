@@ -409,7 +409,7 @@ hyp deploy check --url https://<hostname> --json
 ### F. Configure Event Streams & External Chat Bridges
 1. **GitHub Event Streams — ALWAYS explain Webhook vs. Local Polling BEFORE minting any token (even in Local mode!)**:
    - **Never silently assume "Local mode = polling"** without stating the trade-offs first — even a laptop user can expose a webhook via Tailscale Funnel / Cloudflare Tunnel or a Team Hub if they need real-time CI alerts:
-     - **Webhook (Hub node, or Local node behind Tailscale Funnel / Cloudflare Tunnel) — via compiled-in Rust `github-webhook` in `sources[]`, GitHub App (`/v1/webhooks/github-app`), or optional `hyp plugin install webhook`**:
+     - **Webhook (Hub node, or Local node behind Tailscale Funnel / Cloudflare Tunnel) — via compiled-in Rust `github-webhook` in `sources[]`, or optional `hyp plugin install webhook`**:
        - Real-time (`<1–2s` latency), delivers **every** event type including live GitHub Actions CI pass/fail (`workflow_run`, `check_run`) and rich payloads.
        - **Zero GitHub PAT required** (uses a shared HMAC-SHA256 webhook signing secret only, stored via `hyp secret set github-webhook-secret --web`).
        - Hub Nodes are the natural place to terminate GitHub webhooks once and fan normalized CloudEvents out over E2EE streams to paired developer laptops (use `"topic": "github-webhooks"` on hubs with guest pairing to keep private webhooks isolated from `"github"`).
@@ -470,7 +470,7 @@ hyp deploy check --url https://<hostname> --json
    hyp secret list --json
    ```
 3. **Compiled-in pure-Rust event sources** (`sources[]` in `~/.config/hyphae/node.json` — zero Node/Python needed):
-   - `github-public` (deduplicated ETag poller with multi-owner `repoTokens` + optional GitHub App webhook at `/v1/webhooks/github-app`), plus compiled-in pure-Rust `github-webhook`, `prometheus-webhook`, and `webhook-stream` wired directly into `hyp node start`. (Optional standalone Node `webhook` / `prometheus` scripts remain available via `hyp plugin install` when needed.)
+   - `github-public` (deduplicated ETag poller with multi-owner `repoTokens`), plus compiled-in pure-Rust `github-webhook`, `prometheus-webhook`, and `webhook-stream` wired directly into `hyp node start`. (Optional standalone Node `webhook` / `prometheus` scripts remain available via `hyp plugin install` when needed.)
    - Reference secrets strictly as `{ "secret": "<name>" }`.
 4. **Optional external chat bridges & harness UI mods (`telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`, `claude-panel`, `claude-code`, `herdr-mod`) — ALWAYS manage via `hyp plugin`**:
    - **NEVER** point `node.json` `plugins[]` at a local git checkout (e.g., `plugins/telegram/index.mjs` inside a workspace repository — checkouts move, get deleted, and are not SHA-256 verified against the installed `hyp` binary).

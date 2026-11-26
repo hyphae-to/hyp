@@ -2482,26 +2482,6 @@ fn parse_github_public_source(
             }
         }
 
-        if let Some(app_sec_val) = obj.get("appWebhookSecret") {
-            if let Some(secret_name) =
-                parse_secret_ref_name(app_sec_val, "sources[].appWebhookSecret")?
-            {
-                match secrets.get(&secret_name) {
-                    Ok(secret) => cfg.app_webhook_secret = Some(secret),
-                    Err(CryptoError::SecretNotFound(_)) => {
-                        warnings.push(format!(
-                            "Secret '{secret_name}' is not set; POST /v1/webhooks/github-app disabled until `hyp secret set {secret_name}` is configured."
-                        ));
-                    }
-                    Err(e) => {
-                        return Err(format!(
-                            "failed to load GitHub App webhook secret '{secret_name}': {e}"
-                        ));
-                    }
-                }
-            }
-        }
-
         active_cfg = Some(cfg);
     }
 

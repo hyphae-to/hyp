@@ -12,7 +12,7 @@ Hyphae unifies event sources and chat bridges onto the single Rust `Node` CloudE
 
 | Layer | Implementation | Routing Model | Secrets Location | Best For |
 | --- | --- | --- | --- | --- |
-| **Compiled-In Rust Event Sources & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure Rust wired directly into `hyp node start` (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus default-enabled socket-only `localIngest` on `ingest.sock` / `ingest.addr`) — zero Node/Python needed | **1-to-many Pub/Sub** via standard `hyp_stream` with server-side CloudEvents filter pushdown (including `local.schedule` / `local.<topic>` triggered via `hyp emit` or raw NDJSON) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + `github-webhook` / GitHub App push), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and OS-scheduled **Local Ingest & Cron triggers** |
+| **Compiled-In Rust Event Sources & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure Rust wired directly into `hyp node start` (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus default-enabled socket-only `localIngest` on `ingest.sock` / `ingest.addr`) — zero Node/Python needed | **1-to-many Pub/Sub** via standard `hyp_stream` with server-side CloudEvents filter pushdown (including `local.schedule` / `local.<topic>` triggered via `hyp emit` or raw NDJSON) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + `github-webhook`), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and OS-scheduled **Local Ingest & Cron triggers** |
 | **External Subprocess Bridges & Custom Sources** (`plugins/`) | Optional self-contained scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom executables) supervised by `SubprocessSupervisor` (Unix fd 3 / Windows loopback TCP) | **Thread-owned + multi-thread fan-in + outbound replies** via `hyp_bridge` and `hyp_send({ to: "<plugin>:<target>", text })`; bridge topics stay **local-only by default** (`exposeTopic: true` opt-in) | Local machine's `SecretStore` — scrubbed subprocess env, never sent to remote hubs | Personal **Slack / Telegram / WhatsApp** bridges, local callbacks, and custom scripts in any language |
 
 ---
@@ -61,7 +61,7 @@ Pick the transport that matches your node topology:
 
 > **Rule of thumb:** **Hub Nodes (`profile: router`) are the natural place to terminate `github-webhook` deliveries** once and fan normalized CloudEvents out over E2EE streams to every paired laptop. Use **`github-public` + `repoTokens`** as the zero-infra fallback on a **Local Node (`profile: local`)** behind NAT when you don't have (or don't want to expose) a hub or public HTTPS endpoint yet.
 
-### A. `github-public` — Demand-Driven Deduplicated ETag Poller (+ Multi-Owner `repoTokens` & Optional `<1s` GitHub App Push)
+### A. `github-public` — Demand-Driven Deduplicated ETag Poller with Multi-Owner `repoTokens`
 
 Compiled directly into `hyp` (`crates/hyp-node/src/adapters/github_public.rs`). Used both on read-only public nodes (`hyp deploy init public-node`) and locally on developer machines behind NAT.
 
@@ -89,8 +89,7 @@ hyp secret set github-acme-token --web
         "alice/*": { "secret": "github-alice-token" },
         "acme/*": { "secret": "github-acme-token" },
         "acme/special": { "secret": "github-acme-special-token" }
-      },
-      "appWebhookSecret": { "secret": "github-app-webhook-secret" }
+      }
     }
   ]
 }
@@ -100,7 +99,6 @@ hyp secret set github-acme-token --web
 - **Single `github-public` source**: Consolidate all GitHub tokens into `sources[0].repoTokens`; if multiple enabled `github-public` entries exist, only the first is active and Hyphae emits a startup warning.
 - **1 poller per distinct `owner/repo` + bounded rate-limit hardening**: Regardless of subscriber count, conditional `If-None-Match` polls returning `304 Not Modified` consume **0** GitHub API quota, adaptively back off on idle repos, enforce bounded backoff on HTTP `403`/`429` (`Retry-After` and `X-RateLimit-Remaining: 0` + `X-RateLimit-Reset`), cap concurrent active pollers at `maxActivePollers` (default `100`), and tear down after `graceWindowSeconds` when active subscribers drop to `0`.
 - **Private repo access**: On non-`publicReadOnly` local/private nodes, setting `"allowPrivateWithToken": true` permits watching a private repo **only** when `token_for_repo(repo)` resolves a matching token (unmatched orgs/private repos still fail closed!).
-- **Optional `<1s` GitHub App webhooks**: Setting `appWebhookSecret` enables HMAC-verified `POST /v1/webhooks/github-app` (returns `404` when unconfigured, `401` on invalid `X-Hub-Signature-256`).
 
 ### B. Compiled-In Pure-Rust Webhooks: `github-webhook`, `prometheus-webhook` & `webhook-stream` (`crates/hyp-node/src/adapters/webhooks.rs`)
 
@@ -130,6 +128,13 @@ All three webhook adapters are compiled in pure Rust and wired directly into `hy
   ]
 }
 ```
+
+#### Repository webhook setup
+
+1. Add a `github-webhook` source to `node.json`. Give it a unique `id`, set `allowedRepos` to the repository slug, and use a private topic such as `github-webhooks`. Limit subscription grants on that topic to the intended peers.
+2. Store a unique shared secret with `hyp secret set github-webhook-secret --web` on the node that runs the receiver. Reference it as `"secret": { "secret": "github-webhook-secret" }` and restart the node.
+3. Expose `POST /v1/webhooks/github/<id>` through your public HTTPS proxy or tunnel. Route only the webhook endpoint if the node also serves private peer or admin routes.
+4. In the repository's **Settings → Webhooks → Add webhook**, enter the public payload URL, for example `https://hooks.example.com/v1/webhooks/github/org-github`. Choose **application/json**, enter the same secret, and select the events to deliver. Check **Recent Deliveries** to verify GitHub reached the receiver.
 
 ### C. `localIngest` — Default Socket-Only Local Event Ingest Route (`ingest.sock` & `hyp emit`)
 
