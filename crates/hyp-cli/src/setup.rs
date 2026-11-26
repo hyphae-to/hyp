@@ -20,8 +20,9 @@ use crate::service;
 use crate::skill_render::{
     HostOrchestratorHints, MANAGED_MARKER_PREFIX, SkillCapabilities, SkillProfile,
     SkillTargetHarness, SkillWriteOutcome, UNMANAGED_MARKER, apply_managed_skill,
-    detect_capabilities_from_config_path, detect_host_orchestrators, render_runtime_skill,
-    resolve_transport_for_harness, retire_legacy_skill, runtime_skill_paths,
+    detect_capabilities_from_config_path, detect_host_orchestrators, legacy_skill_path,
+    migrate_installed_skill, render_runtime_skill, resolve_transport_for_harness,
+    retire_legacy_skill, runtime_skill_paths,
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -2667,6 +2668,53 @@ impl SetupSkillContext {
     }
 }
 
+fn is_managed_legacy_runtime_skill(text: &str) -> bool {
+    text.starts_with("---\nname: hyphae\n")
+        && text
+            .lines()
+            .any(|line| line.starts_with(MANAGED_MARKER_PREFIX))
+        && !text.contains(UNMANAGED_MARKER)
+}
+
+fn legacy_runtime_skills(kind: HarnessKind, home: &Path, installed: &Path) -> Vec<PathBuf> {
+    let local = legacy_skill_path(installed, "hyphae");
+    if matches!(kind, HarnessKind::Codex | HarnessKind::T3) {
+        // Prefer the Codex profile when the host has both old harness copies.
+        vec![
+            home.join(".codex/skills/hyphae/SKILL.md"),
+            local,
+            home.join(".t3/skills/hyphae/SKILL.md"),
+        ]
+    } else {
+        vec![local]
+    }
+}
+
+pub(crate) fn migrate_installed_harness_skills(
+    home: &Path,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
+    warnings: &mut Vec<String>,
+) {
+    let profiles = resolve_claude_profiles(home, explicit_home, claude_config_dir);
+    let mut seen = BTreeSet::new();
+    for kind in HarnessKind::ALL {
+        let (primary, extras) = runtime_skill_paths(kind, home, &profiles);
+        for installed in std::iter::once(primary).chain(extras) {
+            if seen.insert(canonical_dedup_key(&installed)) {
+                migrate_installed_skill(
+                    &installed,
+                    &legacy_runtime_skills(kind, home, &installed),
+                    is_managed_legacy_runtime_skill,
+                    |text| text.replacen("name: hyphae\n", "name: hyp-mesh\n", 1),
+                    warnings,
+                );
+            }
+        }
+    }
+    crate::wizard::migrate_installed_setup_skills(home, explicit_home, claude_config_dir, warnings);
+}
+
 fn install_harness_runtime_skills(
     kind: HarnessKind,
     home: &Path,
@@ -2690,19 +2738,8 @@ fn install_harness_runtime_skills(
         match apply_managed_skill(&path, &rendered, ctx.force_skills, dry_run)? {
             SkillWriteOutcome::Written | SkillWriteOutcome::Unchanged => {
                 if !dry_run {
-                    let managed_legacy = |text: &str| {
-                        text.starts_with("---\nname: hyphae\n")
-                            && text
-                                .lines()
-                                .any(|line| line.starts_with(MANAGED_MARKER_PREFIX))
-                            && !text.contains(UNMANAGED_MARKER)
-                    };
-                    retire_legacy_skill(&path, "hyphae", managed_legacy)?;
-                    if matches!(kind, HarnessKind::Codex | HarnessKind::T3) {
-                        for root in [".codex", ".t3"] {
-                            let old_install = home.join(root).join("skills/hyp-mesh/SKILL.md");
-                            retire_legacy_skill(&old_install, "hyphae", managed_legacy)?;
-                        }
+                    for legacy in legacy_runtime_skills(kind, home, &path) {
+                        retire_legacy_skill(&legacy, is_managed_legacy_runtime_skill)?;
                     }
                 }
                 files.push(path.display().to_string());

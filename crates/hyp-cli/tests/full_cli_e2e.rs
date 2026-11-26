@@ -1470,6 +1470,46 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     let state_dir = tmp.path().join("state");
     fs::create_dir_all(&home).unwrap();
 
+    // Model the two copies older releases installed in Codex's active skill roots.
+    let runtime = "---\nname: hyphae\ndescription: Mesh\n---\n<!-- hyphae:managed profile=codex transport=background-wait caps=core -->\n";
+    let setup = include_str!("../../../skills/hyp-setup/SKILL.md")
+        .replace("hyp-setup", "hyphae-setup")
+        .replace("skills/hyp-mesh/", "skills/hyphae/")
+        .replace("skills/hyp-schedule/", "skills/hyphae-schedule/")
+        .replace("/skills/hyp-panel/", "/skills/hyphae-panel/");
+    let prior_paths = [
+        (".codex/skills/hyphae/SKILL.md", runtime),
+        (".agents/skills/hyphae/SKILL.md", runtime),
+        (".codex/skills/hyphae-setup/SKILL.md", &setup),
+        (".agents/skills/hyphae-setup/SKILL.md", &setup),
+    ];
+    let active_profile = home.join("work-claude");
+    let inactive_profile = home.join("unused-claude");
+    let claude_runtime = runtime.replace("profile=codex", "profile=claude");
+    for profile in [&active_profile, &inactive_profile] {
+        let old = profile.join("skills/hyphae/SKILL.md");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(old, &claude_runtime).unwrap();
+    }
+    let custom_old = home.join(".cursor/skills/hyphae/SKILL.md");
+    let blocked_profile = home.join(".config/opencode/skills");
+    let blocked_old = blocked_profile.join("hyphae/SKILL.md");
+    let blocked_new = blocked_profile.join("hyp-mesh/SKILL.md");
+    for (relative, content) in prior_paths
+        .into_iter()
+        .map(|(relative, content)| (home.join(relative), content))
+        .chain([
+            (custom_old.clone(), "# Custom runtime"),
+            (blocked_old.clone(), runtime),
+            (blocked_new.clone(), "# Existing new skill"),
+        ])
+    {
+        fs::create_dir_all(relative.parent().unwrap()).unwrap();
+        fs::write(relative, content).unwrap();
+    }
+    let extra = home.join(".codex/skills/hyphae/notes.txt");
+    fs::write(&extra, "# My notes").unwrap();
+
     // Build real tar.gz archives:
     // 1) Good archive containing an executable that runs our real compiled `hyp` (`version --json`).
     //    On Unix, use a tiny POSIX exec wrapper so Linux unstripped debug ELF binaries (>128 MiB)
@@ -1878,7 +1918,22 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     // (a) Happy-path `--all` accepts `--all` cleanly while skipping all remote peers with zero
     // remote `/v1/node/update` POSTs (cut from v0.7.0), verifies Ed25519 + SHA-256 + smoke check,
     // and atomically swaps `--target-bin`!
-    let ok_out = isolated_cmd(&home)
+    for (relative, _) in prior_paths {
+        assert!(
+            home.join(relative).exists(),
+            "failed update modified skills"
+        );
+    }
+    let mut old_updater = match std::env::var_os("HYP_TEST_PREV_UPDATER") {
+        Some(bin) => {
+            let mut cmd = Command::new(bin);
+            common::apply_isolated_env(&mut cmd, &home);
+            cmd
+        }
+        None => isolated_cmd(&home),
+    };
+    let ok_out = old_updater
+        .env("CLAUDE_CONFIG_DIR", &active_profile)
         .args([
             "update",
             "--channel",
@@ -1909,6 +1964,67 @@ fn self_update_signed_manifest_atomic_swap_rollback_tamper_and_fleet_all() {
     assert_eq!(ok_json["data"]["smokeCheckPassed"], true);
     assert_eq!(ok_json["data"]["pluginsSync"]["skipped"], false);
     assert_eq!(ok_json["data"]["pluginsSync"]["ok"], true);
+    let new_runtime = home.join(".agents/skills/hyp-mesh/SKILL.md");
+    let new_setup = home.join(".agents/skills/hyp-setup/SKILL.md");
+    assert_eq!(
+        fs::read_to_string(&new_runtime).unwrap(),
+        runtime.replace("name: hyphae", "name: hyp-mesh")
+    );
+    assert_eq!(
+        fs::read_to_string(&new_setup).unwrap(),
+        include_str!("../../../skills/hyp-setup/SKILL.md").replace("\r\n", "\n")
+    );
+    for (relative, _) in prior_paths {
+        assert!(
+            !home.join(relative).exists(),
+            "update preserved managed {relative}"
+        );
+    }
+    assert!(!active_profile.join("skills/hyphae/SKILL.md").exists());
+    assert_eq!(
+        fs::read_to_string(active_profile.join("skills/hyp-mesh/SKILL.md")).unwrap(),
+        claude_runtime.replace("name: hyphae", "name: hyp-mesh")
+    );
+    assert!(inactive_profile.join("skills/hyphae/SKILL.md").exists());
+    assert!(!inactive_profile.join("skills/hyp-mesh/SKILL.md").exists());
+    assert!(!home.join(".codex/skills/hyp-mesh/SKILL.md").exists());
+    assert!(!home.join(".codex/skills/hyp-setup/SKILL.md").exists());
+    assert!(
+        !home.join(".gemini/skills").exists(),
+        "update installed a previously absent skill"
+    );
+    assert_eq!(fs::read_to_string(extra).unwrap(), "# My notes");
+    assert_eq!(fs::read_to_string(custom_old).unwrap(), "# Custom runtime");
+    assert_eq!(fs::read_to_string(blocked_old).unwrap(), runtime);
+    assert_eq!(
+        fs::read_to_string(blocked_new).unwrap(),
+        "# Existing new skill"
+    );
+    let warnings = ok_json["warnings"].as_array().unwrap();
+    assert!(warnings.iter().any(|warning| {
+        warning
+            .as_str()
+            .is_some_and(|text| text.contains("Preserved customized skill"))
+    }));
+    assert!(warnings.iter().any(|warning| {
+        warning
+            .as_str()
+            .is_some_and(|text| text.contains("kept legacy files"))
+    }));
+
+    let before = fs::metadata(&new_runtime).unwrap().modified().unwrap();
+    let mut repeat = Command::new(&target_bin);
+    common::apply_isolated_env(&mut repeat, &home);
+    let repeat = repeat
+        .args(["plugin", "update", "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(repeat.status.success());
+    assert_eq!(
+        fs::metadata(new_runtime).unwrap().modified().unwrap(),
+        before
+    );
+
     assert_eq!(ok_json["data"]["rolloutOrder"], json!(["local"]));
     let fleet_plan = ok_json["data"]["fleetPlan"]
         .as_array()

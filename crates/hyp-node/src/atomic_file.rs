@@ -78,6 +78,20 @@ fn resolve_symlink_write_target(dest: &Path) -> Result<PathBuf, String> {
 /// renames over the resolved target path so the symlink at `dest` remains intact.
 pub fn write_atomic_file(dest: &Path, bytes: &[u8], private: bool) -> Result<(), String> {
     let target = resolve_symlink_write_target(dest)?;
+    write_atomic_file_to(&target, bytes, private, true)
+}
+
+/// Atomically creates a file without replacing an existing path, including a symlink.
+pub fn write_atomic_file_new(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic_file_to(dest, bytes, false, false)
+}
+
+fn write_atomic_file_to(
+    target: &Path,
+    bytes: &[u8],
+    private: bool,
+    replace: bool,
+) -> Result<(), String> {
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -114,13 +128,21 @@ pub fn write_atomic_file(dest: &Path, bytes: &[u8], private: bool) -> Result<(),
             fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))
                 .map_err(|e| format!("failed to set permissions on {}: {e}", tmp_path.display()))?;
         }
-        fs::rename(&tmp_path, &target).map_err(|e| {
-            format!(
-                "failed to atomically rename {} -> {}: {e}",
-                tmp_path.display(),
-                target.display()
-            )
-        })?;
+        if replace {
+            fs::rename(&tmp_path, target).map_err(|e| {
+                format!(
+                    "failed to atomically rename {} -> {}: {e}",
+                    tmp_path.display(),
+                    target.display()
+                )
+            })?;
+        } else {
+            fs::hard_link(&tmp_path, target)
+                .map_err(|err| format!("failed to install {}: {err}", target.display()))?;
+            fs::remove_file(&tmp_path).map_err(|err| {
+                format!("failed to remove temp file {}: {err}", tmp_path.display())
+            })?;
+        }
         Ok(())
     })();
 

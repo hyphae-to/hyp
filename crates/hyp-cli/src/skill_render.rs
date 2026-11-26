@@ -13,7 +13,7 @@
 //!    enabled and permitted for the target harness (0 tokens otherwise), plus a crisp 2-line
 //!    `local.schedule` + `hyp emit` tip on harnesses without native scheduling.
 
-use crate::config_file::{read_json_value, write_atomic_file};
+use crate::config_file::{read_json_value, write_atomic_file, write_atomic_file_new};
 use crate::setup::{ClaudeConfigProfile, canonical_dedup_key};
 use hyp_harness::protocol::HarnessKind;
 use hyp_node::node_file::NodeFile;
@@ -811,42 +811,112 @@ pub fn detect_host_orchestrators(
     }
 }
 
-/// Removes a recognized legacy skill while preserving any additional files in its directory.
-pub(crate) fn retire_legacy_skill(
-    installed: &Path,
-    legacy_name: &str,
-    recognized: impl FnOnce(&str) -> bool,
-) -> Result<(), String> {
-    let Some(legacy_dir) = installed
+pub(crate) fn legacy_skill_path(installed: &Path, legacy_name: &str) -> PathBuf {
+    installed
         .parent()
-        .map(|dir| dir.with_file_name(legacy_name))
-    else {
-        return Ok(());
+        .unwrap_or_else(|| Path::new("."))
+        .with_file_name(legacy_name)
+        .join("SKILL.md")
+}
+
+fn read_regular_skill(path: &Path) -> Result<Option<String>, String> {
+    let Some(dir) = path.parent() else {
+        return Ok(None);
     };
-    if !fs::symlink_metadata(&legacy_dir).is_ok_and(|meta| meta.is_dir()) {
-        return Ok(());
-    }
-    let legacy = legacy_dir.join("SKILL.md");
-    if !fs::symlink_metadata(&legacy).is_ok_and(|meta| meta.is_file()) {
-        return Ok(());
+    if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir())
+        || !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+    {
+        return Ok(None);
     }
     const MAX_SKILL_BYTES: u64 = 64 * 1024;
     let mut bytes = Vec::new();
-    fs::File::open(&legacy)
+    fs::File::open(path)
         .and_then(|file| file.take(MAX_SKILL_BYTES + 1).read_to_end(&mut bytes))
-        .map_err(|err| format!("could not read {}: {err}", legacy.display()))?;
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return Ok(());
-    };
-    if bytes.len() as u64 > MAX_SKILL_BYTES || !recognized(&text.replace("\r\n", "\n")) {
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    if bytes.len() as u64 > MAX_SKILL_BYTES {
+        return Ok(None);
+    }
+    Ok(std::str::from_utf8(&bytes)
+        .ok()
+        .map(|text| text.replace("\r\n", "\n")))
+}
+
+/// Removes a recognized legacy skill while preserving any additional files in its directory.
+pub(crate) fn retire_legacy_skill(
+    legacy: &Path,
+    recognized: impl FnOnce(&str) -> bool,
+) -> Result<(), String> {
+    if !read_regular_skill(legacy)?.is_some_and(|text| recognized(&text)) {
         return Ok(());
     }
-    fs::remove_file(&legacy)
+    fs::remove_file(legacy)
         .map_err(|err| format!("could not retire {}: {err}", legacy.display()))?;
-    match fs::remove_dir(&legacy_dir) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
-        Err(err) => Err(format!("could not retire {}: {err}", legacy_dir.display())),
+    if let Some(dir) = legacy.parent() {
+        match fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(err) => return Err(format!("could not retire {}: {err}", dir.display())),
+        }
+    }
+    Ok(())
+}
+
+fn install_skill_without_overwriting(path: &Path, text: &str) -> Result<(), String> {
+    if fs::symlink_metadata(path).is_ok() {
+        if read_regular_skill(path)?.as_deref() == Some(text) {
+            return Ok(());
+        }
+        return Err(format!("preserved existing skill at {}", path.display()));
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("missing skill directory for {}", path.display()))?;
+    fs::create_dir_all(dir).map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+    if !fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return Err(format!(
+            "preserved existing skill directory at {}",
+            dir.display()
+        ));
+    }
+    write_atomic_file_new(path, text.as_bytes())
+}
+
+pub(crate) fn migrate_installed_skill(
+    destination: &Path,
+    legacy_paths: &[PathBuf],
+    recognized: fn(&str) -> bool,
+    replacement: impl FnOnce(&str) -> String,
+    warnings: &mut Vec<String>,
+) {
+    let mut managed = Vec::new();
+    let mut seen = BTreeSet::new();
+    for legacy in legacy_paths {
+        if fs::symlink_metadata(legacy).is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+            || !seen.insert(canonical_dedup_key(legacy))
+        {
+            continue;
+        }
+        match read_regular_skill(legacy) {
+            Ok(Some(text)) if recognized(&text) => managed.push((legacy, text)),
+            Ok(_) => warnings.push(format!(
+                "Preserved customized skill at {}.",
+                legacy.display()
+            )),
+            Err(err) => warnings.push(err),
+        }
+    }
+    let Some((_, previous)) = managed.first() else {
+        return;
+    };
+    let replacement = replacement(previous).replace("\r\n", "\n");
+    if let Err(err) = install_skill_without_overwriting(destination, &replacement) {
+        warnings.push(format!("Skill migration kept legacy files ({err})."));
+        return;
+    }
+    for (legacy, _) in managed {
+        if let Err(err) = retire_legacy_skill(legacy, recognized) {
+            warnings.push(err);
+        }
     }
 }
 
