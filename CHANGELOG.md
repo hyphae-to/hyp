@@ -4,6 +4,13 @@ All notable changes to Hyphae (`hyp`) are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Metadata-only delivery ([RFC 0004](docs/rfcs/0004-metadata-only-delivery.md), #49)**: Hooks and push wakes no longer carry message or event text for any source or tier. Every delivery is a small `<hyphae-inbox>` XML digest of counts grouped by source, and an agent reads content by calling `hyp_inbox`, which now acknowledges `unread` items by default (`ack: false` peeks). Each returned item states its `trustTier`.
+- **Untrusted tiers can wake a thread**: Security Gate Stage 1 now defaults `guest` and `external-webhook` to `cap_to_queue` (never `interrupt`) instead of `downgrade_to_notify`, so mail, calendar and webhook events wake an idle agent at turn end. `downgrade_to_notify` remains available per tier.
+- **Long-turn reminder**: during a long active turn, unread `queue` items produce a digest on `PostToolUse` every 30 minutes. Set `delivery.midturnQueueDigestSeconds` in `node.json` to change it (`0` disables).
+- **Quarantine in digests**: a digest shows only `<quarantined count="N"/>`; receipt, source and reason stay in `hyp gate review`.
+- **Rollback note**: saved per-session delivery policies no longer contain `maxBatchTokens`, `maxInlineItems` or `maxSingleItemShare`. Releases up to 0.7.0 require those fields, so after a downgrade a session whose policy was saved by this version fails to load its policy until the policy is saved again from scratch.
+
 ### Added
 - **Six event-source plugins (Beta)**: `agentmail`, `sentry`, `gmail`, `google-calendar`, `vercel` and `notion`, installed with `hyp plugin install <name>` and wired as `kind: "source"` so each thread subscribes with its own `hyp_stream` filter. All are outbound-only by default (WebSocket or polling) and run on a laptop or a hub; Sentry, Vercel and Notion also accept signed webhooks (`*_MODE=webhook`). Events carry routing metadata and short previews only, never message or page bodies.
 - **Tailscale Funnel for plugin webhooks (`<PREFIX>_WEBHOOK_FUNNEL`)**: Sentry, Vercel and Notion webhook modes can publish their own loopback path through Funnel and log the public URL, with no reverse proxy to configure; their onboarding trees offer it as the recommended route on a tailnet.
