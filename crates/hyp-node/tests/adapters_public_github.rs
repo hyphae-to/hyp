@@ -1322,31 +1322,35 @@ lines.on("line", (line) => {
         assert_eq!(sup.health(), AdapterHealth::Stopped);
     }
 
-    #[tokio::test]
-    async fn supervisor_correlates_post_while_a_publish_is_blocked() {
+    async fn assert_post_reply_during_blocked_publish(notification: bool) {
         let host = RecordingHost::new();
         let blocked_publish = host.events.lock().await;
         let script = r#"
-import json, socket
+import json, os, socket
 sock = socket.socket(fileno=3)
 reader = sock.makefile("rb")
 def send(value):sock.sendall((json.dumps(value)+"\n").encode())
 hello = json.loads(reader.readline())
 assert hello["method"] == "hyphae/hello"
-send({"jsonrpc":"2.0","id":"publish-1","method":"hyphae/publish","params":{
-    "to":"ops","event":{"specversion":"1.0","id":"blocked","source":"test/concurrent","type":"test.concurrent","data":{}}}})
+publication = {"jsonrpc":"2.0","id":"publish-1","method":"hyphae/publish","params":{
+    "to":"ops","event":{"specversion":"1.0","id":"blocked","source":"test/concurrent","type":"test.concurrent","data":{}}}}
+if os.environ["TEST_NOTIFICATION"] == "true":publication.pop("id")
+send(publication)
 for line in reader:
     message = json.loads(line)
     if message.get("method") == "hyphae/post":
         send({"jsonrpc":"2.0","id":message["id"],"result":{"concurrent":True}})
 "#;
-        let supervisor = SubprocessSupervisor::new(SubprocessConfig::new(
+        let mut cfg = SubprocessConfig::new(
             "concurrent",
             AdapterKind::Bridge,
             python_bin(),
             vec!["-u".into(), "-c".into(), script.into()],
             vec!["ops".into()],
-        ));
+        );
+        cfg.env
+            .insert("TEST_NOTIFICATION".into(), notification.to_string());
+        let supervisor = SubprocessSupervisor::new(cfg);
         supervisor.start(host.clone()).await.unwrap();
         let reply = supervisor
             .post("ops", BTreeMap::new(), Duration::from_secs(2))
@@ -1363,6 +1367,16 @@ for line in reader:
         .await
         .unwrap();
         supervisor.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_correlates_post_while_a_publish_is_blocked() {
+        assert_post_reply_during_blocked_publish(false).await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_correlates_post_while_a_publish_notification_is_blocked() {
+        assert_post_reply_during_blocked_publish(true).await;
     }
 }
 
