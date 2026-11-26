@@ -20,7 +20,7 @@ import {
 } from './state';
 
 const PANE_ID = 'hyphae-panel';
-const COMMAND_NAME = 'hyphae-panel';
+const COMMAND_NAME = 'hyp-panel';
 const REFRESH_INTERVAL_MS = 5_000;
 const CONTROL_TIMEOUT_MS = 10_000;
 const MAX_VISIBLE_ROWS = 12;
@@ -923,7 +923,7 @@ export const register: Register = (on) => {
   // Quiet AbovePrompt indicator:
   // - Emergency red quarantine alert whenever quarantined > 0
   // - Subtle dim single-line indicator when enrolled outside Herdr (auto-hidden inside Herdr when the native Herdr mod is active)
-  // - 100% hidden when unenrolled or silenced (`/hyphae-panel status off`)
+  // - 100% hidden when unenrolled or silenced (`/hyp-panel status off`)
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const state = await computePromptStripState($, uiState);
     const { Box, Text, Button } = $.ui.resolve(e);

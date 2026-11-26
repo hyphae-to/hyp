@@ -1,5 +1,5 @@
 {
-  "description": "Hyphae v2 Claude Code lifecycle hooks and native side-panel mod: export HYPHAE_SESSION_ID on SessionStart, verify MCP callers on PreToolUse, drain queued mesh messages on PostToolUse and Stop, and provide the native /hyphae-panel live side panel.",
+  "description": "Hyphae v2 Claude Code lifecycle hooks and native side-panel mod: export HYPHAE_SESSION_ID on SessionStart, verify MCP callers on PreToolUse, drain queued mesh messages on PostToolUse and Stop, and provide the native /hyp-panel live side panel.",
   "modules": ["./register.tsx"],
   "hooks": {
     "SessionStart": [

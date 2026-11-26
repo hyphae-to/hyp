@@ -89,14 +89,10 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
 
     // 4. All 4 slash commands + README + SKILL.md
     let expected_commands = [
-        ("hyphae.md", "hyp inspect --json", "!hyp ui"),
-        (
-            "hyphae-subs.md",
-            "hyp session unsubscribe",
-            "hyp session rule",
-        ),
-        ("hyphae-focus.md", "hyp session focus", "focusMode"),
-        ("hyphae-mute.md", "hyp session mute", "hyp session unmute"),
+        ("hyp.md", "hyp inspect --json", "!hyp ui"),
+        ("hyp-subs.md", "hyp session unsubscribe", "hyp session rule"),
+        ("hyp-focus.md", "hyp session focus", "focusMode"),
+        ("hyp-mute.md", "hyp session mute", "hyp session unmute"),
     ];
     for (file, needle_a, needle_b) in expected_commands {
         let path = plugin_dir.join("commands").join(file);
@@ -164,10 +160,10 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
             .as_array()
             .expect("provides.commands array");
         for expected in [
-            "hyphae:hyphae",
-            "hyphae:hyphae-subs",
-            "hyphae:hyphae-focus",
-            "hyphae:hyphae-mute",
+            "hyphae:hyp",
+            "hyphae:hyp-subs",
+            "hyphae:hyp-focus",
+            "hyphae:hyp-mute",
         ] {
             assert!(
                 cmds.iter().any(|c| c.as_str() == Some(expected)),
@@ -267,12 +263,7 @@ fn claude_statusline_fresh_idempotent_and_slash_commands() {
     );
 
     // All 4 slash commands installed under ~/.claude/commands/
-    for file in [
-        "hyphae.md",
-        "hyphae-subs.md",
-        "hyphae-focus.md",
-        "hyphae-mute.md",
-    ] {
+    for file in ["hyp.md", "hyp-subs.md", "hyp-focus.md", "hyp-mute.md"] {
         let installed = fs::read_to_string(home.join(".claude/commands").join(file))
             .unwrap_or_else(|e| panic!("missing ~/.claude/commands/{file}: {e}"));
         let canonical =

@@ -615,6 +615,38 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     }
     assert_eq!(onboarding_of("telegram"), Value::Null);
 
+    // Seed the previous standalone panel and a file the user added.
+    let legacy_panel = home.join(".claude/skills/hyphae-panel");
+    fs::create_dir_all(legacy_panel.join("hooks")).unwrap();
+    fs::create_dir_all(legacy_panel.join(".claude-plugin")).unwrap();
+    fs::write(
+        legacy_panel.join(".claude-plugin/plugin.json"),
+        json!({
+            "name": "hyphae-panel",
+            "version": "0.7.0",
+            "description": "Native Hyphae live mesh side-panel mod (/hyphae-panel) for Claude Code.",
+            "author": {"name": "Hyphae"},
+            "license": "MIT",
+            "repository": "https://github.com/hyphae-to/hyp",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        legacy_panel.join("hooks/hooks.json"),
+        r#"{"modules":["./register.tsx"]}"#,
+    )
+    .unwrap();
+    for file in ["register.tsx", "state.ts"] {
+        let current = fs::read_to_string(plugins_dir.join("claude-code/hooks").join(file)).unwrap();
+        let legacy = current.replace("/hyp-panel", "/hyphae-panel").replace(
+            "COMMAND_NAME = 'hyp-panel'",
+            "COMMAND_NAME = 'hyphae-panel'",
+        );
+        fs::write(legacy_panel.join("hooks").join(file), legacy).unwrap();
+    }
+    fs::write(legacy_panel.join("notes.txt"), "my notes").unwrap();
+
     // 2. Install telegram, claude-panel, and herdr-mod via --from-dir.
     for name in ["telegram", "claude-panel", "herdr-mod"] {
         let inst = run(
@@ -639,11 +671,17 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
             String::from_utf8_lossy(&inst.stderr)
         );
     }
+    assert!(!legacy_panel.join("hooks/register.tsx").exists());
+    assert!(!legacy_panel.join(".claude-plugin/plugin.json").exists());
+    assert_eq!(
+        fs::read_to_string(legacy_panel.join("notes.txt")).unwrap(),
+        "my notes"
+    );
     assert!(state_dir.join("plugins/installed.json").is_file());
     assert!(state_dir.join("plugins/telegram/index.mjs").is_file());
     assert!(state_dir.join("plugins/sdk/client.mjs").is_file());
     assert!(
-        home.join(".claude/skills/hyphae-panel/hooks/register.tsx")
+        home.join(".claude/skills/hyp-panel/hooks/register.tsx")
             .is_file()
     );
     assert!(
@@ -766,7 +804,7 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert_eq!(real_upd_json["data"]["updated"], json!(["telegram"]));
 
     // 5. Local edit on `claude-panel` (`modified`) -> refuses without `--force`, succeeds with `--force`!
-    let panel_reg = home.join(".claude/skills/hyphae-panel/hooks/register.tsx");
+    let panel_reg = home.join(".claude/skills/hyp-panel/hooks/register.tsx");
     let user_edit = b"// user custom edit\n";
     fs::write(&panel_reg, user_edit).unwrap();
 
@@ -847,7 +885,7 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     // Pure-Rust configs MUST exist!
     assert!(offline_home.join(".claude.json").is_file());
     assert!(offline_home.join(".claude/settings.json").is_file());
-    assert!(offline_home.join(".claude/commands/hyphae.md").is_file());
+    assert!(offline_home.join(".claude/commands/hyp.md").is_file());
     assert!(!offline_home.join(".config/herdr/hyphae.json").exists());
     assert!(
         offline_home
@@ -922,7 +960,7 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     );
     assert!(
         offline_home
-            .join(".claude/skills/hyphae-panel/hooks/register.tsx")
+            .join(".claude/skills/hyp-panel/hooks/register.tsx")
             .is_file()
     );
     assert!(
@@ -963,7 +1001,7 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
         &[],
     );
     assert_eq!(tamper_setup.status.code(), Some(1));
-    assert!(!tamper_home.join(".claude/skills/hyphae-panel").exists());
+    assert!(!tamper_home.join(".claude/skills/hyp-panel").exists());
 }
 
 #[test]

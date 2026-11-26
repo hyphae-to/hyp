@@ -1,5 +1,5 @@
 //! End-to-end tests for OpenCode real lifecycle hooks (`plugins/opencode/hyphae.ts`),
-//! `/hyphae` slash command (`~/.config/opencode/commands/hyphae.md`), verified
+//! `/hyp` slash command (`~/.config/opencode/commands/hyp.md`), verified
 //! per-session MCP caller binding (`hyp mcp --backend opencode` without `--ephemeral`),
 //! and optional zero-polling TUI status widget (`plugins/opencode/tui.mjs`).
 //!
@@ -47,7 +47,7 @@ fn node_available() -> bool {
 }
 
 // ============================================================================
-// 1. `hyp setup --harness opencode`: Verified MCP, Lifecycle Plugin, /hyphae, Idempotency
+// 1. `hyp setup --harness opencode`: Verified MCP, Lifecycle Plugin, /hyp, Idempotency
 // ============================================================================
 
 #[test]
@@ -81,6 +81,11 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     let fake_sock = tmp.path().join("connector.sock");
     let fake_sock_str = fake_sock.to_str().unwrap();
 
+    let legacy_command = config_root.join("commands/hyphae.md");
+    let stock_command = include_str!("../../../plugins/opencode/commands/hyp.md");
+    fs::create_dir_all(legacy_command.parent().unwrap()).unwrap();
+    fs::write(&legacy_command, stock_command.replace("\n", "\r\n")).unwrap();
+
     // 1. `--dry-run` must NOT mutate existing config or write plugin/command/skill.
     let dry = isolated_cmd(&home)
         .args([
@@ -102,10 +107,14 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
         .unwrap();
     assert_eq!(dry.status.code(), Some(0));
     assert!(!config_root.join("plugins/hyphae.ts").exists());
-    assert!(!config_root.join("commands/hyphae.md").exists());
+    assert!(!config_root.join("commands/hyp.md").exists());
+    assert!(
+        legacy_command.exists(),
+        "dry run leaves the legacy command in place"
+    );
     assert!(!config_root.join("skills/hyphae/SKILL.md").exists());
 
-    // 2. Real setup writes opencode.json (NO --ephemeral!), plugins/hyphae.ts, commands/hyphae.md, SKILL.md.
+    // 2. Real setup writes opencode.json (NO --ephemeral!), plugins/hyphae.ts, commands/hyp.md, SKILL.md.
     let run1 = isolated_cmd(&home)
         .args([
             "setup",
@@ -126,10 +135,14 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     assert_eq!(run1.status.code(), Some(0));
     let run1_json = parse_json_stdout(&run1);
     assert_eq!(run1_json["ok"], true);
+    assert!(
+        !legacy_command.exists(),
+        "setup removes the stock legacy command"
+    );
 
     let cfg_path = config_root.join("opencode.json");
     let plugin_path = config_root.join("plugins/hyphae.ts");
-    let cmd_path = config_root.join("commands/hyphae.md");
+    let cmd_path = config_root.join("commands/hyp.md");
     let skill_path = config_root.join("skills/hyphae/SKILL.md");
 
     let cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
@@ -186,7 +199,7 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     assert!(plugin_src.contains("export default HyphaeV2Plugin"));
     assert!(!plugin_src.contains("shell: true"));
 
-    // Inspect installed /hyphae slash command.
+    // Inspect installed /hyp slash command.
     let cmd_md = fs::read_to_string(&cmd_path).unwrap().replace("\r\n", "\n");
     assert!(cmd_md.starts_with("---\n"));
     assert!(cmd_md.contains("description:"));
@@ -230,6 +243,8 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     let snap_cmd = fs::read_to_string(&cmd_path).unwrap();
     let snap_skill = fs::read_to_string(&skill_path).unwrap();
 
+    let custom_command = "# My custom Hyphae command";
+    fs::write(&legacy_command, custom_command).unwrap();
     let run2 = isolated_cmd(&home)
         .args([
             "setup",
@@ -252,6 +267,7 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     assert_eq!(fs::read_to_string(&plugin_path).unwrap(), snap_plugin);
     assert_eq!(fs::read_to_string(&cmd_path).unwrap(), snap_cmd);
     assert_eq!(fs::read_to_string(&skill_path).unwrap(), snap_skill);
+    assert_eq!(fs::read_to_string(legacy_command).unwrap(), custom_command);
 }
 
 #[test]
@@ -284,7 +300,7 @@ fn setup_opencode_respects_no_commands_and_no_skills_flags() {
 
     assert!(home.join(".config/opencode/opencode.json").exists());
     assert!(home.join(".config/opencode/plugins/hyphae.ts").exists());
-    assert!(!home.join(".config/opencode/commands/hyphae.md").exists());
+    assert!(!home.join(".config/opencode/commands/hyp.md").exists());
     assert!(
         !home
             .join(".config/opencode/skills/hyphae/SKILL.md")
@@ -1138,7 +1154,7 @@ fn opencode_plugin_bundle_files_exist_and_node_tests_pass() {
     for rel in [
         "hyphae.ts",
         "tui.mjs",
-        "commands/hyphae.md",
+        "commands/hyp.md",
         "README.md",
         "test/opencode.test.mjs",
     ] {

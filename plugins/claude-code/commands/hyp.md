@@ -29,7 +29,7 @@ Inspect this Claude Code session's Hyphae mesh state and render a crisp, scannab
 
 4. Conclude with a compact **Quick Actions** line:
    - Interactive zero-token TUI: `!hyp ui`
-   - Manage subscriptions & rules: `/hyphae-subs` (or `/hyphae:hyphae-subs`)
-   - Toggle Focus Mode: `/hyphae-focus` (or `/hyphae:hyphae-focus`)
-   - Mute/unmute a source: `/hyphae-mute` (or `/hyphae:hyphae-mute`)
+   - Manage subscriptions & rules: `/hyp-subs` (or `/hyphae:hyp-subs`)
+   - Toggle Focus Mode: `/hyp-focus` (or `/hyphae:hyp-focus`)
+   - Mute/unmute a source: `/hyp-mute` (or `/hyphae:hyp-mute`)
    - Enable persistent live status bar: `hyp setup --harness claude --statusline`

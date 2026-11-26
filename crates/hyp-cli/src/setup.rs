@@ -77,7 +77,7 @@ impl ClaudeConfigProfile {
     }
 
     pub fn panel_dir(&self) -> PathBuf {
-        self.skills_dir().join("hyphae-panel")
+        self.skills_dir().join("hyp-panel")
     }
 }
 
@@ -246,20 +246,53 @@ fn claude_chain_file_path(home: &Path, profile: &ClaudeConfigProfile, state_dir:
 
 const MAX_JOIN_TOKEN_BYTES: u64 = 64 * 1024;
 
-const CLAUDE_CMD_HYPHAE: &str = include_str!("../../../plugins/claude-code/commands/hyphae.md");
-const CLAUDE_CMD_HYPHAE_SUBS: &str =
-    include_str!("../../../plugins/claude-code/commands/hyphae-subs.md");
-const CLAUDE_CMD_HYPHAE_FOCUS: &str =
-    include_str!("../../../plugins/claude-code/commands/hyphae-focus.md");
-const CLAUDE_CMD_HYPHAE_MUTE: &str =
-    include_str!("../../../plugins/claude-code/commands/hyphae-mute.md");
+const CLAUDE_CMD_HYP: &str = include_str!("../../../plugins/claude-code/commands/hyp.md");
+const CLAUDE_CMD_HYP_SUBS: &str = include_str!("../../../plugins/claude-code/commands/hyp-subs.md");
+const CLAUDE_CMD_HYP_FOCUS: &str =
+    include_str!("../../../plugins/claude-code/commands/hyp-focus.md");
+const CLAUDE_CMD_HYP_MUTE: &str = include_str!("../../../plugins/claude-code/commands/hyp-mute.md");
 
-const CLAUDE_SLASH_COMMANDS: [(&str, &str); 4] = [
-    ("hyphae.md", CLAUDE_CMD_HYPHAE),
-    ("hyphae-subs.md", CLAUDE_CMD_HYPHAE_SUBS),
-    ("hyphae-focus.md", CLAUDE_CMD_HYPHAE_FOCUS),
-    ("hyphae-mute.md", CLAUDE_CMD_HYPHAE_MUTE),
+pub(crate) struct SlashCommand {
+    pub filename: &'static str,
+    pub content: &'static str,
+    pub legacy_name: &'static str,
+    pub legacy_sha256: &'static str,
+}
+
+// Original bundled command digests identify files safe to retire on upgrade.
+pub(crate) const CLAUDE_SLASH_COMMANDS: [SlashCommand; 4] = [
+    SlashCommand {
+        filename: "hyp.md",
+        content: CLAUDE_CMD_HYP,
+        legacy_name: "hyphae.md",
+        legacy_sha256: "a395e833d24ebb4c6ce33cfcd611cd4fc508f7a872c335b8683fb25577656f3c",
+    },
+    SlashCommand {
+        filename: "hyp-subs.md",
+        content: CLAUDE_CMD_HYP_SUBS,
+        legacy_name: "hyphae-subs.md",
+        legacy_sha256: "a8939e5519e150a099cfbab968e4c6234469b121a2a5dc19caafe3cc4e402eff",
+    },
+    SlashCommand {
+        filename: "hyp-focus.md",
+        content: CLAUDE_CMD_HYP_FOCUS,
+        legacy_name: "hyphae-focus.md",
+        legacy_sha256: "5a8e0d1781421630132f74c99b3079a8b3cfff9d3754aad11dccd097adfbd926",
+    },
+    SlashCommand {
+        filename: "hyp-mute.md",
+        content: CLAUDE_CMD_HYP_MUTE,
+        legacy_name: "hyphae-mute.md",
+        legacy_sha256: "e5d5b7414393f538dd98528f91a62da8f7f67ed0e22834099ec88b8d53f2b533",
+    },
 ];
+
+const OPENCODE_SLASH_COMMAND: SlashCommand = SlashCommand {
+    filename: "hyp.md",
+    content: include_str!("../../../plugins/opencode/commands/hyp.md"),
+    legacy_name: "hyphae.md",
+    legacy_sha256: "80a3d44e5a96420427601034572d32e9e7f5fc43a0139afef63a0b2430190b84",
+};
 
 /// OpenClaw message delivery mode chosen during `hyp setup` / `hyp onboard`.
 #[derive(
@@ -333,7 +366,7 @@ pub struct SetupArgs {
     /// Skip writing/updating runtime hyphae/SKILL.md files (keep MCP & hooks only)
     #[arg(long)]
     pub no_skills: bool,
-    /// Skip installing Claude Code slash commands (~/.claude/commands/hyphae*.md)
+    /// Skip installing Claude Code slash commands (~/.claude/commands/hyp*.md)
     #[arg(long)]
     pub no_commands: bool,
     /// Open the interactive harness & component toggle checklist before writing any files (requires a TTY)
@@ -430,7 +463,7 @@ pub struct OnboardArgs {
     /// Skip writing/updating runtime hyphae/SKILL.md files during onboarding
     #[arg(long)]
     pub no_skills: bool,
-    /// Skip installing Claude Code slash commands (~/.claude/commands/hyphae*.md) during onboarding
+    /// Skip installing Claude Code slash commands (~/.claude/commands/hyp*.md) during onboarding
     #[arg(long)]
     pub no_commands: bool,
     /// Local plugins directory for verified harness UI plugin installation (overrides HYPHAE_PLUGINS_DIR)
@@ -2556,6 +2589,33 @@ fn maybe_write_json(path: &Path, val: &Value, private: bool, dry_run: bool) -> R
     write_atomic_json(path, val, private)
 }
 
+impl SlashCommand {
+    pub(crate) fn matches_legacy(&self, directory: &Path) -> Result<bool, String> {
+        let path = directory.join(self.legacy_name);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() && meta.len() <= 64 * 1024 => {}
+            Ok(_) => return Ok(false),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(format!("could not inspect {}: {err}", path.display())),
+        }
+        let bytes =
+            fs::read(&path).map_err(|err| format!("could not read {}: {err}", path.display()))?;
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Ok(false);
+        };
+        Ok(hyp_store::sha256_hex(text.replace("\r\n", "\n").as_bytes()) == self.legacy_sha256)
+    }
+
+    pub(crate) fn retire_legacy(&self, directory: &Path, dry_run: bool) -> Result<(), String> {
+        if !dry_run && self.matches_legacy(directory)? {
+            let path = directory.join(self.legacy_name);
+            fs::remove_file(&path)
+                .map_err(|err| format!("could not retire {}: {err}", path.display()))?;
+        }
+        Ok(())
+    }
+}
+
 fn maybe_write_text(path: &Path, text: &str, private: bool, dry_run: bool) -> Result<(), String> {
     if dry_run {
         return Ok(());
@@ -3555,9 +3615,10 @@ fn setup_claude(
         if !opts.no_commands {
             let commands_dir = profile.commands_dir();
             if seen_commands.insert(canonical_dedup_key(&commands_dir)) {
-                for (filename, content) in CLAUDE_SLASH_COMMANDS {
-                    let cmd_path = commands_dir.join(filename);
-                    maybe_write_text(&cmd_path, content, false, dry_run)?;
+                for command in CLAUDE_SLASH_COMMANDS {
+                    let cmd_path = commands_dir.join(command.filename);
+                    maybe_write_text(&cmd_path, command.content, false, dry_run)?;
+                    command.retire_legacy(&commands_dir, dry_run)?;
                     files.push(cmd_path.display().to_string());
                 }
             }
@@ -3579,16 +3640,16 @@ fn setup_claude(
             Ok(report) => {
                 files.extend(report.files);
                 let default_panel_key =
-                    canonical_dedup_key(&home.join(".claude").join("skills").join("hyphae-panel"));
+                    canonical_dedup_key(&home.join(".claude").join("skills").join("hyp-panel"));
                 for panel_root in &report.target_paths {
                     if canonical_dedup_key(panel_root) == default_panel_key {
                         notes.push(
-                            "Installed native Claude Code plugin (live status indicator + /hyphae-panel) under ~/.claude/skills/hyphae-panel/ (activates on next Claude session)."
+                            "Installed native Claude Code plugin (live status indicator + /hyp-panel) under ~/.claude/skills/hyp-panel/ (activates on next Claude session)."
                                 .to_string(),
                         );
                     } else {
                         notes.push(format!(
-                            "Installed native Claude Code side-panel mod (/hyphae-panel) under {}/.",
+                            "Installed native Claude Code side-panel mod (/hyp-panel) under {}/.",
                             panel_root.display()
                         ));
                     }
@@ -3863,14 +3924,14 @@ fn setup_opencode(
     skill_ctx: &SetupSkillContext,
 ) -> Result<HarnessSetupOutcome, String> {
     const OPENCODE_PLUGIN_TS: &str = include_str!("../../../plugins/opencode/hyphae.ts");
-    const OPENCODE_CMD_HYPHAE: &str = include_str!("../../../plugins/opencode/commands/hyphae.md");
 
     let socket = opts.socket;
     let dry_run = opts.dry_run;
     let config_root = home.join(".config").join("opencode");
     let config_file = config_root.join("opencode.json");
     let plugin_file = config_root.join("plugins").join("hyphae.ts");
-    let command_file = config_root.join("commands").join("hyphae.md");
+    let commands_dir = config_root.join("commands");
+    let command_file = commands_dir.join(OPENCODE_SLASH_COMMAND.filename);
 
     let mut cfg_doc = read_json_object_or_empty(&config_file)?;
     cfg_doc
@@ -3921,14 +3982,20 @@ fn setup_opencode(
         "OpenCode opencode.json, verified lifecycle hook plugin (plugins/hyphae.ts), and tailored runtime skill configured (existing settings preserved)."
             .to_string()
     } else {
-        "OpenCode opencode.json, verified lifecycle hook plugin (plugins/hyphae.ts), /hyphae slash command, and tailored runtime skill configured (existing settings preserved)."
+        "OpenCode opencode.json, verified lifecycle hook plugin (plugins/hyphae.ts), /hyp slash command, and tailored runtime skill configured (existing settings preserved)."
             .to_string()
     }];
 
     if opts.no_commands {
-        notes.push("Skipped OpenCode /hyphae slash command (--no-commands).".to_string());
+        notes.push("Skipped OpenCode /hyp slash command (--no-commands).".to_string());
     } else {
-        maybe_write_text(&command_file, OPENCODE_CMD_HYPHAE, false, dry_run)?;
+        maybe_write_text(
+            &command_file,
+            OPENCODE_SLASH_COMMAND.content,
+            false,
+            dry_run,
+        )?;
+        OPENCODE_SLASH_COMMAND.retire_legacy(&commands_dir, dry_run)?;
         files.push(command_file.display().to_string());
     }
 

@@ -17,10 +17,10 @@ User arguments: `$ARGUMENTS`
 
 2. **Dispatch based on `$ARGUMENTS`**:
    - **Empty (no arguments)**: Run `hyp inspect --json` and display the session's active `mutes` and `rules` in a compact table, plus usage examples:
-     - `/hyphae-mute #noisy-ci` — mute `#noisy-ci` for this session
-     - `/hyphae-mute github.pr --ttl 3600` — mute `github.pr` for 1 hour
-     - `/hyphae-mute '*'` — mute all sources (`muted*`)
-     - `/hyphae-mute unmute #noisy-ci` — remove a mute rule
+     - `/hyp-mute #noisy-ci` — mute `#noisy-ci` for this session
+     - `/hyp-mute github.pr --ttl 3600` — mute `github.pr` for 1 hour
+     - `/hyp-mute '*'` — mute all sources (`muted*`)
+     - `/hyp-mute unmute #noisy-ci` — remove a mute rule
    - **`unmute <pattern>`**: Run:
      ```sh
      hyp session unmute '<pattern>' --json

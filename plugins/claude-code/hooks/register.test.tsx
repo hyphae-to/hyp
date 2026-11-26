@@ -389,7 +389,7 @@ describe('hyphae pure state & security helpers', () => {
 });
 
 describe('hyphae native Claude Code side-panel mod', () => {
-  test('registers /hyphae-panel on session.start, never emits loud ui.status text, and opens/closes panel', async ($, on) => {
+  test('registers /hyp-panel on session.start, never emits loud ui.status text, and opens/closes panel', async ($, on) => {
     const registered: { name: string; immediate?: boolean }[] = [];
     const opened: { id: string; title?: string; focus?: boolean; closeOnEscape?: boolean }[] = [];
     const closed: string[] = [];
@@ -429,11 +429,11 @@ describe('hyphae native Claude Code side-panel mod', () => {
     on('ui.invalidate', () => ({ value: undefined }));
 
     await $.session.start({ cwd: '/workspace', surface: 'terminal', isInteractive: true });
-    expect(registered).toEqual([{ name: 'hyphae-panel', immediate: true }]);
+    expect(registered).toEqual([{ name: 'hyp-panel', immediate: true }]);
     // Never emits non-empty `$.ui.status(...)` (Claude Code styles it as a bright yellow ⚠ warning).
     expect(statusUpdates.every((t) => t === undefined)).toBe(true);
 
-    // Compact prompt indicator renders quietly in AbovePrompt outside Herdr (no repeated "hyphae" or "/hyphae-panel").
+    // Compact prompt indicator renders quietly in AbovePrompt outside Herdr (no repeated "hyphae" or "/hyp-panel").
     const stripMount = await $.ui.mount({
       plugin: 'hyphae',
       surface: 'terminal',
@@ -445,12 +445,12 @@ describe('hyphae native Claude Code side-panel mod', () => {
     expect(await stripMount.keepsBeneath()).toBe(false);
     const stripText = collectStrings(await stripMount.drawn()).join('\n');
     expect(stripText).toContain('@alice · telegram:personal · 1 sub · 2 queued · focus · 1 muted');
-    expect(stripText).not.toContain('/hyphae-panel');
+    expect(stripText).not.toContain('/hyp-panel');
     expect(stripText).not.toContain('hyphae @alice');
 
-    // Users can silence and re-enable the quiet prompt strip via `/hyphae-panel status off|on`.
+    // Users can silence and re-enable the quiet prompt strip via `/hyp-panel status off|on`.
     await $.command.run({
-      command: 'hyphae-panel',
+      command: 'hyp-panel',
       args: 'status off',
       origin: { kind: 'composer' },
       presentation: { isFullscreen: false, columns: 120 },
@@ -459,7 +459,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     expect(await stripMount.keepsBeneath()).toBe(true);
 
     await $.command.run({
-      command: 'hyphae-panel',
+      command: 'hyp-panel',
       args: 'status on',
       origin: { kind: 'composer' },
       presentation: { isFullscreen: false, columns: 120 },
@@ -469,7 +469,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     await stripMount.unmount();
 
     await $.command.run({
-      command: 'hyphae-panel',
+      command: 'hyp-panel',
       args: '',
       origin: { kind: 'composer' },
       presentation: { isFullscreen: false, columns: 120 },
@@ -484,7 +484,7 @@ describe('hyphae native Claude Code side-panel mod', () => {
     ]);
 
     await $.command.run({
-      command: 'hyphae-panel',
+      command: 'hyp-panel',
       args: 'close',
       origin: { kind: 'composer' },
       presentation: { isFullscreen: false, columns: 120 },

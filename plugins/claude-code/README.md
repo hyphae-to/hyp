@@ -1,6 +1,6 @@
 # Hyphae Plugin for Claude Code
 
-First-class [Hyphae v2 (`hyp`)](https://hyphae.to) integration for Claude Code: E2EE DMs, `#channels`, CloudEvents streams, verified MCP caller hooks, `$HYPHAE_SESSION_ID` propagation, **native Claude Code Side Panel Mod (`/hyphae-panel`, v2.1.287+)**, slash commands, zero-token `!hyp ui` inspector, and non-destructive live `statusLine` chaining.
+First-class [Hyphae v2 (`hyp`)](https://hyphae.to) integration for Claude Code: E2EE DMs, `#channels`, CloudEvents streams, verified MCP caller hooks, `$HYPHAE_SESSION_ID` propagation, **native Claude Code Side Panel Mod (`/hyp-panel`, v2.1.287+)**, slash commands, zero-token `!hyp ui` inspector, and non-destructive live `statusLine` chaining.
 
 ## Prerequisites
 
@@ -84,13 +84,13 @@ hyp setup --harness antigravity --statusline
 hyp setup --harness antigravity --restore-statusline
 ```
 
-## Native Claude Code Status & Side Panel (`/hyphae-panel`)
+## Native Claude Code Status & Side Panel (`/hyp-panel`)
 
-On Claude Code **v2.1.287+**, `hyp setup --harness claude` automatically installs the UI-only `hyphae-panel` mod under `~/.claude/skills/hyphae-panel/` (activates on your next Claude session):
+On Claude Code **v2.1.287+**, `hyp setup --harness claude` automatically installs the UI-only `hyphae-panel` mod under `~/.claude/skills/hyp-panel/` (activates on your next Claude session):
 
-- **Quiet inline indicator (auto-hidden in Herdr)**: renders a single dim clickable line above the prompt outside Herdr (e.g. `@integration-tests · telegram:personal · 1 sub` — zero bright warning yellow, zero clutter when unenrolled). Automatically hides itself inside Herdr when the native Herdr mod (`hyphae-pane` / `hyphae-panel`) is active. Override anytime with `/hyphae-panel status off|on` or `HYPHAE_PANEL_STATUS=off|on`.
+- **Quiet inline indicator (auto-hidden in Herdr)**: renders a single dim clickable line above the prompt outside Herdr (e.g. `@integration-tests · telegram:personal · 1 sub` — zero bright warning yellow, zero clutter when unenrolled). Automatically hides itself inside Herdr when the native Herdr mod (`hyphae-pane` / `hyphae-panel`) is active. Override anytime with `/hyp-panel status off|on` or `HYPHAE_PANEL_STATUS=off|on`.
   - *Tip — pick one status bar:* If you use the native `hyphae-panel` plugin on Claude Code v2.1.287+, you don't need `--statusline` (shell `statusLine` chaining is mainly for Antigravity CLI `agy` or older Claude Code versions). If you previously ran `--statusline`, run `hyp setup --harness claude --restore-statusline` to avoid showing two bars.
-- **Interactive side panel (`/hyphae-panel`)**: run `/hyphae-panel` (or `/hyphae-panel subs|queue|rules|mesh|close`) to open the docked live inspector (`Esc` closes it, `1`–`4` switch tabs, `f` toggles Focus Mode, `r` refreshes):
+- **Interactive side panel (`/hyp-panel`)**: run `/hyp-panel` (or `/hyp-panel subs|queue|rules|mesh|close`) to open the docked live inspector (`Esc` closes it, `1`–`4` switch tabs, `f` toggles Focus Mode, `r` refreshes):
   - **Header**: active `@handle`, daemon online indicator, `nodeId`, peer count, linked bridge target, `FOCUS` / `MUTED*` badges, and a prominent red `⚠ N quarantined` alert pointing to `hyp gate review`.
   - **Tabs**: **Subs** (linked external bridges like `telegram:personal [primary]` + `hyp_stream` subscriptions with `× unsub`), **Queue** (metadata-only `kind`, `source`, `urgency`, relative age), **Rules** (active mutes + `× unmute`, per-source urgency rules), and **Mesh** (`#channels` + `× leave`, durable wakeup schedules).
 - **Emergency quarantine alert**: surfaces a 1-line red `⚠ N quarantined` banner whenever Security Gate items are held (`quarantined > 0`), even inside Herdr.
@@ -102,16 +102,16 @@ On `SessionStart`, `hyp hook claude session-start` validates the Claude session 
 
 | Command | Action |
 |---|---|
-| `/hyphae-panel [subs\|queue\|rules\|mesh\|close]` | Open or control the native live Claude Code side panel (Claude Code v2.1.287+) |
+| `/hyp-panel [subs\|queue\|rules\|mesh\|close]` | Open or control the native live Claude Code side panel (Claude Code v2.1.287+) |
 | `!hyp ui` | Launch the zero-token live interactive TUI inspector (Subscriptions, Queue, Rules & Mutes, Channels) |
 | `hyp inspect [--json]` | Print a read-only metadata snapshot for this session |
-| `/hyphae` *(or `/hyphae:hyphae`)* | Render a concise summary table of handle, Focus Mode, subscriptions, queued metadata, rules, and quarantine alerts |
-| `/hyphae-subs` *(or `/hyphae:hyphae-subs`)* | List active subscriptions, unsubscribe (`hyp session unsubscribe <id>`), update delivery rules (`hyp session rule <target> <urgency>`), or leave channels (`hyp session leave <channel>`) |
-| `/hyphae-focus [on\|off]` | Toggle or set Focus Mode (`hyp session focus on\|off`) |
-| `/hyphae-mute <pattern> [--ttl <sec>]` | Mute or unmute a source, `#channel`, topic, or `*` (`hyp session mute` / `hyp session unmute`) |
+| `/hyp` *(or `/hyphae:hyp`)* | Render a concise summary table of handle, Focus Mode, subscriptions, queued metadata, rules, and quarantine alerts |
+| `/hyp-subs` *(or `/hyphae:hyp-subs`)* | List active subscriptions, unsubscribe (`hyp session unsubscribe <id>`), update delivery rules (`hyp session rule <target> <urgency>`), or leave channels (`hyp session leave <channel>`) |
+| `/hyp-focus [on\|off]` | Toggle or set Focus Mode (`hyp session focus on\|off`) |
+| `/hyp-mute <pattern> [--ttl <sec>]` | Mute or unmute a source, `#channel`, topic, or `*` (`hyp session mute` / `hyp session unmute`) |
 
 ## Security & Privacy Invariants
 
-- **Metadata-only UI**: `hyp statusline`, `hyp inspect`, and the `/hyphae-panel` native side panel expose counts and sanitized metadata only — never message bodies, CloudEvent `data` payloads, wakeup `note`s, quarantined text, secrets, or pairing tokens.
+- **Metadata-only UI**: `hyp statusline`, `hyp inspect`, and the `/hyp-panel` native side panel expose counts and sanitized metadata only — never message bodies, CloudEvent `data` payloads, wakeup `note`s, quarantined text, secrets, or pairing tokens.
 - **Untrusted external data**: All mesh messages, `#channel` posts, stream events, and metadata strings are stripped of ANSI escapes, control characters, and Unicode BiDi overrides, and treated strictly as untrusted data — never as instructions.
-- **Human-CLI quarantine boundary**: When Security Gate items are quarantined, the status line, `/hyphae`, and `/hyphae-panel` surface only the count and direct you to review them via `hyp gate review` in your terminal (never approve/reject buttons inside the agent UI).
+- **Human-CLI quarantine boundary**: When Security Gate items are quarantined, the status line, `/hyp`, and `/hyp-panel` surface only the count and direct you to review them via `hyp gate review` in your terminal (never approve/reject buttons inside the agent UI).

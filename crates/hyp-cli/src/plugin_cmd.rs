@@ -29,7 +29,9 @@ use crate::config_file::{
     write_atomic_json,
 };
 use crate::herdr_mod::detect_herdr_app_dir;
-use crate::setup::{ClaudeConfigProfile, canonical_dedup_key, resolve_claude_profiles};
+use crate::setup::{
+    CLAUDE_SLASH_COMMANDS, ClaudeConfigProfile, canonical_dedup_key, resolve_claude_profiles,
+};
 use crate::ui::{
     CheckStatus, CliCheck, CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error,
     print_checks, print_json, print_next_steps, print_warnings,
@@ -49,7 +51,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -104,9 +106,9 @@ const BRIDGE_CONSUMER_IDS: &[&str] = &[
 const ONBOARDING_TREE_FILE: &str = "onboarding.json";
 
 const CLAUDE_PANEL_MANIFEST_JSON: &str = concat!(
-    "{\n  \"name\": \"hyphae-panel\",\n  \"version\": \"",
+    "{\n  \"name\": \"hyp-panel\",\n  \"version\": \"",
     env!("CARGO_PKG_VERSION"),
-    "\",\n  \"description\": \"Native Hyphae live mesh side-panel mod (/hyphae-panel) for Claude Code.\",\n  \"author\": { \"name\": \"Hyphae\" },\n  \"license\": \"MIT\",\n  \"repository\": \"https://github.com/hyphae-to/hyp\"\n}\n"
+    "\",\n  \"description\": \"Native Hyphae live mesh side-panel mod (/hyp-panel) for Claude Code.\",\n  \"author\": { \"name\": \"Hyphae\" },\n  \"license\": \"MIT\",\n  \"repository\": \"https://github.com/hyphae-to/hyp\"\n}\n"
 );
 const CLAUDE_PANEL_HOOKS_JSON: &str = "{\n  \"modules\": [\"./register.tsx\"]\n}\n";
 
@@ -998,6 +1000,223 @@ fn check_claude_panel_wrappers(target_root: &Path) -> Option<String> {
     None
 }
 
+fn legacy_claude_code_tree_matches(
+    spec: &PinnedPluginSpec,
+    root: &Path,
+    receipt_tree: &str,
+) -> bool {
+    let mut entries = Vec::with_capacity(spec.files.len());
+    for entry in spec.files {
+        let legacy = entry
+            .rel_path
+            .strip_prefix("claude-code/commands/")
+            .and_then(|filename| {
+                CLAUDE_SLASH_COMMANDS
+                    .iter()
+                    .find(|command| command.filename == filename)
+            });
+        let rel = if let Some(command) = legacy {
+            if fs::symlink_metadata(rel_path_to_disk_path(spec.id, root, entry.rel_path)).is_ok() {
+                return false;
+            }
+            format!("claude-code/commands/{}", command.legacy_name)
+        } else {
+            entry.rel_path.to_owned()
+        };
+        let path = rel_path_to_disk_path(spec.id, root, &rel);
+        let (_, _, actual, _) = inspect_plugin_file(root, &path, entry.sha256, entry.is_binary);
+        let Some(actual) = actual else { return false };
+        entries.push((rel, actual));
+    }
+    let pairs: Vec<_> = entries
+        .iter()
+        .map(|(rel, sha)| (rel.as_str(), sha.as_str()))
+        .collect();
+    compute_tree_sha256(&pairs) == receipt_tree
+}
+
+fn legacy_panel_root(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "hyphae-panel")
+}
+
+fn install_target_roots(plugin_id: &str, roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots
+        .into_iter()
+        .map(|root| {
+            if plugin_id == CLAUDE_PANEL_ID && legacy_panel_root(&root) {
+                root.with_file_name("hyp-panel")
+            } else {
+                root
+            }
+        })
+        .collect()
+}
+
+fn check_panel_rename_targets(
+    spec: &PinnedPluginSpec,
+    roots: &[PathBuf],
+) -> Result<(), PluginInstallError> {
+    if spec.id != CLAUDE_PANEL_ID {
+        return Ok(());
+    }
+    for old in roots.iter().filter(|path| legacy_panel_root(path)) {
+        let new = old.with_file_name("hyp-panel");
+        let status = fs::symlink_metadata(&new);
+        if matches!(&status, Err(err) if err.kind() == io::ErrorKind::NotFound) {
+            continue;
+        }
+        if status.is_ok_and(|meta| meta.is_dir())
+            && check_claude_panel_wrappers(&new).is_none()
+            && crate::config_file::read_json_value(&new.join(".claude-plugin/plugin.json")).ok()
+                == serde_json::from_str::<Value>(CLAUDE_PANEL_MANIFEST_JSON).ok()
+            && crate::config_file::read_json_value(&new.join("hooks/hooks.json")).ok()
+                == serde_json::from_str::<Value>(CLAUDE_PANEL_HOOKS_JSON).ok()
+            && spec.files.iter().all(|entry| {
+                let path = rel_path_to_disk_path(spec.id, &new, entry.rel_path);
+                inspect_plugin_file(&new, &path, entry.sha256, entry.is_binary).1
+            })
+        {
+            continue;
+        }
+        return Err(PluginInstallError::new(
+            "PLUGIN_MODIFIED",
+            format!("{} already exists (pass --force to replace)", new.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// Retire the managed legacy panel files and keep any files users added.
+fn retire_legacy_claude_panel(
+    spec: &PinnedPluginSpec,
+    root: &Path,
+    previous: Option<&PluginInstallReceipt>,
+) -> Result<(), String> {
+    const LEGACY_TREE: &str = "63620469bad933435dfa3850f3ef49b8bf728a5efb584484cbb53e062c44bdf6";
+    if root.file_name().is_none_or(|name| name != "hyp-panel") {
+        return Ok(());
+    }
+    let old = root.with_file_name("hyphae-panel");
+    let manifest = old.join(".claude-plugin/plugin.json");
+    let hooks = old.join("hooks/hooks.json");
+    let legacy_dirs = [old.clone(), old.join(".claude-plugin"), old.join("hooks")];
+    if !legacy_dirs
+        .iter()
+        .all(|dir| fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()))
+        || check_claude_panel_wrappers(&old).is_some()
+    {
+        return Ok(());
+    }
+
+    let Ok(manifest_json) = crate::config_file::read_json_value(&manifest) else {
+        return Ok(());
+    };
+    let version = manifest_json["version"].as_str();
+    let expected = serde_json::json!({
+        "name": "hyphae-panel",
+        "version": version,
+        "description": "Native Hyphae live mesh side-panel mod (/hyphae-panel) for Claude Code.",
+        "author": {"name": "Hyphae"},
+        "license": "MIT",
+        "repository": "https://github.com/hyphae-to/hyp",
+    });
+    if version.is_none()
+        || manifest_json != expected
+        || crate::config_file::read_json_value(&hooks).ok()
+            != serde_json::from_str::<Value>(CLAUDE_PANEL_HOOKS_JSON).ok()
+    {
+        return Ok(());
+    }
+    let mut entries = Vec::with_capacity(spec.files.len());
+    let mut paths = Vec::with_capacity(spec.files.len());
+    for entry in spec.files {
+        let path = rel_path_to_disk_path(spec.id, &old, entry.rel_path);
+        let (_, _, actual, _) = inspect_plugin_file(&old, &path, entry.sha256, entry.is_binary);
+        let Some(actual) = actual else { return Ok(()) };
+        entries.push((entry.rel_path, actual));
+        paths.push(path);
+    }
+    let pairs: Vec<_> = entries
+        .iter()
+        .map(|(rel, sha)| (*rel, sha.as_str()))
+        .collect();
+    let digest = compute_tree_sha256(&pairs);
+    if digest != LEGACY_TREE
+        && !previous.is_some_and(|receipt| {
+            receipt.tree_sha256 == digest
+                && receipt
+                    .target_paths
+                    .iter()
+                    .any(|path| Path::new(path) == old)
+        })
+    {
+        return Ok(());
+    }
+    for path in std::iter::once(manifest)
+        .chain(std::iter::once(hooks))
+        .chain(paths)
+    {
+        fs::remove_file(&path)
+            .map_err(|err| format!("could not retire {}: {err}", path.display()))?;
+    }
+    for dir in legacy_dirs.into_iter().rev() {
+        match fs::remove_dir(&dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(err) => return Err(format!("could not retire {}: {err}", dir.display())),
+        }
+    }
+    Ok(())
+}
+
+fn migrate_standalone_claude_commands(panel: &Path) -> Result<(), String> {
+    let Some(config_dir) = panel
+        .parent()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "skills"))
+        .and_then(Path::parent)
+    else {
+        return Ok(());
+    };
+    let directory = config_dir.join("commands");
+    if !fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(());
+    }
+    for command in CLAUDE_SLASH_COMMANDS {
+        if command.matches_legacy(&directory)? {
+            let path = directory.join(command.filename);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() => {}
+                Ok(_) => continue,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    write_atomic_file(&path, command.content.as_bytes(), false)?;
+                }
+                Err(err) => return Err(format!("could not inspect {}: {err}", path.display())),
+            }
+            command.retire_legacy(&directory, false)?;
+        }
+    }
+    Ok(())
+}
+
+fn complete_harness_rename(
+    spec: &PinnedPluginSpec,
+    roots: &[PathBuf],
+    previous: Option<&PluginInstallReceipt>,
+) -> Result<(), PluginInstallError> {
+    for root in roots {
+        let outcome = match spec.id {
+            CLAUDE_PANEL_ID => retire_legacy_claude_panel(spec, root, previous)
+                .and_then(|()| migrate_standalone_claude_commands(root)),
+            CLAUDE_CODE_ID => CLAUDE_SLASH_COMMANDS
+                .iter()
+                .try_for_each(|command| command.retire_legacy(&root.join("commands"), false)),
+            _ => Ok(()),
+        };
+        outcome.map_err(|err| PluginInstallError::new("IO_ERROR", err))?;
+    }
+    Ok(())
+}
+
 /// Evaluates three-way status (`up_to_date`, `outdated`, `modified`, `corrupt`, `not_installed`)
 /// for one official plugin across all its target roots.
 fn inspect_plugin(
@@ -1116,6 +1335,17 @@ fn inspect_plugin(
             } else {
                 PluginStatus::NotInstalled
             }
+        } else if spec.id == CLAUDE_CODE_ID
+            && !symlink_or_io_error
+            && missing_in_root > 0
+            && receipt_tree
+                .as_deref()
+                .is_some_and(|tree| legacy_claude_code_tree_matches(spec, root, tree))
+        {
+            if first_detail.is_none() {
+                first_detail = Some("outdated (legacy slash-command filenames)".into());
+            }
+            PluginStatus::Outdated
         } else if symlink_or_io_error || missing_in_root > 0 {
             if first_detail.is_none() {
                 first_detail = Some(format!(
@@ -1145,7 +1375,11 @@ fn inspect_plugin(
             representative_disk_tree = Some(disk_tree.clone());
 
             if ct_eq(disk_tree.as_bytes(), spec.tree_sha256.as_bytes()) {
-                PluginStatus::UpToDate
+                if spec.id == CLAUDE_PANEL_ID && legacy_panel_root(root) {
+                    PluginStatus::Outdated
+                } else {
+                    PluginStatus::UpToDate
+                }
             } else if let Some(ref r_tree) = receipt_tree {
                 if ct_eq(disk_tree.as_bytes(), r_tree.as_bytes()) {
                     if first_detail.is_none() {
@@ -2462,6 +2696,7 @@ pub fn install_claude_panel_for_profiles(
             }
         }
         let mut receipts = load_receipts(state_dir).unwrap_or_default();
+        complete_harness_rename(spec, &target_roots, receipts.installed.get(spec.id))?;
         record_receipt(&mut receipts, spec, &target_roots);
         let _ = save_receipts(state_dir, &receipts);
         return Ok(HarnessPluginInstallReport {
@@ -2477,6 +2712,7 @@ pub fn install_claude_panel_for_profiles(
 
     let mut receipts =
         load_receipts(state_dir).map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
+    complete_harness_rename(spec, &target_roots, receipts.installed.get(spec.id))?;
     record_receipt(&mut receipts, spec, &target_roots);
     save_receipts(state_dir, &receipts).map_err(|e| PluginInstallError::new("RECEIPT_ERROR", e))?;
 
@@ -3026,7 +3262,12 @@ fn run_plugin_install(
                 None,
             );
         }
-        target_roots_by_id.insert(spec.id, roots);
+        if !force {
+            if let Err(err) = check_panel_rename_targets(spec, &roots) {
+                return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
+            }
+        }
+        target_roots_by_id.insert(spec.id, install_target_roots(spec.id, roots));
     }
 
     // Collect deduplicated required files across all target specs.
@@ -3065,6 +3306,9 @@ fn run_plugin_install(
             .get(spec.id)
             .expect("resolved target roots");
         if let Err(err) = write_plugin_to_targets(spec, roots, &verified_files, true) {
+            return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
+        }
+        if let Err(err) = complete_harness_rename(spec, roots, receipts.installed.get(spec.id)) {
             return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
         }
         record_receipt(&mut receipts, spec, roots);
@@ -3492,15 +3736,27 @@ fn run_plugin_update(
         };
 
     // Atomically write ONLY the changed plugins and update their receipts.
+    if !force {
+        for insp in &to_update {
+            if let Err(err) = check_panel_rename_targets(insp.spec, &insp.target_paths) {
+                return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
+            }
+        }
+    }
+
     let mut updated_names: Vec<String> = Vec::new();
     let mut reload_hints: Vec<String> = Vec::new();
     for insp in &to_update {
+        let roots = install_target_roots(insp.spec.id, insp.target_paths.clone());
+        if let Err(err) = write_plugin_to_targets(insp.spec, &roots, &verified_files, force) {
+            return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
+        }
         if let Err(err) =
-            write_plugin_to_targets(insp.spec, &insp.target_paths, &verified_files, force)
+            complete_harness_rename(insp.spec, &roots, receipts.installed.get(insp.spec.id))
         {
             return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
         }
-        record_receipt(&mut receipts, insp.spec, &insp.target_paths);
+        record_receipt(&mut receipts, insp.spec, &roots);
         updated_names.push(insp.spec.id.to_string());
         let hint = reload_hint_for_plugin(insp.spec.id).to_string();
         if !reload_hints.contains(&hint) {

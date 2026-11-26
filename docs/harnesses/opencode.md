@@ -9,7 +9,7 @@ hyp setup --harness opencode
 What this configures (non-destructively merging into `~/.config/opencode/opencode.json`):
 - Verified MCP entry (`hyp mcp --backend opencode`, non-ephemeral).
 - Real lifecycle hook plugin `~/.config/opencode/plugins/hyphae.ts`.
-- `/hyphae` slash command (`~/.config/opencode/commands/hyphae.md`) and tailored skill (`~/.config/opencode/skills/hyphae/SKILL.md`).
+- `/hyp` slash command (`~/.config/opencode/commands/hyp.md`) and tailored skill (`~/.config/opencode/skills/hyphae/SKILL.md`).
 - Optional zero-polling TUI status widget (`plugins/opencode/tui.mjs`).
 
 For OpenCode Desktop, you can also run `hyp onboard --assist opencode-desktop`.
@@ -22,6 +22,6 @@ For OpenCode Desktop, you can also run `hyp onboard --assist opencode-desktop`.
 ## What You Should See
 
 - `hyp doctor` reports `OK` for OpenCode MCP and lifecycle plugin.
-- Running `/hyphae` displays your active session metadata, and idle OpenCode sessions wake automatically on inbound DMs or subscribed stream events.
+- Running `/hyp` displays your active session metadata, and idle OpenCode sessions wake automatically on inbound DMs or subscribed stream events.
 
 See [Troubleshooting](../operations/troubleshooting.md) if hooks do not load after setup.

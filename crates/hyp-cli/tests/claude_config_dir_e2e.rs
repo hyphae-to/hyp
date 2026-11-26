@@ -141,13 +141,8 @@ fn claude_gateway_symlinked_profile_cli_override_env_and_hermetic_isolation() {
         "symlinked settings.json should reuse canonical claude-statusline-chain.json"
     );
 
-    // 3. Separate `gateway/commands/hyphae*.md` installed cleanly.
-    for cmd_file in [
-        "hyphae.md",
-        "hyphae-subs.md",
-        "hyphae-focus.md",
-        "hyphae-mute.md",
-    ] {
+    // 3. Separate `gateway/commands/hyp*.md` installed cleanly.
+    for cmd_file in ["hyp.md", "hyp-subs.md", "hyp-focus.md", "hyp-mute.md"] {
         let content = fs::read_to_string(gateway.join("commands").join(cmd_file))
             .unwrap_or_else(|e| panic!("missing gateway command {cmd_file}: {e}"))
             .replace("\r\n", "\n");
@@ -165,7 +160,7 @@ fn claude_gateway_symlinked_profile_cli_override_env_and_hermetic_isolation() {
     assert!(
         gateway
             .join("skills")
-            .join("hyphae-panel")
+            .join("hyp-panel")
             .join("hooks")
             .join("register.tsx")
             .is_file()
@@ -274,11 +269,11 @@ fn claude_gateway_symlinked_profile_cli_override_env_and_hermetic_isolation() {
     assert_eq!(home_mcp_b["mcpServers"]["hyphae"]["command"], fake_bin);
 
     // Both distinct commands dirs populated; symlinks still intact!
-    assert!(gateway.join("commands").join("hyphae.md").is_file());
+    assert!(gateway.join("commands").join("hyp.md").is_file());
     assert!(
         home.join(".claude")
             .join("commands")
-            .join("hyphae.md")
+            .join("hyp.md")
             .is_file()
     );
     assert!(

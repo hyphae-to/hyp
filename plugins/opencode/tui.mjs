@@ -597,7 +597,7 @@ export function formatSidebarLines(snapshot, active, quarantined) {
     if (enrolledCount > 0) {
       lines.push(`Not joined (${enrolledCount} active on node)`);
     } else {
-      lines.push("Not joined · run /hyphae");
+      lines.push("Not joined · run /hyp");
     }
     return lines;
   }
