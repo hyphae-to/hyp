@@ -2575,35 +2575,52 @@ fn parse_plugins_config(
             }
         };
 
-        let targets = match obj.get("targets").and_then(Value::as_array) {
-            Some(raw_targets) => {
-                let mut out = Vec::with_capacity(raw_targets.len());
-                let mut err = None;
-                for (tidx, item) in raw_targets.iter().enumerate() {
-                    if let Some(s) = item.as_str().map(str::trim).filter(|t| !t.is_empty()) {
-                        if !out.iter().any(|existing: &String| existing == s) {
-                            out.push(s.to_string());
-                        }
-                    } else {
-                        err = Some(format!(
-                            "plugins[{id}].targets[{tidx}] must be a non-empty string"
-                        ));
-                        break;
-                    }
-                }
-                match err {
-                    Some(e) => Err(e),
-                    None if out.is_empty() => Err(format!(
-                        "plugins[{id}].targets must contain at least one target"
-                    )),
-                    None => Ok(out),
+        let explicit_targets_res = match obj.get("targets") {
+            None | Some(Value::Null) => {
+                if id == "telegram" {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "plugins[{id}].targets must be a non-empty array of strings"
+                    ))
                 }
             }
-            None => Err(format!(
-                "plugins[{id}].targets must be a non-empty array of strings"
-            )),
+            Some(val) => match val.as_array() {
+                Some(raw_targets) => {
+                    let mut out = Vec::with_capacity(raw_targets.len());
+                    let mut err = None;
+                    for (tidx, item) in raw_targets.iter().enumerate() {
+                        if let Some(s) = item.as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                            if !out.iter().any(|existing: &String| existing == s) {
+                                out.push(s.to_string());
+                            }
+                        } else {
+                            err = Some(format!(
+                                "plugins[{id}].targets[{tidx}] must be a non-empty string"
+                            ));
+                            break;
+                        }
+                    }
+                    match err {
+                        Some(e) => Err(e),
+                        None if out.is_empty() => {
+                            if id == "telegram" {
+                                Ok(None)
+                            } else {
+                                Err(format!(
+                                    "plugins[{id}].targets must contain at least one target"
+                                ))
+                            }
+                        }
+                        None => Ok(Some(out)),
+                    }
+                }
+                None => Err(format!(
+                    "plugins[{id}].targets must be a non-empty array of strings"
+                )),
+            },
         };
-        let targets = match targets {
+        let explicit_targets = match explicit_targets_res {
             Ok(v) => v,
             Err(e) => {
                 push_plugin_error(&id, explicit_kind, None, e, warnings, skipped_statuses);
@@ -2708,11 +2725,16 @@ fn parse_plugins_config(
             }
         };
 
+        let status_targets_fallback = [crate::plugin_cmd::DEFAULT_TELEGRAM_TARGET.to_string()];
+        let status_targets_slice = explicit_targets
+            .as_deref()
+            .unwrap_or(&status_targets_fallback);
+
         if let Some(reason) = config_error_reason {
             push_plugin_error(
                 &id,
                 Some(kind),
-                Some(&targets),
+                Some(status_targets_slice),
                 reason,
                 warnings,
                 skipped_statuses,
@@ -2727,13 +2749,42 @@ fn parse_plugins_config(
             skipped_statuses.push(json!({
                 "id": id,
                 "kind": plugin_kind_str(kind),
-                "targets": targets,
+                "targets": status_targets_slice,
                 "status": "skipped",
                 "error": reason,
                 "lastError": reason,
             }));
             continue;
         }
+
+        let targets = match explicit_targets {
+            Some(explicit) => explicit,
+            None => {
+                // Only `id == "telegram"` reaches here when `targets` is omitted/empty:
+                // resolve bot username via Telegram `getMe` with fail-safe fallback to `"personal"`.
+                let resolved = match env_map.get("TELEGRAM_BOT_TOKEN").map(String::as_str) {
+                    Some(token) if !token.trim().is_empty() => {
+                        let api_base = env_map
+                            .get("TELEGRAM_API_BASE")
+                            .map(String::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        crate::plugin_cmd::resolve_telegram_default_target_with_token(
+                            token, api_base,
+                        )
+                    }
+                    _ => crate::plugin_cmd::TelegramTargetResolution {
+                        target: crate::plugin_cmd::DEFAULT_TELEGRAM_TARGET.to_string(),
+                        source: "fallback",
+                        warning: None,
+                    },
+                };
+                if let Some(w) = resolved.warning {
+                    warnings.push(w);
+                }
+                vec![resolved.target]
+            }
+        };
 
         warnings.extend(plaintext_warnings);
 
@@ -3788,5 +3839,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parse_plugins_config_telegram_omitted_targets_resolves_via_getme_and_falls_back_safely() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let ok_tok = "20001:NODE_CMD_OK_TOKEN_NEVER_LEAK";
+        let fail_tok = "20002:NODE_CMD_500_TOKEN_NEVER_LEAK";
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("");
+                if path == format!("/bot{ok_tok}/getMe") {
+                    let body = r#"{"ok":true,"result":{"username":"Moneypenny0_Bot"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    let body = r#"{"ok":false,"description":"upstream error"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
+        secrets.set("tg-ok-tok", ok_tok).unwrap();
+        secrets.set("tg-fail-tok", fail_tok).unwrap();
+        let api_base = format!("http://{addr}");
+        let explicit_topics = HashSet::new();
+
+        // 1. Omitted targets on id="telegram" resolves bot username via getMe!
+        let mut warnings_ok = Vec::new();
+        let mut skipped_ok = Vec::new();
+        let parsed_ok = parse_plugins_config(
+            &json!([{
+                "id": "telegram",
+                "command": "node",
+                "args": ["/tmp/tg.mjs"],
+                "env": {
+                    "TELEGRAM_BOT_TOKEN": { "secret": "tg-ok-tok" },
+                    "TELEGRAM_API_BASE": api_base,
+                    "TELEGRAM_ALLOWED_USERS": "42"
+                }
+            }]),
+            None,
+            tmp.path(),
+            &explicit_topics,
+            &secrets,
+            &mut warnings_ok,
+            &mut skipped_ok,
+        );
+        assert!(skipped_ok.is_empty(), "skipped: {skipped_ok:?}");
+        assert_eq!(parsed_ok.len(), 1);
+        assert_eq!(parsed_ok[0].config.targets, vec!["moneypenny0_bot"]);
+        assert!(warnings_ok.is_empty(), "warnings: {warnings_ok:?}");
+
+        // 2. HTTP 500 from getMe falls back to ["personal"] without blocking startup or leaking token!
+        let mut warnings_fail = Vec::new();
+        let mut skipped_fail = Vec::new();
+        let parsed_fail = parse_plugins_config(
+            &json!([{
+                "id": "telegram",
+                "command": "node",
+                "args": ["/tmp/tg.mjs"],
+                "targets": [],
+                "env": {
+                    "TELEGRAM_BOT_TOKEN": { "secret": "tg-fail-tok" },
+                    "TELEGRAM_API_BASE": api_base,
+                    "TELEGRAM_ALLOWED_USERS": "42"
+                }
+            }]),
+            None,
+            tmp.path(),
+            &explicit_topics,
+            &secrets,
+            &mut warnings_fail,
+            &mut skipped_fail,
+        );
+        assert!(skipped_fail.is_empty(), "skipped: {skipped_fail:?}");
+        assert_eq!(parsed_fail.len(), 1);
+        assert_eq!(parsed_fail[0].config.targets, vec!["personal"]);
+        assert!(
+            warnings_fail.iter().any(|w| w.contains("personal")),
+            "expected fallback warning: {warnings_fail:?}"
+        );
+        for w in &warnings_fail {
+            assert!(!w.contains(fail_tok), "token leaked in warning: {w}");
+        }
+
+        let _ = server.join();
     }
 }

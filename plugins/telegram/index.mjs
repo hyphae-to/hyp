@@ -219,8 +219,13 @@ const mesh = new MeshPluginClient({
     };
   },
 });
+function redactToken(msg) {
+  const s = String(msg ?? "");
+  return token ? s.replaceAll(token, "[REDACTED]") : s;
+}
+
 const hello = await mesh.ready;
-const target = process.env.TELEGRAM_TARGET ?? hello.targets[0];
+const target = pickNonEmpty(process.env.TELEGRAM_TARGET, hello.targets?.[0]);
 if (!target || !hello.targets.includes(target)) {
   throw new Error(`Target '${target}' not in configured targets: ${hello.targets.join(", ")}`);
 }
@@ -302,7 +307,7 @@ while (true) {
       saveOffset(nextOffset);
     }
   } catch (error) {
-    console.error(`telegram poll error: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`telegram poll error: ${redactToken(error instanceof Error ? error.message : String(error))}`);
     await new Promise((r) => setTimeout(r, backoff));
     backoff = Math.min(backoff * 2, 30_000);
   }

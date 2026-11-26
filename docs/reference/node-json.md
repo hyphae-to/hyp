@@ -68,7 +68,7 @@ Enabled by default even when omitted (`defaultTopic: "schedule"`, accepting `to.
 ### External Subprocess Bridges (`plugins[]`)
 - `id`: Unique plugin identifier (also determines `<state_dir>/logs/plugin-<id>.log`).
 - `command` *(alias `exec`)* and `args`: Absolute binary and verified script path returned by `hyp plugin install <name> --json`.
-- `targets`: List of target identifiers (e.g. `["personal"]`).
+- `targets`: List of target identifiers (e.g. `["my_assistant_bot"]`; for `id: "telegram"`, omitting `targets` auto-resolves the bot's Telegram username via `getMe` with `"personal"` as fallback).
 - `exposeTopic`: Boolean (default **`false`**). Bridge topics stay local-only unless explicitly set to `true`.
 - `env`: Map of string values or `{ "secret": "<name>" }` references.
 

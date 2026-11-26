@@ -2297,6 +2297,117 @@ client._dead.wait(timeout=15)
     }
 
     #[tokio::test]
+    async fn real_telegram_plugin_uses_first_hello_target_when_telegram_target_env_unset_or_empty()
+    {
+        let Some(node_bin) = find_binary("node") else {
+            eprintln!(
+                "SKIP real_telegram_plugin_uses_first_hello_target_when_telegram_target_env_unset_or_empty: `node` not on PATH"
+            );
+            return;
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let token = "555666:TEST_TG_USERNAME_TARGET_TOKEN";
+        let token_file = tmp.path().join("tg.token");
+        fs::write(&token_file, token).unwrap();
+
+        let updates_sent = Arc::new(AtomicBool::new(false));
+        let updates_sent_srv = Arc::clone(&updates_sent);
+        let mock_tg = MockHttpServer::start(move |req| {
+            let updates_sent = Arc::clone(&updates_sent_srv);
+            async move {
+                let path = req.path.clone();
+                if path.ends_with("/getUpdates") {
+                    if !updates_sent.swap(true, Ordering::SeqCst) {
+                        return MockResponse::json(
+                            StatusCode::OK,
+                            &json!({
+                                "ok": true,
+                                "result": [
+                                    {
+                                        "update_id": 501,
+                                        "message": {
+                                            "message_id": 51,
+                                            "date": 1710000100,
+                                            "chat": { "id": 77777, "type": "private" },
+                                            "from": { "id": 42, "username": "bogdan", "first_name": "Bogdan" },
+                                            "text": "Hello bot username target!"
+                                        }
+                                    }
+                                ]
+                            }),
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    return MockResponse::json(
+                        StatusCode::OK,
+                        &json!({ "ok": true, "result": [] }),
+                    );
+                }
+                if path.ends_with("/sendMessage") {
+                    return MockResponse::json(
+                        StatusCode::OK,
+                        &json!({ "ok": true, "result": { "message_id": 888 } }),
+                    );
+                }
+                MockResponse::json(
+                    StatusCode::NOT_FOUND,
+                    &json!({ "ok": false, "description": "not found" }),
+                )
+            }
+        })
+        .await;
+
+        let node = open_test_node("tg-username-node", tmp.path());
+        let host = UnifiedNodeAdapterHost::new(Arc::clone(&node));
+        let plugin_script = repo_root().join("plugins/telegram/index.mjs");
+
+        // Configure a bot-username target via hello.targets[0] with whitespace-only TELEGRAM_TARGET.
+        // index.mjs MUST pick hello.targets[0] ("moneypenny0bot") with zero hardcoded "personal"!
+        let mut cfg = SubprocessConfig::new(
+            "telegram",
+            AdapterKind::Bridge,
+            node_bin,
+            vec![plugin_script.to_string_lossy().into_owned()],
+            vec!["moneypenny0bot".to_string()],
+        );
+        cfg.hello_mode = HelloMode::Auto;
+        cfg.env.insert(
+            "TELEGRAM_BOT_TOKEN_FILE".into(),
+            token_file.to_string_lossy().into_owned(),
+        );
+        cfg.env.insert("TELEGRAM_TARGET".into(), "   ".into());
+        cfg.env.insert("TELEGRAM_ALLOWED_USERS".into(), "42".into());
+        cfg.env
+            .insert("TELEGRAM_DEFAULT_CHAT".into(), "77777".into());
+        cfg.env
+            .insert("TELEGRAM_API_BASE".into(), mock_tg.base_url());
+
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(Arc::clone(&host) as _).await.unwrap();
+
+        let _ = host.wait_for_event_count(1, Duration::from_secs(10)).await;
+        let all_events = host.published_events().await;
+        assert_eq!(all_events.len(), 1);
+        assert_eq!(all_events[0].0, "moneypenny0bot");
+        assert_eq!(all_events[0].1.source, "telegram/moneypenny0bot");
+
+        let post_ok = supervisor
+            .post(
+                "moneypenny0bot",
+                BTreeMap::from([("text".to_string(), json!("Hello back from moneypenny0bot"))]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("outbound post on bot-username target must succeed");
+        assert_eq!(post_ok["ok"], json!(true));
+        assert_eq!(post_ok["messageId"], json!(888));
+
+        let _ = supervisor.stop().await;
+        node.shutdown();
+    }
+
+    #[tokio::test]
     async fn real_whatsapp_bridge_isolates_per_recipient_reactions_and_requires_explicit_to_when_ambiguous()
      {
         let Some(node_bin) = find_binary("node") else {

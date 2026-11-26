@@ -6,20 +6,7 @@ Connect personal Telegram, Slack (Socket Mode), or WhatsApp chats directly to li
 
 ---
 
-## 1. Install a Verified Official Bridge (`hyp plugin`)
-
-Always install official bridges via `hyp plugin install` (never point `node.json` at a local git checkout). `hyp` verifies every file in constant time against compile-time pinned SHA-256 digests before writing to `~/.config/hyphae/plugins/`:
-
-```sh
-hyp plugin install telegram --json
-hyp plugin install slack --json
-```
-
-Capture the returned `data.nodePath` and `data.plugins[0].scriptPath`.
-
----
-
-## 2. Store Bot Tokens Out-of-Band
+## 1. Store Bot Tokens Out-of-Band
 
 ```sh
 # Telegram: create a bot via https://t.me/BotFather and find your numeric ID via https://t.me/userinfobot
@@ -32,11 +19,24 @@ hyp secret set slack-bot-token --web
 
 ---
 
+## 2. Install a Verified Official Bridge (`hyp plugin`)
+
+Always install official bridges via `hyp plugin install` (never point `node.json` at a local git checkout). `hyp` verifies every file in constant time against compile-time pinned SHA-256 digests before writing to `~/.config/hyphae/plugins/`:
+
+```sh
+hyp plugin install telegram --json
+hyp plugin install slack --json
+```
+
+Capture the returned `data.nodePath` and `data.plugins[0].scriptPath`. For **Telegram**, when `telegram-bot-token` is already stored in your keystore, `hyp plugin install telegram --json` automatically fetches your bot's public `@username` via Telegram `getMe` (without echoing the token) and returns it as `data.plugins[0].defaultTarget` (lowercase, leading `@` stripped, e.g. `my_assistant_bot`, falling back to `"personal"` if offline or unreachable).
+
+---
+
 ## 3. Configure `plugins[]` in `~/.config/hyphae/node.json`
 
 Use `{ "secret": "<name>" }` for all credentials (plaintext secret-like values in `plugins[].env` trigger a startup warning) and **always configure explicit sender allowlists** (all included bridges drop unauthorized senders fail-closed):
 
-- **Telegram:** `TELEGRAM_ALLOWED_USERS` and/or `TELEGRAM_ALLOWED_CHATS` (numeric IDs)
+- **Telegram:** `TELEGRAM_ALLOWED_USERS` and/or `TELEGRAM_ALLOWED_CHATS` (numeric IDs); set `"targets"` to `["<bot_username>"]` from `data.plugins[0].defaultTarget` (or omit `"targets"` on `id: "telegram"` to auto-resolve the bot's Telegram username via `getMe` at daemon startup, with `"personal"` as fallback)
 - **Slack:** `SLACK_ALLOWED_USERS` and/or `SLACK_ALLOWED_CHANNELS`
 - **WhatsApp:** `WHATSAPP_ALLOWED_NUMBERS`
 
@@ -58,11 +58,11 @@ hyp setup --refresh-skills
 
 ## 4. Link a Live Session & Reply
 
-In any agent session:
+In any agent session (replace `my_assistant_bot` with your bot's Telegram username target from `hyp_bridge({ action: "targets" })`, or `"personal"` if using the fallback):
 - **List targets:** `hyp_bridge({ action: "targets" })`
-- **Link session:** `hyp_bridge({ action: "link", plugin: "telegram", target: "personal" })` *(automatically claims primary ownership if unowned unless `readOnly: true` is passed)*
-- **Hand off primary ownership:** `hyp_bridge({ action: "handoff", plugin: "telegram", target: "personal", handle: "codex" })`
-- **Reply or react:** `hyp_send({ to: "telegram:personal", text: "Tests are green." })` or `hyp_send({ to: "telegram:personal", reaction: "👍", replyTo: "<msg-id>" })`
+- **Link session:** `hyp_bridge({ action: "link", plugin: "telegram", target: "my_assistant_bot" })` *(automatically claims primary ownership if unowned unless `readOnly: true` is passed)*
+- **Hand off primary ownership:** `hyp_bridge({ action: "handoff", plugin: "telegram", target: "my_assistant_bot", handle: "codex" })`
+- **Reply or react:** `hyp_send({ to: "telegram:my_assistant_bot", text: "Tests are green." })` or `hyp_send({ to: "telegram:my_assistant_bot", reaction: "👍", replyTo: "<msg-id>" })`
 
 ---
 
@@ -77,6 +77,6 @@ In any agent session:
 ## What You Should See
 
 - `hyp doctor` reports `OK` for `plugin:telegram` / `plugin:slack` and zero `crash_loop_backoff` warnings.
-- Messaging your bot from an allowlisted user wakes the linked agent session with `[hyphae · telegram:personal]`, and replies appear back in chat.
+- Messaging your bot from an allowlisted user wakes the linked agent session with `[hyphae · telegram:my_assistant_bot]`, and replies appear back in chat.
 
 If a bridge crashes or messages are dropped, inspect `<state_dir>/logs/plugin-<id>.log` and see [Troubleshooting](../operations/troubleshooting.md).

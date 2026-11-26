@@ -912,3 +912,168 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert_eq!(tamper_setup.status.code(), Some(1));
     assert!(!tamper_home.join(".claude/skills/hyphae-panel").exists());
 }
+
+#[test]
+fn compiled_hyp_plugin_install_telegram_resolves_bot_username_via_getme_and_falls_back_safely() {
+    use hyp_crypto::keystore::{SecretBackend, SecretStore};
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    let bin = env!("CARGO_BIN_EXE_hyp");
+    let root = repo_root();
+    let plugins_dir = root.join("plugins");
+
+    let ok_tok = "30001:CLI_E2E_OK_TOKEN_NEVER_LEAK";
+    let fail_tok = "30002:CLI_E2E_500_TOKEN_NEVER_LEAK";
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            if path == format!("/bot{ok_tok}/getMe") {
+                let body =
+                    r#"{"ok":true,"result":{"id":7,"is_bot":true,"username":"Moneypenny0_Bot"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            } else {
+                let body = r#"{"ok":false,"description":"service unavailable"}"#;
+                let resp = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        }
+    });
+
+    let api_base = format!("http://{addr}");
+
+    // 1. Happy path: stored telegram-bot-token + mock getMe -> defaultTarget == "moneypenny0_bot"
+    let tmp_ok = TempDir::new().expect("tempdir ok");
+    let home_ok = tmp_ok.path().join("home");
+    let state_ok = tmp_ok.path().join("state");
+    fs::create_dir_all(&home_ok).unwrap();
+    fs::create_dir_all(&state_ok).unwrap();
+    SecretStore::new(&state_ok, SecretBackend::File)
+        .set("telegram-bot-token", ok_tok)
+        .unwrap();
+
+    let out_ok = Command::new(bin)
+        .args([
+            "plugin",
+            "install",
+            "telegram",
+            "--from-dir",
+            plugins_dir.to_str().unwrap(),
+            "--home",
+            home_ok.to_str().unwrap(),
+            "--state-dir",
+            state_ok.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", &home_ok)
+        .env("TELEGRAM_API_BASE", &api_base)
+        .output()
+        .expect("run hyp plugin install telegram");
+    assert!(
+        out_ok.status.success(),
+        "install telegram failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_ok.stdout),
+        String::from_utf8_lossy(&out_ok.stderr)
+    );
+    let stdout_ok = String::from_utf8_lossy(&out_ok.stdout);
+    let stderr_ok = String::from_utf8_lossy(&out_ok.stderr);
+    assert!(!stdout_ok.contains(ok_tok) && !stderr_ok.contains(ok_tok));
+    let json_ok: Value = serde_json::from_str(&stdout_ok).expect("parse json");
+    assert_eq!(json_ok["ok"], true);
+    assert_eq!(
+        json_ok["data"]["plugins"][0]["defaultTarget"],
+        "moneypenny0_bot"
+    );
+    assert_eq!(
+        json_ok["data"]["plugins"][0]["defaultTargetSource"],
+        "getMe"
+    );
+    assert!(
+        json_ok["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.contains("moneypenny0_bot"))),
+        "next hints should suggest resolved target: {}",
+        json_ok["next"]
+    );
+
+    // 2. Fallback path: HTTP 500 -> install still succeeds (exit 0), defaultTarget == "personal", zero token leak!
+    let tmp_fail = TempDir::new().expect("tempdir fail");
+    let home_fail = tmp_fail.path().join("home");
+    let state_fail = tmp_fail.path().join("state");
+    fs::create_dir_all(&home_fail).unwrap();
+    fs::create_dir_all(&state_fail).unwrap();
+    SecretStore::new(&state_fail, SecretBackend::File)
+        .set("telegram-bot-token", fail_tok)
+        .unwrap();
+
+    let out_fail = Command::new(bin)
+        .args([
+            "plugin",
+            "install",
+            "telegram",
+            "--from-dir",
+            plugins_dir.to_str().unwrap(),
+            "--home",
+            home_fail.to_str().unwrap(),
+            "--state-dir",
+            state_fail.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .env("HOME", &home_fail)
+        .env("TELEGRAM_API_BASE", &api_base)
+        .output()
+        .expect("run hyp plugin install telegram (500 fallback)");
+    assert!(
+        out_fail.status.success(),
+        "install telegram must never block on getMe error: stdout={} stderr={}",
+        String::from_utf8_lossy(&out_fail.stdout),
+        String::from_utf8_lossy(&out_fail.stderr)
+    );
+    let stdout_fail = String::from_utf8_lossy(&out_fail.stdout);
+    let stderr_fail = String::from_utf8_lossy(&out_fail.stderr);
+    assert!(
+        !stdout_fail.contains(fail_tok) && !stderr_fail.contains(fail_tok),
+        "token leaked on fallback!"
+    );
+    let json_fail: Value = serde_json::from_str(&stdout_fail).expect("parse json");
+    assert_eq!(json_fail["ok"], true);
+    assert_eq!(json_fail["data"]["plugins"][0]["defaultTarget"], "personal");
+    assert_eq!(
+        json_fail["data"]["plugins"][0]["defaultTargetSource"],
+        "fallback"
+    );
+    assert!(
+        json_fail["warnings"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty()),
+        "expected non-fatal fallback warning"
+    );
+
+    let _ = server.join();
+}

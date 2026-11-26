@@ -341,7 +341,7 @@ All included `.mjs` scripts have zero external npm dependencies (**requires Node
 
 ### Example `plugins[]` Configuration (`~/.config/hyphae/node.json`)
 
-Install the verified plugins first (`hyp plugin install telegram --json`, `hyp plugin install slack --json`), store tokens out-of-band (`hyp secret set telegram-bot-token --web`, `hyp secret set slack-app-token --web`, `hyp secret set slack-bot-token --web`), then wire `node.json` using the returned `data.nodePath` and `data.plugins[0].scriptPath` (add `"exposeTopic": true` to a plugin entry **only** if you intentionally want paired remote peers to subscribe to its topic):
+Store tokens out-of-band (`hyp secret set telegram-bot-token --web`, `hyp secret set slack-app-token --web`, `hyp secret set slack-bot-token --web`), install the verified plugins (`hyp plugin install telegram --json`, `hyp plugin install slack --json`), then wire `node.json` using the returned `data.nodePath`, `data.plugins[0].scriptPath`, and (for Telegram) `data.plugins[0].defaultTarget` (auto-fetched from Telegram `getMe` as the bot's lowercase `@username` without `@`, falling back to `"personal"` if offline/unreachable; omitting `"targets"` on `id: "telegram"` also auto-resolves it at startup). Add `"exposeTopic": true` to a plugin entry **only** if you intentionally want paired remote peers to subscribe to its topic:
 
 ```json
 {
@@ -350,7 +350,7 @@ Install the verified plugins first (`hyp plugin install telegram --json`, `hyp p
       "id": "telegram",
       "command": "/opt/homebrew/bin/node",
       "args": ["/Users/you/.config/hyphae/plugins/telegram/index.mjs"],
-      "targets": ["personal"],
+      "targets": ["my_assistant_bot"],
       "env": {
         "TELEGRAM_BOT_TOKEN": { "secret": "telegram-bot-token" },
         "TELEGRAM_ALLOWED_USERS": "123456789",

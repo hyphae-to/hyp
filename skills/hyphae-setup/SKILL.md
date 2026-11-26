@@ -429,7 +429,7 @@ hyp deploy check --url https://<hostname> --json
      ```
    - Offline/air-gapped installs work identically with `--archive <path-to-plugins.tar.gz>` or `--from-dir <plugins-dir>` (and `hyp setup --plugins-dir` / `--plugins-archive`). If `hyp setup` runs offline without a local cache/archive, pure-Rust harness config still succeeds and prompts `hyp plugin install claude-panel` / `hyp plugin install herdr-mod`.
    - `hyp update` automatically runs `hyp plugin update --all` after replacing the binary (pass `--no-plugins` to opt out); locally modified plugins are never clobbered without `--force`.
-   - Wire `~/.config/hyphae/node.json` `plugins[]` using the exact **`data.nodePath`** (absolute `node` binary path, falling back to `"node"` only if `null`) as `"command"` and **`data.plugins[0].scriptPath`** (`~/.config/hyphae/plugins/<name>/index.mjs`) as `"args"`:
+   - Wire `~/.config/hyphae/node.json` `plugins[]` using the exact **`data.nodePath`** (absolute `node` binary path, falling back to `"node"` only if `null`) as `"command"` and **`data.plugins[0].scriptPath`** (`~/.config/hyphae/plugins/<name>/index.mjs`) as `"args"`. For **Telegram**, store `telegram-bot-token` first (Step 2) so `hyp plugin install telegram --json` automatically fetches the bot's public `@username` via Telegram `getMe` (without echoing the token) and returns it as **`data.plugins[0].defaultTarget`** (lowercase, leading `@` stripped, falling back to `"personal"` if offline/unreachable; omitting `"targets"` on `id: "telegram"` in `node.json` also auto-resolves it at daemon startup):
      ```json
      {
        "plugins": [
@@ -437,7 +437,7 @@ hyp deploy check --url https://<hostname> --json
            "id": "telegram",
            "command": "<data.nodePath>",
            "args": ["<data.plugins[0].scriptPath>"],
-           "targets": ["personal"],
+           "targets": ["my_assistant_bot"],
            "env": {
              "TELEGRAM_BOT_TOKEN": { "secret": "telegram-bot-token" },
              "TELEGRAM_ALLOWED_USERS": "<numeric-user-id>",
@@ -447,6 +447,7 @@ hyp deploy check --url https://<hostname> --json
        ]
      }
      ```
+     *(Replace `"my_assistant_bot"` with `data.plugins[0].defaultTarget` — your bot's Telegram username without `@`, or `"personal"` as fallback.)*
    - Supervised natively by `hyp daemon` (Unix fd 3 on macOS/Linux, authenticated loopback TCP on Windows); bridge topics stay local-only by default (`"exposeTopic": true` opt-in). Always configure explicit allowlists (`SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS`, etc.) and reference tokens via `{ "secret": "<name>" }`. Use `hyp plugin remove <name> --json` when retiring a bridge (automatically removes matching `plugins[]` entries from `node.json`; pass `--keep-config` to preserve them).
 5. Restart the background daemon after editing `node.json` (`hyp service restart --json`), then verify with `hyp doctor --json`.
 
