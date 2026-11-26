@@ -187,8 +187,7 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Set up Node.js 24 (Linux plugin & JS interop E2E)
-        if: runner.os == 'Linux'
+      - name: Set up Node.js 24 (native plugin & JS interop E2E)
         uses: actions/setup-node@v4
         with:
           node-version-file: ".tool-versions"
