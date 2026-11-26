@@ -2834,7 +2834,10 @@ async fn canonical_tools_keep_live_controls_shorthands_and_reject_retired_entrie
         serde_json::from_str::<Value>(&mode).unwrap()["deliveryMode"],
         "notify"
     );
-    for control in [json!({"mute":"spam/*"}), json!({"unmute":"spam/*"})] {
+    for control in [
+        json!({"mute":"spam/*","target":"other/*"}),
+        json!({"unmute":"spam/*","target":"other/*"}),
+    ] {
         let expect_muted = control.get("mute").is_some();
         let (result, error) = mcp
             .call_verified_claude(&sock, "canonical-session", "hyp_inbox", control)
@@ -2900,6 +2903,68 @@ async fn canonical_tools_keep_live_controls_shorthands_and_reject_retired_entrie
             "canonical-session",
             "hyp_stream",
             json!({"action":"unsubscribe","key":id}),
+        )
+        .await;
+    assert!(!error, "{removed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&removed).unwrap()["removed"],
+        true
+    );
+
+    // A bare stored key is not an unsubscribe key: the public shorthand treats it as an ID.
+    let (bare, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"subscribe","topic":"primary.schedule","key":"bare-key"}),
+        )
+        .await;
+    assert!(!error, "{bare}");
+    let bare: Value = serde_json::from_str(&bare).unwrap();
+    assert_eq!(bare["topic"], "schedule");
+    let (removed, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"unsubscribe","key":"bare-key"}),
+        )
+        .await;
+    assert!(!error, "{removed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&removed).unwrap()["removed"],
+        false
+    );
+    let (removed, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"unsubscribe","id":bare["id"]}),
+        )
+        .await;
+    assert!(!error, "{removed}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&removed).unwrap()["removed"],
+        true
+    );
+
+    let (keyed, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"subscribe","topic":"local.schedule","key":"watch:qualified"}),
+        )
+        .await;
+    assert!(!error, "{keyed}");
+    let (removed, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"unsubscribe","key":"watch:qualified"}),
         )
         .await;
     assert!(!error, "{removed}");

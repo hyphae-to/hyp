@@ -5955,8 +5955,8 @@ impl LocalDaemonInner {
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
         let target = args
-            .get("target")
-            .or_else(|| args.get("mute"))
+            .get("mute")
+            .or_else(|| args.get("target"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -6030,8 +6030,8 @@ impl LocalDaemonInner {
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
         let target = args
-            .get("target")
-            .or_else(|| args.get("unmute"))
+            .get("unmute")
+            .or_else(|| args.get("target"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -6657,10 +6657,19 @@ impl LocalDaemonInner {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ("invalid_request".into(), "Expected topic".into()))?;
-        let router = args.get("router").and_then(Value::as_str);
+        let (router, topic) = if args.contains_key("router") {
+            (args.get("router").and_then(Value::as_str), raw_topic)
+        } else if let Some((router, topic)) = raw_topic
+            .split_once('.')
+            .filter(|(router, topic)| is_valid_router_name(router) && !topic.is_empty())
+        {
+            (Some(router), topic)
+        } else {
+            (None, raw_topic)
+        };
         let qualified_topic = match router {
-            Some("primary") | None => raw_topic.to_string(),
-            Some(r) => format!("{r}.{raw_topic}"),
+            Some("primary") | None => topic.to_string(),
+            Some(r) => format!("{r}.{topic}"),
         };
 
         let filters: Vec<ProtoFilter> = match args.get("filters") {
@@ -6791,8 +6800,12 @@ impl LocalDaemonInner {
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
-        let id_arg = args.get("id").and_then(Value::as_str);
         let key_arg = args.get("key").and_then(Value::as_str);
+        let id_arg = if args.contains_key("id") {
+            args.get("id").and_then(Value::as_str)
+        } else {
+            key_arg.filter(|key| !key.contains(':'))
+        };
         let target_id = if let Some(id) = id_arg {
             Some(id.to_string())
         } else if let Some(key) = key_arg {
