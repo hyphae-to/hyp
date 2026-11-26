@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "canarySchedule": "0 5 */3 * *",
+  "description": "Pinned upstream harness and orchestrator versions for Hyphae black-box integration testing.",
+  "tools": {
+    "openclaw": {
+      "kind": "npm",
+      "package": "openclaw",
+      "version": "2026.11.10",
+      "bin": "openclaw",
+      "versionArgs": ["--version"],
+      "tier": 1
+    },
+    "claude": {
+      "kind": "npm",
+      "package": "@anthropic-ai/claude-code",
+      "version": "2.1.332",
+      "bin": "claude",
+      "versionArgs": ["--version"],
+      "tier": 1
+    },
+    "codex": {
+      "kind": "npm",
+      "package": "@openai/codex",
+      "version": "0.172.0",
+      "bin": "codex",
+      "versionArgs": ["--version"],
+      "tier": 1
+    },
+    "gemini": {
+      "kind": "npm",
+      "package": "@google/gemini-cli",
+      "version": "0.1.22",
+      "bin": "gemini",
+      "versionArgs": ["--version"],
+      "tier": 2
+    },
+    "opencode": {
+      "kind": "binary",
+      "version": "2.3.2",
+      "bin": "opencode",
+      "versionArgs": ["--version"],
+      "tier": 2,
+      "installHint": "https://opencode.ai/install"
+    },
+    "hc": {
+      "kind": "binary",
+      "version": "0.1.22",
+      "bin": "hc",
+      "versionArgs": ["--version"],
+      "tier": 1,
+      "installHint": "https://github.com/herdr-dev/herdr"
+    },
+    "t3": {
+      "kind": "binary",
+      "version": "0.0.46-nightly.20261005.2676",
+      "bin": "t3",
+      "versionArgs": ["--version"],
+      "tier": 2,
+      "installHint": "https://github.com/t3-oss/t3-code"
+    }
+  }
+}

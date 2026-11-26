@@ -1,0 +1,18 @@
+{
+  "name": "hyphae-blackbox-itest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Black-box integration testing harness for Hyphae (hyp) against real coding harnesses, orchestrators, and plugins using programmable multi-protocol llm-shim.",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "itest:unit": "node --test suites/llm-shim.test.ts",
+    "itest:openclaw": "node --test suites/openclaw.test.ts",
+    "itest:claude": "node --test suites/claude.test.ts",
+    "itest:phase1": "node --test suites/llm-shim.test.ts suites/openclaw.test.ts suites/claude.test.ts",
+    "provision": "node scripts/provision.mjs",
+    "provision:host": "node scripts/provision.mjs --use-host-bins --json"
+  }
+}
