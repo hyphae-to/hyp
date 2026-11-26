@@ -2,7 +2,7 @@
  * End-to-end tests for the official event-source plugins (agentmail, sentry, gmail,
  * google-calendar, vercel, notion) and the Google OAuth helper.
  *
- * Each test spawns the real plugin script with fd 3 wired to this process (the same v1
+ * Each test spawns the real plugin script with fd 3 wired to this process (the same JSON-RPC v2
  * NDJSON channel `SubprocessSupervisor` speaks), points it at loopback mock provider
  * servers, and asserts on the CloudEvents it publishes. Zero npm dependencies, zero real
  * network calls, every temp dir and child process cleaned up.
@@ -81,12 +81,12 @@ function startPlugin(name, env, { targets = [name], ackWith } = {}) {
   });
   rl.on("line", (line) => {
     const msg = JSON.parse(line);
-    if (msg.type !== "event") return;
-    const reply = ackWith ? ackWith(msg, events.length) : { type: "ack", status: "stored" };
-    if (reply.type === "ack") events.push({ to: msg.to, event: msg.event });
-    channel.write(JSON.stringify({ ...reply, id: msg.event.id }) + "\n");
+    if (msg.method !== "hyphae/publish") return;
+    const reply = ackWith ? ackWith(msg, events.length) : { result: { status: "stored" } };
+    if (Object.hasOwn(reply, "result")) events.push({ to: msg.params.to, event: msg.params.event });
+    channel.write(JSON.stringify({ jsonrpc: "2.0", ...reply, id: msg.id }) + "\n");
   });
-  channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: name, targets }) + "\n");
+  channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: name, targets } }) + "\n");
   cleanups.push(() => new Promise((resolve) => {
     rl.close();
     if (exit !== null) {
@@ -679,7 +679,7 @@ test("agentmail: a failed publish stops the connection from advancing the cursor
   startPlugin(
     "agentmail",
     { AGENTMAIL_API_KEY: "am_test_key", AGENTMAIL_WS_URL: mock.url, AGENTMAIL_API_BASE: api.base, AGENTMAIL_STATE_FILE: stateFile, AGENTMAIL_INBOXES: "billing@agentmail.to" },
-    { ackWith: () => { attempts += 1; return { type: "nack", error: "unavailable" }; } },
+    { ackWith: () => { attempts += 1; return { error: { code: -32005, message: "unavailable" } }; } },
   );
   // The plugin reconnects after the failure; by then both live events have been handled.
   await until(() => connections >= 2, "agentmail reconnect after failed publish");
@@ -696,7 +696,7 @@ test("a node that cannot store yet makes the plugin retry instead of dropping th
   const plugin = startPlugin(
     "sentry",
     { SENTRY_AUTH_TOKEN: "t", SENTRY_ORG: "acme", SENTRY_API_BASE: mock.base, SENTRY_STATE_FILE: stateFile, SENTRY_POLL_SECONDS: "15" },
-    { ackWith: () => { attempts += 1; return attempts === 1 ? { type: "nack", error: "unavailable" } : { type: "ack", status: "stored" }; } },
+    { ackWith: () => { attempts += 1; return attempts === 1 ? { error: { code: -32005, message: "unavailable" } } : { result: { status: "stored" } }; } },
   );
   await until(() => attempts === 1, "first (nacked) publish");
   assert.deepEqual(JSON.parse(readFileSync(stateFile, "utf8")).seen, {}, "a nacked event must not be marked as delivered");

@@ -31,7 +31,7 @@ mod unix_tests {
     use crate::common::{MockHttpServer, MockRequest, MockResponse, UnifiedNodeAdapterHost};
     use hyp_crypto::SecretBackend;
     use hyp_node::adapters::{
-        AdapterError, AdapterHealth, AdapterKind, HelloMode, NodeAdapter, PrometheusWebhookAdapter,
+        AdapterError, AdapterHealth, AdapterKind, NodeAdapter, PrometheusWebhookAdapter,
         PrometheusWebhookConfig, SubprocessConfig, SubprocessSupervisor,
         compute_hmac_sha256_header, verify_hmac_sha256_header,
     };
@@ -155,7 +155,7 @@ mod unix_tests {
             vec![plugin_script.to_string_lossy().into_owned()],
             vec!["webhook".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.env.insert("WEBHOOK_HOST".into(), "127.0.0.1".into());
         cfg.env.insert("WEBHOOK_PORT".into(), port.to_string());
         cfg.env.insert("WEBHOOK_PATH".into(), "/webhook".into());
@@ -437,7 +437,7 @@ mod unix_tests {
             vec![plugin_script.to_string_lossy().into_owned()],
             vec!["alerts".to_string()],
         );
-        sub_cfg.hello_mode = HelloMode::Auto;
+
         sub_cfg
             .env
             .insert("PROMETHEUS_HOST".into(), "127.0.0.1".into());
@@ -771,7 +771,7 @@ mod unix_tests {
             vec![plugin_script.to_string_lossy().into_owned()],
             vec!["telegram".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.env.insert(
             "TELEGRAM_BOT_TOKEN_FILE".into(),
             token_file.to_string_lossy().into_owned(),
@@ -1173,7 +1173,7 @@ mod unix_tests {
             vec![plugin_script.to_string_lossy().into_owned()],
             vec!["slack".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.env.insert(
             "SLACK_APP_TOKEN_FILE".into(),
             app_token_file.to_string_lossy().into_owned(),
@@ -1395,7 +1395,7 @@ mod unix_tests {
             vec![plugin_script.to_string_lossy().into_owned()],
             vec!["whatsapp".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.env.insert("WHATSAPP_HOST".into(), "127.0.0.1".into());
         cfg.env.insert("WHATSAPP_PORT".into(), port.to_string());
         cfg.env.insert("WHATSAPP_PATH".into(), "/whatsapp".into());
@@ -1615,8 +1615,8 @@ const nackInvalid = await mesh.send("sdk-node", {
   id: "",
   source: "bad",
   type: "bad",
-});
-const nackTarget = await mesh.send("unconfigured-target", validEvent);
+}).catch(error => ({ code: error.code, message: error.message }));
+const nackTarget = await mesh.send("unconfigured-target", validEvent).catch(error => ({ code: error.code, message: error.message }));
 
 writeFileSync(
   process.env.SDK_REPORT_FILE,
@@ -1640,7 +1640,7 @@ setInterval(() => {}, 10_000);
             vec![helper_script.to_string_lossy().into_owned()],
             vec!["sdk-node".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.env.insert(
             "SDK_MJS_PATH".into(),
             sdk_path.to_string_lossy().into_owned(),
@@ -1667,17 +1667,16 @@ setInterval(() => {}, 10_000);
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
 
-        assert_eq!(report["hello"]["type"], "hello");
-        assert_eq!(report["hello"]["protocol"], 1);
+        assert_eq!(report["hello"]["protocol"], 2);
         assert_eq!(report["hello"]["targets"], json!(["sdk-node"]));
-        assert_eq!(report["ackStored"]["type"], "ack");
+
         assert_eq!(report["ackStored"]["status"], "stored");
-        assert_eq!(report["ackDup"]["type"], "ack");
+
         assert_eq!(report["ackDup"]["status"], "duplicate");
-        assert_eq!(report["nackInvalid"]["type"], "nack");
-        assert_eq!(report["nackInvalid"]["error"], "invalid_event");
-        assert_eq!(report["nackTarget"]["type"], "nack");
-        assert_eq!(report["nackTarget"]["error"], "unknown_target");
+
+        assert_eq!(report["nackInvalid"]["code"], -32002);
+
+        assert_eq!(report["nackTarget"]["code"], -32003);
 
         let ingested = host.published_events().await;
         assert_eq!(ingested.len(), 1);
@@ -1740,7 +1739,7 @@ import os
 import sys
 
 sys.path.insert(0, os.environ["SDK_PY_DIR"])
-from client import MeshPluginClient
+from client import MeshPluginClient, PluginRpcError
 
 def on_status(msg):
     with open(os.environ["SDK_STATUS_FILE"], "w", encoding="utf-8") as f:
@@ -1764,14 +1763,14 @@ ack_dup = client.send("sdk-py", valid_event, retry_unavailable=False)
 nack_invalid_err = None
 try:
     client.send("sdk-py", {"specversion": "9.9", "id": "", "source": "x", "type": "y"}, retry_unavailable=False)
-except RuntimeError as exc:
-    nack_invalid_err = str(exc)
+except PluginRpcError as exc:
+    nack_invalid_err = str(exc.code)
 
 nack_target_err = None
 try:
     client.send("wrong-target", valid_event, retry_unavailable=False)
-except RuntimeError as exc:
-    nack_target_err = str(exc)
+except PluginRpcError as exc:
+    nack_target_err = str(exc.code)
 
 with open(os.environ["SDK_REPORT_FILE"], "w", encoding="utf-8") as f:
     json.dump({
@@ -1799,7 +1798,7 @@ client._dead.wait(timeout=15)
             vec![helper_script.to_string_lossy().into_owned()],
             vec!["sdk-py".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.env
             .insert("SDK_PY_DIR".into(), sdk_dir.to_string_lossy().into_owned());
         cfg.env.insert(
@@ -1830,22 +1829,22 @@ client._dead.wait(timeout=15)
 
         assert_eq!(report["plugin"], "sdk-py-test");
         assert_eq!(report["targets"], json!(["sdk-py"]));
-        assert_eq!(report["ack_stored"]["type"], "ack");
+
         assert_eq!(report["ack_stored"]["status"], "stored");
-        assert_eq!(report["ack_dup"]["type"], "ack");
+
         assert_eq!(report["ack_dup"]["status"], "duplicate");
         let inv_err = report["nack_invalid_err"]
             .as_str()
             .expect("invalid event must raise RuntimeError on nack");
         assert!(
-            inv_err.contains("invalid_event"),
+            inv_err.contains("-32002"),
             "expected invalid_event in python nack error, got {inv_err}"
         );
         let tgt_err = report["nack_target_err"]
             .as_str()
             .expect("unknown target must raise RuntimeError on nack");
         assert!(
-            tgt_err.contains("unknown_target"),
+            tgt_err.contains("-32003"),
             "expected unknown_target in python nack error, got {tgt_err}"
         );
 
@@ -1873,7 +1872,6 @@ client._dead.wait(timeout=15)
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
-        assert_eq!(st_msg["type"], "status");
         assert_eq!(st_msg["target"], "sdk-py");
         assert_eq!(st_msg["pending"], 3);
 
@@ -2371,7 +2369,7 @@ client._dead.wait(timeout=15)
             vec![plugin_script.to_string_lossy().into_owned()],
             vec!["moneypenny0bot".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.env.insert(
             "TELEGRAM_BOT_TOKEN_FILE".into(),
             token_file.to_string_lossy().into_owned(),
@@ -2682,8 +2680,8 @@ mod loopback_tcp_parity_tests {
     use hyp_crypto::SecretBackend;
     use hyp_node::adapters::supervisor::PluginTransportMode;
     use hyp_node::adapters::{
-        AdapterError, AdapterHealth, AdapterKind, HelloMode, NodeAdapter, SubprocessConfig,
-        SubprocessSupervisor, WireProtocol, compute_hmac_sha256_header, verify_hmac_sha256_header,
+        AdapterError, AdapterHealth, AdapterKind, NodeAdapter, SubprocessConfig,
+        SubprocessSupervisor, compute_hmac_sha256_header, verify_hmac_sha256_header,
     };
     use hyp_node::engine::http_util::{HttpClient, empty_body, full_body};
     use hyp_node::engine::{NodeConfig, SubscribeRequest, UnifiedNode};
@@ -2854,8 +2852,8 @@ const nackInvalid = await mesh.send("sdk-tcp", {
   id: "",
   source: "bad",
   type: "bad",
-});
-const nackTarget = await mesh.send("wrong-target", validEvent);
+}).catch(error => ({ code: error.code, message: error.message }));
+const nackTarget = await mesh.send("wrong-target", validEvent).catch(error => ({ code: error.code, message: error.message }));
 
 writeFileSync(
   process.env.SDK_REPORT_FILE,
@@ -2888,7 +2886,7 @@ setInterval(() => {}, 10_000);
             vec!["sdk-tcp".to_string()],
         );
         sdk_cfg.transport_mode = PluginTransportMode::LoopbackTcp;
-        sdk_cfg.hello_mode = HelloMode::Auto;
+
         sdk_cfg.env.insert(
             "SDK_MJS_PATH".into(),
             sdk_path.to_string_lossy().into_owned(),
@@ -2924,17 +2922,17 @@ setInterval(() => {}, 10_000);
             report["tokenPoppedAfterCtor"], true,
             "client.mjs MUST delete HYPHAE_PLUGIN_TOKEN from process.env immediately"
         );
-        assert_eq!(report["hello"]["type"], "hello");
-        assert_eq!(report["hello"]["protocol"], 1);
+
+        assert_eq!(report["hello"]["protocol"], 2);
         assert_eq!(report["hello"]["targets"], json!(["sdk-tcp"]));
-        assert_eq!(report["ackStored"]["type"], "ack");
+
         assert_eq!(report["ackStored"]["status"], "stored");
-        assert_eq!(report["ackDup"]["type"], "ack");
+
         assert_eq!(report["ackDup"]["status"], "duplicate");
-        assert_eq!(report["nackInvalid"]["type"], "nack");
-        assert_eq!(report["nackInvalid"]["error"], "invalid_event");
-        assert_eq!(report["nackTarget"]["type"], "nack");
-        assert_eq!(report["nackTarget"]["error"], "unknown_target");
+
+        assert_eq!(report["nackInvalid"]["code"], -32002);
+
+        assert_eq!(report["nackTarget"]["code"], -32003);
 
         let post_ok = sdk_sup
             .post(
@@ -3041,7 +3039,6 @@ rl.on("close", () => process.exit(0));
             vec!["ops".to_string()],
         );
         v2_cfg.transport_mode = PluginTransportMode::LoopbackTcp;
-        v2_cfg.hello_mode = HelloMode::Auto;
 
         let v2_sup = SubprocessSupervisor::new(v2_cfg);
         v2_sup.start(Arc::clone(&v2_host) as _).await.unwrap();
@@ -3051,7 +3048,6 @@ rl.on("close", () => process.exit(0));
             .await;
         assert_eq!(v2_events[0].0, "ops");
         assert_eq!(v2_events[0].1.id, "v2-tcp-evt-1");
-        assert_eq!(v2_sup.detected_protocol(), WireProtocol::JsonRpcV2);
 
         let v2_post = v2_sup
             .post(
@@ -3117,7 +3113,7 @@ rl.on("close", () => process.exit(0));
             vec!["webhook".to_string()],
         );
         wh_cfg.transport_mode = PluginTransportMode::LoopbackTcp;
-        wh_cfg.hello_mode = HelloMode::Auto;
+
         wh_cfg.env.insert("WEBHOOK_HOST".into(), "127.0.0.1".into());
         wh_cfg
             .env
@@ -3222,7 +3218,7 @@ rl.on("close", () => process.exit(0));
                 vec!["webhook".to_string()],
             );
             fd3_cfg.transport_mode = PluginTransportMode::UnixFd3;
-            fd3_cfg.hello_mode = HelloMode::Auto;
+
             fd3_cfg
                 .env
                 .insert("WEBHOOK_HOST".into(), "127.0.0.1".into());
@@ -3296,7 +3292,7 @@ rl.on("close", () => process.exit(0));
             r#"
 import os, sys
 sys.path.insert(0, os.environ["SDK_PY_DIR"])
-from client import MeshPluginClient
+from client import MeshPluginClient, PluginRpcError
 
 for bad_addr in ["192.168.1.5:9000", "0.0.0.0:9000", "evil.example:9000", "127.0.0.1:0", "broken"]:
     os.environ["HYPHAE_PLUGIN_ADDR"] = bad_addr
@@ -3335,7 +3331,7 @@ import os
 import sys
 
 sys.path.insert(0, os.environ["SDK_PY_DIR"])
-from client import MeshPluginClient
+from client import MeshPluginClient, PluginRpcError
 
 transport_before = os.environ.get("HYPHAE_PLUGIN_TRANSPORT")
 had_token_before = bool(os.environ.get("HYPHAE_PLUGIN_TOKEN"))
@@ -3372,14 +3368,14 @@ ack_dup = client.send("sdk-py-tcp", valid_event, retry_unavailable=False)
 nack_invalid_err = None
 try:
     client.send("sdk-py-tcp", {"specversion": "9.9", "id": "", "source": "x", "type": "y"}, retry_unavailable=False)
-except RuntimeError as exc:
-    nack_invalid_err = str(exc)
+except PluginRpcError as exc:
+    nack_invalid_err = str(exc.code)
 
 nack_target_err = None
 try:
     client.send("wrong-target", valid_event, retry_unavailable=False)
-except RuntimeError as exc:
-    nack_target_err = str(exc)
+except PluginRpcError as exc:
+    nack_target_err = str(exc.code)
 
 with open(os.environ["SDK_REPORT_FILE"], "w", encoding="utf-8") as f:
     json.dump({
@@ -3413,7 +3409,7 @@ client._dead.wait(timeout=15)
             vec!["sdk-py-tcp".to_string()],
         );
         cfg.transport_mode = PluginTransportMode::LoopbackTcp;
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.env
             .insert("SDK_PY_DIR".into(), sdk_dir.to_string_lossy().into_owned());
         cfg.env.insert(
@@ -3452,19 +3448,19 @@ client._dead.wait(timeout=15)
         );
         assert_eq!(report["plugin"], "sdk-py-tcp-test");
         assert_eq!(report["targets"], json!(["sdk-py-tcp"]));
-        assert_eq!(report["ack_stored"]["type"], "ack");
+
         assert_eq!(report["ack_stored"]["status"], "stored");
-        assert_eq!(report["ack_dup"]["type"], "ack");
+
         assert_eq!(report["ack_dup"]["status"], "duplicate");
         assert!(
             report["nack_invalid_err"]
                 .as_str()
-                .is_some_and(|s| s.contains("invalid_event"))
+                .is_some_and(|s| s.contains("-32002"))
         );
         assert!(
             report["nack_target_err"]
                 .as_str()
-                .is_some_and(|s| s.contains("unknown_target"))
+                .is_some_and(|s| s.contains("-32003"))
         );
 
         // Verify host -> Python `status` notification over LoopbackTcp.
@@ -3491,7 +3487,6 @@ client._dead.wait(timeout=15)
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
-        assert_eq!(st_msg["type"], "status");
         assert_eq!(st_msg["target"], "sdk-py-tcp");
         assert_eq!(st_msg["pending"], 4);
 
@@ -3565,8 +3560,8 @@ sock.on("error", () => {});
 sock.write(
   JSON.stringify({ type: "auth", token: badToken }) + "\n" +
   JSON.stringify({
-    type: "event",
-    to: "ops",
+    jsonrpc: "2.0", id: "publish-unauth", method: "hyphae/publish",
+    params: { to: "ops",
     event: {
       specversion: "1.0",
       id: "unauth-evt-wrong-tok",
@@ -3574,7 +3569,7 @@ sock.write(
       type: "com.evil.spoof",
       data: { pwned: true }
     }
-  }) + "\n",
+  }}) + "\n",
 );
 setInterval(() => {}, 10_000);
 "#,
@@ -3660,8 +3655,8 @@ const [host, portStr] = process.env.HYPHAE_PLUGIN_ADDR.split(":");
 const sock = net.createConnection({ host, port: Number(portStr) });
 sock.on("error", () => {});
 sock.write(JSON.stringify({
-  type: "event",
-  to: "ops",
+  jsonrpc: "2.0", id: "publish-unauth", method: "hyphae/publish",
+  params: { to: "ops",
   event: {
     specversion: "1.0",
     id: "unauth-evt-missing",
@@ -3669,7 +3664,7 @@ sock.write(JSON.stringify({
     type: "com.evil.noauth",
     data: { pwned: true }
   }
-}) + "\n");
+}}) + "\n");
 setInterval(() => {}, 10_000);
 "#,
         )

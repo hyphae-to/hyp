@@ -25,8 +25,8 @@ use hyp_node::adapters::github_public::normalize_repo_token_pattern;
 use hyp_node::adapters::supervisor::is_secret_like_env_key;
 use hyp_node::adapters::{
     AdapterKind, GenericWebhookAdapter, GenericWebhookConfig, GitHubPublicAdapter,
-    GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, HelloMode,
-    PrometheusWebhookAdapter, PrometheusWebhookConfig, SubprocessConfig,
+    GitHubPublicConfig, GitHubWebhookAdapter, GitHubWebhookConfig, PrometheusWebhookAdapter,
+    PrometheusWebhookConfig, SubprocessConfig,
 };
 use hyp_node::engine::config::{ForwardingPolicy, validate_trusted_proxy_cidr};
 use hyp_node::engine::{
@@ -3187,7 +3187,7 @@ fn parse_plugins_config(
                 Ok(resolved)
             }));
         }
-        cfg.hello_mode = HelloMode::Auto;
+
         cfg.stderr_log_path = Some(state_dir.join("logs").join(format!("plugin-{id}.log")));
         cfg.redacted_values = redacted_values;
         configs.push(ParsedPlugin {

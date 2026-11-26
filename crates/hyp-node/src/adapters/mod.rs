@@ -11,8 +11,7 @@ pub use github_public::{
     GitHubPublicAdapter, GitHubPublicConfig, GitHubPublicStats, normalize_github_api_event,
 };
 pub use supervisor::{
-    HelloMode, PluginTransportMode, SubprocessConfig, SubprocessSupervisor, WireProtocol,
-    build_isolated_env,
+    PluginTransportMode, SubprocessConfig, SubprocessSupervisor, build_isolated_env,
 };
 pub use trait_def::{
     AdapterError, AdapterHealth, AdapterKind, BoxFuture, CompiledSubscription, NodeAdapter,

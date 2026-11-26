@@ -853,9 +853,7 @@ fn differential_github_webhook_and_events_api_produce_identical_cloudevents() {
 #[cfg(unix)]
 mod unix_supervisor_tests {
     use super::*;
-    use hyp_node::adapters::{
-        HelloMode, SubprocessConfig, SubprocessSupervisor, WireProtocol, build_isolated_env,
-    };
+    use hyp_node::adapters::{SubprocessConfig, SubprocessSupervisor, build_isolated_env};
     use hyp_proto::rpc::StatusParams;
 
     fn python_bin() -> &'static str {
@@ -863,10 +861,10 @@ mod unix_supervisor_tests {
     }
 
     #[tokio::test]
-    async fn supervisor_legacy_v1_real_child_event_post_status_oversized_and_env_isolation() {
+    async fn supervisor_v2_host_first_real_child_event_post_status_oversized_and_env_isolation() {
         let host = RecordingHost::new();
 
-        // Real Python child speaking LEGACY fd-3 v1 over fd 3 socketpair (just like plugins/sdk/client.py!).
+        // Real Python child speaking LEGACY fd-3 v2 over fd 3 socketpair (just like plugins/sdk/client.py!).
         let script = r#"
 import json, os, signal, socket, sys
 
@@ -882,9 +880,13 @@ def recv():
         sys.exit(0)
     return json.loads(line.decode("utf-8"))
 
-# 1. Wait for legacy v1 hello from supervisor (HelloMode::Auto grace fallback)
+# 1. The host immediately sends its JSON-RPC v2 hello.
 hello = recv()
-assert hello["type"] == "hello" and hello["protocol"] == 1, f"bad hello: {hello}"
+assert hello["method"] == "hyphae/hello" and hello["params"]["protocol"] == 2, f"bad hello: {hello}"
+send({"type":"event","to":"ops","event":{"id":"retired-v1"}})
+retired = recv()
+assert retired["jsonrpc"] == "2.0" and retired["error"]["code"] == -32600
+
 
 # 2. Verify environment allowlist: secret NOT leaked, HYPHAE_PROTOCOL=2 & explicit config present
 leaked = os.environ.get("TOP_SECRET_HOST_TOKEN")
@@ -894,45 +896,44 @@ assert leaked is None, f"secret leaked into child: {leaked}"
 assert explicit == "bridge-test", f"missing explicit env: {explicit}"
 assert proto == "2", f"expected HYPHAE_PROTOCOL=2, got {proto}"
 
-# 3. Publish a valid CloudEvent via legacy v1 `event` -> expect `ack`
+# 3. Publish a valid CloudEvent via jsonrpc v2 `event` -> expect `ack`
 send({
-    "type": "event",
-    "to": "ops",
+    "jsonrpc": "2.0", "id": "publish-1", "method": "hyphae/publish",
+    "params": {"to": "ops",
     "event": {
         "specversion": "1.0",
-        "id": "v1-msg-1",
+        "id": "v2-msg-1",
         "source": "local/slack/ops",
         "type": "to.hyphae.bridge.slack",
         "datacontenttype": "application/json",
-        "data": {"text": "hello from legacy v1"}
+        "data": {"text": "hello from jsonrpc v2"}
     }
-})
+}})
 ack = recv()
-assert ack["type"] == "ack" and ack["id"] == "v1-msg-1" and ack["status"] == "stored", f"bad ack: {ack}"
+assert ack["id"] == "publish-1" and ack["result"]["status"] == "stored", f"bad ack: {ack}"
 
-# 4. Send legacy v1 `status` frame
+# 4. Send jsonrpc v2 `status` frame
 send({
-    "type": "status",
-    "target": "ops",
+    "jsonrpc": "2.0", "method": "hyphae/status",
+    "params": {"target": "ops",
     "pending": 3,
     "oldestAgeSeconds": 12,
     "t3Connected": True
-})
+}})
 
-# 5. Send >64 KiB oversized frame -> expect legacy v1 `nack` with `too_large`
-sock.sendall((json.dumps({"type": "event", "to": "ops", "pad": "A" * 70000}) + "\n").encode("utf-8"))
+# 5. Send >64 KiB oversized frame -> expect jsonrpc v2 `nack` with `too_large`
+sock.sendall((json.dumps({"jsonrpc": "2.0", "id": 99, "method": "hyphae/publish", "params": {"pad": "A" * 70000}}) + "\n").encode("utf-8"))
 nack = recv()
-assert nack["type"] == "nack" and nack["error"] == "too_large", f"expected too_large nack: {nack}"
+assert nack["error"]["code"] == -32001, f"expected too_large nack: {nack}"
 
 # 6. Loop awaiting inbound `request` (post) and replying with `response`
 while True:
     msg = recv()
-    if msg.get("type") == "request" and msg.get("method") == "post":
+    if msg.get("method") == "hyphae/post":
         send({
-            "type": "response",
+            "jsonrpc": "2.0",
             "id": msg["id"],
-            "ok": True,
-            "result": {"proto": "v1", "target": msg["target"], "echo": msg["params"].get("text")}
+            "result": {"proto": "v2", "target": msg["params"]["target"], "echo": msg["params"]["params"].get("text")}
         })
 "#;
 
@@ -943,7 +944,7 @@ while True:
         );
 
         let mut cfg = SubprocessConfig::new(
-            "slack-v1",
+            "slack-v2",
             AdapterKind::Bridge,
             python_bin(),
             vec!["-u".to_string(), "-c".to_string(), script.to_string()],
@@ -951,7 +952,7 @@ while True:
         );
         cfg.env
             .insert("PLUGIN_CUSTOM_MODE".to_string(), "bridge-test".to_string());
-        cfg.auto_hello_grace = Duration::from_millis(30);
+
         cfg.kill_timeout = Duration::from_millis(500);
         cfg.parent_env_override = Some(parent_env.clone());
 
@@ -965,7 +966,7 @@ while True:
         );
 
         let sup = SubprocessSupervisor::new(cfg);
-        sup.start(host.clone()).await.expect("start v1 supervisor");
+        sup.start(host.clone()).await.expect("start v2 supervisor");
 
         // Wait until child publishes event, reports status, and triggers oversized frame nack.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -978,7 +979,7 @@ while True:
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "timed out waiting for v1 child handshake/events; events={:?} status={:?} oversized={}",
+                "timed out waiting for v2 child handshake/events; events={:?} status={:?} oversized={}",
                 host.events().await.len(),
                 sup.last_status(),
                 sup.oversized_frames_rejected()
@@ -986,12 +987,11 @@ while True:
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
 
-        assert_eq!(sup.detected_protocol(), WireProtocol::LegacyV1);
         assert_eq!(sup.health(), AdapterHealth::Healthy);
         let evs = host.events().await;
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].0, "ops");
-        assert_eq!(evs[0].1.id, "v1-msg-1");
+        assert_eq!(evs[0].1.id, "v2-msg-1");
         assert_eq!(
             sup.last_status(),
             Some(StatusParams {
@@ -1002,20 +1002,20 @@ while True:
             })
         );
 
-        // Outbound correlated `post()` request over legacy v1!
+        // Outbound correlated `post()` request over legacy v2!
         let mut params = BTreeMap::new();
         params.insert("text".to_string(), json!("deploy complete"));
         let reply = sup
             .post("ops", params, Duration::from_secs(3))
             .await
-            .expect("v1 post request must succeed");
+            .expect("v2 post request must succeed");
         assert_eq!(
             reply,
-            json!({ "proto": "v1", "target": "ops", "echo": "deploy complete" })
+            json!({ "proto": "v2", "target": "ops", "echo": "deploy complete" })
         );
 
         // Clean SIGTERM shutdown.
-        sup.stop().await.expect("stop v1 supervisor");
+        sup.stop().await.expect("stop v2 supervisor");
         assert_eq!(sup.health(), AdapterHealth::Stopped);
         assert!(!sup.is_connected().await);
     }
@@ -1042,7 +1042,9 @@ def recv():
 
 assert os.environ.get("HYPHAE_PROTOCOL") == "2"
 
-# 1. Initiate JSON-RPC 2.0 `hyphae/hello` request immediately (auto-detected by HelloMode::Auto!)
+# 1. Receive host-first greeting, then optionally request v2 discovery metadata.
+host_hello = recv()
+assert host_hello["method"] == "hyphae/hello" and host_hello["params"]["protocol"] == 2
 send({
     "jsonrpc": "2.0",
     "id": "h1",
@@ -1115,8 +1117,7 @@ while True:
             vec!["-u".to_string(), "-c".to_string(), script.to_string()],
             vec!["alerts".to_string()],
         );
-        cfg.hello_mode = HelloMode::Auto;
-        cfg.auto_hello_grace = Duration::from_millis(200);
+
         cfg.kill_timeout = Duration::from_millis(500);
 
         let sup = SubprocessSupervisor::new(cfg);
@@ -1142,7 +1143,6 @@ while True:
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
 
-        assert_eq!(sup.detected_protocol(), WireProtocol::JsonRpcV2);
         let evs = host.events().await;
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].0, "alerts");
@@ -1188,6 +1188,8 @@ if not os.path.exists(marker):
     sys.exit(1)
 
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(marker, "w") as f:
+    f.write("2")
 sock = socket.socket(fileno=3)
 sock.sendall((json.dumps({
     "jsonrpc": "2.0",
@@ -1219,14 +1221,15 @@ while True:
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if sup.restart_count() >= 1 && sup.detected_protocol() == WireProtocol::JsonRpcV2 {
+            if sup.restart_count() >= 1
+                && std::fs::read_to_string(&marker).is_ok_and(|value| value == "2")
+            {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "timed out waiting for supervisor restart; restarts={} proto={:?}",
-                sup.restart_count(),
-                sup.detected_protocol()
+                "timed out waiting for supervisor restart; restarts={}",
+                sup.restart_count()
             );
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
@@ -1242,7 +1245,7 @@ while True:
     }
 
     #[tokio::test]
-    async fn supervisor_node_fs_fd3_child_works_like_v1_js_sdk() {
+    async fn supervisor_node_fs_fd3_child_uses_v2() {
         // Skip cleanly if `node` isn't installed in PATH on a minimal host.
         if std::process::Command::new("node")
             .arg("--version")
@@ -1263,10 +1266,10 @@ const send = (obj) => out.write(JSON.stringify(obj) + "\n");
 lines.on("line", (line) => {
   if (!line.trim()) return;
   const msg = JSON.parse(line);
-  if (msg.type === "hello") {
+  if (msg.method === "hyphae/hello") {
     send({
-      type: "event",
-      to: "ops",
+      jsonrpc: "2.0", id: "publish-1", method: "hyphae/publish",
+      params: { to: "ops",
       event: {
         specversion: "1.0",
         id: "node-v1-1",
@@ -1274,10 +1277,10 @@ lines.on("line", (line) => {
         type: "to.hyphae.bridge.node",
         datacontenttype: "application/json",
         data: { from: "node-fs-fd3" }
-      }
+      }}
     });
-  } else if (msg.type === "request" && msg.method === "post") {
-    send({ type: "response", id: msg.id, ok: true, result: { runtime: "node", echo: msg.params.text } });
+  } else if (msg.method === "hyphae/post") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { runtime: "node", echo: msg.params.params.text } });
   }
 });
 "#;
@@ -1288,7 +1291,7 @@ lines.on("line", (line) => {
             vec!["-e".to_string(), js_script.to_string()],
             vec!["ops".to_string()],
         );
-        cfg.auto_hello_grace = Duration::from_millis(25);
+
         cfg.kill_timeout = Duration::from_millis(500);
 
         let sup = SubprocessSupervisor::new(cfg);
@@ -1306,7 +1309,6 @@ lines.on("line", (line) => {
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
         assert_eq!(host.events().await[0].1.id, "node-v1-1");
-        assert_eq!(sup.detected_protocol(), WireProtocol::LegacyV1);
 
         let mut params = BTreeMap::new();
         params.insert("text".to_string(), json!("ping node"));
@@ -1318,6 +1320,98 @@ lines.on("line", (line) => {
 
         sup.stop().await.expect("stop node child");
         assert_eq!(sup.health(), AdapterHealth::Stopped);
+    }
+
+    async fn assert_post_reply_during_blocked_publish(notification: bool) {
+        let host = RecordingHost::new();
+        let blocked_publish = host.events.lock().await;
+        let script = r#"
+import json, os, socket
+sock = socket.socket(fileno=3)
+reader = sock.makefile("rb")
+def send(value):sock.sendall((json.dumps(value)+"\n").encode())
+hello = json.loads(reader.readline())
+assert hello["method"] == "hyphae/hello"
+publication = {"jsonrpc":"2.0","id":"publish-1","method":"hyphae/publish","params":{
+    "to":"ops","event":{"specversion":"1.0","id":"blocked","source":"test/concurrent","type":"test.concurrent","data":{}}}}
+if os.environ["TEST_NOTIFICATION"] == "true":publication.pop("id")
+send(publication)
+for line in reader:
+    message = json.loads(line)
+    if message.get("method") == "hyphae/post":
+        send({"jsonrpc":"2.0","id":message["id"],"result":{"concurrent":True}})
+"#;
+        let mut cfg = SubprocessConfig::new(
+            "concurrent",
+            AdapterKind::Bridge,
+            python_bin(),
+            vec!["-u".into(), "-c".into(), script.into()],
+            vec!["ops".into()],
+        );
+        cfg.env
+            .insert("TEST_NOTIFICATION".into(), notification.to_string());
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(host.clone()).await.unwrap();
+        let reply = supervisor
+            .post("ops", BTreeMap::new(), Duration::from_secs(2))
+            .await;
+        // The child's publish precedes its post response on the same stream. A serial
+        // dispatcher cannot read that response until the publication lock is released.
+        assert_eq!(reply.unwrap(), json!({"concurrent":true}));
+        drop(blocked_publish);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while host.events().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        supervisor.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervisor_correlates_post_while_a_publish_is_blocked() {
+        assert_post_reply_during_blocked_publish(false).await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_correlates_post_while_a_publish_notification_is_blocked() {
+        assert_post_reply_during_blocked_publish(true).await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_closes_a_saturated_connection_and_stops_promptly() {
+        let host = RecordingHost::new();
+        let script = r#"
+import json, socket, time
+sock = socket.socket(fileno=3)
+# Never read the host greeting or responses. Valid requests generate large correlated errors.
+for i in range(1024):
+    sock.sendall((json.dumps({"jsonrpc":"2.0","id":"x"*32000+str(i),"method":"unsupported"})+"\n").encode())
+time.sleep(30)
+"#;
+        let mut cfg = SubprocessConfig::new(
+            "stalled-reader",
+            AdapterKind::Bridge,
+            python_bin(),
+            vec!["-u".into(), "-c".into(), script.into()],
+            vec!["ops".into()],
+        );
+        cfg.initial_backoff = Duration::from_secs(10);
+        cfg.max_backoff = Duration::from_secs(10);
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(host).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while supervisor.is_connected().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("saturated connection must close without waiting for the peer");
+        tokio::time::timeout(Duration::from_secs(2), supervisor.stop())
+            .await
+            .expect("stalled writer must not prevent shutdown")
+            .unwrap();
     }
 }
 
