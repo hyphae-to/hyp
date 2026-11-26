@@ -17,9 +17,7 @@ use crate::config_file::{
     resolve_config_path_for_read, resolve_config_path_for_write, resolve_effective_node_id,
     resolve_state_dir, write_atomic_json,
 };
-use crate::ui::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
-};
+use crate::ui::{CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::human::HumanApprovalActionKind;
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
@@ -324,10 +322,6 @@ pub(crate) fn require_controlling_tty_confirmation(
         let _ = (summary_lines, prompt, &mut stderr_lock);
         Err(ConfirmError::NotInteractiveTty)
     }
-}
-
-pub(crate) fn emit_confirm_error(cmd: &str, as_json: bool, err: ConfirmError) -> ExitCode {
-    crate::ui::print_command_error(cmd, as_json, err.into_cli_error(cmd))
 }
 
 impl ConfirmError {
@@ -1819,23 +1813,37 @@ fn summarize_filter_plugin(cfg: &FilterPluginConfig) -> GateFilterSummary {
     }
 }
 
-pub fn run_gate(command: GateCommand) -> ExitCode {
+pub fn run_gate(command: GateCommand) -> CommandResult {
     match command {
-        GateCommand::Init(args) => run_gate_init_or_propose(args, false),
-        GateCommand::Propose(args) => run_gate_init_or_propose(args, true),
+        GateCommand::Init(args) => {
+            let json = args.json;
+            CommandResult::new("gate init", json, run_gate_init_or_propose(args, false))
+        }
+        GateCommand::Propose(args) => {
+            let json = args.json;
+            CommandResult::new("gate propose", json, run_gate_init_or_propose(args, true))
+        }
         GateCommand::Apply {
             config,
             state_dir,
             ceremony,
             json,
-        } => run_gate_apply(config, state_dir, ceremony, json),
+        } => CommandResult::new(
+            "gate apply",
+            json,
+            run_gate_apply(config, state_dir, ceremony, json),
+        ),
         GateCommand::Remove {
             filter_id,
             config,
             state_dir,
             ceremony,
             json,
-        } => run_gate_remove(filter_id, config, state_dir, ceremony, json),
+        } => CommandResult::new(
+            "gate remove",
+            json,
+            run_gate_remove(filter_id, config, state_dir, ceremony, json),
+        ),
         GateCommand::Review {
             receipt,
             session,
@@ -1844,30 +1852,42 @@ pub fn run_gate(command: GateCommand) -> ExitCode {
             full,
             state_dir,
             json,
-        } => run_gate_review(receipt, session, limit, show_body, full, state_dir, json),
+        } => CommandResult::new(
+            "gate review",
+            json,
+            run_gate_review(receipt, session, limit, show_body, full, state_dir, json),
+        ),
         GateCommand::Show {
             receipt,
             state_dir,
             json,
-        } => run_gate_show(receipt, state_dir, json),
+        } => CommandResult::new("gate show", json, run_gate_show(receipt, state_dir, json)),
         GateCommand::Log {
             decision,
             limit,
             session,
             state_dir,
             json,
-        } => run_gate_log(decision, limit, session, state_dir, json),
+        } => CommandResult::new(
+            "gate log",
+            json,
+            run_gate_log(decision, limit, session, state_dir, json),
+        ),
     }
 }
 
-pub fn run_inbox(command: InboxCommand) -> ExitCode {
+pub fn run_inbox(command: InboxCommand) -> CommandResult {
     match command {
         InboxCommand::Approve {
             receipt,
             reviewer,
             state_dir,
             json,
-        } => run_inbox_approve(receipt, reviewer, state_dir, json),
+        } => CommandResult::new(
+            "inbox approve",
+            json,
+            run_inbox_approve(receipt, reviewer, state_dir, json),
+        ),
         InboxCommand::Reject {
             receipt,
             mute,
@@ -1875,7 +1895,11 @@ pub fn run_inbox(command: InboxCommand) -> ExitCode {
             reviewer,
             state_dir,
             json,
-        } => run_inbox_reject(receipt, mute, reason, reviewer, state_dir, json),
+        } => CommandResult::new(
+            "inbox reject",
+            json,
+            run_inbox_reject(receipt, mute, reason, reviewer, state_dir, json),
+        ),
     }
 }
 
@@ -2043,7 +2067,7 @@ fn looks_like_raw_api_key(s: &str) -> bool {
         .any(|p| trimmed.starts_with(p))
 }
 
-fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode {
+fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> Result<ExitCode, CliError> {
     let cmd = if propose_only {
         "gate propose"
     } else {
@@ -2054,7 +2078,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     let plugin = match build_filter_plugin_from_args(&args) {
         Ok(p) => p,
         Err(e) => {
-            return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_GATE_CONFIG", e, None);
+            return Err(CliError::usage("INVALID_GATE_CONFIG", e));
         }
     };
 
@@ -2062,10 +2086,8 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     let config_path =
         resolve_config_path_for_write(args.config.as_deref(), args.state_dir.as_deref(), None);
 
-    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
-        Ok(m) => m,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
-    };
+    let mut cfg_map = NodeFile::read_document_or_empty(&config_path)
+        .map_err(|e| CliError::error("CONFIG_ERROR", e))?;
 
     let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
     let lock_state = inspect_policy_integrity(&config_path, &state_dir, &secrets);
@@ -2098,12 +2120,11 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         let proposal_val = match serde_json::to_value(&gate_cfg) {
             Ok(v) => v,
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None);
+                return Err(CliError::error("JSON_ERROR", e.to_string()));
             }
         };
-        if let Err(e) = write_atomic_json(&proposal_path, &proposal_val, true) {
-            return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-        }
+        write_atomic_json(&proposal_path, &proposal_val, true)
+            .map_err(|e| CliError::error("IO_ERROR", e))?;
         let next = vec![
             format!("Review proposed policy at {}", proposal_path.display()),
             format!(
@@ -2113,32 +2134,29 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             ),
         ];
         if as_json {
-            let envelope = JsonEnvelope {
-                ok: true,
-                command: cmd.to_string(),
-                summary: Some(format!(
+            let envelope = JsonEnvelope::ok(
+                cmd.to_string(),
+                format!(
                     "Staged unsigned gate policy proposal ({}) at {}",
                     plugin.id,
                     proposal_path.display()
-                )),
-                data: Some(json!({
+                ),
+                json!({
                     "proposalPath": proposal_path.display().to_string(),
                     "adapter": args.adapter.as_str(),
                     "filterId": plugin.id,
                     "approved": false,
                     "gate": proposal_val,
-                })),
-                warnings: Vec::new(),
-                next,
-                error: None,
-            };
+                }),
+            )
+            .next(next);
             print_json(&envelope);
         } else {
             println!("OK    Staged unsigned gate policy proposal '{}'", plugin.id);
             println!("      Proposal: {}", proposal_path.display());
             print_next_steps(&next);
         }
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     let approved_seal_seq: Option<u64>;
@@ -2147,13 +2165,9 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
     let approved_policy_sha256: Option<String>;
 
     {
-        if let Err(e) = ensure_dir(&state_dir, true) {
-            return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-        }
-        let db = match NodeDb::open(state_dir.join("node.sqlite")) {
-            Ok(d) => d,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-        };
+        ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
+        let db = NodeDb::open(state_dir.join("node.sqlite"))
+            .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
         let loaded_cfg = if config_path.exists() {
             load_node_or_legacy_config(&config_path).ok()
         } else {
@@ -2167,10 +2181,10 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
 
         let existing_tampered = lock_state.tampered_reason.clone();
         gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
-        let auth_digest = match db.human().authorities_digest() {
-            Ok(d) => d,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-        };
+        let auth_digest = db
+            .human()
+            .authorities_digest()
+            .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
         gate_cfg.human_authorities_digest = Some(auth_digest.clone());
         gate_cfg.require_signed_policy = true;
         gate_cfg.policy_signature = None;
@@ -2178,20 +2192,10 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         let policy_sha = match gate_policy_sha256(&gate_cfg) {
             Ok(h) => h,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "POLICY_HASH_FAILED",
-                    e.to_string(),
-                    None,
-                );
+                return Err(CliError::error("POLICY_HASH_FAILED", e.to_string()));
             }
         };
-        let seal_seq = match next_seal_seq(&db) {
-            Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
-        };
+        let seal_seq = next_seal_seq(&db).map_err(|e| CliError::error("DB_ERROR", e))?;
 
         let mut summary = format_gate_policy_summary(
             existing_gate.as_ref(),
@@ -2217,9 +2221,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         action.policy_sha256 = Some(policy_sha.clone());
         action.authorities_digest = Some(auth_digest);
 
-        let verified = match approve_gate_operation(
-            cmd,
-            as_json,
+        let verified = approve_gate_operation(
             &state_dir,
             &config_path,
             &db,
@@ -2227,10 +2229,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             action,
             &summary,
             &args.ceremony,
-        ) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
+        )?;
         let node_id = cfg_map
             .get("nodeId")
             .and_then(Value::as_str)
@@ -2242,14 +2241,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
             match serde_json::to_value(&gate_cfg) {
                 Ok(value) => value,
                 Err(error) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "JSON_ERROR",
-                        error.to_string(),
-                        None,
-                    );
+                    return Err(CliError::error("JSON_ERROR", error.to_string()));
                 }
             },
         );
@@ -2259,14 +2251,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
                 NodeFile::write_document(&config_path, cfg_map)
             })
         {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "APPROVAL_COMMIT_FAILED",
-                error,
-                None,
-            );
+            return Err(CliError::error("APPROVAL_COMMIT_FAILED", error));
         }
         approved_seal_seq = Some(verified.action.seal_seq);
         approved_human_id = Some(verified.human_id);
@@ -2327,21 +2312,19 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         if let Some(ref err) = daemon_reload_error {
             data["daemonReloadError"] = json!(err);
         }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Configured gate adapter '{}' ({}) in {}{}",
                 plugin.id,
                 args.adapter.as_str(),
                 config_path.display(),
                 { " [PASSKEY APPROVED]" }
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error: None,
-        };
+            ),
+            data,
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -2374,7 +2357,7 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> ExitCode 
         }
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn check_raw_gate_json_signing_secret(val: &Value, label: &str) -> Result<(), String> {
@@ -2402,11 +2385,9 @@ fn check_raw_gate_json_signing_secret(val: &Value, label: &str) -> Result<(), St
 }
 
 /// Runs the Passkey ceremony for one gate operation. The caller commits its policy and
-/// evidence only through the serialized approved-operation transaction. `Err` carries the exit code to return (pending URL printed, or failure).
+/// evidence only through the serialized approved-operation transaction.
 #[allow(clippy::too_many_arguments)]
 fn approve_gate_operation(
-    cmd: &str,
-    as_json: bool,
     state_dir: &std::path::Path,
     config_path: &std::path::Path,
     db: &NodeDb,
@@ -2414,7 +2395,7 @@ fn approve_gate_operation(
     action: hyp_crypto::human::HumanApprovalActionV1,
     summary: &[String],
     ceremony: &ApprovalCeremonyArgs,
-) -> Result<Box<crate::approval::VerifiedApproval>, ExitCode> {
+) -> Result<Box<crate::approval::VerifiedApproval>, CliError> {
     let verified = match run_passkey_approval_ceremony(
         state_dir,
         config_path,
@@ -2425,7 +2406,7 @@ fn approve_gate_operation(
         ceremony,
     ) {
         Ok(CeremonyOutcome::Approved(verified)) => verified,
-        Err(err) => return Err(err.emit(cmd, as_json)),
+        Err(err) => return Err(err.into_cli_error()),
     };
     Ok(verified)
 }
@@ -2435,7 +2416,7 @@ fn run_gate_apply(
     state_dir: Option<PathBuf>,
     ceremony: ApprovalCeremonyArgs,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "gate apply";
 
     let dir = resolve_state_dir(state_dir.as_deref(), config.as_deref(), None);
@@ -2447,38 +2428,21 @@ fn run_gate_apply(
     // before touching or complaining about missing `node.json`.
     let db_path = dir.join("node.sqlite");
     if !db_path.exists() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "PASSKEY_AUTHORITY_REQUIRED",
-            "No enrolled Passkey Admin authority found. Locking/unlocking the Security Gate or mutating authorities requires a browser Passkey Admin (local CLI PKCS#8 keys in SecretStore cannot satisfy the human boundary).",
-            Some(format!("hyp auth init --web --state-dir {}", dir.display())),
-        );
+        return Err(CliError::error("PASSKEY_AUTHORITY_REQUIRED", "No enrolled Passkey Admin authority found. Locking/unlocking the Security Gate or mutating authorities requires a browser Passkey Admin (local CLI PKCS#8 keys in SecretStore cannot satisfy the human boundary).").with_fix(format!("hyp auth init --web --state-dir {}", dir.display())));
     }
-    let db = match NodeDb::open(&db_path) {
-        Ok(d) => d,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
-    if let Err(err) = select_passkey_admin(&db, &secrets, &dir, None) {
-        return err.emit(cmd, as_json);
-    }
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
+    select_passkey_admin(&db, &secrets, &dir, None).map_err(|error| error.into_cli_error())?;
 
     if !config_path.exists() && !proposal_path.exists() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "CONFIG_NOT_FOUND",
             format!("Config file not found: {}", config_path.display()),
-            Some("Run `hyp gate init --adapter ...` or `hyp onboard` first.".to_string()),
-        );
+        )
+        .with_fix("Run `hyp gate init --adapter ...` or `hyp onboard` first.".to_string()));
     }
 
-    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
-        Ok(m) => m,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
-    };
+    let mut cfg_map = NodeFile::read_document_or_empty(&config_path)
+        .map_err(|e| CliError::error("CONFIG_ERROR", e))?;
     if !config_path.exists() {
         let node_id = cfg_map
             .get("nodeId")
@@ -2492,22 +2456,16 @@ fn run_gate_apply(
         Some(v) => match serde_json::from_value(v.clone()) {
             Ok(g) => Some(g),
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "INVALID_GATE_CONFIG",
                     format!("Malformed gate config in {}: {e}", config_path.display()),
-                    None,
-                );
+                ));
             }
         },
         None => None,
     };
 
-    if let Err(e) = ensure_dir(&dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
 
     // Tamper laundering defense: verify existing external lock seal / policy FIRST before merging
     // any proposal so unauthorized disk edits are surfaced inside the Passkey approval diff!
@@ -2523,53 +2481,39 @@ fn run_gate_apply(
         let raw_proposal = match std::fs::read_to_string(&proposal_path) {
             Ok(s) => s,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "IO_ERROR",
                     format!(
                         "Failed to read staged gate proposal {}: {e}",
                         proposal_path.display()
                     ),
-                    None,
-                );
+                ));
             }
         };
         let raw_proposal_val: Value = match serde_json::from_str(&raw_proposal) {
             Ok(v) => v,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "INVALID_GATE_CONFIG",
                     format!(
                         "Malformed staged gate proposal {}: {e}",
                         proposal_path.display()
                     ),
-                    None,
-                );
+                ));
             }
         };
-        if let Err(e) = check_raw_gate_json_signing_secret(&raw_proposal_val, "gate.proposed.json")
-        {
-            return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e, None);
-        }
+        check_raw_gate_json_signing_secret(&raw_proposal_val, "gate.proposed.json")
+            .map_err(|e| CliError::error("INVALID_GATE_CONFIG", e))?;
         let mut proposed_cfg: SecurityGateConfig = match serde_json::from_value(raw_proposal_val) {
             Ok(g) => g,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "INVALID_GATE_CONFIG",
                     format!(
                         "Malformed staged gate proposal {}: {e}",
                         proposal_path.display()
                     ),
-                    None,
-                );
+                ));
             }
         };
         for existing_filter in gate_cfg.filters {
@@ -2585,47 +2529,24 @@ fn run_gate_apply(
         merged_proposal = true;
     }
 
-    if let Err(e) = gate_cfg.validate() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "INVALID_GATE_CONFIG",
-            e.to_string(),
-            None,
-        );
-    }
+    gate_cfg
+        .validate()
+        .map_err(|e| CliError::error("INVALID_GATE_CONFIG", e.to_string()))?;
     if gate_cfg.stage2.enabled {
-        if let Err(e) = validate_stage2_endpoint_urls(&gate_cfg.stage2) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "INVALID_GATE_CONFIG",
-                e.to_string(),
-                None,
-            );
-        }
+        validate_stage2_endpoint_urls(&gate_cfg.stage2)
+            .map_err(|e| CliError::error("INVALID_GATE_CONFIG", e.to_string()))?;
     }
     for f in &gate_cfg.filters {
         if f.enabled {
-            if let Err(e) = validate_filter_plugin_endpoint_url(f) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "INVALID_GATE_CONFIG",
-                    e.to_string(),
-                    None,
-                );
-            }
+            validate_filter_plugin_endpoint_url(f)
+                .map_err(|e| CliError::error("INVALID_GATE_CONFIG", e.to_string()))?;
         }
     }
 
-    let auth_digest = match db.human().authorities_digest() {
-        Ok(d) => d,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let auth_digest = db
+        .human()
+        .authorities_digest()
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
     gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
     gate_cfg.human_authorities_digest = Some(auth_digest.clone());
     gate_cfg.require_signed_policy = true;
@@ -2634,20 +2555,10 @@ fn run_gate_apply(
     let policy_sha = match gate_policy_sha256(&gate_cfg) {
         Ok(h) => h,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "POLICY_HASH_FAILED",
-                e.to_string(),
-                None,
-            );
+            return Err(CliError::error("POLICY_HASH_FAILED", e.to_string()));
         }
     };
-    let seal_seq = match next_seal_seq(&db) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
-    };
+    let seal_seq = next_seal_seq(&db).map_err(|e| CliError::error("DB_ERROR", e))?;
 
     let loaded_cfg = if config_path.exists() {
         load_node_or_legacy_config(&config_path).ok()
@@ -2677,9 +2588,7 @@ fn run_gate_apply(
     action.policy_sha256 = Some(policy_sha.clone());
     action.authorities_digest = Some(auth_digest);
 
-    let verified = match approve_gate_operation(
-        cmd,
-        as_json,
+    let verified = approve_gate_operation(
         &dir,
         &config_path,
         &db,
@@ -2687,15 +2596,10 @@ fn run_gate_apply(
         action,
         &summary,
         &ceremony,
-    ) {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
+    )?;
 
-    let gate_val = match serde_json::to_value(&gate_cfg) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
-    };
+    let gate_val = serde_json::to_value(&gate_cfg)
+        .map_err(|e| CliError::error("JSON_ERROR", e.to_string()))?;
     cfg_map.insert("gate".to_string(), gate_val);
     if let Err(error) =
         execute_approved_operation(&config_path, &config_path, &db, &verified, || {
@@ -2703,14 +2607,7 @@ fn run_gate_apply(
             NodeFile::write_document(&config_path, cfg_map)
         })
     {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "APPROVAL_COMMIT_FAILED",
-            error,
-            None,
-        );
+        return Err(CliError::error("APPROVAL_COMMIT_FAILED", error));
     }
     if merged_proposal {
         let _ = std::fs::remove_file(&proposal_path);
@@ -2766,10 +2663,9 @@ fn run_gate_apply(
         if let Some(ref err) = daemon_reload_error {
             data["daemonReloadError"] = json!(err);
         }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Applied Passkey-approved Security Gate policy for {} ({} filter(s){})",
                 config_path.display(),
                 gate_cfg.filters.len(),
@@ -2778,12 +2674,11 @@ fn run_gate_apply(
                 } else {
                     ""
                 }
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error: None,
-        };
+            ),
+            data,
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -2813,7 +2708,7 @@ fn run_gate_apply(
         }
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn run_gate_remove(
@@ -2822,66 +2717,48 @@ fn run_gate_remove(
     state_dir: Option<PathBuf>,
     ceremony: ApprovalCeremonyArgs,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "gate remove";
     let trimmed_id = filter_id.trim();
     if trimmed_id.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_FILTER_ID",
             "Filter ID cannot be empty",
-            None,
-        );
+        ));
     }
 
     let dir = resolve_state_dir(state_dir.as_deref(), config.as_deref(), None);
     let config_path = resolve_config_path_for_read(config.as_deref(), state_dir.as_deref(), None);
     if !config_path.exists() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "CONFIG_NOT_FOUND",
             format!("Config file not found: {}", config_path.display()),
-            Some("Run `hyp gate init --adapter ...` first.".to_string()),
-        );
+        )
+        .with_fix("Run `hyp gate init --adapter ...` first.".to_string()));
     }
 
-    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
-        Ok(m) => m,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
-    };
+    let mut cfg_map = NodeFile::read_document_or_empty(&config_path)
+        .map_err(|e| CliError::error("CONFIG_ERROR", e))?;
 
     let Some(raw_gate_val) = cfg_map.get("gate") else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "FILTER_NOT_FOUND",
             format!(
                 "No Security Gate policy configured in {}; filter '{trimmed_id}' not found",
                 config_path.display()
             ),
-            None,
-        );
+        ));
     };
-    if let Err(e) = check_raw_gate_json_signing_secret(raw_gate_val, "node.json") {
-        return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_GATE_CONFIG", e, None);
-    }
+    check_raw_gate_json_signing_secret(raw_gate_val, "node.json")
+        .map_err(|e| CliError::error("INVALID_GATE_CONFIG", e))?;
 
     let existing_gate: SecurityGateConfig = match serde_json::from_value(raw_gate_val.clone()) {
         Ok(g) => g,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "INVALID_GATE_CONFIG",
                 format!("Malformed gate config in {}: {e}", config_path.display()),
-                None,
-            );
+            ));
         }
     };
 
@@ -2909,47 +2786,24 @@ fn run_gate_remove(
                 configured.join(", ")
             )
         };
-        return emit_error(cmd, as_json, EXIT_ERROR, "FILTER_NOT_FOUND", detail, None);
+        return Err(CliError::error("FILTER_NOT_FOUND", detail));
     };
 
     let mut after_gate = existing_gate.clone();
     let removed_filter = after_gate.filters.remove(removed_pos);
 
-    if let Err(e) = after_gate.validate() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "INVALID_GATE_CONFIG",
-            e.to_string(),
-            None,
-        );
-    }
+    after_gate
+        .validate()
+        .map_err(|e| CliError::error("INVALID_GATE_CONFIG", e.to_string()))?;
     {
         if after_gate.stage2.enabled {
-            if let Err(e) = validate_stage2_endpoint_urls(&after_gate.stage2) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "INVALID_GATE_CONFIG",
-                    e.to_string(),
-                    None,
-                );
-            }
+            validate_stage2_endpoint_urls(&after_gate.stage2)
+                .map_err(|e| CliError::error("INVALID_GATE_CONFIG", e.to_string()))?;
         }
         for f in &after_gate.filters {
             if f.enabled {
-                if let Err(e) = validate_filter_plugin_endpoint_url(f) {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "INVALID_GATE_CONFIG",
-                        e.to_string(),
-                        None,
-                    );
-                }
+                validate_filter_plugin_endpoint_url(f)
+                    .map_err(|e| CliError::error("INVALID_GATE_CONFIG", e.to_string()))?;
             }
         }
     }
@@ -2962,29 +2816,22 @@ fn run_gate_remove(
     let approved_kid: Option<String>;
 
     {
-        if let Err(e) = ensure_dir(&dir, true) {
-            return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-        }
-        let db = match NodeDb::open(dir.join("node.sqlite")) {
-            Ok(d) => d,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-        };
+        ensure_dir(&dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
+        let db = NodeDb::open(dir.join("node.sqlite"))
+            .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
         let loaded_cfg = load_node_or_legacy_config(&config_path).ok();
         let effective_node_id = cfg_map
             .get("nodeId")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| resolve_effective_node_id(loaded_cfg.as_ref(), Some(&db)));
-        let seal_seq = match next_seal_seq(&db) {
-            Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None),
-        };
+        let seal_seq = next_seal_seq(&db).map_err(|e| CliError::error("DB_ERROR", e))?;
 
         let (policy_sha_opt, auth_digest_opt) = {
             let auth_digest = match db.human().authorities_digest() {
                 Ok(d) => d,
                 Err(e) => {
-                    return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None);
+                    return Err(CliError::error("DB_ERROR", e.to_string()));
                 }
             };
             after_gate.human_authorities_digest = Some(auth_digest.clone());
@@ -2993,14 +2840,7 @@ fn run_gate_remove(
             let psha = match gate_policy_sha256(&after_gate) {
                 Ok(h) => h,
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "POLICY_HASH_FAILED",
-                        e.to_string(),
-                        None,
-                    );
+                    return Err(CliError::error("POLICY_HASH_FAILED", e.to_string()));
                 }
             };
             (Some(psha), Some(auth_digest))
@@ -3022,9 +2862,7 @@ fn run_gate_remove(
         action.policy_sha256 = policy_sha_opt;
         action.authorities_digest = auth_digest_opt;
 
-        let verified = match approve_gate_operation(
-            cmd,
-            as_json,
+        let verified = approve_gate_operation(
             &dir,
             &config_path,
             &db,
@@ -3032,23 +2870,13 @@ fn run_gate_remove(
             action,
             &summary,
             &ceremony,
-        ) {
-            Ok(v) => v,
-            Err(code) => return code,
-        };
+        )?;
         cfg_map.insert(
             "gate".to_string(),
             match serde_json::to_value(&after_gate) {
                 Ok(value) => value,
                 Err(error) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "JSON_ERROR",
-                        error.to_string(),
-                        None,
-                    );
+                    return Err(CliError::error("JSON_ERROR", error.to_string()));
                 }
             },
         );
@@ -3058,14 +2886,7 @@ fn run_gate_remove(
                 NodeFile::write_document(&config_path, cfg_map)
             })
         {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "APPROVAL_COMMIT_FAILED",
-                error,
-                None,
-            );
+            return Err(CliError::error("APPROVAL_COMMIT_FAILED", error));
         }
         approved_seal_seq = Some(verified.action.seal_seq);
         approved_human_id = Some(verified.human_id);
@@ -3127,21 +2948,19 @@ fn run_gate_remove(
         if let Some(ref err) = daemon_reload_error {
             data["daemonReloadError"] = json!(err);
         }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Removed Security Gate filter '{}' ({}) from {}{}",
                 removed_summary.id,
                 removed_summary.adapter_type,
                 config_path.display(),
                 { " [APPROVED]" }
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error: None,
-        };
+            ),
+            data,
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -3175,7 +2994,7 @@ fn run_gate_remove(
         }
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3249,55 +3068,34 @@ fn fetch_single_quarantined_entry(
     db: &NodeDb,
     receipt: &str,
     session_filter: Option<&str>,
-    cmd: &str,
-    as_json: bool,
-) -> Result<MailboxEntry, ExitCode> {
+) -> Result<MailboxEntry, CliError> {
     let entry = match db.local().get_mailbox_entry(receipt) {
         Ok(Some(e)) => e,
         Ok(None) => {
-            return Err(emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RECEIPT_NOT_FOUND",
                 format!("receipt '{receipt}' not found"),
-                None,
             ));
         }
         Err(e) => {
-            return Err(emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "DB_ERROR",
-                e.to_string(),
-                None,
-            ));
+            return Err(CliError::error("DB_ERROR", e.to_string()));
         }
     };
     if entry.gate_state != GateState::Quarantined {
-        return Err(emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "INVALID_RECEIPT_STATE",
             format!(
                 "receipt '{}' is in state '{}', not 'quarantined'",
                 entry.receipt,
                 entry.gate_state.as_str()
             ),
-            None,
         ));
     }
     if let Some(sess) = session_filter {
         if entry.session_id != sess {
-            return Err(emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RECEIPT_NOT_FOUND",
                 format!("quarantined receipt '{receipt}' not found in session '{sess}'"),
-                None,
             ));
         }
     }
@@ -3312,7 +3110,7 @@ fn run_gate_review(
     full: bool,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "gate review";
 
     // G6/G10: Quarantined plaintext is NEVER emitted in `--json`, and `--show-body` / `--full`
@@ -3332,10 +3130,10 @@ fn run_gate_review(
                     "Run `hyp gate review --show-body` directly in an interactive human terminal.",
                 )
             };
-            return emit_error(cmd, true, EXIT_USAGE, code, msg, Some(fix.to_string()));
+            return Err(CliError::usage(code, msg).with_fix(fix.to_string()));
         }
         if !is_interactive_tty() {
-            return emit_confirm_error(cmd, false, ConfirmError::NotInteractiveTty);
+            return Err(ConfirmError::NotInteractiveTty.into_cli_error(cmd));
         }
     }
 
@@ -3349,21 +3147,19 @@ fn run_gate_review(
 
     let dir = resolve_state_dir(state_dir.as_deref(), None, None);
     let db_path = dir.join("node.sqlite");
-    let db = match NodeDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
 
     let items = if let Some(ref rcpt) = receipt {
-        match fetch_single_quarantined_entry(&db, rcpt, session.as_deref(), cmd, as_json) {
-            Ok(entry) => vec![entry],
-            Err(code) => return code,
-        }
+        vec![fetch_single_quarantined_entry(
+            &db,
+            rcpt,
+            session.as_deref(),
+        )?]
     } else {
         match db.local().list_quarantined(session.as_deref(), limit) {
             Ok(v) => v,
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None);
+                return Err(CliError::error("DB_ERROR", e.to_string()));
             }
         }
     };
@@ -3397,21 +3193,15 @@ fn run_gate_review(
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
-                "{} quarantined item(s) awaiting human review",
-                rows.len()
-            )),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!("{} quarantined item(s) awaiting human review", rows.len()),
+            json!({
                 "count": rows.len(),
                 "items": rows,
-            })),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        };
+            }),
+        )
+        .next(next);
         print_json(&envelope);
     } else {
         println!("Hyphae Quarantine Review ({} item(s))", items.len());
@@ -3431,29 +3221,27 @@ fn run_gate_review(
             print_next_steps(&next);
         }
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
-fn run_gate_show(receipt: String, state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
+fn run_gate_show(
+    receipt: String,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
     let cmd = "gate show";
 
     // G6/G10: Human-only full body inspection requires an interactive terminal.
     // `--json` is allowed strictly as metadata-only (zero body/text/preview fields!).
     if !as_json && !is_interactive_tty() {
-        return emit_confirm_error(cmd, false, ConfirmError::NotInteractiveTty);
+        return Err(ConfirmError::NotInteractiveTty.into_cli_error(cmd));
     }
 
     let dir = resolve_state_dir(state_dir.as_deref(), None, None);
     let db_path = dir.join("node.sqlite");
-    let db = match NodeDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
 
-    let entry = match fetch_single_quarantined_entry(&db, &receipt, None, cmd, as_json) {
-        Ok(e) => e,
-        Err(code) => return code,
-    };
+    let entry = fetch_single_quarantined_entry(&db, &receipt, None)?;
     let trust_tier = lookup_quarantined_trust_tier(&db, &entry.receipt, &entry.session_id);
     let next = vec![
         format!(
@@ -3470,18 +3258,15 @@ fn run_gate_show(receipt: String, state_dir: Option<PathBuf>, as_json: bool) -> 
 
     if as_json {
         let meta = quarantined_item_metadata_json(&entry, &trust_tier);
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Quarantined receipt '{}' metadata (body omitted in --json)",
                 entry.receipt
-            )),
-            data: Some(json!({ "item": meta })),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        };
+            ),
+            json!({ "item": meta }),
+        )
+        .next(next);
         print_json(&envelope);
     } else {
         println!("Hyphae Quarantine Item");
@@ -3489,7 +3274,7 @@ fn run_gate_show(receipt: String, state_dir: Option<PathBuf>, as_json: bool) -> 
         print_quarantined_item_tty(&entry, &trust_tier, ReviewBodyMode::Full);
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn run_gate_log(
@@ -3498,14 +3283,11 @@ fn run_gate_log(
     session: Option<String>,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "gate log";
     let dir = resolve_state_dir(state_dir.as_deref(), None, None);
     let db_path = dir.join("node.sqlite");
-    let db = match NodeDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
 
     let entries = match db.local().query_gate_audit(&GateAuditQuery {
         decision: decision.to_store_filter(),
@@ -3516,7 +3298,7 @@ fn run_gate_log(
         limit: Some(limit),
     }) {
         Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+        Err(e) => return Err(CliError::error("DB_ERROR", e.to_string())),
     };
 
     if as_json {
@@ -3542,18 +3324,14 @@ fn run_gate_log(
                 })
             })
             .collect();
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!("{} gate_audit record(s)", rows.len())),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!("{} gate_audit record(s)", rows.len()),
+            json!({
                 "count": rows.len(),
                 "entries": rows,
-            })),
-            warnings: Vec::new(),
-            next: Vec::new(),
-            error: None,
-        };
+            }),
+        );
         print_json(&envelope);
     } else {
         println!(
@@ -3582,7 +3360,7 @@ fn run_gate_log(
             }
         }
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn run_inbox_approve(
@@ -3590,46 +3368,35 @@ fn run_inbox_approve(
     reviewer: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "inbox approve";
     if !is_interactive_tty() {
-        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
+        return Err(ConfirmError::NotInteractiveTty.into_cli_error(cmd));
     }
 
     let dir = resolve_state_dir(state_dir.as_deref(), None, None);
     let db_path = dir.join("node.sqlite");
-    let db = match NodeDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
 
     let entry = match db.local().get_mailbox_entry(&receipt) {
         Ok(Some(e)) => e,
         Ok(None) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RECEIPT_NOT_FOUND",
                 format!("receipt '{receipt}' not found"),
-                None,
-            );
+            ));
         }
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+        Err(e) => return Err(CliError::error("DB_ERROR", e.to_string())),
     };
     if entry.gate_state != GateState::Quarantined {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "INVALID_RECEIPT_STATE",
             format!(
                 "receipt '{}' is in state '{}', not 'quarantined'",
                 entry.receipt,
                 entry.gate_state.as_str()
             ),
-            None,
-        );
+        ));
     }
 
     let trust_tier = lookup_quarantined_trust_tier(&db, &entry.receipt, &entry.session_id);
@@ -3638,9 +3405,8 @@ fn run_inbox_approve(
         "Approve quarantined item {} for delivery? [y/N]: ",
         sanitize_tty_display(&entry.receipt)
     );
-    if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
-        return emit_confirm_error(cmd, as_json, err);
-    }
+    require_interactive_tty_confirmation(&summary, &prompt)
+        .map_err(|err| err.into_cli_error(cmd))?;
 
     match db
         .local()
@@ -3676,18 +3442,14 @@ fn run_inbox_approve(
                 if let Some(rem) = quarantined_remaining {
                     data["quarantinedRemaining"] = json!(rem);
                 }
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!(
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!(
                         "Approved quarantined receipt '{}' -> pending for session '{}'",
                         entry.receipt, entry.session_id
-                    )),
-                    data: Some(data),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                };
+                    ),
+                    data,
+                );
                 print_json(&envelope);
             } else {
                 println!(
@@ -3710,22 +3472,11 @@ fn run_inbox_approve(
                     );
                 }
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Err(StoreError::NotFound(m)) => {
-            emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_NOT_FOUND", m, None)
-        }
-        Err(StoreError::InvalidState(m)) => {
-            emit_error(cmd, as_json, EXIT_ERROR, "INVALID_RECEIPT_STATE", m, None)
-        }
-        Err(e) => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "APPROVE_FAILED",
-            e.to_string(),
-            None,
-        ),
+        Err(StoreError::NotFound(m)) => Err(CliError::error("RECEIPT_NOT_FOUND", m)),
+        Err(StoreError::InvalidState(m)) => Err(CliError::error("INVALID_RECEIPT_STATE", m)),
+        Err(e) => Err(CliError::error("APPROVE_FAILED", e.to_string())),
     }
 }
 
@@ -3736,46 +3487,35 @@ fn run_inbox_reject(
     reviewer: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "inbox reject";
     if !is_interactive_tty() {
-        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
+        return Err(ConfirmError::NotInteractiveTty.into_cli_error(cmd));
     }
 
     let dir = resolve_state_dir(state_dir.as_deref(), None, None);
     let db_path = dir.join("node.sqlite");
-    let db = match NodeDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
 
     let entry = match db.local().get_mailbox_entry(&receipt) {
         Ok(Some(e)) => e,
         Ok(None) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RECEIPT_NOT_FOUND",
                 format!("receipt '{receipt}' not found"),
-                None,
-            );
+            ));
         }
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+        Err(e) => return Err(CliError::error("DB_ERROR", e.to_string())),
     };
     if entry.gate_state != GateState::Quarantined {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "INVALID_RECEIPT_STATE",
             format!(
                 "receipt '{}' is in state '{}', not 'quarantined'",
                 entry.receipt,
                 entry.gate_state.as_str()
             ),
-            None,
-        );
+        ));
     }
 
     let mute_rule = if mute {
@@ -3803,9 +3543,8 @@ fn run_inbox_reject(
         "Reject quarantined item {}? [y/N]: ",
         sanitize_tty_display(&entry.receipt)
     );
-    if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
-        return emit_confirm_error(cmd, as_json, err);
-    }
+    require_interactive_tty_confirmation(&summary, &prompt)
+        .map_err(|err| err.into_cli_error(cmd))?;
 
     match db
         .local()
@@ -3837,22 +3576,18 @@ fn run_inbox_reject(
                 if let Some(rem) = quarantined_remaining {
                     data["quarantinedRemaining"] = json!(rem);
                 }
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!(
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!(
                         "Rejected quarantined receipt '{}'{}",
                         entry.receipt,
                         muted_pattern
                             .as_deref()
                             .map(|p| format!(" and muted '{p}'"))
                             .unwrap_or_default()
-                    )),
-                    data: Some(data),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                };
+                    ),
+                    data,
+                );
                 print_json(&envelope);
             } else {
                 println!(
@@ -3869,22 +3604,11 @@ fn run_inbox_reject(
                     println!("      Daemon offline — rejection recorded in SQLite.");
                 }
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Err(StoreError::NotFound(m)) => {
-            emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_NOT_FOUND", m, None)
-        }
-        Err(StoreError::InvalidState(m)) => {
-            emit_error(cmd, as_json, EXIT_ERROR, "INVALID_RECEIPT_STATE", m, None)
-        }
-        Err(e) => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "REJECT_FAILED",
-            e.to_string(),
-            None,
-        ),
+        Err(StoreError::NotFound(m)) => Err(CliError::error("RECEIPT_NOT_FOUND", m)),
+        Err(StoreError::InvalidState(m)) => Err(CliError::error("INVALID_RECEIPT_STATE", m)),
+        Err(e) => Err(CliError::error("REJECT_FAILED", e.to_string())),
     }
 }
 

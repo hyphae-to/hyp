@@ -26,8 +26,7 @@ use crate::config_file::{
 use crate::pair::{attempt_delegated_pair_enroll, credential_secret_name, try_reload_live_daemon};
 use crate::setup::configure_detected_harnesses_for_join;
 use crate::ui::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
-    print_warnings,
+    CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
 use clap::Args;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -190,33 +189,27 @@ struct ValidatedHandoff {
     claim_request: Option<AuthClaimRequest>,
 }
 
-pub fn run_join(args: JoinArgs) -> ExitCode {
+pub fn run_join(args: JoinArgs) -> CommandResult {
+    let as_json = args.json;
+    CommandResult::new("join", as_json, join(args))
+}
+
+fn join(args: JoinArgs) -> Result<ExitCode, CliError> {
     let cmd = "join";
     let as_json = args.json;
 
     if let Some(ref nid) = args.node_id {
         if nid == LOCAL_NODE_ID || !is_valid_node_id(nid) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_NODE_ID",
-                format!(
+            return Err(CliError::usage("INVALID_NODE_ID", format!(
                     "Invalid --node-id '{nid}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
-                ),
-                Some("Example: --node-id philip@macbook".to_string()),
-            );
+                )).with_fix("Example: --node-id philip@macbook".to_string()));
         }
     }
     if args.stdin && args.token_file.is_some() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "--stdin and --token-file are mutually exclusive",
-            None,
-        );
+        ));
     }
 
     let explicit_state = args.state_dir.is_some() || args.config.is_some() || args.home.is_some();
@@ -235,9 +228,7 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         args.state_dir.as_deref(),
         args.home.as_deref(),
     );
-    if let Err(e) = ensure_dir(&state_dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
     let secrets = open_secret_store(&state_dir, explicit_state);
     let already_onboarded = config_read.exists();
     let loaded = if already_onboarded {
@@ -261,14 +252,10 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         let keys = match secrets.load_or_create_node_keys(&local_node_id) {
             Ok(k) => k,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "KEYSTORE_ERROR",
                     format!("Failed to load/create device keys: {e}"),
-                    None,
-                );
+                ));
             }
         };
         let card = RemoteDeviceCard {
@@ -282,34 +269,19 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         let card_json = match serde_json::to_string(&card) {
             Ok(s) => s,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "ENCODE_ERROR",
-                    e.to_string(),
-                    None,
-                );
+                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
             }
         };
         if args.print_card {
             if as_json {
-                let env = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!("Public device card for '{local_node_id}'")),
-                    data: Some(json!({ "deviceCard": card, "deviceCardJson": card_json })),
-                    warnings: Vec::new(),
-                    next: vec![
+                let env = JsonEnvelope::ok(cmd.to_string(), format!("Public device card for '{local_node_id}'"), json!({ "deviceCard": card, "deviceCardJson": card_json })).next(vec![
                         "Paste deviceCardJson into https://hyphae.to/join (Safari / Remote VPS tab), sign with Passkey, then pipe the signed bundle into `hyp join --stdin`.".to_string(),
-                    ],
-                    error: None,
-                };
+                    ]);
                 print_json(&env);
             } else {
                 println!("{card_json}");
             }
-            return ExitCode::from(EXIT_OK);
+            return Ok(ExitCode::from(EXIT_OK));
         }
 
         // Emit card on stderr so user/agent can copy it, then read signed bundle on stdin.
@@ -320,28 +292,18 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         eprintln!("Waiting for signed handoff bundle JSON on stdin (paste then Ctrl-D)...");
         let _ = io::stderr().flush();
 
-        let raw = match read_bounded_stdin() {
-            Ok(s) => s,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "STDIN_ERROR", e, None),
-        };
+        let raw = read_bounded_stdin().map_err(|e| CliError::error("STDIN_ERROR", e))?;
         let bundle: JoinHandoffBundle = match serde_json::from_str(raw.trim()) {
             Ok(b) => b,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "INVALID_BUNDLE",
                     format!("Invalid signed handoff bundle JSON on stdin: {e}"),
-                    None,
-                );
+                ));
             }
         };
-        let validated =
-            match validate_handoff_bundle(&bundle, &local_node_id, &keys, already_onboarded) {
-                Ok(v) => v,
-                Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HANDOFF", e, None),
-            };
+        let validated = validate_handoff_bundle(&bundle, &local_node_id, &keys, already_onboarded)
+            .map_err(|e| CliError::usage("INVALID_HANDOFF", e))?;
         return finalize_join(
             cmd,
             &args,
@@ -359,36 +321,25 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         let raw = if let Some(ref path) = args.token_file {
             match read_bounded_file(path) {
                 Ok(s) => s,
-                Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None),
+                Err(e) => return Err(CliError::error("IO_ERROR", e)),
             }
         } else {
             match read_bounded_stdin() {
                 Ok(s) => s,
-                Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "STDIN_ERROR", e, None),
+                Err(e) => return Err(CliError::error("STDIN_ERROR", e)),
             }
         };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "EMPTY_INPUT",
                 "No invite token or signed handoff bundle received",
-                None,
-            );
+            ));
         }
 
         if trimmed.starts_with("hjoin1_") {
             if !args.local_key {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
-                    "LOCAL_KEY_REQUIRED",
-                    "Raw hjoin1_ token requires --local-key for headless CLI join (or open the https://hyphae.to/join link in your browser and run `hyp join` for Passkey auth)",
-                    Some("Run `hyp join --token-file <path> --local-key` for headless servers/CI, or open the join URL in a browser and run `hyp join`.".to_string()),
-                );
+                return Err(CliError::usage("LOCAL_KEY_REQUIRED", "Raw hjoin1_ token requires --local-key for headless CLI join (or open the https://hyphae.to/join link in your browser and run `hyp join` for Passkey auth)").with_fix("Run `hyp join --token-file <path> --local-key` for headless servers/CI, or open the join URL in a browser and run `hyp join`.".to_string()));
             }
             return run_headless_local_key_join(
                 cmd,
@@ -407,16 +358,12 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         let bundle: JoinHandoffBundle = match serde_json::from_str(trimmed) {
             Ok(b) => b,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "INVALID_BUNDLE",
                     format!(
                         "Input is neither an hjoin1_ token nor a valid signed handoff bundle JSON: {e}"
                     ),
-                    None,
-                );
+                ));
             }
         };
         let existing_db = if state_dir.join("node.sqlite").exists() {
@@ -434,21 +381,14 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
         let keys = match secrets.load_or_create_node_keys(&local_node_id) {
             Ok(k) => k,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "KEYSTORE_ERROR",
                     format!("Failed to load/create device keys: {e}"),
-                    None,
-                );
+                ));
             }
         };
-        let validated =
-            match validate_handoff_bundle(&bundle, &local_node_id, &keys, already_onboarded) {
-                Ok(v) => v,
-                Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_HANDOFF", e, None),
-            };
+        let validated = validate_handoff_bundle(&bundle, &local_node_id, &keys, already_onboarded)
+            .map_err(|e| CliError::usage("INVALID_HANDOFF", e))?;
         return finalize_join(
             cmd,
             &args,
@@ -468,14 +408,10 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RUNTIME_ERROR",
                 format!("Failed to start async runtime: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -499,14 +435,7 @@ pub fn run_join(args: JoinArgs) -> ExitCode {
     )) {
         Ok(pair) => pair,
         Err((code, msg)) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                code,
-                msg,
-                Some("Retry `hyp join`, or use the Safari / Remote VPS tab on https://hyphae.to/join with `hyp join --remote`.".to_string()),
-            );
+            return Err(CliError::error(code, msg).with_fix("Retry `hyp join`, or use the Safari / Remote VPS tab on https://hyphae.to/join with `hyp join --remote`.".to_string()));
         }
     };
 
@@ -534,33 +463,24 @@ fn run_headless_local_key_join(
     already_onboarded: bool,
     loaded: Option<&crate::config_file::LoadedNodeFile>,
     secrets: &SecretStore,
-) -> ExitCode {
-    let as_json = args.json;
+) -> Result<ExitCode, CliError> {
     let now = now_unix_ms();
     let signed_invite = match decode_hjoin1(hjoin1_raw) {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_HJOIN1",
                 format!("Invalid hjoin1_ token: {e}"),
-                None,
-            );
+            ));
         }
     };
     let (invite, _embedded_admin_pk) = match verify_human_invite_embedded(&signed_invite, now) {
         Ok(v) => v,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_HJOIN1",
                 format!("hjoin1_ invite validation failed: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -577,33 +497,26 @@ fn run_headless_local_key_join(
     );
     drop(existing_db);
     if !matches_node_prefix(&invite.node_prefix, &local_node_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "NODE_PREFIX_MISMATCH",
             format!(
                 "Local nodeId '{}' does not match invite allowed nodePrefix '{}'",
                 local_node_id, invite.node_prefix
             ),
-            Some(format!(
-                "Pass --node-id {}@<device-name> matching '{}'",
-                invite.human_id, invite.node_prefix
-            )),
-        );
+        )
+        .with_fix(format!(
+            "Pass --node-id {}@<device-name> matching '{}'",
+            invite.human_id, invite.node_prefix
+        )));
     }
 
     let device_keys = match secrets.load_or_create_node_keys(&local_node_id) {
         Ok(k) => k,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "KEYSTORE_ERROR",
                 format!("Failed to load/create device keys: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -611,28 +524,22 @@ fn run_headless_local_key_join(
     let human_kp = match Ed25519KeyPair::generate() {
         Ok(kp) => kp,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "KEYGEN_FAILED",
                 format!("Failed to generate local Ed25519 human keypair: {e}"),
-                None,
-            );
+            ));
         }
     };
     let human_kid = human_kp.kid();
     let human_secret_name = admin_secret_name_for_kid(&human_kid);
-    if let Err(e) = secrets.set(&human_secret_name, &human_kp.export_pkcs8_b64()) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "KEYSTORE_ERROR",
-            format!("Failed to persist local human key in SecretStore: {e}"),
-            None,
-        );
-    }
+    secrets
+        .set(&human_secret_name, &human_kp.export_pkcs8_b64())
+        .map_err(|e| {
+            CliError::error(
+                "KEYSTORE_ERROR",
+                format!("Failed to persist local human key in SecretStore: {e}"),
+            )
+        })?;
 
     let claim = HumanInviteClaimV1 {
         invite_id: invite.invite_id.clone(),
@@ -643,10 +550,8 @@ fn run_headless_local_key_join(
         prf_salt: None,
         timestamp: format_rfc3339_millis(now),
     };
-    let claim_sig = match sign_human_invite_claim(&claim, &human_kp) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "SIGN_FAILED", e.to_string(), None),
-    };
+    let claim_sig = sign_human_invite_claim(&claim, &human_kp)
+        .map_err(|e| CliError::error("SIGN_FAILED", e.to_string()))?;
 
     let cert_expires_ms = now + 365i64 * 86_400_000;
     let cert_payload = NodeCertPayloadV1 {
@@ -660,34 +565,18 @@ fn run_headless_local_key_join(
         issued_at: format_rfc3339_millis(now),
         expires_at: format_rfc3339_millis(cert_expires_ms),
     };
-    let signed_cert = match sign_node_cert(&cert_payload, &human_kp) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "SIGN_FAILED", e.to_string(), None),
-    };
+    let signed_cert = sign_node_cert(&cert_payload, &human_kp)
+        .map_err(|e| CliError::error("SIGN_FAILED", e.to_string()))?;
     let hcert1 = match encode_hcert1(&signed_cert) {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "ENCODE_FAILED",
-                e.to_string(),
-                None,
-            );
+            return Err(CliError::error("ENCODE_FAILED", e.to_string()));
         }
     };
     let human_jwk_json = match to_canonical_json(&human_kp.to_jwk()) {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "ENCODE_FAILED",
-                e.to_string(),
-                None,
-            );
+            return Err(CliError::error("ENCODE_FAILED", e.to_string()));
         }
     };
 
@@ -1451,7 +1340,7 @@ fn finalize_join(
     secrets: &SecretStore,
     device_keys: &NodeIdentityKeys,
     validated: ValidatedHandoff,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let as_json = args.json;
     let mut warnings: Vec<String> = Vec::new();
     let now_db = now_ms();
@@ -1473,16 +1362,12 @@ fn finalize_join(
             NodeProfile::Local,
             state_dir,
         );
-        if let Err(e) = NodeFile::write_document(config_write, cfg_map) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+        NodeFile::write_document(config_write, cfg_map).map_err(|e| {
+            CliError::error(
                 "CONFIG_WRITE_ERROR",
                 format!("Failed to write {}: {e}", config_write.display()),
-                None,
-            );
-        }
+            )
+        })?;
         if !args.no_setup {
             if let Some(home) = resolve_home_dir(args.home.as_deref()) {
                 configured_harnesses = configure_detected_harnesses_for_join(
@@ -1501,14 +1386,10 @@ fn finalize_join(
     let db = match NodeDb::open(&db_path) {
         Ok(d) => d,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "DB_ERROR",
                 format!("Failed to open {}: {e}", db_path.display()),
-                None,
-            );
+            ));
         }
     };
     let _ = db.local().ensure_metadata("node_id", &validated.node_id);
@@ -1516,16 +1397,12 @@ fn finalize_join(
     match db.human().requires_live_approval() {
         Ok(false) => {}
         Ok(true) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "PASSKEY_APPROVAL_REQUIRED",
                 "Joining cannot mutate an existing Passkey-managed authority store; use live hyp auth add.",
-                None,
-            );
+            ));
         }
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+        Err(e) => return Err(CliError::error("DB_ERROR", e.to_string())),
     }
     if let Err(e) = db.human().bootstrap_authority(
         &HumanAuthorityInput {
@@ -1540,27 +1417,16 @@ fn finalize_join(
         },
         now_db,
     ) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "DB_ERROR",
             format!("Failed to persist local human authority: {e}"),
-            None,
-        );
+        ));
     }
 
     let signed_cert_json = match to_canonical_json(&validated.signed_cert) {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "ENCODE_ERROR",
-                e.to_string(),
-                None,
-            );
+            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
         }
     };
     if let Err(e) = db.human().put_node_cert(&HumanNodeCertInput {
@@ -1571,14 +1437,10 @@ fn finalize_join(
         issued_at: validated.cert_issued_ms,
         expires_at: validated.cert_expires_ms,
     }) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "DB_ERROR",
             format!("Failed to persist local hcert1_ NodeCert: {e}"),
-            None,
-        );
+        ));
     }
 
     if inspect_policy_integrity(config_write, state_dir, secrets).approved {
@@ -1596,14 +1458,7 @@ fn finalize_join(
                 claim_reply = Some(reply);
             }
             Err((code, msg)) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    code,
-                    msg,
-                    Some("Verify the hub is reachable and this single-use hjoin1_ invite has not expired or been claimed already.".to_string()),
-                );
+                return Err(CliError::error(code, msg).with_fix("Verify the hub is reachable and this single-use hjoin1_ invite has not expired or been claimed already.".to_string()));
             }
         }
     }
@@ -1620,29 +1475,20 @@ fn finalize_join(
     ) {
         Ok(d) => d,
         Err((_status, code, msg)) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                code,
-                msg,
-                Some("Verify your nodeId matches the hub's allowed nodePrefix and your device limit has not been exceeded.".to_string()),
-            );
+            return Err(CliError::error(code, msg).with_fix("Verify your nodeId matches the hub's allowed nodePrefix and your device limit has not been exceeded.".to_string()));
         }
     };
 
     // 5. Persist hub bearer credential in SecretStore, pin hub keys, and cache verified manifest!
     let cred_ref = credential_secret_name("peer-auth", &delegated.hub_node_id);
-    if let Err(e) = secrets.set(&cred_ref, &delegated.auth_credential) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "KEYSTORE_ERROR",
-            format!("Failed to store hub authCredential in SecretStore: {e}"),
-            None,
-        );
-    }
+    secrets
+        .set(&cred_ref, &delegated.auth_credential)
+        .map_err(|e| {
+            CliError::error(
+                "KEYSTORE_ERROR",
+                format!("Failed to store hub authCredential in SecretStore: {e}"),
+            )
+        })?;
 
     if let Err(e) = db.peers().upsert_peer(
         &PeerInput {
@@ -1656,17 +1502,13 @@ fn finalize_join(
         },
         now_db,
     ) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "DB_ERROR",
             format!(
                 "Failed to register hub peer '{}': {e}",
                 delegated.hub_node_id
             ),
-            None,
-        );
+        ));
     }
 
     let hub_sign_jwk = proto_jwk_to_crypto_local(&delegated.manifest_payload.identity.signing_jwk);
@@ -1720,14 +1562,10 @@ fn finalize_join(
             },
             now_db,
         ) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "MANIFEST_CACHE_ERROR",
                 format!("Failed to cache hub manifest: {e}"),
-                None,
-            );
+            ));
         }
     }
 
@@ -1759,14 +1597,13 @@ fn finalize_join(
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Joined hub '{}' as '{}' via human:{} (ep {})",
                 delegated.hub_node_id, validated.node_id, delegated.human_id, delegated.auth_epoch
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "nodeId": validated.node_id,
                 "hubNodeId": delegated.hub_node_id,
                 "hubEndpoint": validated.hub_endpoint,
@@ -1780,11 +1617,10 @@ fn finalize_join(
                 "alreadyOnboarded": validated.already_onboarded,
                 "daemonReloaded": daemon_reloaded,
                 "stateDir": state_dir.display().to_string(),
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -1806,7 +1642,7 @@ fn finalize_join(
         print_warnings(&warnings);
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn post_auth_claim(
