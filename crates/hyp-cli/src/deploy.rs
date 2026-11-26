@@ -3141,12 +3141,10 @@ fn run_check(url: Option<String>, config: Option<PathBuf>, as_json: bool) -> Exi
         let error = if ok {
             None
         } else {
-            Some(CliError {
-                exit: EXIT_ERROR,
-                code: "DEPLOY_CHECK_FAILED".to_string(),
-                message: summary.clone(),
-                fix: next.first().cloned(),
-            })
+            Some(
+                CliError::error("DEPLOY_CHECK_FAILED".to_string(), summary.clone())
+                    .with_optional_fix(next.first().cloned()),
+            )
         };
         let envelope = JsonEnvelope {
             ok,

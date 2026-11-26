@@ -8,7 +8,7 @@ use crate::config_file::{
     resolve_effective_node_id, resolve_state_dir,
 };
 use crate::statusline_cmd::sanitize_terminal_text;
-use crate::ui::{CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
+use crate::ui::{CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, print_json};
 use clap::{Subcommand, ValueEnum};
 use hyp_harness::local_kv::{LocalKvAction, LocalKvError, LocalKvRequest, LocalKvResponse};
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_local_kv_rpc, default_socket_path};
@@ -175,7 +175,7 @@ pub enum KvCommand {
     },
 }
 
-pub fn run_kv(command: KvCommand) -> ExitCode {
+pub fn run_kv(command: KvCommand) -> crate::ui::CommandResult {
     match command {
         KvCommand::Get {
             ns,
@@ -183,21 +183,33 @@ pub fn run_kv(command: KvCommand) -> ExitCode {
             node,
             state_dir,
             json,
-        } => run_kv_get(ns, key, node, state_dir, json),
+        } => crate::ui::CommandResult::new(
+            "kv get",
+            json,
+            run_kv_get(ns, key, node, state_dir, json),
+        ),
         KvCommand::Keys {
             ns,
             after,
             node,
             state_dir,
             json,
-        } => run_kv_keys(ns, after, node, state_dir, json),
+        } => crate::ui::CommandResult::new(
+            "kv keys",
+            json,
+            run_kv_keys(ns, after, node, state_dir, json),
+        ),
         KvCommand::Preview {
             ns,
             key,
             node,
             state_dir,
             json,
-        } => run_kv_preview(ns, key, node, state_dir, json),
+        } => crate::ui::CommandResult::new(
+            "kv preview",
+            json,
+            run_kv_preview(ns, key, node, state_dir, json),
+        ),
         KvCommand::Set {
             ns,
             key,
@@ -211,19 +223,23 @@ pub fn run_kv(command: KvCommand) -> ExitCode {
             node,
             state_dir,
             json,
-        } => run_kv_set(
-            ns,
-            key,
-            value,
-            expected_version,
-            write_model,
-            owner,
-            allowlist,
-            writer,
-            ttl_seconds,
-            node,
-            state_dir,
+        } => crate::ui::CommandResult::new(
+            "kv set",
             json,
+            run_kv_set(
+                ns,
+                key,
+                value,
+                expected_version,
+                write_model,
+                owner,
+                allowlist,
+                writer,
+                ttl_seconds,
+                node,
+                state_dir,
+                json,
+            ),
         ),
         KvCommand::Delete {
             ns,
@@ -233,14 +249,22 @@ pub fn run_kv(command: KvCommand) -> ExitCode {
             node,
             state_dir,
             json,
-        } => run_kv_delete(ns, key, expected_version, writer, node, state_dir, json),
+        } => crate::ui::CommandResult::new(
+            "kv delete",
+            json,
+            run_kv_delete(ns, key, expected_version, writer, node, state_dir, json),
+        ),
         KvCommand::List {
             ns,
             prefix,
             node,
             state_dir,
             json,
-        } => run_kv_list(ns, prefix, node, state_dir, json),
+        } => crate::ui::CommandResult::new(
+            "kv list",
+            json,
+            run_kv_list(ns, prefix, node, state_dir, json),
+        ),
     }
 }
 
@@ -342,39 +366,35 @@ fn execute_kv(
         .map_err(KvCommandError::Operation)
 }
 
-fn emit_kv_error(cmd: &str, as_json: bool, error: KvCommandError) -> ExitCode {
-    let (exit, code, message) = match error {
-        KvCommandError::Config(msg) => (EXIT_ERROR, "CONFIG_ERROR", msg),
-        KvCommandError::Db(msg) => (EXIT_ERROR, "DB_ERROR", msg),
-        KvCommandError::Daemon(msg) => (EXIT_ERROR, "DAEMON_ERROR", msg),
-        KvCommandError::Operation(LocalKvError::Unauthorized(msg)) => {
-            (EXIT_ERROR, "UNAUTHORIZED", msg)
-        }
-        KvCommandError::Operation(LocalKvError::InvalidInput(msg)) => {
-            (EXIT_USAGE, "INVALID_INPUT", msg)
-        }
-        KvCommandError::Operation(LocalKvError::Other(msg)) => (EXIT_ERROR, "KV_ERROR", msg),
-        KvCommandError::Operation(other) => (EXIT_ERROR, "KV_ERROR", format!("{other:?}")),
-    };
-    emit_error(cmd, as_json, exit, code, message, None)
+impl From<KvCommandError> for CliError {
+    fn from(error: KvCommandError) -> Self {
+        let (exit, code, message) = match error {
+            KvCommandError::Config(msg) => (EXIT_ERROR, "CONFIG_ERROR", msg),
+            KvCommandError::Db(msg) => (EXIT_ERROR, "DB_ERROR", msg),
+            KvCommandError::Daemon(msg) => (EXIT_ERROR, "DAEMON_ERROR", msg),
+            KvCommandError::Operation(LocalKvError::Unauthorized(msg)) => {
+                (EXIT_ERROR, "UNAUTHORIZED", msg)
+            }
+            KvCommandError::Operation(LocalKvError::InvalidInput(msg)) => {
+                (EXIT_USAGE, "INVALID_INPUT", msg)
+            }
+            KvCommandError::Operation(LocalKvError::Other(msg)) => (EXIT_ERROR, "KV_ERROR", msg),
+            KvCommandError::Operation(other) => (EXIT_ERROR, "KV_ERROR", format!("{other:?}")),
+        };
+        Self::new(exit, code, message)
+    }
 }
 
-fn unexpected_kv_response(cmd: &str, as_json: bool) -> ExitCode {
-    emit_kv_error(
-        cmd,
-        as_json,
-        KvCommandError::Daemon("Unexpected KV response".into()),
-    )
+fn unexpected_kv_response() -> CliError {
+    CliError::error("DAEMON_ERROR", "Unexpected KV response")
 }
 
-fn emit_version_conflict(
-    cmd: &str,
-    as_json: bool,
+fn version_conflict(
     ns: &str,
     key: &str,
     expected_version: Option<u64>,
     current_version: u64,
-) -> ExitCode {
+) -> CliError {
     let msg = format!(
         "CAS version conflict for '{ns}/{key}': expected {:?}, current version is {current_version}",
         expected_version
@@ -382,32 +402,14 @@ fn emit_version_conflict(
     let fix = format!(
         "Re-read latest value (`hyp kv get --ns {ns} --key {key}`) and retry with `--expected-version {current_version}`."
     );
-    if as_json {
-        let envelope = JsonEnvelope {
-            ok: false,
-            command: cmd.to_string(),
-            summary: Some(msg.clone()),
-            data: Some(json!({
-                "namespace": ns,
-                "key": key,
-                "expectedVersion": expected_version,
-                "currentVersion": current_version,
-            })),
-            warnings: Vec::new(),
-            next: vec![fix.clone()],
-            error: Some(CliError {
-                exit: EXIT_ERROR,
-                code: "VERSION_CONFLICT".to_string(),
-                message: msg,
-                fix: Some(fix),
-            }),
-        };
-        print_json(&envelope);
-    } else {
-        eprintln!("FAIL [VERSION_CONFLICT] {msg}");
-        eprintln!("Fix:  {fix}");
-    }
-    ExitCode::from(EXIT_ERROR)
+    CliError::error("VERSION_CONFLICT", msg)
+        .with_fix(fix)
+        .with_data(json!({
+            "namespace": ns,
+            "key": key,
+            "expectedVersion": expected_version,
+            "currentVersion": current_version,
+        }))
 }
 
 fn run_kv_get(
@@ -416,17 +418,16 @@ fn run_kv_get(
     node: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "kv get";
     let action = LocalKvAction::Get { key: key.clone() };
     match execute_kv(&node, &ns, action, state_dir.as_deref()) {
         Ok(LocalKvResponse::Get(Some(entry))) => {
             if as_json {
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!("{ns}/{key} (v{})", entry.version)),
-                    data: Some(json!({
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!("{ns}/{key} (v{})", entry.version),
+                    json!({
                         "hostNode": entry.host_node,
                         "namespace": entry.namespace,
                         "key": entry.key,
@@ -439,11 +440,8 @@ fn run_kv_get(
                         "createdAt": entry.created_at,
                         "updatedAt": entry.updated_at,
                         "expiresAt": entry.expires_at,
-                    })),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                };
+                    }),
+                );
                 print_json(&envelope);
             } else {
                 println!(
@@ -459,18 +457,15 @@ fn run_kv_get(
                     serde_json::to_string_pretty(&entry.value).unwrap_or_default()
                 );
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Ok(LocalKvResponse::Get(None)) => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        Ok(LocalKvResponse::Get(None)) => Err(CliError::error(
             "NOT_FOUND",
             format!("KV entry '{node}/{ns}/{key}' not found"),
-            Some(format!("List keys with `hyp kv list --ns {ns}`.")),
-        ),
-        Err(err) => emit_kv_error(cmd, as_json, err),
-        Ok(_) => unexpected_kv_response(cmd, as_json),
+        )
+        .with_fix(format!("List keys with `hyp kv list --ns {ns}`."))),
+        Err(err) => Err(err.into()),
+        Ok(_) => Err(unexpected_kv_response()),
     }
 }
 
@@ -480,21 +475,17 @@ fn run_kv_keys(
     node: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let command = "kv keys";
     let action = LocalKvAction::Keys { after };
     match execute_kv(&node, &namespace, action, state_dir.as_deref()) {
         Ok(LocalKvResponse::Keys(page)) => {
             if as_json {
-                print_json(&JsonEnvelope {
-                    ok: true,
-                    command: command.to_owned(),
-                    summary: Some(format!("{} live KV keys", page.entries.len())),
-                    data: Some(json!(page)),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                });
+                print_json(&JsonEnvelope::ok(
+                    command,
+                    format!("{} live KV keys", page.entries.len()),
+                    json!(page),
+                ));
             } else {
                 if page.entries.is_empty() {
                     println!("No visible keys.");
@@ -512,10 +503,10 @@ fn run_kv_keys(
                     println!("More keys after {}", sanitize_terminal_text(&after));
                 }
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Err(err) => emit_kv_error(command, as_json, err),
-        Ok(_) => unexpected_kv_response(command, as_json),
+        Err(err) => Err(err.into()),
+        Ok(_) => Err(unexpected_kv_response()),
     }
 }
 
@@ -525,21 +516,17 @@ fn run_kv_preview(
     node: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let command = "kv preview";
     let action = LocalKvAction::Preview { key };
     match execute_kv(&node, &namespace, action, state_dir.as_deref()) {
         Ok(LocalKvResponse::Preview(Some(preview))) => {
             if as_json {
-                print_json(&JsonEnvelope {
-                    ok: true,
-                    command: command.to_owned(),
-                    summary: Some(format!("KV value preview (v{})", preview.version)),
-                    data: Some(json!(preview)),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                });
+                print_json(&JsonEnvelope::ok(
+                    command,
+                    format!("KV value preview (v{})", preview.version),
+                    json!(preview),
+                ));
             } else {
                 for line in preview.text.lines() {
                     println!("{}", sanitize_terminal_text(line));
@@ -548,18 +535,14 @@ fn run_kv_preview(
                     println!("… (truncated)");
                 }
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Ok(LocalKvResponse::Preview(None)) => emit_error(
-            command,
-            as_json,
-            EXIT_ERROR,
+        Ok(LocalKvResponse::Preview(None)) => Err(CliError::error(
             "NOT_FOUND",
             "No visible KV entry at this key.",
-            None,
-        ),
-        Err(err) => emit_kv_error(command, as_json, err),
-        Ok(_) => unexpected_kv_response(command, as_json),
+        )),
+        Err(err) => Err(err.into()),
+        Ok(_) => Err(unexpected_kv_response()),
     }
 }
 
@@ -615,31 +598,17 @@ fn run_kv_set(
     node: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "kv set";
     let value: Value = match serde_json::from_str(&raw_value) {
         Ok(v) => v,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_JSON_VALUE",
-                format!("--value must be valid JSON: {e}"),
-                Some("Quote strings as valid JSON, e.g. --value '\"ready\"' or --value '{\"ready\":true}'.".to_string()),
-            );
+            return Err(CliError::usage("INVALID_JSON_VALUE", format!("--value must be valid JSON: {e}")).with_fix("Quote strings as valid JSON, e.g. --value '\"ready\"' or --value '{\"ready\":true}'.".to_string()));
         }
     };
     let ttl_ms = match ttl_seconds {
         Some(s) if s <= 0 => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_TTL",
-                "--ttl-seconds must be > 0",
-                None,
-            );
+            return Err(CliError::usage("INVALID_TTL", "--ttl-seconds must be > 0"));
         }
         Some(s) => Some(s.saturating_mul(1000)),
         None => None,
@@ -658,17 +627,16 @@ fn run_kv_set(
     match execute_kv(&node, &ns, action, state_dir.as_deref()) {
         Ok(LocalKvResponse::Set(entry)) => {
             if as_json {
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!(
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!(
                         "Set {}/{} -> v{} ({})",
                         entry.namespace,
                         entry.key,
                         entry.version,
                         entry.write_model.as_str()
-                    )),
-                    data: Some(json!({
+                    ),
+                    json!({
                         "hostNode": entry.host_node,
                         "namespace": entry.namespace,
                         "key": entry.key,
@@ -680,11 +648,8 @@ fn run_kv_set(
                         "writerId": entry.writer_id,
                         "updatedAt": entry.updated_at,
                         "expiresAt": entry.expires_at,
-                    })),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                };
+                    }),
+                );
                 print_json(&envelope);
             } else {
                 println!(
@@ -696,13 +661,13 @@ fn run_kv_set(
                     entry.writer_id
                 );
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Err(KvCommandError::Operation(LocalKvError::VersionConflict(current_version))) => {
-            emit_version_conflict(cmd, as_json, &ns, &key, expected_version, current_version)
-        }
-        Err(err) => emit_kv_error(cmd, as_json, err),
-        Ok(_) => unexpected_kv_response(cmd, as_json),
+        Err(KvCommandError::Operation(LocalKvError::VersionConflict(current_version))) => Err(
+            version_conflict(&ns, &key, expected_version, current_version),
+        ),
+        Err(err) => Err(err.into()),
+        Ok(_) => Err(unexpected_kv_response()),
     }
 }
 
@@ -714,7 +679,7 @@ fn run_kv_delete(
     node: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "kv delete";
     let action = LocalKvAction::Delete {
         key: key.clone(),
@@ -727,24 +692,20 @@ fn run_kv_delete(
             previous_version,
         }) => {
             if as_json {
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(if deleted {
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    if deleted {
                         format!("Deleted {ns}/{key}")
                     } else {
                         format!("KV entry {ns}/{key} did not exist")
-                    }),
-                    data: Some(json!({
+                    },
+                    json!({
                         "namespace": ns,
                         "key": key,
                         "deleted": deleted,
                         "previousVersion": previous_version,
-                    })),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                };
+                    }),
+                );
                 print_json(&envelope);
             } else if deleted {
                 println!(
@@ -754,13 +715,13 @@ fn run_kv_delete(
             } else {
                 println!("OK    KV entry {ns}/{key} was already absent");
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Err(KvCommandError::Operation(LocalKvError::VersionConflict(current_version))) => {
-            emit_version_conflict(cmd, as_json, &ns, &key, expected_version, current_version)
-        }
-        Err(err) => emit_kv_error(cmd, as_json, err),
-        Ok(_) => unexpected_kv_response(cmd, as_json),
+        Err(KvCommandError::Operation(LocalKvError::VersionConflict(current_version))) => Err(
+            version_conflict(&ns, &key, expected_version, current_version),
+        ),
+        Err(err) => Err(err.into()),
+        Ok(_) => Err(unexpected_kv_response()),
     }
 }
 
@@ -770,7 +731,7 @@ fn run_kv_list(
     node: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "kv list";
     let action = LocalKvAction::List {
         prefix: prefix.clone(),
@@ -798,21 +759,17 @@ fn run_kv_list(
                         })
                     })
                     .collect();
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!("{} key(s) in '{node}/{ns}'", items.len())),
-                    data: Some(json!({
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!("{} key(s) in '{node}/{ns}'", items.len()),
+                    json!({
                         "hostNode": node,
                         "namespace": ns,
                         "prefix": prefix,
                         "count": items.len(),
                         "entries": items,
-                    })),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                };
+                    }),
+                );
                 print_json(&envelope);
             } else {
                 println!("KV Namespace '{node}/{ns}' ({} entries)", entries.len());
@@ -835,9 +792,9 @@ fn run_kv_list(
                     }
                 }
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Err(err) => emit_kv_error(cmd, as_json, err),
-        Ok(_) => unexpected_kv_response(cmd, as_json),
+        Err(err) => Err(err.into()),
+        Ok(_) => Err(unexpected_kv_response()),
     }
 }

@@ -10,10 +10,7 @@
 use crate::config_file::{
     ct_eq, open_secret_store, resolve_config_path_for_read, resolve_state_dir,
 };
-use crate::ui::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
-    print_warnings,
-};
+use crate::ui::{CliError, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Subcommand;
@@ -118,7 +115,7 @@ impl From<SecretMetadata> for SecretListItem {
     }
 }
 
-pub fn run_secret(command: SecretCommand) -> ExitCode {
+pub fn run_secret(command: SecretCommand) -> crate::ui::CommandResult {
     match command {
         SecretCommand::Set {
             name_pos,
@@ -129,22 +126,32 @@ pub fn run_secret(command: SecretCommand) -> ExitCode {
             no_open,
             state_dir,
             json,
-        } => run_secret_set(
-            name_flag.or(name_pos),
-            web,
-            port,
-            timeout,
-            no_open,
-            state_dir,
+        } => crate::ui::CommandResult::new(
+            "secret set",
             json,
+            run_secret_set(
+                name_flag.or(name_pos),
+                web,
+                port,
+                timeout,
+                no_open,
+                state_dir,
+                json,
+            ),
         ),
-        SecretCommand::List { state_dir, json } => run_secret_list(state_dir, json),
+        SecretCommand::List { state_dir, json } => {
+            crate::ui::CommandResult::new("secret list", json, run_secret_list(state_dir, json))
+        }
         SecretCommand::Delete {
             name_pos,
             name_flag,
             state_dir,
             json,
-        } => run_secret_delete(name_flag.or(name_pos), state_dir, json),
+        } => crate::ui::CommandResult::new(
+            "secret delete",
+            json,
+            run_secret_delete(name_flag.or(name_pos), state_dir, json),
+        ),
     }
 }
 
@@ -222,31 +229,25 @@ fn run_secret_set(
     no_open: bool,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "secret set";
     let Some(name) = name else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "MISSING_NAME",
             "Missing secret name (pass `<name>` or `--name <name>`)",
-            Some(
-                "Example: printf '%s' \"$API_KEY\" | hyp secret set anthropic-api-key".to_string(),
-            ),
-        );
+        )
+        .with_fix(
+            "Example: printf '%s' \"$API_KEY\" | hyp secret set anthropic-api-key".to_string(),
+        ));
     };
 
-    if let Err(e) = validate_secret_name(&name) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+    validate_secret_name(&name).map_err(|e| {
+        CliError::usage(
             "INVALID_SECRET_NAME",
             format!("Invalid secret name '{name}': {e}"),
-            Some("Use lowercase [a-z0-9._-] starting with [a-z0-9] (max 64 chars).".to_string()),
-        );
-    }
+        )
+        .with_fix("Use lowercase [a-z0-9._-] starting with [a-z0-9] (max 64 chars).".to_string())
+    })?;
 
     let (dir, store) = resolve_store(state_dir.as_ref());
 
@@ -257,14 +258,10 @@ fn run_secret_set(
         {
             Ok(rt) => rt,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "RUNTIME_ERROR",
                     format!("Failed to start async runtime: {e}"),
-                    None,
-                );
+                ));
             }
         };
         return match rt.block_on(capture_secret_via_web(
@@ -291,25 +288,23 @@ fn run_secret_set(
                     ));
                 }
                 if as_json {
-                    let envelope = JsonEnvelope {
-                        ok: true,
-                        command: cmd.to_string(),
-                        summary: Some(format!(
+                    let envelope = JsonEnvelope::ok(
+                        cmd.to_string(),
+                        format!(
                             "Saved secret '{name}' via one-shot localhost form into {}",
                             saved.backend
-                        )),
-                        data: Some(json!({
+                        ),
+                        json!({
                             "name": name,
                             "backend": saved.backend,
                             "location": saved.location,
                             "captureMode": "web",
                             "stateDir": dir.display().to_string(),
                             "referencedBy": referenced_by,
-                        })),
-                        warnings,
-                        next,
-                        error: None,
-                    };
+                        }),
+                    )
+                    .warnings(warnings)
+                    .next(next);
                     print_json(&envelope);
                 } else {
                     println!(
@@ -320,9 +315,9 @@ fn run_secret_set(
                     print_warnings(&warnings);
                     print_next_steps(&next);
                 }
-                ExitCode::from(EXIT_OK)
+                Ok(ExitCode::from(EXIT_OK))
             }
-            Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "WEB_CAPTURE_FAILED", e, None),
+            Err(e) => Err(CliError::error("WEB_CAPTURE_FAILED", e)),
         };
     }
 
@@ -332,38 +327,23 @@ fn run_secret_set(
         .lock()
         .take(MAX_SECRET_INPUT_BYTES + 1)
         .read_to_string(&mut raw);
-    if let Err(e) = read_res {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+    read_res.map_err(|e| {
+        CliError::error(
             "STDIN_ERROR",
             format!("Failed to read secret from stdin: {e}"),
-            None,
-        );
-    }
+        )
+    })?;
     if raw.len() as u64 > MAX_SECRET_INPUT_BYTES {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "SECRET_TOO_LARGE",
             format!("Secret input exceeds {MAX_SECRET_INPUT_BYTES} byte safety cap"),
-            None,
-        );
+        ));
     }
     let trimmed = raw.trim().to_string();
     if trimmed.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "EMPTY_SECRET",
-            format!("No secret value received on stdin for '{name}'"),
-            Some(format!(
+        return Err(CliError::error("EMPTY_SECRET", format!("No secret value received on stdin for '{name}'")).with_fix(format!(
                 "Pipe secret over stdin (`hyp secret set {name} <<< \"$SECRET\"`) or run `hyp secret set {name} --web`."
-            )),
-        );
+            )));
     }
 
     match store.set(&name, &trimmed) {
@@ -384,25 +364,20 @@ fn run_secret_set(
                 ));
             }
             if as_json {
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!(
-                        "Saved secret '{name}' into {}",
-                        saved.backend.as_str()
-                    )),
-                    data: Some(json!({
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!("Saved secret '{name}' into {}", saved.backend.as_str()),
+                    json!({
                         "name": saved.name,
                         "backend": saved.backend.as_str(),
                         "location": saved.location,
                         "captureMode": "stdin",
                         "stateDir": dir.display().to_string(),
                         "referencedBy": referenced_by,
-                    })),
-                    warnings,
-                    next,
-                    error: None,
-                };
+                    }),
+                )
+                .warnings(warnings)
+                .next(next);
                 print_json(&envelope);
             } else {
                 println!(
@@ -414,33 +389,25 @@ fn run_secret_set(
                 print_warnings(&warnings);
                 print_next_steps(&next);
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Err(e) => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        Err(e) => Err(CliError::error(
             "SECRET_STORE_ERROR",
             format!("Failed to store secret '{name}': {e}"),
-            None,
-        ),
+        )),
     }
 }
 
-fn run_secret_list(state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
+fn run_secret_list(state_dir: Option<PathBuf>, as_json: bool) -> Result<ExitCode, CliError> {
     let cmd = "secret list";
     let (dir, store) = resolve_store(state_dir.as_ref());
     let items: Vec<SecretListItem> = match store.list() {
         Ok(list) => list.into_iter().map(SecretListItem::from).collect(),
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "SECRET_STORE_ERROR",
                 format!("Failed to list secrets: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -456,28 +423,26 @@ fn run_secret_list(state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
         .collect();
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "{} secret(s) stored in {} ({})",
                 items.len(),
                 store.backend().as_str(),
                 dir.display()
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "backend": store.backend().as_str(),
                 "stateDir": dir.display().to_string(),
                 "secrets": items,
-            })),
-            warnings,
-            next: if items.is_empty() {
-                vec!["hyp secret set <name> --web".to_string()]
-            } else {
-                Vec::new()
-            },
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(if items.is_empty() {
+            vec!["hyp secret set <name> --web".to_string()]
+        } else {
+            Vec::new()
+        });
         print_json(&envelope);
     } else {
         println!(
@@ -500,31 +465,27 @@ fn run_secret_list(state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
             }
         }
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
-fn run_secret_delete(name: Option<String>, state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
+fn run_secret_delete(
+    name: Option<String>,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
     let cmd = "secret delete";
     let Some(name) = name else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "MISSING_NAME",
             "Missing secret name (pass `<name>` or `--name <name>`)",
-            None,
-        );
+        ));
     };
-    if let Err(e) = validate_secret_name(&name) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+    validate_secret_name(&name).map_err(|e| {
+        CliError::usage(
             "INVALID_SECRET_NAME",
             format!("Invalid secret name '{name}': {e}"),
-            None,
-        );
-    }
+        )
+    })?;
 
     let (dir, store) = resolve_store(state_dir.as_ref());
     match store.delete(&name) {
@@ -541,45 +502,36 @@ fn run_secret_delete(name: Option<String>, state_dir: Option<PathBuf>, as_json: 
                 next.push("hyp service restart --json".to_string());
             }
             if as_json {
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!("Deleted secret '{name}'")),
-                    data: Some(json!({
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!("Deleted secret '{name}'"),
+                    json!({
                         "name": name,
                         "deleted": true,
                         "backend": store.backend().as_str(),
                         "stateDir": dir.display().to_string(),
                         "referencedBy": referenced_by,
-                    })),
-                    warnings,
-                    next,
-                    error: None,
-                };
+                    }),
+                )
+                .warnings(warnings)
+                .next(next);
                 print_json(&envelope);
             } else {
                 println!("OK    Deleted secret '{name}'");
                 print_warnings(&warnings);
                 print_next_steps(&next);
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
-        Ok(false) => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        Ok(false) => Err(CliError::error(
             "SECRET_NOT_FOUND",
             format!("Secret '{name}' was not found"),
-            Some("Run `hyp secret list` to inspect stored secrets.".to_string()),
-        ),
-        Err(e) => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        )
+        .with_fix("Run `hyp secret list` to inspect stored secrets.".to_string())),
+        Err(e) => Err(CliError::error(
             "SECRET_STORE_ERROR",
             format!("Failed to delete secret '{name}': {e}"),
-            None,
-        ),
+        )),
     }
 }
 

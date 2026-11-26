@@ -4125,15 +4125,10 @@ fn run_plugin_verify(
             error: if all_ok {
                 None
             } else {
-                Some(CliError {
-                    exit: EXIT_ERROR,
-                    code: "PLUGIN_VERIFY_FAILED".to_string(),
-                    message: summary,
-                    fix: Some(
+                Some(CliError::error("PLUGIN_VERIFY_FAILED".to_string(), summary).with_fix(
                         "Update outdated plugins via `hyp plugin update --all` or reinstall tampered ones via `hyp plugin install <name> --force`."
                             .to_string(),
-                    ),
-                })
+                    ))
             },
         };
         print_json(&envelope);

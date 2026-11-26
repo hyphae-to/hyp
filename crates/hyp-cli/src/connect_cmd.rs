@@ -10,7 +10,7 @@
 use crate::config_file::{
     load_node_or_legacy_config, resolve_config_path_for_read, resolve_state_dir,
 };
-use crate::ui::{EXIT_ERROR, EXIT_OK};
+use crate::ui::{CliError, EXIT_OK};
 use clap::Args;
 use hyp_node::engine::DEFAULT_PEER_SOCKET_FILENAME;
 use serde_json::Value;
@@ -220,25 +220,23 @@ where
     }
 }
 
-pub fn run_connect(args: ConnectArgs) -> ExitCode {
-    let target = match resolve_connect_target(&args) {
-        Ok(t) => t,
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            return ExitCode::from(EXIT_ERROR);
-        }
-    };
+pub fn run_connect(args: ConnectArgs) -> crate::ui::CommandResult {
+    crate::ui::CommandResult::new("connect", false, connect(args))
+}
 
-    let rt = match tokio::runtime::Builder::new_current_thread()
+fn connect(args: ConnectArgs) -> Result<ExitCode, CliError> {
+    let target = resolve_connect_target(&args)
+        .map_err(|message| CliError::error("CONNECT_TARGET", message).plain())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("error: Failed to start async runtime: {e}");
-            return ExitCode::from(EXIT_ERROR);
-        }
-    };
+        .map_err(|error| {
+            CliError::error(
+                "RUNTIME_ERROR",
+                format!("Failed to start async runtime: {error}"),
+            )
+            .plain()
+        })?;
 
     let res: Result<(), String> = rt.block_on(async move {
         match target {
@@ -270,13 +268,8 @@ pub fn run_connect(args: ConnectArgs) -> ExitCode {
     // delays process exit after the peer stream closes cleanly.
     rt.shutdown_background();
 
-    match res {
-        Ok(()) => ExitCode::from(EXIT_OK),
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            ExitCode::from(EXIT_ERROR)
-        }
-    }
+    res.map_err(|message| CliError::error("CONNECT_FAILED", message).plain())?;
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[cfg(test)]

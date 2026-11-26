@@ -17,10 +17,8 @@ use crate::auth_cmd::select_local_signing_authority;
 use crate::config_file::{
     load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read, resolve_state_dir,
 };
-use crate::gate_cmd::{
-    ConfirmError, emit_confirm_error, require_controlling_tty_confirmation, sanitize_tty_display,
-};
-use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
+use crate::gate_cmd::{ConfirmError, require_controlling_tty_confirmation, sanitize_tty_display};
+use crate::ui::{CliError, EXIT_OK, JsonEnvelope, print_json};
 use clap::Args;
 use hyp_crypto::human::sign_local_ingest_event;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
@@ -87,20 +85,20 @@ pub struct EmitArgs {
     pub json: bool,
 }
 
-pub fn run_emit(args: EmitArgs) -> ExitCode {
+pub fn run_emit(args: EmitArgs) -> crate::ui::CommandResult {
+    crate::ui::CommandResult::new("emit", args.json, emit(args))
+}
+
+fn emit(args: EmitArgs) -> Result<ExitCode, CliError> {
     let cmd = "emit";
     let as_json = args.json;
 
     if let Some(ttl) = args.ttl {
         if ttl == 0 || ttl > MAX_TTL_SECONDS {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_TTL",
                 format!("--ttl must be in 1..={MAX_TTL_SECONDS} seconds"),
-                None,
-            );
+            ));
         }
     }
 
@@ -108,7 +106,9 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
     // key and MUST require an interactive human controlling terminal (unsigned `hyp emit` for
     // cron/scripts remains completely non-interactive).
     if args.sign && !io::stderr().is_terminal() {
-        return emit_confirm_error("emit --sign", as_json, ConfirmError::NotInteractiveTty);
+        return Err(ConfirmError::NotInteractiveTty
+            .into_cli_error("emit --sign")
+            .with_command("emit --sign"));
     }
 
     let config_path =
@@ -117,7 +117,7 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
         match load_node_or_legacy_config(&config_path) {
             Ok(cfg) => Some(cfg),
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None);
+                return Err(CliError::error("CONFIG_ERROR", e));
             }
         }
     } else {
@@ -139,17 +139,13 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
             Some(val) => match val {
                 Ok(cfg) => cfg.clone(),
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
+                    return Err(CliError::error(
                         "CONFIG_ERROR",
                         format!(
                             "Invalid localIngest config in {}: {e}",
                             config_path.display()
                         ),
-                        None,
-                    );
+                    ));
                 }
             },
             None => LocalIngestConfig::default(),
@@ -158,7 +154,7 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
     let stdin_json: Option<Map<String, Value>> = match read_optional_stdin_json() {
         Ok(opt) => opt,
         Err((code, msg)) => {
-            return emit_error(cmd, as_json, EXIT_USAGE, code, msg, None);
+            return Err(CliError::usage(code, msg));
         }
     };
 
@@ -170,7 +166,7 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
     } = match build_emit_payload(&args, stdin_json.as_ref(), &local_ingest_cfg.default_topic) {
         Ok(built) => built,
         Err((code, msg)) => {
-            return emit_error(cmd, as_json, EXIT_USAGE, code, msg, None);
+            return Err(CliError::usage(code, msg));
         }
     };
 
@@ -178,22 +174,19 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
     if args.sign {
         let db_path = state_dir.join("node.sqlite");
         if !db_path.exists() {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "NOT_INITIALIZED",
                 format!(
                     "Cannot sign event: node.sqlite not found at {}",
                     db_path.display()
                 ),
-                Some(format!("hyp auth init --state-dir {}", state_dir.display())),
-            );
+            )
+            .with_fix(format!("hyp auth init --state-dir {}", state_dir.display())));
         }
         let db = match NodeDb::open(&db_path) {
             Ok(db) => db,
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None);
+                return Err(CliError::error("DB_ERROR", e.to_string()));
             }
         };
         let secrets = open_secret_store(&state_dir, args.state_dir.is_some());
@@ -201,14 +194,8 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
             match select_local_signing_authority(&db, &secrets, args.kid.as_deref(), true) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "ADMIN_KEY_UNAVAILABLE",
-                        e,
-                        Some(format!("hyp auth init --state-dir {}", state_dir.display())),
-                    );
+                    return Err(CliError::error("ADMIN_KEY_UNAVAILABLE", e)
+                        .with_fix(format!("hyp auth init --state-dir {}", state_dir.display())));
                 }
             };
         let label_summary = event
@@ -255,19 +242,17 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
             &confirm_summary,
             "Sign & emit this event as HumanVerified? [y/N]: ",
         ) {
-            return emit_confirm_error("emit --sign", as_json, err);
+            return Err(err
+                .into_cli_error("emit --sign")
+                .with_command("emit --sign"));
         }
         let canonical = match canonical_local_event_for_signing(&event) {
             Ok(c) => c,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "SIGN_FAILED",
                     format!("Failed to canonicalize CloudEvent for signing: {e}"),
-                    None,
-                );
+                ));
             }
         };
         let sig = sign_local_ingest_event(&admin_kp, &canonical);
@@ -277,24 +262,16 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
     let mut wire_obj = match serde_json::to_value(&event) {
         Ok(Value::Object(map)) => map,
         Ok(_) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "SERIALIZE_ERROR",
                 "Serialized CloudEvent was not a JSON object",
-                None,
-            );
+            ));
         }
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "SERIALIZE_ERROR",
                 format!("Failed to serialize CloudEvent: {e}"),
-                None,
-            );
+            ));
         }
     };
     wire_obj.insert("topic".to_string(), Value::String(topic.clone()));
@@ -312,17 +289,14 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
         .unwrap_or_else(|| local_ingest_cfg.resolved_socket_path(&state_dir));
 
     if !endpoint_path.exists() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "INGEST_OFFLINE",
             format!(
                 "Local ingest socket not found at {} (is `hyp node start` running?)",
                 endpoint_path.display()
             ),
-            Some("hyp node start".to_string()),
-        );
+        )
+        .with_fix("hyp node start".to_string()));
     }
 
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -331,34 +305,27 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RUNTIME_ERROR",
                 format!("Failed to start async runtime: {e}"),
-                None,
-            );
+            ));
         }
     };
 
     let receipt = match rt.block_on(send_local_ingest_event(&endpoint_path, &wire_json)) {
         Ok(r) => r,
         Err(LocalIngestError::Transport(msg)) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "INGEST_OFFLINE",
                 format!(
                     "Failed to reach local ingest endpoint {}: {msg}",
                     endpoint_path.display()
                 ),
-                Some("hyp node start".to_string()),
-            );
+            )
+            .with_fix("hyp node start".to_string()));
         }
         Err(e) => {
-            return emit_error(cmd, as_json, EXIT_ERROR, "EMIT_FAILED", e.to_string(), None);
+            return Err(CliError::error("EMIT_FAILED", e.to_string()));
         }
     };
 
@@ -373,7 +340,7 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
             .or_else(|| receipt.get("reason"))
             .and_then(Value::as_str)
             .unwrap_or("Local ingest rejected event");
-        return emit_error(cmd, as_json, EXIT_ERROR, &err_code, err_msg, None);
+        return Err(CliError::error(&err_code, err_msg));
     }
 
     let ev_id = receipt
@@ -410,15 +377,7 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
     );
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(receipt),
-            warnings: Vec::new(),
-            next: Vec::new(),
-            error: None,
-        };
+        let envelope = JsonEnvelope::ok(cmd.to_string(), summary, receipt);
         print_json(&envelope);
     } else {
         println!("OK    Emitted event {ev_id} -> {eff_topic}");
@@ -433,7 +392,7 @@ pub fn run_emit(args: EmitArgs) -> ExitCode {
         }
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 struct BuiltEmitPayload {
