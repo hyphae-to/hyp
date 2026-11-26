@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -104,7 +105,7 @@ function startPlugin(name, env, { targets = [name], ackWith } = {}) {
     stderr: () => stderr,
     exited: () => until(() => exit, `${name} exit`),
     webhookUrl: async () => {
-      const match = await until(() => stderr.match(/webhook listening on (http:\/\/127\.0\.0\.1:\d+\S*)/), `${name} webhook listener`);
+      const match = await until(() => stderr.match(/(?:webhook listening on |plugin listening on |listen=)(http:\/\/127\.0\.0\.1:\d+\S*)/), `${name} webhook listener`);
       return match[1];
     },
   };
@@ -183,6 +184,51 @@ test("sentry poll: emits only issues first seen after the cursor, once, and pers
   assert.match(mock.requests[0].url, /project=api/);
   assert.equal(statSync(stateFile).mode & 0o777, 0o600);
   assert.ok(!plugin.stderr().includes("sntrys_test"), "token must never reach stderr");
+});
+
+test("migrated webhook listeners survive incomplete bodies and accept subsequent deliveries", async () => {
+  const secret = "migration-test-secret";
+  const webhook = startPlugin("webhook", { WEBHOOK_SECRET: secret, WEBHOOK_PORT: "0", WEBHOOK_LEGACY_NATIVE: "1" });
+  const prometheus = startPlugin("prometheus", { PROMETHEUS_BEARER_TOKEN: secret, PROMETHEUS_PORT: "0", PROMETHEUS_LEGACY_NATIVE: "1" });
+  const requests = [
+    { plugin: webhook, body: '{"message":"ok"}', status: 202 },
+    { plugin: prometheus, body: '{"alerts":[{"labels":{"alertname":"Recovered"}}]}', status: 200 },
+  ];
+  for (const { plugin, body, status } of requests) {
+    const url = new URL(await plugin.webhookUrl());
+    await new Promise((resolve, reject) => {
+      const conn = createConnection({ host: url.hostname, port: Number(url.port) }, () => {
+        conn.end(`POST ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${secret}\r\nContent-Length: 120\r\n\r\n{`);
+      });
+      conn.setTimeout(2_000, () => conn.destroy(new Error("incomplete request socket timed out")));
+      conn.on("error", reject);
+      conn.on("close", resolve);
+      conn.resume();
+    });
+    const response = await post(url, body, {
+      authorization: `Bearer ${secret}`,
+      "x-webhook-signature-256": `sha256=${hmac("sha256", secret, body)}`,
+    });
+    assert.equal(response.status, status);
+    assert.equal(plugin.events.length, 1);
+  }
+});
+
+test("migrated Alertmanager listener rejects deeply nested labels and continues", async () => {
+  const plugin = startPlugin("prometheus", {
+    PROMETHEUS_ALLOW_UNSIGNED: "1",
+    PROMETHEUS_PORT: "0",
+    PROMETHEUS_LEGACY_NATIVE: "1",
+  });
+  const url = await plugin.webhookUrl();
+  const nested = "[".repeat(10_000) + "0" + "]".repeat(10_000);
+  const bad = await post(url, `{"alerts":[{"labels":{"extra":${nested}}}]}`);
+  assert.equal(bad.status, 400);
+  assert.deepEqual(await bad.json(), { error: "invalid_json" });
+  assert.equal(plugin.events.length, 0);
+  const valid = await post(url, '{"alerts":[{"labels":{"alertname":"Recovered"}}]}');
+  assert.equal(valid.status, 200);
+  assert.equal(plugin.events.length, 1);
 });
 
 test("sentry webhook: valid signature publishes; 1-bit flip, missing signature and wrong path fail closed", async () => {

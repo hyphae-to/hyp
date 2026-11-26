@@ -19,7 +19,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
-import { answerWebhookReadiness, envInt } from "../sdk/source-kit.mjs";
+import { answerWebhookReadiness, envInt, readWebhookBody } from "../sdk/source-kit.mjs";
 
 const maxBodyBytes = envInt("PROMETHEUS_MAX_BODY_BYTES", 1024 * 1024, { min: 1 });
 const nativeCompat = process.env.PROMETHEUS_LEGACY_NATIVE === "1";
@@ -76,21 +76,10 @@ function sendJson(res, status, body, extraHeaders = {}) {
     .end(JSON.stringify(body));
 }
 
-async function readRawBody(req, maxBytes) {
-  const contentLength = Number(req.headers["content-length"]);
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    return null;
-  }
-  const chunks = [];
-  let bytes = 0;
-  for await (const chunk of req) {
-    bytes += chunk.length;
-    if (bytes > maxBytes) {
-      return null;
-    }
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
+// Match serde_json's supported nesting range before walking untrusted JSON.
+function withinJsonDepth(value, remaining = 127) {
+  if (value === null || typeof value !== "object") return true;
+  return remaining > 0 && Object.values(value).every((child) => withinJsonDepth(child, remaining - 1));
 }
 
 function fitDataBytes(data) {
@@ -164,16 +153,16 @@ if (!topic || !hello.targets.includes(topic)) {
   throw new Error(`Topic '${topic}' not in configured targets: ${hello.targets.join(", ")}`);
 }
 
-const server = createServer(async (req, res) => {
+async function handleRequest(req, res) {
   if (answerWebhookReadiness(req, res, expectedPath, (bearerToken || basicAuth || webhookSecret) && isLoopbackHost(host))) return;
-  const url = new URL(req.url ?? "/", "http://localhost");
+  const path = (req.url ?? "").split("?")[0];
 
-  if (req.method === "GET" && url.pathname === "/health") {
+  if (req.method === "GET" && path === "/health") {
     sendJson(res, 200, { ok: true });
     return;
   }
 
-  if (url.pathname !== expectedPath) {
+  if (path !== expectedPath) {
     sendJson(res, 404, { error: "not_found" });
     return;
   }
@@ -203,7 +192,8 @@ const server = createServer(async (req, res) => {
     }
   }
 
-  const raw = await readRawBody(req, maxBodyBytes);
+  const raw = await readWebhookBody(req, maxBodyBytes);
+  if (raw === undefined) return;
   if (raw === null) {
     sendJson(res, 413, { error: "payload_too_large" }, { connection: "close" });
     return;
@@ -222,6 +212,11 @@ const server = createServer(async (req, res) => {
   try {
     payload = JSON.parse(raw.toString("utf8"));
   } catch {
+    sendJson(res, 400, { error: "invalid_json" });
+    return;
+  }
+
+  if (!withinJsonDepth(payload)) {
     sendJson(res, 400, { error: "invalid_json" });
     return;
   }
@@ -312,6 +307,14 @@ const server = createServer(async (req, res) => {
   }
 
   sendJson(res, 200, { ok: true, alerts: count });
+}
+
+const server = createServer((req, res) => {
+  handleRequest(req, res).catch(() => {
+    if (res.destroyed || res.writableEnded) return;
+    if (res.headersSent) res.destroy();
+    else res.writeHead(400, { "content-type": "application/json" }).end('{"error":"invalid_request"}');
+  });
 });
 
 server.on("error", (error) => {

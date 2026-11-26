@@ -332,3 +332,24 @@ export function startWebhookServer({ prefix, name, defaultPort, defaultPath, max
     });
   });
 }
+
+// A null body exceeds the limit. An undefined body was interrupted.
+export async function readWebhookBody(req, maxBytes) {
+  const contentLength = Number(req.headers["content-length"]);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    return null;
+  }
+  const chunks = [];
+  let bytes = 0;
+  try {
+    for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+      bytes += chunk.length;
+      if (bytes > maxBytes) return null;
+      chunks.push(chunk);
+    }
+  } catch {
+    // The sender disconnected before delivering the complete request.
+    return undefined;
+  }
+  return Buffer.concat(chunks);
+}

@@ -21,7 +21,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
-import { answerWebhookReadiness, envInt } from "../sdk/source-kit.mjs";
+import { answerWebhookReadiness, envInt, readWebhookBody } from "../sdk/source-kit.mjs";
 
 const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 
@@ -109,28 +109,18 @@ if (!target || !hello.targets.includes(target)) {
   throw new Error(`Target '${target}' not in configured targets: ${hello.targets.join(", ")}`);
 }
 
-const server = createServer(async (req, res) => {
+async function handleRequest(req, res) {
   if (answerWebhookReadiness(req, res, expectedPath, secret && isLoopbackHost(host))) return;
   if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== expectedPath) {
     res.writeHead(404).end();
     return;
   }
-  const length = Number(req.headers["content-length"]);
-  if (Number.isFinite(length) && length > maxBodyBytes) {
+  const raw = await readWebhookBody(req, maxBodyBytes);
+  if (raw === undefined) return;
+  if (raw === null) {
     res.writeHead(413, { connection: "close" }).end('{"error":"too_large"}');
     return;
   }
-  const chunks = [];
-  let bytes = 0;
-  for await (const chunk of req) {
-    bytes += chunk.length;
-    if (bytes > maxBodyBytes) {
-      res.writeHead(413, { connection: "close" }).end('{"error":"too_large"}');
-      return;
-    }
-    chunks.push(chunk);
-  }
-  const raw = Buffer.concat(chunks);
   const rawTsHeader =
     typeof req.headers["x-webhook-timestamp"] === "string"
       ? req.headers["x-webhook-timestamp"].trim()
@@ -150,7 +140,7 @@ const server = createServer(async (req, res) => {
     }
     hmac.update(raw);
     const expected = "sha256=" + hmac.digest("hex");
-    if (header.length !== expected.length || !timingSafeEqual(Buffer.from(header), Buffer.from(expected))) {
+    if (Buffer.byteLength(header) !== expected.length || !timingSafeEqual(Buffer.from(header), Buffer.from(expected))) {
       res.writeHead(401, { "content-type": "application/json" }).end('{"error":"bad_signature"}');
       return;
     }
@@ -203,6 +193,14 @@ const server = createServer(async (req, res) => {
     const status = error instanceof PluginRpcError && error.code !== RPC_UNAVAILABLE ? 400 : 503;
     res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify({ error: error.message, ...(error instanceof PluginRpcError ? { code: error.code } : {}) }));
   }
+}
+
+const server = createServer((req, res) => {
+  handleRequest(req, res).catch(() => {
+    if (res.destroyed || res.writableEnded) return;
+    if (res.headersSent) res.destroy();
+    else res.writeHead(400, { "content-type": "application/json" }).end('{"error":"invalid_request"}');
+  });
 });
 
 server.listen(port, host, () => {
