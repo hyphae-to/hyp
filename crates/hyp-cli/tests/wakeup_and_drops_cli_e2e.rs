@@ -1541,7 +1541,7 @@ fn cli_auth_init_web_callback_csrf_cors_and_live_relay_drop_wait() {
     let mut proc = ManagedProcess::spawn("hyp auth init --web", &mut cmd);
 
     let url_line = proc
-        .try_read_stderr_line(Duration::from_secs(5))
+        .read_web_enrollment_url()
         .expect("read enrollment URL from stderr");
     let enroll_url = url_line
         .split("https://hyphae.to/drop#enroll=")
@@ -2088,7 +2088,7 @@ fn cli_drop_portal_url_override_and_fail_closed_validation() {
         ]);
     let mut web_proc = ManagedProcess::spawn("hyp auth init --web (custom portal)", &mut web_cmd);
     let url_line = web_proc
-        .try_read_stderr_line(Duration::from_secs(5))
+        .read_web_enrollment_url()
         .expect("read custom portal enroll URL from stderr");
     assert!(
         url_line.contains("https://drop.acme.com#enroll="),
