@@ -14,7 +14,6 @@ import type { HypCli } from "../hyp-cli.ts";
 import type { LlmShimServer } from "../llm-shim/index.ts";
 import type { Sandbox, TrackedProcess } from "../sandbox.ts";
 import type {
-  AdapterSessionHandle,
   HarnessBootOptions,
   HarnessRuntime,
   RealHarnessAdapter,

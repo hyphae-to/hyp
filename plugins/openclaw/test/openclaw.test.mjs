@@ -11,7 +11,6 @@ import defaultPlugin, {
   HYPHAE_TOOL_MATCHER,
   canonicalOpenClawSessionId,
   createHyphaePlugin,
-  createOpenClawWakeService,
   extractOpenClawSessionPayload,
   handleOpenClawWakePacket,
   isHyphaeToolName,

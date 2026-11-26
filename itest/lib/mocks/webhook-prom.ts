@@ -83,6 +83,59 @@ export function buildOversizedAlertmanagerBody(minBytes = 1_100_000): string {
   );
 }
 
+function postLoopbackHttp(
+  url: string,
+  headers: Record<string, string>,
+  raw: string,
+): Promise<{ status: number; json: any; text: string }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const bodyBuf = Buffer.from(raw, "utf8");
+    let settled = false;
+    const req = http.request(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname,
+        port: parsed.port || 80,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-length": String(bodyBuf.length),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          if (settled) return;
+          settled = true;
+          const text = Buffer.concat(chunks).toString("utf8");
+          let json: any = null;
+          try {
+            json = JSON.parse(text);
+          } catch {
+            json = null;
+          }
+          resolve({ status: res.statusCode ?? 0, json, text });
+        });
+      },
+    );
+    req.on("error", (err: NodeJS.ErrnoException) => {
+      // Ignore write-side EPIPE/ECONNRESET when server rejects an oversized body with 413
+      // before draining the full request stream; the response listener will resolve cleanly.
+      if (err.code === "EPIPE" || err.code === "ECONNRESET") {
+        return;
+      }
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+    req.end(bodyBuf);
+  });
+}
+
 /** Sends a Prometheus Alertmanager v4 webhook with Bearer, Basic, and/or HMAC-SHA256 auth. */
 export async function sendAlertmanagerWebhook(
   url: string,
@@ -111,15 +164,7 @@ export async function sendAlertmanagerWebhook(
     const valid = `sha256=${hmacHex("sha256", opts.hmacSecret, raw)}`;
     headers["x-webhook-signature-256"] = opts.tamperSignature ? flipHexBit(valid) : valid;
   }
-  const res = await fetch(url, { method: "POST", headers, body: raw });
-  const text = await res.text();
-  let json: any = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
-  return { status: res.status, json, text };
+  return postLoopbackHttp(url, headers, raw);
 }
 
 /**
@@ -167,15 +212,8 @@ export async function sendGenericWebhook(
     headers["x-webhook-signature-256"] = signature;
   }
 
-  const res = await fetch(url, { method: "POST", headers, body: raw });
-  const text = await res.text();
-  let json: any = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
-  return { status: res.status, json, text, signature, timestamp: tsStr };
+  const res = await postLoopbackHttp(url, headers, raw);
+  return { ...res, signature, timestamp: tsStr };
 }
 
 export interface RecordedWebhookCallback {

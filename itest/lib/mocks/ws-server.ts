@@ -375,7 +375,7 @@ export class LoopbackWsServer {
   }
 
   async close(): Promise<void> {
-    for (const sock of [...this.rawSockets]) {
+    for (const sock of Array.from(this.rawSockets)) {
       try {
         sock.destroy();
       } catch {

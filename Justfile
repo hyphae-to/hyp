@@ -8,9 +8,29 @@ hyp_bin := env_var_or_default("HYP_BIN", justfile_directory() / "target/debug/hy
 default:
     @just --list
 
+# Tier 0: Rust formatting check
+fmt-check:
+    cargo fmt --all -- --check
+
 # Tier 0: Rust clippy lint check (zero warnings)
 check:
     cargo clippy --workspace --all-targets -- -D warnings
+
+# Tier 0: JS/TS lint check (oxlint, zero warnings)
+lint-js:
+    npm run lint:js
+
+# Tier 0: Pure-Node JS/TS unit test suite (plugins, site, worker, drop crypto, llm-shim)
+test-js:
+    npm run test:js
+
+# Activate repo-tracked git hooks (.githooks/pre-push)
+install-hooks:
+    git config core.hooksPath .githooks
+
+# Run pre-push checks manually (cargo fmt + JS/TS lint)
+pre-push:
+    bash .githooks/pre-push
 
 # Tier 0: Full Rust workspace test suite (isolated file SecretStore)
 test:

@@ -260,7 +260,7 @@ export function startWebhookServer({ prefix, name, defaultPort, defaultPath, max
   const host = envString(`${prefix}_WEBHOOK_HOST`, "127.0.0.1");
   const port = envInt(`${prefix}_WEBHOOK_PORT`, defaultPort, { min: 0, max: 65_535 });
   const path = envString(`${prefix}_WEBHOOK_PATH`, defaultPath);
-  if (!/^\/[A-Za-z0-9._~\/-]*$/.test(path)) throw new Error(`${prefix}_WEBHOOK_PATH must be an absolute URL path (got '${clip(path, 60)}')`);
+  if (!/^\/[A-Za-z0-9._~/-]*$/.test(path)) throw new Error(`${prefix}_WEBHOOK_PATH must be an absolute URL path (got '${clip(path, 60)}')`);
   const funnelPort = envString(`${prefix}_WEBHOOK_FUNNEL`);
   if (funnelPort) {
     if (!FUNNEL_PORTS.has(funnelPort)) throw new Error(`${prefix}_WEBHOOK_FUNNEL must be 443, 8443 or 10000 (got '${clip(funnelPort, 20)}')`);

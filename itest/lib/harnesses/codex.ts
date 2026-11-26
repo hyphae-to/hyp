@@ -18,7 +18,6 @@ import { spawnInPty, type PtyProcess } from "../pty.ts";
 import type { Sandbox, TrackedProcess } from "../sandbox.ts";
 import {
   extractSessionsFromInspect,
-  type AdapterSessionHandle,
   type HarnessBootOptions,
   type HarnessRuntime,
   type RealHarnessAdapter,

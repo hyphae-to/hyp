@@ -47,25 +47,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Syntax-check site script, external JS/Python plugins, installers, and mirror parity
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install JS/TS dev linter (oxlint)
+        run: npm ci
+
+      - name: Lint JS/TS, run JS/TS unit tests, syntax-check Python/shell/PowerShell, and verify mirror parity
         shell: bash
         run: |
           set -euo pipefail
           node --version
           python3 --version
 
-          node --check site/app.js
-          node --check site/drop/crypto.js
-          node --check site/drop/drop.js
-          node scripts/test-drop-crypto.mjs
-          node --check scripts/pack-plugins.mjs
-          node --check workers/drop-relay/src/index.mjs
-          node workers/drop-relay/test/worker.test.mjs
+          npm run lint:js
+          npm run test:js
+
           while IFS= read -r file; do
             node --check "$file"
-          done < <(find plugins -type f \( -name '*.mjs' -o -name '*.js' \) | sort)
-          node plugins/herdr-mod/test/mod.test.mjs
-          node --test plugins/test/sources.test.mjs
+          done < <(find plugins site workers scripts -type f \( -name '*.mjs' -o -name '*.js' \) | sort)
 
           while IFS= read -r file; do
             python3 -m py_compile "$file"
@@ -190,13 +193,23 @@ jobs:
       - name: Install Rust 1.87.0
         uses: dtolnay/rust-toolchain@1.87.0
         with:
-          components: clippy
+          components: clippy, rustfmt
+
+      - name: Set up Node.js 24 (Linux plugin & JS interop E2E)
+        if: runner.os == 'Linux'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Formatting check (rustfmt)
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
 
       - name: Clippy (zero warnings across workspace & all targets)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

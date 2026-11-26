@@ -1,0 +1,17 @@
+{
+  "name": "hyphae-workspace-tools",
+  "version": "0.7.0",
+  "private": true,
+  "type": "module",
+  "description": "Dev-only JS/TS lint and test entry points for Hyphae (core hyp binary remains pure static Rust with zero runtime Node.js dependency).",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "lint:js": "oxlint --config .oxlintrc.json --deny-warnings plugins site workers scripts itest",
+    "test:js": "node --test plugins/test/sdk_and_prometheus.test.mjs plugins/test/sources.test.mjs plugins/herdr-mod/test/mod.test.mjs plugins/openclaw/test/openclaw.test.mjs plugins/openclaw/test/openclaw_shim_e2e.test.mjs plugins/opencode/test/opencode.test.mjs site/join/join.test.mjs workers/drop-relay/test/worker.test.mjs scripts/test-drop-crypto.mjs itest/suites/llm-shim.test.ts"
+  },
+  "devDependencies": {
+    "oxlint": "1.95.0"
+  }
+}

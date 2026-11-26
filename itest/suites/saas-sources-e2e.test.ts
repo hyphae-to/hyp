@@ -127,7 +127,7 @@ function pullInboxOnNotifyRule(name = "pull-stream-inbox", topic?: string) {
     name,
     when: (req: any) =>
       req.lastToolResults.length === 0 &&
-      /\[hyphae (?:notify|\+\d+ more unread)/.test(req.lastUserText),
+      /<hyphae-inbox\b|\[hyphae (?:notify|\+\d+ more unread)/.test(req.lastUserText),
     do: (req: any) =>
       callTool(req, "hyp_inbox", {
         ...(topic ? { filter: { topic } } : {}),
@@ -1072,7 +1072,7 @@ test("Sources E2E — webhook-stream (Rust) vs plugins/webhook (Node) bidirectio
             text: `WH_CALLBACK_ACK:${rustMarker}+${nodeMarker}`,
           }),
       },
-      pullInboxOnNotifyRule("pull-wh-rust-inbox", "local.wh-rust"),
+      pullInboxOnNotifyRule("pull-wh-both-inbox"),
       {
         name: "done-reply",
         once: true,

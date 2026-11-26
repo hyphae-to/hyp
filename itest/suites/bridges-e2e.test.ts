@@ -71,6 +71,14 @@ function bridgeToolSearchRule(name = "load-bridge-tools") {
   };
 }
 
+function pullInboxOnDigestRule(name = "pull-bridge-inbox") {
+  return {
+    name,
+    when: (req: any) => req.lastToolResults.length === 0 && /<hyphae-inbox\b/.test(req.lastUserText),
+    do: (req: any) => callTool(req, "hyp_inbox", { ack: true, limit: 20 }),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // 1. Telegram Full E2E Loop
 // ---------------------------------------------------------------------------
@@ -221,6 +229,7 @@ test("Bridges E2E — Telegram: full inbound->Claude->outbound+reaction loop, 42
         },
         do: () => emitText("TG_REPLIES_SENT"),
       },
+      pullInboxOnDigestRule("pull-tg-inbox"),
       {
         name: "ack-waiter-prompt",
         when: (req) => req.lastUserText.includes("no background waiter is running yet"),
@@ -454,6 +463,7 @@ test("Bridges E2E — Slack Socket Mode: auth.test, apps.connections.open, envel
         },
         do: () => emitText("SLACK_REPLIED"),
       },
+      pullInboxOnDigestRule("pull-slack-inbox"),
       {
         name: "ack-waiter-prompt",
         when: (req) => req.lastUserText.includes("no background waiter is running yet"),
@@ -683,6 +693,7 @@ test("Bridges E2E — WhatsApp Cloud API: GET verify challenge (403/200), 1-bit 
         },
         do: () => emitText("WA_REPLIED"),
       },
+      pullInboxOnDigestRule("pull-wa-inbox"),
       {
         name: "ack-waiter-prompt",
         when: (req) => req.lastUserText.includes("no background waiter is running yet"),
@@ -894,11 +905,17 @@ test("Bridges E2E — Blind Spot B2: real Node plugin crash -> CrashLoopBackOff 
     );
     const hasB2FatalHandler = installedSdk.includes("unhandledRejection");
     if (hasB2FatalHandler) {
-      assert.ok(
-        tgEntry.status === "crash_loop_backoff" || tgEntry.status === "degraded",
-        `B2 regression: telegram threw post-hello yet status=${tgEntry.status}: ${JSON.stringify(tgEntry)}`,
+      const settledTg = await waitUntil(
+        () => {
+          const doc = readStatus();
+          const entry = (doc?.plugins ?? []).find((p: any) => p.id === "telegram");
+          return entry?.status === "crash_loop_backoff" || entry?.status === "degraded" ? entry : false;
+        },
+        "telegram plugin transitioning to crash_loop_backoff/degraded",
+        15_000,
+        150,
       );
-      assert.ok(tgEntry.restarts >= 1, `expected telegram restarts >= 1, got ${tgEntry.restarts}`);
+      assert.ok(settledTg.restarts >= 1, `expected telegram restarts >= 1, got ${settledTg.restarts}`);
     } else if (tgEntry.status === "running") {
       // ISSUE #40: Blind Spot B2 reproduced live on `main`: `plugins/sdk/client.mjs` keeps fd-3
       // `createReadStream` open without `uncaughtException`/`unhandledRejection` exit handlers,

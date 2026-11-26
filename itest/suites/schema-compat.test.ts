@@ -181,12 +181,12 @@ function seedHistoricalNodeDb(dbPath: string, targetVersion: 5 | 6): void {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Forward Migration (`v5 -> v7` and `v6 -> v7`) with Pre-Migration Backup & Zero Data Loss
+// 1. Forward Migration (`v5 -> v8` and `v6 -> v8`) with Pre-Migration Backup & Zero Data Loss
 // ---------------------------------------------------------------------------
 
 for (const fromVersion of [5, 6] as const) {
-  test(`Schema Compat — forward migration v${fromVersion} -> v7 creates 0600 backup, preserves all rows, passes status/doctor/daemon`, async () => {
-    await withSandbox(`schema-compat-v${fromVersion}-to-v7`, async (sandbox) => {
+  test(`Schema Compat — forward migration v${fromVersion} -> v8 creates 0600 backup, preserves all rows, passes status/doctor/daemon`, async () => {
+    await withSandbox(`schema-compat-v${fromVersion}-to-v8`, async (sandbox) => {
       const hyp = new HypCli(sandbox);
       const dbPath = path.join(sandbox.paths.hyphaeStateDir, "node.sqlite");
       seedHistoricalNodeDb(dbPath, fromVersion);
@@ -206,35 +206,35 @@ for (const fromVersion of [5, 6] as const) {
         { mode: 0o600 },
       );
 
-      // Run `hyp doctor --json` to trigger atomic v{5,6} -> v7 migration + VACUUM INTO backup!
+      // Run `hyp doctor --json` to trigger atomic v{5,6} -> v8 migration + VACUUM INTO backup!
       const docRes = await hyp.doctor();
-      assert.equal(docRes.exitCode, 0, `hyp doctor failed after v${fromVersion}->v7 migration: ${docRes.stderr}`);
+      assert.equal(docRes.exitCode, 0, `hyp doctor failed after v${fromVersion}->v8 migration: ${docRes.stderr}`);
       assert.equal(docRes.json?.ok, true, `hyp doctor not ok: ${docRes.stdout}`);
 
       const statusRes = await hyp.status();
       assert.equal(statusRes.exitCode, 0, `hyp status failed: ${statusRes.stderr}`);
       assert.equal(statusRes.json?.ok, true);
-      assert.equal(statusRes.json?.data?.storage?.schemaVersion, 7);
+      assert.equal(statusRes.json?.data?.storage?.schemaVersion, 8);
 
       // Verify pre-migration `.bak` backup created with strictly `0600` permissions!
       const backupsDir = path.join(sandbox.paths.hyphaeStateDir, "backups");
       assert.ok(fs.existsSync(backupsDir), "Pre-migration backups/ directory must exist");
       const backups = fs
         .readdirSync(backupsDir)
-        .filter((f) => f.startsWith(`node.sqlite.v${fromVersion}-to-v7-`) && f.endsWith(".bak"));
+        .filter((f) => f.startsWith(`node.sqlite.v${fromVersion}-to-v8-`) && f.endsWith(".bak"));
       assert.equal(
         backups.length,
         1,
-        `Expected 1 pre-migration v${fromVersion}-to-v7 backup in ${backupsDir}, found: ${JSON.stringify(backups)}`,
+        `Expected 1 pre-migration v${fromVersion}-to-v8 backup in ${backupsDir}, found: ${JSON.stringify(backups)}`,
       );
       const backupMode = fs.statSync(path.join(backupsDir, backups[0])).mode & 0o777;
       assert.equal(backupMode, 0o600, `Pre-migration backup must be 0600, got ${backupMode.toString(8)}`);
 
-      // Inspect migrated `node.sqlite` directly to confirm v7 schema + ZERO data loss across all tables!
+      // Inspect migrated `node.sqlite` directly to confirm v8 schema + ZERO data loss across all tables!
       const db = new DatabaseSync(dbPath, { readOnly: true });
       try {
         const verRow = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
-        assert.equal(verRow.v, 7, "Schema version must be upgraded to 7");
+        assert.equal(verRow.v, 8, "Schema version must be upgraded to 8");
 
         const sess = db
           .prepare("SELECT id, handle FROM sessions WHERE id = ?")
@@ -283,6 +283,11 @@ for (const fromVersion of [5, 6] as const) {
           )
           .get() as any;
         assert.equal(delegTbl?.name, "human_delegation_policies", "v7 table must be created");
+
+        const sealTbl = db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gate_lock_seal'")
+          .get() as any;
+        assert.equal(sealTbl?.name, "gate_lock_seal", "v8 gate_lock_seal table must be created");
       } finally {
         db.close();
       }

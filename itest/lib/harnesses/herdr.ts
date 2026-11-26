@@ -22,7 +22,6 @@ import type { Sandbox } from "../sandbox.ts";
 import { ClaudeHarness, resolveClaudeBin } from "./claude.ts";
 import {
   extractSessionsFromInspect,
-  type AdapterSessionHandle,
   type HarnessBootOptions,
   type HarnessRuntime,
   type RealHarnessAdapter,

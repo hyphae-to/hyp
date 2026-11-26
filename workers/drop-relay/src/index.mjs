@@ -1753,13 +1753,13 @@ function expandIpv6Groups(raw) {
     const right = dblParts[1] === "" ? [] : dblParts[1].split(":");
     const missing = 8 - (left.length + right.length);
     if (missing < 1) return null;
-    groupStrs = [...left, ...new Array(missing).fill("0"), ...right];
+    groupStrs = [...left, ...Array.from({ length: missing }, () => "0"), ...right];
   } else {
     groupStrs = addr.split(":");
     if (groupStrs.length !== 8) return null;
   }
 
-  const groups = new Array(8);
+  const groups = Array.from({ length: 8 });
   for (let i = 0; i < 8; i += 1) {
     const g = groupStrs[i];
     if (!/^[0-9a-f]{1,4}$/.test(g)) return null;

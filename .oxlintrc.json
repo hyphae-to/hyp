@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": [
+    "**/node_modules/**",
+    "**/*.d.ts",
+    "target/**",
+    "dist/**",
+    "itest-forensics/**"
+  ],
+  "rules": {
+    "no-control-regex": "off",
+    "unicorn/no-thenable": "off",
+    "unicorn/no-useless-fallback-in-spread": "off"
+  }
+}

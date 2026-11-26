@@ -13,7 +13,6 @@ import type {
   LlmProtocol,
   ScriptAction,
   ScriptRule,
-  ToolCallSpec,
 } from "./types.ts";
 
 /**

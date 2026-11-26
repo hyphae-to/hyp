@@ -10,7 +10,6 @@ import path from "node:path";
 import test from "node:test";
 import {
   HostCanary,
-  Sandbox,
   withSandbox,
 } from "../lib/sandbox.ts";
 import {

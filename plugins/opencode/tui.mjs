@@ -801,7 +801,7 @@ export function createHyphaeTuiController(options = {}) {
       clearTimeout(debounceTimer);
       debounceTimer = null;
     }
-    for (const dir of [...watchers.keys()]) {
+    for (const dir of Array.from(watchers.keys())) {
       closeWatcher(dir);
     }
   }

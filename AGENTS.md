@@ -68,7 +68,12 @@ All `hyp` CLI commands follow an **agent-first, consistent output contract** (`c
 
 ## Verification Checklist Before Committing
 
+Enable the repo pre-push hook once per clone (`git config core.hooksPath .githooks` or `just install-hooks`, running `cargo fmt --all -- --check` and JS/TS `oxlint --deny-warnings`):
+
 ```bash
+cargo fmt --all -- --check
+npm run lint:js
+npm run test:js
 cargo clippy --workspace --all-targets -- -D warnings
 # Clean-env form ensures zero ambient harness/session variables leak when run inside a live agent session:
 env -i HOME="$HOME" PATH="$PATH" USER="$USER" TMPDIR="${TMPDIR:-/tmp}" HYPHAE_SECRET_BACKEND=file cargo test --workspace

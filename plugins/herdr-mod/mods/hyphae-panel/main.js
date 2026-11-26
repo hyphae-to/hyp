@@ -35,7 +35,6 @@ import {
   formatNextFire,
   formatRelativeAge,
   getEffectiveQuarantinedCount,
-  parseTerminalAddress,
   qualifyChannelTarget,
   resolveSessionById,
   sanitizeUiText,
@@ -357,7 +356,7 @@ export default class HyphaePanel extends View {
       .child(label);
   }
 
-  renderHeader(t, target, cx) {
+  renderHeader(t, target, _cx) {
     const entry = target.entry;
     const isOverlay = Boolean(props()?.overlay);
     const hasDockPanel = Boolean(findLayoutNode(layout(), "panel-body") && findLayoutNode(layout(), "hyphae"));

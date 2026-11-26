@@ -323,7 +323,7 @@ function serializeJcs(value) {
   }
   if (t === "string") return escapeJcsString(value);
   if (Array.isArray(value)) {
-    const parts = new Array(value.length);
+    const parts = Array.from({ length: value.length });
     for (let i = 0; i < value.length; i++) {
       const item = value[i];
       parts[i] = item === undefined || typeof item === "function" || typeof item === "symbol"
@@ -419,7 +419,7 @@ const ED25519_P_LE = new Uint8Array([
 
 const SMALL_ORDER_ED25519_Y_LE = [
   new Uint8Array(32),
-  new Uint8Array([1, ...new Array(31).fill(0)]),
+  new Uint8Array([1, ...new Uint8Array(31)]),
   new Uint8Array([
     0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
@@ -436,7 +436,7 @@ const SMALL_ORDER_ED25519_Y_LE = [
 
 const LOW_ORDER_X25519_POINTS = [
   new Uint8Array(32),
-  new Uint8Array([1, ...new Array(31).fill(0)]),
+  new Uint8Array([1, ...new Uint8Array(31)]),
   new Uint8Array([
     0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
     0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00,

@@ -70,10 +70,16 @@ function startPlugin(name, env, { targets = [name], ackWith } = {}) {
   const events = [];
   let stderr = "";
   let exit = null;
+  child.stderr.on("error", () => {});
   child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
-  child.on("exit", (code, signal) => { exit = { code, signal }; });
   channel.on("error", () => {});
-  createInterface({ input: channel }).on("line", (line) => {
+  const rl = createInterface({ input: channel });
+  rl.on("error", () => {});
+  child.on("exit", (code, signal) => {
+    exit = { code, signal };
+    rl.close();
+  });
+  rl.on("line", (line) => {
     const msg = JSON.parse(line);
     if (msg.type !== "event") return;
     const reply = ackWith ? ackWith(msg, events.length) : { type: "ack", status: "stored" };
@@ -82,8 +88,15 @@ function startPlugin(name, env, { targets = [name], ackWith } = {}) {
   });
   channel.write(JSON.stringify({ type: "hello", protocol: 1, plugin: name, targets }) + "\n");
   cleanups.push(() => new Promise((resolve) => {
-    if (exit !== null) return resolve();
-    child.once("exit", resolve);
+    rl.close();
+    if (exit !== null) {
+      channel.destroy();
+      return resolve();
+    }
+    child.once("exit", () => {
+      channel.destroy();
+      resolve();
+    });
     child.kill("SIGKILL");
   }));
   return {

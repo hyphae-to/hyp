@@ -1759,7 +1759,6 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
   if (params.get("deploys") && ["mute", "notify", "queue"].includes(params.get("deploys"))) gateState.deploysMode = params.get("deploys");
   if (params.get("guard") === "0") gateState.guard = false;
 
-  let lastCmd = 'hyp_inbox({ mode: "queue", burst: "notify" })';
   let gatePlaying = fixedPhase === null && !reducedMotion;
   let gateRaf = null;
   let shieldTimer = null;
@@ -2679,54 +2678,23 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
     if (key === "ciMode") {
       const order = ["burst", "unsub", "all"];
       gateState.ciMode = order[(order.indexOf(gateState.ciMode) + 1) % order.length];
-      lastCmd =
-        gateState.ciMode === "burst"
-          ? 'hyp_stream({ topic: "ci", burstCap: "notify" })'
-          : gateState.ciMode === "unsub"
-          ? 'hyp_stream({ action: "unsubscribe", key: "ci" })'
-          : 'hyp_stream({ topic: "ci", burstCap: "off" })';
       renderControlCenter();
       return;
     }
     if (key === "aliceMode") {
       const order = ["queue", "interrupt", "notify", "mute"];
       gateState.aliceMode = order[(order.indexOf(gateState.aliceMode) + 1) % order.length];
-      lastCmd =
-        gateState.aliceMode === "mute"
-          ? 'hyp_inbox({ mute: "@alice" })'
-          : `hyp_inbox({ from: "@alice", mode: "${gateState.aliceMode}" })`;
       renderControlCenter();
       return;
     }
     if (key === "deploysMode") {
       const order = ["mute", "notify", "queue"];
       gateState.deploysMode = order[(order.indexOf(gateState.deploysMode) + 1) % order.length];
-      lastCmd =
-        gateState.deploysMode === "mute"
-          ? 'hyp_inbox({ mute: "#deploys" })'
-          : `hyp_inbox({ from: "#deploys", mode: "${gateState.deploysMode}" })`;
       renderControlCenter();
       return;
     }
     if (!(key in gateState)) return;
     gateState[key] = !gateState[key];
-    switch (key) {
-      case "publicLinked":
-        lastCmd = gateState.publicLinked
-          ? "hyp pair join https://public.hyphae.to"
-          : "hyp pair revoke public.hyphae.to";
-        break;
-      case "guard":
-        lastCmd = gateState.guard
-          ? "hyp gate init --adapter anthropic|openai|plugin"
-          : "hyp gate disable injection-guard";
-        break;
-      case "focus":
-        lastCmd = gateState.focus
-          ? 'hyp_inbox({ mode: "notify", filter: {...}, cursor })'
-          : 'hyp_inbox({ mode: "queue" })';
-        break;
-    }
     renderControlCenter();
   }
 
@@ -2751,12 +2719,6 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
       const val = ciStep.dataset.ci;
       if (["unsub", "burst", "all"].includes(val)) {
         gateState.ciMode = val;
-        lastCmd =
-          val === "burst"
-            ? 'hyp_stream({ topic: "ci", burstCap: "notify" })'
-            : val === "unsub"
-            ? 'hyp_stream({ action: "unsubscribe", key: "ci" })'
-            : 'hyp_stream({ topic: "ci", burstCap: "off" })';
         renderControlCenter();
       }
       return;
@@ -2764,7 +2726,6 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
     const resetEl = e.target.closest("[data-reset-gate]");
     if (resetEl) {
       gateState = { ...DEFAULT_STATE };
-      lastCmd = 'hyp_inbox({ mode: "queue", burst: "notify" })';
       renderControlCenter();
       return;
     }
@@ -2783,7 +2744,6 @@ if (new URLSearchParams(window.location.search).get("chapter") !== null) {
 
   document.getElementById("gateResetBtn")?.addEventListener("click", () => {
     gateState = { ...DEFAULT_STATE };
-    lastCmd = 'hyp_inbox({ mode: "queue", burst: "notify" })';
     renderControlCenter();
   });
 

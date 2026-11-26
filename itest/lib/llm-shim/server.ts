@@ -123,8 +123,6 @@ function flattenContentBlocks(content: unknown): string {
     } else if (block && typeof block === "object") {
       const b = block as any;
       if (typeof b.text === "string") parts.push(b.text);
-      else if (b.type === "input_text" && typeof b.text === "string") parts.push(b.text);
-      else if (b.type === "output_text" && typeof b.text === "string") parts.push(b.text);
     }
   }
   return parts.join("\n");
@@ -909,13 +907,13 @@ export class LlmShimServer {
   }
 
   private emitTurnRecorded(record: RecordedTurn): void {
-    for (const listener of [...this.turnListeners]) {
+    for (const listener of Array.from(this.turnListeners)) {
       listener(record);
     }
   }
 
   private emitTurnAborted(record: RecordedTurn): void {
-    for (const listener of [...this.abortListeners]) {
+    for (const listener of Array.from(this.abortListeners)) {
       listener(record);
     }
   }
