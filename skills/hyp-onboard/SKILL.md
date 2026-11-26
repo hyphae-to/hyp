@@ -1,5 +1,5 @@
 ---
-name: hyphae-onboard
+name: hyp-onboard
 description: Install and onboard the pure-Rust Hyphae (hyp) binary on laptops and servers — local, Direct P2P (hp2p1_), Team Hub (am2_), and Public Nodes (public.hyphae.to or self-hosted), all 9 coding harnesses, OS Keychain secrets, and Local Security Gates.
 ---
 

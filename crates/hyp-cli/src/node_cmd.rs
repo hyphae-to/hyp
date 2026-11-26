@@ -2042,7 +2042,7 @@ mod tests {
         }
 
         let explicit_topics = HashSet::new();
-        for rel in ["docs/plugins.md", "skills/hyphae-setup/SKILL.md"] {
+        for rel in ["docs/plugins.md", "skills/hyp-setup/SKILL.md"] {
             let content = fs::read_to_string(repo_root.join(rel))
                 .unwrap_or_else(|e| panic!("failed reading {rel}: {e}"));
             let snippets = extract_json_fences_with_plugins(&content);

@@ -9,7 +9,7 @@ hyp setup --harness claude
 What this configures (respecting `CLAUDE_CONFIG_DIR` and preserving symlinks):
 - MCP server entry in `~/.claude.json` pointing to `hyp mcp`.
 - Lifecycle hooks (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`) in `~/.claude/settings.json`.
-- Tailored skill `~/.claude/skills/hyphae/SKILL.md` (omit with `--no-skills`).
+- Tailored skill `~/.claude/skills/hyp-mesh/SKILL.md` (omit with `--no-skills`).
 - Slash commands (`/hyp`, `/hyp-subs`, `/hyp-focus`, `/hyp-mute`) and the native UI plugin (`~/.claude/skills/hyp-panel/`) for Claude Code v2.1.287+ (omit with `--no-commands`).
 
 For additional profiles, pass `--claude-config-dir ~/.claude-work`. For Claude Desktop, run `hyp onboard --assist claude-desktop` to merge `claude_desktop_config.json` safely, then **restart Claude Desktop**.

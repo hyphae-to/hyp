@@ -45,7 +45,7 @@ claude plugin test plugins/claude-code
 
 ### Option B — Direct `hyp setup` (Hooks, MCP, Slash Commands & Live `statusLine`)
 
-Configure Claude Code hooks, MCP server, `/hyphae*` slash commands, and opt into the persistent live `statusLine`:
+Configure Claude Code hooks, MCP server, `/hyp*` slash commands, and opt into the persistent live `statusLine`:
 
 ```sh
 hyp setup --harness claude --statusline
@@ -86,10 +86,10 @@ hyp setup --harness antigravity --restore-statusline
 
 ## Native Claude Code Status & Side Panel (`/hyp-panel`)
 
-On Claude Code **v2.1.287+**, `hyp setup --harness claude` automatically installs the UI-only `hyphae-panel` mod under `~/.claude/skills/hyp-panel/` (activates on your next Claude session):
+On Claude Code **v2.1.287+**, `hyp setup --harness claude` automatically installs the UI-only `hyp-panel` mod under `~/.claude/skills/hyp-panel/` (activates on your next Claude session):
 
 - **Quiet inline indicator (auto-hidden in Herdr)**: renders a single dim clickable line above the prompt outside Herdr (e.g. `@integration-tests · telegram:personal · 1 sub` — zero bright warning yellow, zero clutter when unenrolled). Automatically hides itself inside Herdr when the native Herdr mod (`hyphae-pane` / `hyphae-panel`) is active. Override anytime with `/hyp-panel status off|on` or `HYPHAE_PANEL_STATUS=off|on`.
-  - *Tip — pick one status bar:* If you use the native `hyphae-panel` plugin on Claude Code v2.1.287+, you don't need `--statusline` (shell `statusLine` chaining is mainly for Antigravity CLI `agy` or older Claude Code versions). If you previously ran `--statusline`, run `hyp setup --harness claude --restore-statusline` to avoid showing two bars.
+  - *Tip — pick one status bar:* If you use the native `hyp-panel` plugin on Claude Code v2.1.287+, you don't need `--statusline` (shell `statusLine` chaining is mainly for Antigravity CLI `agy` or older Claude Code versions). If you previously ran `--statusline`, run `hyp setup --harness claude --restore-statusline` to avoid showing two bars.
 - **Interactive side panel (`/hyp-panel`)**: run `/hyp-panel` (or `/hyp-panel subs|queue|rules|mesh|close`) to open the docked live inspector (`Esc` closes it, `1`–`4` switch tabs, `f` toggles Focus Mode, `r` refreshes):
   - **Header**: active `@handle`, daemon online indicator, `nodeId`, peer count, linked bridge target, `FOCUS` / `MUTED*` badges, and a prominent red `⚠ N quarantined` alert pointing to `hyp gate review`.
   - **Tabs**: **Subs** (linked external bridges like `telegram:personal [primary]` + `hyp_stream` subscriptions with `× unsub`), **Queue** (metadata-only `kind`, `source`, `urgency`, relative age), **Rules** (active mutes + `× unmute`, per-source urgency rules), and **Mesh** (`#channels` + `× leave`).

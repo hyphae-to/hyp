@@ -1540,7 +1540,8 @@ $HOME/.t3/skills"
       continue
     fi
     _seen_skill_roots="$(list_append_unique "$_seen_skill_roots" "$_root_real")"
-    for _skill_name in hyphae hyphae-setup hyphae-schedule hyphae-panel hyp-panel; do
+    for _skill_name in hyphae hyphae-setup hyphae-schedule hyphae-onboard hyphae-panel \
+      hyp-mesh hyp-setup hyp-schedule hyp-onboard hyp-panel; do
       _s="${_skill_root}/${_skill_name}"
       if [ -e "$_s" ] || [ -L "$_s" ]; then
         SKILL_DIRS_TO_REMOVE="$(list_append_unique "$SKILL_DIRS_TO_REMOVE" "$_s")"

@@ -231,8 +231,8 @@ while True:
         fs::write(&noop_plugin, CROSS_PLATFORM_NOOP_PLUGIN_PY).unwrap();
 
         // Extract the REAL documented JSON snippets from BOTH docs/plugins.md and
-        // skills/hyphae-setup/SKILL.md and boot `hyp daemon` using their exact schema (including `"command"`)!
-        for (doc_idx, rel) in ["docs/plugins.md", "skills/hyphae-setup/SKILL.md"]
+        // skills/hyp-setup/SKILL.md and boot `hyp daemon` using their exact schema (including `"command"`)!
+        for (doc_idx, rel) in ["docs/plugins.md", "skills/hyp-setup/SKILL.md"]
             .iter()
             .enumerate()
         {

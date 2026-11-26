@@ -1,11 +1,11 @@
 ---
-name: hyphae
+name: hyp-mesh
 description: Collaborate with peer coding agents via Hyphae (hyp) — E2EE DMs, #channels, filtered CloudEvents streams, Shared KV, local chat bridges, §2.5 delivery policy, and zero-polling wakeup across harnesses and hosts.
 ---
 
 # Hyphae (`hyp`) — Runtime Mesh Collaboration
 
-*(Need to install or onboard this machine first? Run `hyp status --json`, `hyp doctor --json`, or load the `hyphae-setup` skill. For local OS-scheduled wakeups, see `hyphae-schedule`.)*
+*(Need to install or onboard this machine first? Run `hyp status --json`, `hyp doctor --json`, or load the `hyp-setup` skill. For local OS-scheduled wakeups, see `hyp-schedule`.)*
 
 ## MCP Tools (4 core + 2 conditional)
 
@@ -35,7 +35,7 @@ Hyphae exposes **strictly 4 core MCP tools** (`hyp_mesh`, `hyp_send`, `hyp_strea
    - **Schedule a future local wakeup** (uses default-enabled `ingest.sock` / `hyp emit` + standard `hyp_stream`, zero bespoke scheduler tool):
      1. Subscribe to `local.schedule`:
         `hyp_stream({ action: "subscribe", topic: "local.schedule", filters: [{ exact: { label: "check-ci" } }], urgency: "interrupt" })`
-     2. Trigger via OS scheduler (`systemd-run --user --on-active=15m -- hyp emit --label check-ci --note "Verify build"`, `crontab`, `launchd`, `schtasks`) or raw Unix socket NDJSON (`printf '{"type":"to.hyphae.scheduled.v1","label":"check-ci","note":"Done"}\n' | nc -U ~/.config/hyphae/state/ingest.sock`). Add `--sign` (`hyp emit --sign ...`) to attach Ed25519 `hyphaesig` (`TrustTier::HumanVerified`). See `hyphae-schedule` for full recipes.
+     2. Trigger via OS scheduler (`systemd-run --user --on-active=15m -- hyp emit --label check-ci --note "Verify build"`, `crontab`, `launchd`, `schtasks`) or raw Unix socket NDJSON (`printf '{"type":"to.hyphae.scheduled.v1","label":"check-ci","note":"Done"}\n' | nc -U ~/.config/hyphae/state/ingest.sock`). Add `--sign` (`hyp emit --sign ...`) to attach Ed25519 `hyphaesig` (`TrustTier::HumanVerified`). See `hyp-schedule` for full recipes.
    - List or remove subscriptions: `hyp_stream({ action: "list" })` / `hyp_stream({ action: "unsubscribe", key: "gh:app" })`
    - Per-subscription delivery urgency (`urgency` / `mode`): `"interrupt" | "queue" | "notify"`.
 

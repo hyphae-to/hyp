@@ -2,7 +2,7 @@
 
 One shared stateless `hyp mcp` subprocess (~2.8 MB RSS) multiplexes concurrent threads across coding harnesses, backed by `CallRegistry` and per-session HMAC `sessionToken`s.
 
-Run `hyp setup --harness auto` (or `--harness <comma-list>`) to wire MCP entries, lifecycle hooks, and orchestrator-aware tailored `hyphae/SKILL.md` guides. Refresh managed skills after upgrades with `hyp setup --refresh-skills`.
+Run `hyp setup --harness auto` (or `--harness <comma-list>`) to wire MCP entries, lifecycle hooks, and orchestrator-aware tailored `hyp-mesh/SKILL.md` guides. Refresh managed skills after upgrades with `hyp setup --refresh-skills`.
 
 ## Support Matrix
 

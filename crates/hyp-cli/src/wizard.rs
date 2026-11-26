@@ -1,4 +1,4 @@
-//! Interactive Fullscreen Mycelium Onboarding Wizard & `hyphae-setup` Agent Concierge.
+//! Interactive Fullscreen Mycelium Onboarding Wizard & `hyp-setup` Agent Concierge.
 //!
 //! Pure Rust (zero external TUI crates):
 //! - Fullscreen alternate-screen (`\x1b[?1049h` / `\x1b[?1049l`) RAII guard and Unix `/dev/tty`
@@ -8,7 +8,7 @@
 //! - Zero-typing highlighted menus showing only harnesses detected on this machine, including a
 //!   native Herdr (`hc templates --json`) launch-template picker sub-screen.
 //! - Clean two-path handoff: Path A auto-launches interactive CLIs / Herdr templates after
-//!   installing `hyphae-setup/SKILL.md`; Path B installs the skill and presents an interactive
+//!   installing `hyp-setup/SKILL.md`; Path B installs the skill and presents an interactive
 //!   copy-paste guide screen (with clipboard support) for OpenClaw, T3 Code, and config-only CLIs.
 
 use crate::config_file::{
@@ -40,8 +40,8 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
-/// Embedded pure-Rust v2 `hyphae-setup` concierge skill (zero network access needed).
-pub const HYPHAE_SETUP_SKILL_MD: &str = include_str!("../../../skills/hyphae-setup/SKILL.md");
+/// Embedded pure-Rust v2 `hyp-setup` concierge skill (zero network access needed).
+pub const HYPHAE_SETUP_SKILL_MD: &str = include_str!("../../../skills/hyp-setup/SKILL.md");
 
 pub const DEFAULT_CANVAS_WIDTH: usize = 54;
 pub const DEFAULT_CANVAS_HEIGHT: usize = 18;
@@ -155,12 +155,12 @@ impl LaunchableHarness {
         }
     }
 
-    /// Primary global skill file path for `hyphae-setup/SKILL.md`.
+    /// Primary global skill file path for `hyp-setup/SKILL.md`.
     pub fn primary_skill_path(self, home: &Path) -> PathBuf {
         self.primary_skill_path_for(home, true, None)
     }
 
-    /// Profile-aware primary skill path for `hyphae-setup/SKILL.md` (honors `$CLAUDE_CONFIG_DIR`
+    /// Profile-aware primary skill path for `hyp-setup/SKILL.md` (honors `$CLAUDE_CONFIG_DIR`
     /// and `--claude-config-dir` for Claude Code).
     pub fn primary_skill_path_for(
         self,
@@ -176,35 +176,35 @@ impl LaunchableHarness {
                 .unwrap_or_else(|| {
                     home.join(".claude")
                         .join("skills")
-                        .join("hyphae-setup")
+                        .join("hyp-setup")
                         .join("SKILL.md")
                 }),
             Self::Codex => home
                 .join(".codex")
                 .join("skills")
-                .join("hyphae-setup")
+                .join("hyp-setup")
                 .join("SKILL.md"),
             Self::Antigravity => home
                 .join(".gemini")
                 .join("config")
                 .join("skills")
-                .join("hyphae-setup")
+                .join("hyp-setup")
                 .join("SKILL.md"),
             Self::Opencode => home
                 .join(".config")
                 .join("opencode")
                 .join("skills")
-                .join("hyphae-setup")
+                .join("hyp-setup")
                 .join("SKILL.md"),
             Self::Cursor => home
                 .join(".cursor")
                 .join("skills")
-                .join("hyphae-setup")
+                .join("hyp-setup")
                 .join("SKILL.md"),
             Self::Gemini => home
                 .join(".gemini")
                 .join("skills")
-                .join("hyphae-setup")
+                .join("hyp-setup")
                 .join("SKILL.md"),
         }
     }
@@ -238,7 +238,7 @@ impl LaunchableHarness {
             Self::Codex => vec![
                 home.join(".agents")
                     .join("skills")
-                    .join("hyphae-setup")
+                    .join("hyp-setup")
                     .join("SKILL.md"),
             ],
             _ => Vec::new(),
@@ -264,7 +264,7 @@ impl LaunchableHarness {
 }
 
 /// Non-launchable Desktop/IDE/GUI/daemon harnesses (or CLI harnesses whose binary is not on PATH)
-/// handled cleanly via Path B (install `hyphae-setup` skill + interactive copy-paste / deep-link guide).
+/// handled cleanly via Path B (install `hyp-setup` skill + interactive copy-paste / deep-link guide).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManualGuideHarness {
     ClaudeDesktop,
@@ -348,12 +348,12 @@ impl ManualGuideHarness {
             Self::Openclaw => home
                 .join(".openclaw")
                 .join("skills")
-                .join("hyphae-setup")
+                .join("hyp-setup")
                 .join("SKILL.md"),
             Self::T3 => home
                 .join(".agents")
                 .join("skills")
-                .join("hyphae-setup")
+                .join("hyp-setup")
                 .join("SKILL.md"),
             Self::ConfigOnlyCli(lh) => {
                 lh.primary_skill_path_for(home, explicit_home, claude_config_dir)
@@ -382,7 +382,7 @@ impl ManualGuideHarness {
             Self::OpenCodeDesktop => vec![
                 home.join(".agents")
                     .join("skills")
-                    .join("hyphae-setup")
+                    .join("hyp-setup")
                     .join("SKILL.md"),
             ],
             Self::CursorIde => Vec::new(),
@@ -401,7 +401,7 @@ impl ManualGuideHarness {
                 out.push(
                     home.join(".codex")
                         .join("skills")
-                        .join("hyphae-setup")
+                        .join("hyp-setup")
                         .join("SKILL.md"),
                 );
                 out
@@ -3590,7 +3590,7 @@ pub fn parse_herdr_run_address_json(raw: &str) -> Option<String> {
 }
 
 /// Infers which coding harness a Herdr template runs from its `name` and `command`
-/// so `hyphae-setup/SKILL.md` is installed into the right global skill directory before launch.
+/// so `hyp-setup/SKILL.md` is installed into the right global skill directory before launch.
 pub fn infer_harness_from_herdr_template(
     template_name: &str,
     template_command: &str,
@@ -4083,7 +4083,7 @@ fn parse_skill_harness_selection(
     Ok(selected)
 }
 
-/// Installs the embedded `hyphae-setup/SKILL.md` for all specified harnesses (deduplicating paths).
+/// Installs the embedded `hyp-setup/SKILL.md` for all specified harnesses (deduplicating paths).
 #[allow(dead_code)]
 pub fn install_setup_skill_for_harnesses(
     home: &Path,
@@ -4092,7 +4092,7 @@ pub fn install_setup_skill_for_harnesses(
     install_setup_skill_for_harnesses_with_claude(home, true, None, harnesses)
 }
 
-/// Profile-aware installer for `hyphae-setup/SKILL.md` that deduplicates symlinked `skills/`
+/// Profile-aware installer for `hyp-setup/SKILL.md` that deduplicates symlinked `skills/`
 /// directories by canonical path while populating distinct `$CLAUDE_CONFIG_DIR` skill dirs.
 pub fn install_setup_skill_for_harnesses_with_claude(
     home: &Path,
@@ -4110,12 +4110,12 @@ pub fn install_setup_skill_for_harnesses_with_claude(
             continue;
         };
         if written_paths.insert(canonical_dedup_key(&primary)) {
-            write_atomic_file(&primary, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
+            write_setup_skill(&primary)?;
         }
         let mut written_extras = Vec::new();
         for extra in extras {
             if written_paths.insert(canonical_dedup_key(&extra)) {
-                write_atomic_file(&extra, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
+                write_setup_skill(&extra)?;
             }
             written_extras.push(extra.display().to_string());
         }
@@ -4127,14 +4127,14 @@ pub fn install_setup_skill_for_harnesses_with_claude(
     }
 
     // If `<home>/.agents` already exists and wasn't populated yet (e.g., Codex/T3 not detected),
-    // also populate `<home>/.agents/skills/hyphae-setup/SKILL.md` for cross-tool discovery.
+    // also populate `<home>/.agents/skills/hyp-setup/SKILL.md` for cross-tool discovery.
     let agents_skill = home
         .join(".agents")
         .join("skills")
-        .join("hyphae-setup")
+        .join("hyp-setup")
         .join("SKILL.md");
     if home.join(".agents").is_dir() && written_paths.insert(canonical_dedup_key(&agents_skill)) {
-        write_atomic_file(&agents_skill, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
+        write_setup_skill(&agents_skill)?;
         entries.push(InstalledSkillEntry {
             harness: "agents".to_string(),
             path: agents_skill.display().to_string(),
@@ -4143,6 +4143,21 @@ pub fn install_setup_skill_for_harnesses_with_claude(
     }
 
     Ok(entries)
+}
+
+fn write_setup_skill(path: &Path) -> Result<(), String> {
+    // The stock setup skill predates the managed runtime marker.
+    const LEGACY_DIGESTS: &[&str] = &[
+        "4a336e5b76253e513b4f57edae22cc9fbb2640080294c5cf0622912c1fb02186",
+        "c86649c74bbca523f0cb5a2408fc5fd3080812f8aba1b28a921c0de8af16a547",
+        "d34e2926a7f1d801b875efe526cc9e6044cd59201aad3b9bb3b3c4ff20ca7d48",
+        "934bc876321ad2abf31c8bb918bc21d44e1257b70699a478a51cf80b659632d7",
+        "d78d6f7cd123e39442fbe13158d0a15827e8d076a9d1b6e3fc54b872d6928e23",
+    ];
+    write_atomic_file(path, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
+    crate::skill_render::retire_legacy_skill(path, "hyphae-setup", |text| {
+        LEGACY_DIGESTS.contains(&hyp_store::sha256_hex(text.as_bytes()).as_str())
+    })
 }
 
 /// Entrypoint for `hyp onboard --install-skill`.
@@ -4199,7 +4214,7 @@ pub fn run_install_skill(
     }
 
     let summary = format!(
-        "Installed 'hyphae-setup' skill for {} harness target(s)",
+        "Installed 'hyp-setup' skill for {} harness target(s)",
         installed.len()
     );
     let next = if installed.is_empty() {
@@ -4209,7 +4224,7 @@ pub fn run_install_skill(
         )]
     } else {
         vec![
-            "Open any configured agent harness and invoke the 'hyphae-setup' skill.".to_string(),
+            "Open any configured agent harness and invoke the 'hyp-setup' skill.".to_string(),
             "Or run `hyp onboard --assist` to launch guided setup directly.".to_string(),
         ]
     };
@@ -4221,7 +4236,7 @@ pub fn run_install_skill(
             summary: Some(summary),
             data: Some(json!({
                 "mode": "install-skill",
-                "skill": "hyphae-setup",
+                "skill": "hyp-setup",
                 "home": home.display().to_string(),
                 "installedCount": installed.len(),
                 "installed": installed,
@@ -4273,11 +4288,11 @@ pub fn build_onboarding_prompt(skill_path: &Path, existing_node_id: Option<&str>
     let path_str = skill_path.display();
     if let Some(node_id) = existing_node_id {
         format!(
-            "Load and follow the hyphae-setup skill (installed at {path_str}) to inspect my existing Hyphae node ({node_id}) and help me update my harnesses, peers, hubs, streams, bridges, or security gates."
+            "Load and follow the hyp-setup skill (installed at {path_str}) to inspect my existing Hyphae node ({node_id}) and help me update my harnesses, peers, hubs, streams, bridges, or security gates."
         )
     } else {
         format!(
-            "Load and follow the hyphae-setup skill (installed at {path_str}) to onboard me to Hyphae and configure my local node, harnesses, and any peers, hubs, streams, bridges, or security gates I want."
+            "Load and follow the hyp-setup skill (installed at {path_str}) to onboard me to Hyphae and configure my local node, harnesses, and any peers, hubs, streams, bridges, or security gates I want."
         )
     }
 }
@@ -4289,7 +4304,7 @@ pub fn build_manual_guide_prompt(
 ) -> String {
     if let Some(node_id) = existing_node_id {
         return format!(
-            "Load and follow the hyphae-setup skill to inspect my existing Hyphae node ({node_id}) and configure my harnesses, peers, and transports."
+            "Load and follow the hyp-setup skill to inspect my existing Hyphae node ({node_id}) and configure my harnesses, peers, and transports."
         );
     }
     match harness {
@@ -4297,12 +4312,12 @@ pub fn build_manual_guide_prompt(
         | ManualGuideHarness::CodexDesktop
         | ManualGuideHarness::OpenCodeDesktop
         | ManualGuideHarness::CursorIde => {
-            "Set up Hyphae on this machine using the hyphae-setup skill".to_string()
+            "Set up Hyphae on this machine using the hyp-setup skill".to_string()
         }
         ManualGuideHarness::Openclaw
         | ManualGuideHarness::T3
         | ManualGuideHarness::ConfigOnlyCli(_) => {
-            "Load and follow the hyphae-setup skill to onboard me to Hyphae and configure my local node, harnesses, and transports."
+            "Load and follow the hyp-setup skill to onboard me to Hyphae and configure my local node, harnesses, and transports."
                 .to_string()
         }
     }
@@ -4717,7 +4732,7 @@ fn collect_skill_targets_with_primary(
 
 fn print_installed_skills_banner(installed: &[InstalledSkillEntry]) {
     println!();
-    println!("Installed 'hyphae-setup' skill:");
+    println!("Installed 'hyp-setup' skill:");
     for item in installed {
         println!("  • [{}] {}", item.harness, item.path);
         for extra in &item.extra_paths {
@@ -4840,9 +4855,9 @@ fn install_and_handoff_herdr(
         let fallback = home
             .join(".agents")
             .join("skills")
-            .join("hyphae-setup")
+            .join("hyp-setup")
             .join("SKILL.md");
-        if let Err(e) = write_atomic_file(&fallback, HYPHAE_SETUP_SKILL_MD.as_bytes(), false) {
+        if let Err(e) = write_setup_skill(&fallback) {
             return emit_error(
                 "onboard",
                 as_json,
@@ -4906,7 +4921,7 @@ fn install_manual_guide_skills(
     for extra in harness.extra_skill_paths_for(home, explicit_home, claude_config_dir) {
         if already_recorded.insert(canonical_dedup_key(&extra)) {
             let extra_str = extra.display().to_string();
-            write_atomic_file(&extra, HYPHAE_SETUP_SKILL_MD.as_bytes(), false)?;
+            write_setup_skill(&extra)?;
             if let Some(first) = installed.first_mut() {
                 first.extra_paths.push(extra_str);
             } else {
@@ -4938,7 +4953,7 @@ fn print_manual_guide_plain(
 ) {
     println!();
     println!(
-        "OK    Installed 'hyphae-setup' skill to {}",
+        "OK    Installed 'hyp-setup' skill to {}",
         primary_skill.display()
     );
     for item in installed {
@@ -5039,7 +5054,7 @@ fn install_and_emit_manual_guide(
             "mode": "manual_guide",
             "harness": harness.id(),
             "displayName": harness.display_name(),
-            "skill": "hyphae-setup",
+            "skill": "hyp-setup",
             "primarySkillPath": primary_skill.display().to_string(),
             "installedCount": installed.len(),
             "installed": installed,
@@ -5068,7 +5083,7 @@ fn install_and_emit_manual_guide(
             ok: true,
             command: "onboard".to_string(),
             summary: Some(format!(
-                "Installed 'hyphae-setup' skill for {} (manual handoff guide)",
+                "Installed 'hyp-setup' skill for {} (manual handoff guide)",
                 harness.display_name()
             )),
             data: Some(data),
@@ -5862,7 +5877,7 @@ pub fn render_desktop_mcp_confirm(
         )
     ));
     let skill_ok = format!(
-        "✓ Installed hyphae-setup skill to {}",
+        "✓ Installed hyp-setup skill to {}",
         display_compact_path(primary_skill, home)
     );
     lines.push(format!(
@@ -6045,7 +6060,7 @@ pub fn render_manual_guide(
     lines.push(String::new());
 
     let confirm = format!(
-        "✓ Installed hyphae-setup skill to {}",
+        "✓ Installed hyp-setup skill to {}",
         display_compact_path(primary_skill, home)
     );
     lines.push(format!(
@@ -6500,7 +6515,7 @@ impl SetupToggleState {
                     );
                     if sel.install_skills {
                         preview.push(
-                            "  + skill: ~/.gemini/config/plugins/hyphae/skills/hyphae/SKILL.md"
+                            "  + skill: ~/.gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md"
                                 .to_string(),
                         );
                     }
@@ -6527,14 +6542,14 @@ impl SetupToggleState {
                         );
                     }
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.claude/skills/hyphae/SKILL.md".to_string());
+                        preview.push("  + skill: ~/.claude/skills/hyp-mesh/SKILL.md".to_string());
                     }
                 }
                 HarnessKind::Codex => {
                     preview.push("codex: ~/.codex/{config.toml,hooks.json}".to_string());
                     if sel.install_skills {
                         preview.push(
-                            "  + skill: ~/.codex/skills/hyphae/SKILL.md (+ ~/.agents/skills/hyphae/SKILL.md)"
+                            "  + skill: ~/.codex/skills/hyp-mesh/SKILL.md (+ ~/.agents/skills/hyp-mesh/SKILL.md)"
                                 .to_string(),
                         );
                     }
@@ -6542,7 +6557,7 @@ impl SetupToggleState {
                 HarnessKind::Cursor => {
                     preview.push("cursor: ~/.cursor/{mcp.json,hooks.json}".to_string());
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.cursor/skills/hyphae/SKILL.md".to_string());
+                        preview.push("  + skill: ~/.cursor/skills/hyp-mesh/SKILL.md".to_string());
                     }
                 }
                 HarnessKind::Opencode => {
@@ -6552,14 +6567,14 @@ impl SetupToggleState {
                     );
                     if sel.install_skills {
                         preview.push(
-                            "  + skill: ~/.config/opencode/skills/hyphae/SKILL.md".to_string(),
+                            "  + skill: ~/.config/opencode/skills/hyp-mesh/SKILL.md".to_string(),
                         );
                     }
                 }
                 HarnessKind::Gemini => {
                     preview.push("gemini: ~/.gemini/settings.json (MCP + hooks)".to_string());
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.gemini/skills/hyphae/SKILL.md".to_string());
+                        preview.push("  + skill: ~/.gemini/skills/hyp-mesh/SKILL.md".to_string());
                     }
                 }
                 HarnessKind::Openclaw => {
@@ -6573,7 +6588,7 @@ impl SetupToggleState {
                         if sel.openclaw_prompt_injection { "on" } else { "off" }
                     ));
                     if sel.install_skills {
-                        preview.push("  + skill: ~/.openclaw/skills/hyphae/SKILL.md".to_string());
+                        preview.push("  + skill: ~/.openclaw/skills/hyp-mesh/SKILL.md".to_string());
                     }
                 }
                 HarnessKind::Herdr => {
@@ -6582,8 +6597,9 @@ impl SetupToggleState {
                             .to_string(),
                     );
                     if sel.install_skills {
-                        preview
-                            .push("  + skill: ~/.config/herdr/skills/hyphae/SKILL.md".to_string());
+                        preview.push(
+                            "  + skill: ~/.config/herdr/skills/hyp-mesh/SKILL.md".to_string(),
+                        );
                     }
                     if sel.install_herdr_mod {
                         preview.push(
@@ -6596,7 +6612,7 @@ impl SetupToggleState {
                     preview.push("t3: ~/.config/hyphae/node.json (\"t3\" block)".to_string());
                     if sel.install_skills {
                         preview.push(
-                            "  + skill: ~/.t3/skills/hyphae/SKILL.md (+ ~/.agents/skills/hyphae/SKILL.md)"
+                            "  + skill: ~/.t3/skills/hyp-mesh/SKILL.md (+ ~/.agents/skills/hyp-mesh/SKILL.md)"
                                 .to_string(),
                         );
                     }
@@ -7111,7 +7127,7 @@ fn harness_toggle_display(kind: HarnessKind) -> (&'static str, &'static str) {
 
 fn component_toggle_display(idx: usize) -> (&'static str, &'static str) {
     match idx {
-        9 => ("Runtime skills", "(hyphae/SKILL.md)"),
+        9 => ("Runtime skills", "(hyp-mesh/SKILL.md)"),
         10 => (
             "Live statusLine",
             "(Claude Code / Antigravity — chains existing)",
@@ -9772,7 +9788,7 @@ mod tests {
 
         // Launch command builder (`hc run --bg --outlive-parent --label app=hyphae --json`).
         let hc_path = Path::new("/usr/local/bin/hc");
-        let prompt = "Load and follow hyphae-setup";
+        let prompt = "Load and follow hyp-setup";
         let cmd = build_herdr_template_launch_command(hc_path, "claude-gateway", prompt);
         assert_eq!(cmd.get_program(), OsStr::new("/usr/local/bin/hc"));
         let args: Vec<&OsStr> = cmd.get_args().collect();
@@ -10675,7 +10691,7 @@ command = "other"
             "/opt/hyp",
             &ManualGuideHarness::ClaudeDesktop.primary_skill_path(&home),
             &[],
-            "Set up Hyphae on this machine using the hyphae-setup skill",
+            "Set up Hyphae on this machine using the hyp-setup skill",
             &DesktopMcpStatus::Applied(plan.config_path.clone()),
             Some("claude://claude.ai/new?q=test"),
             0,
@@ -10765,7 +10781,7 @@ command = "other"
 
     #[test]
     fn launch_command_builders_match_all_six_verified_clis() {
-        let prompt = "Load and follow hyphae-setup";
+        let prompt = "Load and follow hyp-setup";
 
         let claude = LaunchableHarness::Claude.build_launch_spec(prompt);
         assert_eq!(claude.program, "claude");
@@ -10835,7 +10851,7 @@ command = "other"
     #[test]
     fn embedded_skill_matches_frontmatter_and_security_invariants() {
         let normalized = HYPHAE_SETUP_SKILL_MD.replace("\r\n", "\n");
-        assert!(normalized.starts_with("---\nname: hyphae-setup\n"));
+        assert!(normalized.starts_with("---\nname: hyp-setup\n"));
         assert!(!HYPHAE_SETUP_SKILL_MD.contains("hyp share"));
         assert!(!HYPHAE_SETUP_SKILL_MD.contains("npm install"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp pair ssh"));

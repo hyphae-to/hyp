@@ -18,10 +18,10 @@ use crate::pair::{
 };
 use crate::service;
 use crate::skill_render::{
-    HostOrchestratorHints, SkillCapabilities, SkillProfile, SkillTargetHarness, SkillWriteOutcome,
-    UNMANAGED_MARKER, apply_managed_skill, detect_capabilities_from_config_path,
-    detect_host_orchestrators, render_runtime_skill, resolve_transport_for_harness,
-    runtime_skill_paths,
+    HostOrchestratorHints, MANAGED_MARKER_PREFIX, SkillCapabilities, SkillProfile,
+    SkillTargetHarness, SkillWriteOutcome, UNMANAGED_MARKER, apply_managed_skill,
+    detect_capabilities_from_config_path, detect_host_orchestrators, render_runtime_skill,
+    resolve_transport_for_harness, retire_legacy_skill, runtime_skill_paths,
 };
 use crate::ui::{
     EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
@@ -70,11 +70,11 @@ impl ClaudeConfigProfile {
     }
 
     pub fn runtime_skill_path(&self) -> PathBuf {
-        self.skills_dir().join("hyphae").join("SKILL.md")
+        self.skills_dir().join("hyp-mesh").join("SKILL.md")
     }
 
     pub fn setup_skill_path(&self) -> PathBuf {
-        self.skills_dir().join("hyphae-setup").join("SKILL.md")
+        self.skills_dir().join("hyp-setup").join("SKILL.md")
     }
 
     pub fn panel_dir(&self) -> PathBuf {
@@ -364,13 +364,13 @@ pub struct SetupArgs {
     /// Plan changes without writing or modifying any files on disk
     #[arg(long)]
     pub dry_run: bool,
-    /// Refresh only managed runtime hyphae/SKILL.md files without rewriting hooks or MCP configs
+    /// Refresh only managed runtime hyp-mesh/SKILL.md files without rewriting hooks or MCP configs
     #[arg(long)]
     pub refresh_skills: bool,
     /// Overwrite runtime SKILL.md files even when they contain <!-- hyphae:unmanaged -->
     #[arg(long)]
     pub force_skills: bool,
-    /// Skip writing/updating runtime hyphae/SKILL.md files (keep MCP & hooks only)
+    /// Skip writing/updating runtime hyp-mesh/SKILL.md files (keep MCP & hooks only)
     #[arg(long)]
     pub no_skills: bool,
     /// Skip installing Claude Code slash commands (~/.claude/commands/hyp*.md)
@@ -446,10 +446,10 @@ pub struct OnboardArgs {
     /// Skip interactive wizard and run deterministic local CLI onboarding directly
     #[arg(long, short = 'y')]
     pub yes: bool,
-    /// Install the 'hyphae-setup' skill and launch guided onboarding in an agent harness (auto, claude, codex, agy, opencode, cursor, gemini)
+    /// Install the 'hyp-setup' skill and launch guided onboarding in an agent harness (auto, claude, codex, agy, opencode, cursor, gemini)
     #[arg(long, num_args = 0..=1, default_missing_value = "auto", value_name = "HARNESS")]
     pub assist: Option<String>,
-    /// Install the embedded 'hyphae-setup' skill for detected (or --harness) harnesses and exit
+    /// Install the embedded 'hyp-setup' skill for detected (or --harness) harnesses and exit
     #[arg(long)]
     pub install_skill: bool,
     /// Disable the dot-matrix mycelium intro animation
@@ -467,7 +467,7 @@ pub struct OnboardArgs {
     /// Install native Herdr desktop mod (`hyphae-pane` + `hyphae-panel`, symlink-safe) when Herdr is selected
     #[arg(long = "mod")]
     pub install_mod: bool,
-    /// Skip writing/updating runtime hyphae/SKILL.md files during onboarding
+    /// Skip writing/updating runtime hyp-mesh/SKILL.md files during onboarding
     #[arg(long)]
     pub no_skills: bool,
     /// Skip installing Claude Code slash commands (~/.claude/commands/hyp*.md) during onboarding
@@ -2296,12 +2296,9 @@ pub fn detect_harness_statuses(
                     (has_cfg, loc)
                 }
                 HarnessKind::Herdr => {
-                    let skill = home
-                        .join(".config")
-                        .join("herdr")
-                        .join("skills")
-                        .join("hyphae")
-                        .join("SKILL.md");
+                    let skill_root = home.join(".config").join("herdr").join("skills");
+                    let skill = skill_root.join("hyp-mesh/SKILL.md");
+                    let legacy_skill = skill_root.join("hyphae/SKILL.md");
                     let mod_pane = home
                         .join(".config")
                         .join("herdr-app")
@@ -2311,6 +2308,8 @@ pub fn detect_harness_statuses(
                     let legacy = home.join(".config").join("herdr").join("hyphae.json");
                     if skill.exists() {
                         (true, skill.display().to_string())
+                    } else if legacy_skill.exists() {
+                        (true, legacy_skill.display().to_string())
                     } else if mod_pane.exists() {
                         (true, mod_pane.display().to_string())
                     } else {
@@ -2318,11 +2317,9 @@ pub fn detect_harness_statuses(
                     }
                 }
                 HarnessKind::T3 => {
-                    let t3_skill = home
-                        .join(".t3")
-                        .join("skills")
-                        .join("hyphae")
-                        .join("SKILL.md");
+                    let skill_root = home.join(".t3").join("skills");
+                    let t3_skill = skill_root.join("hyp-mesh/SKILL.md");
+                    let legacy_skill = skill_root.join("hyphae/SKILL.md");
                     let legacy = home.join(".t3").join("hyphae.json");
                     let in_node_cfg = config_path
                         .and_then(|path| NodeFile::read_document(path).ok())
@@ -2333,10 +2330,18 @@ pub fn detect_harness_statuses(
                             .unwrap_or_else(|| t3_skill.display().to_string())
                     } else if t3_skill.exists() {
                         t3_skill.display().to_string()
+                    } else if legacy_skill.exists() {
+                        legacy_skill.display().to_string()
                     } else {
                         legacy.display().to_string()
                     };
-                    (in_node_cfg || t3_skill.exists() || legacy.exists(), loc)
+                    (
+                        in_node_cfg
+                            || t3_skill.exists()
+                            || legacy_skill.exists()
+                            || legacy.exists(),
+                        loc,
+                    )
                 }
             };
 
@@ -2676,6 +2681,15 @@ fn install_harness_runtime_skills(
     for path in std::iter::once(primary).chain(extras) {
         match apply_managed_skill(&path, &rendered, ctx.force_skills, dry_run)? {
             SkillWriteOutcome::Written | SkillWriteOutcome::Unchanged => {
+                if !dry_run {
+                    retire_legacy_skill(&path, "hyphae", |text| {
+                        text.starts_with("---\nname: hyphae\n")
+                            && text
+                                .lines()
+                                .any(|line| line.starts_with(MANAGED_MARKER_PREFIX))
+                            && !text.contains(UNMANAGED_MARKER)
+                    })?;
+                }
                 files.push(path.display().to_string());
             }
             SkillWriteOutcome::SkippedUnmanaged => {
@@ -2710,7 +2724,7 @@ fn refresh_harness_skill_only(
     )?;
     if notes.is_empty() {
         notes.push(format!(
-            "Refreshed tailored runtime hyphae/SKILL.md for {}.",
+            "Refreshed tailored runtime hyp-mesh/SKILL.md for {}.",
             kind.as_str()
         ));
     }

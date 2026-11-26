@@ -893,8 +893,8 @@ fast_mode = true
         assert!(h.join(".config/opencode/plugins/hyphae.ts").exists());
         assert!(!h.join(".config/herdr/hyphae.json").exists());
         assert!(!h.join(".t3/hyphae.json").exists());
-        assert!(h.join(".config/herdr/skills/hyphae/SKILL.md").exists());
-        assert!(h.join(".t3/skills/hyphae/SKILL.md").exists());
+        assert!(h.join(".config/herdr/skills/hyp-mesh/SKILL.md").exists());
+        assert!(h.join(".t3/skills/hyp-mesh/SKILL.md").exists());
 
         // Now run `scripts/uninstall.sh --yes`!
         let script = repo_root().join("scripts/uninstall.sh");
@@ -1270,6 +1270,21 @@ fast_mode = true
         fs::create_dir_all(&panel_dir).unwrap();
         fs::write(panel_dir.join("register.tsx"), "// panel mod").unwrap();
 
+        let renamed_assets = [
+            ".claude/commands/hyp.md",
+            ".claude/commands/hyp-focus.md",
+            ".claude/skills/hyp-panel/hooks/register.tsx",
+            ".claude/skills/hyp-mesh/SKILL.md",
+            ".claude/skills/hyp-setup/SKILL.md",
+            ".claude/skills/hyp-onboard/SKILL.md",
+            ".claude/skills/hyp-schedule/SKILL.md",
+            ".config/opencode/commands/hyp.md",
+            ".config/opencode/commands/hyphae.md",
+        ];
+        for rel in renamed_assets {
+            write_file(&h.join(rel), "# fixture\n");
+        }
+
         // 1. `hyp uninstall --dry-run --home <tmp>` leaves everything intact.
         let dry = Command::new(bin)
             .args(["uninstall", "--dry-run", "--home", h.to_str().unwrap()])
@@ -1295,6 +1310,10 @@ fast_mode = true
         );
         assert!(h.join(".config/hyphae/node.json").exists());
 
+        for rel in renamed_assets {
+            assert!(h.join(rel).exists(), "dry run removed {rel}");
+        }
+
         // 2. `hyp uninstall --yes --home <tmp>` runs the embedded script and removes everything cleanly.
         let run = Command::new(bin)
             .args(["uninstall", "--yes", "--home", h.to_str().unwrap()])
@@ -1315,6 +1334,10 @@ fast_mode = true
             String::from_utf8_lossy(&run.stderr)
         );
         assert!(!h.join(".claude/skills/hyphae-panel").exists());
+        for rel in renamed_assets {
+            assert!(!h.join(rel).exists(), "uninstall left {rel}");
+        }
+
         assert!(!h.join(".config/hyphae").exists());
         assert!(!h.join(".local/bin/hyp").exists());
         // Original custom Claude statusLine was restored verbatim!

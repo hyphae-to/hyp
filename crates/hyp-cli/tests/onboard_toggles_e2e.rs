@@ -72,7 +72,7 @@ fn setup_claude_no_skills_and_no_commands_writes_only_mcp_and_hooks() {
 
     // Runtime skill and ALL 4 slash commands MUST NOT exist.
     assert!(
-        !home.join(".claude/skills/hyphae/SKILL.md").exists(),
+        !home.join(".claude/skills/hyp-mesh/SKILL.md").exists(),
         "runtime skill must be skipped when --no-skills is passed"
     );
     for cmd_file in ["hyp.md", "hyp-subs.md", "hyp-focus.md", "hyp-mute.md"] {
@@ -167,7 +167,7 @@ fn setup_claude_and_antigravity_statusline_without_skills() {
         "Claude slash commands should still install when --no-commands is not passed"
     );
     assert!(
-        !home.join(".claude/skills/hyphae/SKILL.md").exists(),
+        !home.join(".claude/skills/hyp-mesh/SKILL.md").exists(),
         "Claude runtime skill must not be written when --no-skills is passed"
     );
 
@@ -187,7 +187,7 @@ fn setup_claude_and_antigravity_statusline_without_skills() {
     assert_eq!(agy_settings["statusLine"]["stack_with_default"], true);
     assert!(
         !home
-            .join(".gemini/config/plugins/hyphae/skills/hyphae/SKILL.md")
+            .join(".gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md")
             .exists(),
         "Antigravity runtime skill must not be written when --no-skills is passed"
     );
@@ -229,15 +229,15 @@ fn setup_all_no_skills_skips_runtime_skills_across_all_nine_harnesses() {
     assert_eq!(payload["data"]["configuredCount"], 9);
 
     for skill_rel in [
-        ".gemini/config/plugins/hyphae/skills/hyphae/SKILL.md",
-        ".claude/skills/hyphae/SKILL.md",
-        ".codex/skills/hyphae/SKILL.md",
-        ".agents/skills/hyphae/SKILL.md",
-        ".cursor/skills/hyphae/SKILL.md",
-        ".config/opencode/skills/hyphae/SKILL.md",
-        ".gemini/skills/hyphae/SKILL.md",
-        ".openclaw/skills/hyphae/SKILL.md",
-        ".config/herdr/skills/hyphae/SKILL.md",
+        ".gemini/config/plugins/hyphae/skills/hyp-mesh/SKILL.md",
+        ".claude/skills/hyp-mesh/SKILL.md",
+        ".codex/skills/hyp-mesh/SKILL.md",
+        ".agents/skills/hyp-mesh/SKILL.md",
+        ".cursor/skills/hyp-mesh/SKILL.md",
+        ".config/opencode/skills/hyp-mesh/SKILL.md",
+        ".gemini/skills/hyp-mesh/SKILL.md",
+        ".openclaw/skills/hyp-mesh/SKILL.md",
+        ".config/herdr/skills/hyp-mesh/SKILL.md",
     ] {
         assert!(
             !home.join(skill_rel).exists(),
@@ -326,11 +326,11 @@ fn onboard_yes_selected_harnesses_with_statusline_mod_and_no_skills() {
             .is_some_and(|c| c.contains("statusline --harness claude"))
     );
     assert!(home.join(".claude/commands/hyp.md").is_file());
-    assert!(!home.join(".claude/skills/hyphae/SKILL.md").exists());
+    assert!(!home.join(".claude/skills/hyp-mesh/SKILL.md").exists());
 
     // Native Herdr mod installed safely, runtime skills skipped, no dead ~/.config/herdr/hyphae.json written (X9).
     assert!(!home.join(".config/herdr/hyphae.json").exists());
-    assert!(!home.join(".config/herdr/skills/hyphae/SKILL.md").exists());
+    assert!(!home.join(".config/herdr/skills/hyp-mesh/SKILL.md").exists());
     assert!(
         home.join(".config/herdr-app/mods/hyphae-pane/mod.json")
             .is_file()
@@ -378,7 +378,7 @@ fn onboard_yes_no_commands_skips_claude_slash_commands_and_default_yes_preserves
         .output()
         .unwrap();
     assert_eq!(out1.status.code(), Some(0));
-    assert!(home1.join(".claude/skills/hyphae/SKILL.md").is_file());
+    assert!(home1.join(".claude/skills/hyp-mesh/SKILL.md").is_file());
     assert!(!home1.join(".claude/commands/hyp.md").exists());
 
     // 2. Default `hyp onboard --yes` (no new flags): skills enabled, statusLine off, Herdr mod off.
@@ -409,7 +409,7 @@ fn onboard_yes_no_commands_skips_claude_slash_commands_and_default_yes_preserves
     let payload2 = parse_json_stdout(&out2);
     assert_eq!(payload2["ok"], true);
     assert!(payload2["data"].get("herdrMod").is_none());
-    assert!(home2.join(".claude/skills/hyphae/SKILL.md").is_file());
+    assert!(home2.join(".claude/skills/hyp-mesh/SKILL.md").is_file());
     assert!(home2.join(".claude/commands/hyp.md").is_file());
     let claude_settings2: Value =
         serde_json::from_str(&fs::read_to_string(home2.join(".claude/settings.json")).unwrap())
@@ -687,7 +687,7 @@ fn onboard_kv_choice_controls_mcp_tools_and_runtime_skill() {
     let state_dir = tmp.path().join("s");
     fs::create_dir_all(home.join(".claude")).unwrap();
     let node_config = state_dir.join("node.json");
-    let runtime_skill = home.join(".claude/skills/hyphae/SKILL.md");
+    let runtime_skill = home.join(".claude/skills/hyp-mesh/SKILL.md");
 
     let onboard = |flags: &[&str]| {
         let out = isolated_cmd(&home)

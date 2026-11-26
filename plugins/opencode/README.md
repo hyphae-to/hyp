@@ -19,7 +19,7 @@ This configures OpenCode idempotently while preserving all existing settings:
   - `api.session.hook("prompt")`: invokes `hyp hook opencode pre-invocation` to inject queued messages at the start of a turn.
   - `api.event.subscribe` (`session.execution.succeeded` / `session.idle`) / v1 `event` (`session.idle`): invokes `hyp hook opencode stop` and delivers any returned `followupMessage` via `api.session.prompt({ sessionID, text })` / `client.session.prompt` (guarded against infinite continuation loops and missing APIs).
 - **`~/.config/opencode/commands/hyp.md`** — installs the `/hyp` snapshot slash command (skip with `--no-commands`).
-- **`~/.config/opencode/skills/hyphae/SKILL.md`** — installs the OpenCode runtime skill (skip with `--no-skills`).
+- **`~/.config/opencode/skills/hyp-mesh/SKILL.md`** — installs the OpenCode runtime skill (skip with `--no-skills`).
 
 ## Optional Zero-Polling TUI Status Widget (`tui.json`)
 

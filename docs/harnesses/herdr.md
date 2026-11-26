@@ -9,7 +9,7 @@ hyp setup --harness herdr --mod
 ```
 
 What this configures:
-- Tailored Herdr skill in `~/.config/herdr/skills/hyphae/SKILL.md`.
+- Tailored Herdr skill in `~/.config/herdr/skills/hyp-mesh/SKILL.md`.
 - Native GPUI mods `hyphae-pane` (per-pane header pill + reusable `pill.js`) and `hyphae-panel` (docked or `Cmd+Shift+H` floating inspector) in `~/.config/herdr-app/mods/` when `--mod` is passed.
 
 Herdr setup never mutates shipped layouts (`main`, `terminals`, `win98`), symlinked git-tracked layouts (unless `--patch-layout` is passed), or custom pane headers (unless `--force-layout` is passed). See [Status UI](status-ui.md#3-native-herdr-mod-hyphae-pane--hyphae-panel) for `--clone-layout` and composing `pill.js` into a custom pane header.

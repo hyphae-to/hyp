@@ -9,7 +9,7 @@ hyp setup --harness opencode
 What this configures (non-destructively merging into `~/.config/opencode/opencode.json`):
 - Verified MCP entry (`hyp mcp --backend opencode`, non-ephemeral).
 - Real lifecycle hook plugin `~/.config/opencode/plugins/hyphae.ts`.
-- `/hyp` slash command (`~/.config/opencode/commands/hyp.md`) and tailored skill (`~/.config/opencode/skills/hyphae/SKILL.md`).
+- `/hyp` slash command (`~/.config/opencode/commands/hyp.md`) and tailored skill (`~/.config/opencode/skills/hyp-mesh/SKILL.md`).
 - Optional zero-polling TUI status widget (`plugins/opencode/tui.mjs`).
 
 For OpenCode Desktop, you can also run `hyp onboard --assist opencode-desktop`.

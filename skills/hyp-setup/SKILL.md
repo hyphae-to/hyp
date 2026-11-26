@@ -1,5 +1,5 @@
 ---
-name: hyphae-setup
+name: hyp-setup
 description: >-
   Interactive setup, first-time onboarding, and ongoing configuration concierge for Hyphae (`hyp`) —
   local node, 9 coding harnesses with orchestrator-aware skills, native wakeup transports (Herdr `hc`,
@@ -203,9 +203,9 @@ Check which orchestrators and native push transports are present on this machine
 - **Herdr (`hc`)**: Terminal orchestrator with reusable launch templates (`hc templates --json`, `hc run --bg --outlive-parent <template> <task>` + `hc attach <address>`). When `HC_TERMINAL_ID` is set, `hyp onboard` surfaces discovered Herdr launch templates right on the main menu, launches them detached with `--outlive-parent`, and immediately attaches the user's interactive TTY. When agents run inside Herdr tabs, Hyphae verifies terminal identity and pushes wakeups (both queued and urgent interrupts) directly into live tabs. Wire with `hyp setup --harness herdr --json`.
 - **Codex Queue**: Native push transport for Codex CLI sessions (`hyp mcp --backend codex`, plus `--thread <uuid>`, `--resume`, or `--remote <addr>` for standalone threads). Delivers mesh messages directly into idle Codex threads via `codex queue` alongside hooks (`hyp setup --harness codex --json`).
 - **Claude Native Push Channel (`--claude-channel`)**: Opt-in MCP push channel for Claude Code (`hyp mcp --claude-channel`) emitting `notifications/claude/channel` directly into live sessions in addition to `PreToolUse`/`PostToolUse`/`Stop` hooks (`hyp setup --harness claude --json`).
-- **T3 Code (`t3`)**: Desktop/web orchestrator that spawns Claude and Codex threads. Hyphae resolves active threads via read-only `statev2.sqlite` and pushes wakeups over authenticated WebSocket RPC. Wire with `hyp setup --harness t3 --json`, store any T3 session token out-of-band via `hyp secret set t3-session-token --web` (never plaintext), and install `hyphae-setup` via `hyp onboard --assist t3` so T3-spawned Claude/Codex threads discover it.
-- **OpenClaw (`openclaw`)**: Daemon/GUI orchestrator configured in `~/.openclaw/openclaw.json` (`mcp.servers.hyphae` + `plugins.entries.hyphae`), with the zero-dependency official OpenClaw plugin installed offline to `~/.openclaw/extensions/hyphae/` (`openclaw.plugin.json` + `index.js`) and its orchestrator skill at `~/.openclaw/skills/hyphae/SKILL.md`. Choose delivery mode (`--openclaw-delivery gateway|inbox`) and turn-start prompt injection (`--openclaw-prompt-injection` / `--no-openclaw-prompt-injection`) via `hyp setup --harness openclaw` (or interactively via `hyp setup --interactive` / `hyp onboard --assist openclaw`). Store `openclaw-hooks-token` (`hyp secret set openclaw-hooks-token --web`) for Gateway `/hooks/agent` push wakeups. **Even with prompt injection OFF, OpenClaw still receives all Hyphae messages** via Gateway wake nudges and `hyp_inbox`.
-- **Desktop & IDE Apps (`claude-desktop`, `codex-desktop`, `opencode`, `t3`, `cursor`)**: In `hyp onboard`, **Claude Desktop** and **Codex Desktop** show a preview -> confirm -> atomic non-destructive MCP config merge (`claude_desktop_config.json` / `~/.codex/config.toml`), print a restart reminder, and provide **`[o] Open in App`** verified deep links (`claude://claude.ai/new?q=...`, `codex://threads/new?prompt=...`, `opencode://new-session?...`, `t3code://`, `cursor://`) with automatic clipboard fallback. You can also run `hyp onboard --assist claude-desktop` / `--assist codex-desktop` / `--assist cursor` to install `hyphae-setup` directly into their skill directory (`~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`).
+- **T3 Code (`t3`)**: Desktop/web orchestrator that spawns Claude and Codex threads. Hyphae resolves active threads via read-only `statev2.sqlite` and pushes wakeups over authenticated WebSocket RPC. Wire with `hyp setup --harness t3 --json`, store any T3 session token out-of-band via `hyp secret set t3-session-token --web` (never plaintext), and install `hyp-setup` via `hyp onboard --assist t3` so T3-spawned Claude/Codex threads discover it.
+- **OpenClaw (`openclaw`)**: Daemon/GUI orchestrator configured in `~/.openclaw/openclaw.json` (`mcp.servers.hyphae` + `plugins.entries.hyphae`), with the zero-dependency official OpenClaw plugin installed offline to `~/.openclaw/extensions/hyphae/` (`openclaw.plugin.json` + `index.js`) and its orchestrator skill at `~/.openclaw/skills/hyp-mesh/SKILL.md`. Choose delivery mode (`--openclaw-delivery gateway|inbox`) and turn-start prompt injection (`--openclaw-prompt-injection` / `--no-openclaw-prompt-injection`) via `hyp setup --harness openclaw` (or interactively via `hyp setup --interactive` / `hyp onboard --assist openclaw`). Store `openclaw-hooks-token` (`hyp secret set openclaw-hooks-token --web`) for Gateway `/hooks/agent` push wakeups. **Even with prompt injection OFF, OpenClaw still receives all Hyphae messages** via Gateway wake nudges and `hyp_inbox`.
+- **Desktop & IDE Apps (`claude-desktop`, `codex-desktop`, `opencode`, `t3`, `cursor`)**: In `hyp onboard`, **Claude Desktop** and **Codex Desktop** show a preview -> confirm -> atomic non-destructive MCP config merge (`claude_desktop_config.json` / `~/.codex/config.toml`), print a restart reminder, and provide **`[o] Open in App`** verified deep links (`claude://claude.ai/new?q=...`, `codex://threads/new?prompt=...`, `opencode://new-session?...`, `t3code://`, `cursor://`) with automatic clipboard fallback. You can also run `hyp onboard --assist claude-desktop` / `--assist codex-desktop` / `--assist cursor` to install `hyp-setup` directly into their skill directory (`~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`).
 
 #### Connect Chosen Topology (If Beyond Local-Only)
 
@@ -312,7 +312,7 @@ Identify what the user wants to change and execute only the targeted workflow:
   hyp setup --refresh-skills --json
   hyp setup --force-skills --json
   ```
-- **Refresh the `hyphae-setup` skill across detected harnesses**:
+- **Refresh the `hyp-setup` skill across detected harnesses**:
   ```sh
   hyp onboard --install-skill --json
   ```
@@ -355,7 +355,7 @@ hyp deploy check --url https://<hostname> --json
 
 ### D. Configure Local Ingest Route (`localIngest`), `hyp emit` & OS Cron Triggers
 - Hyphae's **socket-only Local Ingest Route** (`~/.config/hyphae/state/ingest.sock` `0600` on Unix / `<state_dir>/ingest.addr` loopback TCP + constant-time bearer token on Windows) is **enabled by default** — zero extra MCP tools and zero separate scheduler enable step!
-- Agents schedule future wakeups in two steps (see `skills/hyphae-schedule/SKILL.md` for Linux `systemd-run`, `crontab`, macOS `launchd`, Windows `schtasks`, and raw socket recipes):
+- Agents schedule future wakeups in two steps (see `skills/hyp-schedule/SKILL.md` for Linux `systemd-run`, `crontab`, macOS `launchd`, Windows `schtasks`, and raw socket recipes):
   1. Subscribe with standard **`hyp_stream`**:
      `hyp_stream({ action: "subscribe", topic: "local.schedule", filters: [{ exact: { label: "check-ci" } }], urgency: "interrupt" })`
   2. Emit from an OS scheduler via **`hyp emit`** (or raw NDJSON to `ingest.sock`):

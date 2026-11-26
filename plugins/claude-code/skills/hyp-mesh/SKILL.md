@@ -1,5 +1,5 @@
 ---
-name: hyphae
+name: hyp-mesh
 description: Collaborate across Claude Code, Codex, Antigravity, Herdr, and remote hosts over the Hyphae v2 E2EE agent mesh using hyp_mesh, hyp_send, hyp_stream, and hyp_inbox.
 ---
 

@@ -9,7 +9,7 @@ hyp setup --harness cursor
 What this configures:
 - MCP server entry pointing to `hyp mcp`.
 - Lifecycle hooks (`beforeMCPExecution`, `afterMCPExecution`, `stop`).
-- Tailored skill in `~/.cursor/skills/hyphae/SKILL.md`.
+- Tailored skill in `~/.cursor/skills/hyp-mesh/SKILL.md`.
 
 **Restart Cursor** once after setup so it picks up the updated MCP server and hooks.
 

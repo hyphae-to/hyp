@@ -1,13 +1,13 @@
 //! End-to-end deterministic tests for the Interactive Mycelium Onboarding Wizard
-//! and `hyphae-setup` Agent Concierge (`crates/hyp-cli/src/wizard.rs`, `setup.rs`).
+//! and `hyp-setup` Agent Concierge (`crates/hyp-cli/src/wizard.rs`, `setup.rs`).
 //!
 //! Covers:
 //! 1. Dot-matrix animation frame rendering via `--preview-anim --no-anim` in Plain (`NO_COLOR=1`)
 //!    and 24-bit TrueColor (`COLORTERM=truecolor`) modes with exact canvas dimensions.
 //! 2. `hyp onboard --install-skill --home <tmp> --json`: detects fake harness config dirs
 //!    (`.claude`, `.codex`, `.gemini`, `.config/opencode`, `.cursor`), installs
-//!    `hyphae-setup/SKILL.md` into the exact global skill paths, and matches
-//!    `skills/hyphae-setup/SKILL.md` byte-for-byte with clean v2 security invariants.
+//!    `hyp-setup/SKILL.md` into the exact global skill paths, and matches
+//!    `skills/hyp-setup/SKILL.md` byte-for-byte with clean v2 security invariants.
 //! 3. `hyp onboard --assist <harness> --home <tmp>` with isolated fake CLI shims for ALL 6
 //!    launchable CLIs (`claude`, `codex`, `agy --prompt-interactive`, `opencode --prompt`,
 //!    `cursor-agent`, `gemini -i`), verifying pre-launch skill install, exact argv, existing-node
@@ -50,7 +50,7 @@ fn repo_setup_skill_path() -> PathBuf {
         .join("..")
         .join("..")
         .join("skills")
-        .join("hyphae-setup")
+        .join("hyp-setup")
         .join("SKILL.md")
 }
 
@@ -153,6 +153,21 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
     fs::create_dir_all(home.join(".config").join("opencode")).unwrap();
     fs::create_dir_all(home.join(".cursor")).unwrap();
 
+    let legacy_stock = home.join(".claude/skills/hyphae-setup/SKILL.md");
+    let legacy_custom = home.join(".codex/skills/hyphae-setup/SKILL.md");
+    let stock = fs::read_to_string(repo_setup_skill_path()).unwrap();
+    fs::create_dir_all(legacy_stock.parent().unwrap()).unwrap();
+    fs::create_dir_all(legacy_custom.parent().unwrap()).unwrap();
+    fs::write(
+        &legacy_stock,
+        stock
+            .replace("hyp-setup", "hyphae-setup")
+            .replace("skills/hyp-mesh/", "skills/hyphae/")
+            .replace("skills/hyp-schedule/", "skills/hyphae-schedule/"),
+    )
+    .unwrap();
+    fs::write(&legacy_custom, "# Custom setup").unwrap();
+
     let out = isolated_cmd(home)
         .args([
             "onboard",
@@ -175,12 +190,12 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["command"], "onboard");
     assert_eq!(payload["data"]["mode"], "install-skill");
-    assert_eq!(payload["data"]["skill"], "hyphae-setup");
+    assert_eq!(payload["data"]["skill"], "hyp-setup");
     assert_eq!(payload["data"]["installedCount"], 6);
 
     let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
     let canonical_lf = canonical.replace("\r\n", "\n");
-    assert!(canonical_lf.starts_with("---\nname: hyphae-setup\n"));
+    assert!(canonical_lf.starts_with("---\nname: hyp-setup\n"));
     assert!(!canonical.contains("hyp share"));
     assert!(!canonical.contains("npm install"));
     assert!(!canonical.contains("--value"));
@@ -188,15 +203,17 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
     assert!(canonical.contains("hyp connect"));
 
     let expected_paths = [
-        home.join(".claude/skills/hyphae-setup/SKILL.md"),
-        home.join(".codex/skills/hyphae-setup/SKILL.md"),
-        home.join(".agents/skills/hyphae-setup/SKILL.md"),
-        home.join(".gemini/config/skills/hyphae-setup/SKILL.md"),
-        home.join(".gemini/skills/hyphae-setup/SKILL.md"),
-        home.join(".config/opencode/skills/hyphae-setup/SKILL.md"),
-        home.join(".cursor/skills/hyphae-setup/SKILL.md"),
+        home.join(".claude/skills/hyp-setup/SKILL.md"),
+        home.join(".codex/skills/hyp-setup/SKILL.md"),
+        home.join(".agents/skills/hyp-setup/SKILL.md"),
+        home.join(".gemini/config/skills/hyp-setup/SKILL.md"),
+        home.join(".gemini/skills/hyp-setup/SKILL.md"),
+        home.join(".config/opencode/skills/hyp-setup/SKILL.md"),
+        home.join(".cursor/skills/hyp-setup/SKILL.md"),
     ];
 
+    assert!(!legacy_stock.exists());
+    assert_eq!(fs::read_to_string(legacy_custom).unwrap(), "# Custom setup");
     for path in &expected_paths {
         assert!(
             path.is_file(),
@@ -207,7 +224,7 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
         assert_eq!(
             written,
             canonical,
-            "installed skill at {} must match skills/hyphae-setup/SKILL.md byte-for-byte",
+            "installed skill at {} must match skills/hyp-setup/SKILL.md byte-for-byte",
             path.display()
         );
     }
@@ -243,11 +260,11 @@ fn install_skill_handles_bare_gemini_directory_for_antigravity() {
 
     let canonical = fs::read_to_string(repo_setup_skill_path()).expect("read repo SKILL.md");
     for rel in [
-        ".claude/skills/hyphae-setup/SKILL.md",
-        ".codex/skills/hyphae-setup/SKILL.md",
-        ".gemini/config/skills/hyphae-setup/SKILL.md",
-        ".config/opencode/skills/hyphae-setup/SKILL.md",
-        ".cursor/skills/hyphae-setup/SKILL.md",
+        ".claude/skills/hyp-setup/SKILL.md",
+        ".codex/skills/hyp-setup/SKILL.md",
+        ".gemini/config/skills/hyp-setup/SKILL.md",
+        ".config/opencode/skills/hyp-setup/SKILL.md",
+        ".cursor/skills/hyp-setup/SKILL.md",
     ] {
         let p = home.join(rel);
         assert!(p.is_file(), "missing {}", p.display());
@@ -293,42 +310,42 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
         (
             "claude",
             "claude",
-            ".claude/skills/hyphae-setup/SKILL.md",
+            ".claude/skills/hyp-setup/SKILL.md",
             None,
             0,
         ),
         (
             "codex",
             "codex",
-            ".codex/skills/hyphae-setup/SKILL.md",
+            ".codex/skills/hyp-setup/SKILL.md",
             None,
             0,
         ),
         (
             "agy",
             "agy",
-            ".gemini/config/skills/hyphae-setup/SKILL.md",
+            ".gemini/config/skills/hyp-setup/SKILL.md",
             Some("--prompt-interactive"),
             0,
         ),
         (
             "opencode",
             "opencode",
-            ".config/opencode/skills/hyphae-setup/SKILL.md",
+            ".config/opencode/skills/hyp-setup/SKILL.md",
             Some("--prompt"),
             0,
         ),
         (
             "cursor",
             "cursor-agent",
-            ".cursor/skills/hyphae-setup/SKILL.md",
+            ".cursor/skills/hyp-setup/SKILL.md",
             None,
             0,
         ),
         (
             "gemini",
             "gemini",
-            ".gemini/skills/hyphae-setup/SKILL.md",
+            ".gemini/skills/hyp-setup/SKILL.md",
             Some("-i"),
             7,
         ),
@@ -377,7 +394,7 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
         assert_eq!(
             lines.first().copied(),
             Some("SKILL_PREEXISTED=1"),
-            "hyphae-setup/SKILL.md must be installed BEFORE launching {bin_name}"
+            "hyp-setup/SKILL.md must be installed BEFORE launching {bin_name}"
         );
 
         if let Some(flag) = expected_flag {
@@ -393,7 +410,7 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
             );
             let prompt_line = lines.get(3).copied().unwrap_or("");
             assert!(
-                prompt_line.contains("hyphae-setup")
+                prompt_line.contains("hyp-setup")
                     && prompt_line.contains(&expected_skill.display().to_string()),
                 "case {assist_arg} prompt missing skill reference: {prompt_line}"
             );
@@ -405,7 +422,7 @@ fn assist_installs_skill_before_launch_and_invokes_all_six_verified_clis() {
             );
             let prompt_line = lines.get(2).copied().unwrap_or("");
             assert!(
-                prompt_line.contains("hyphae-setup")
+                prompt_line.contains("hyp-setup")
                     && prompt_line.contains(&expected_skill.display().to_string()),
                 "case {assist_arg} prompt missing skill reference: {prompt_line}"
             );
@@ -439,7 +456,7 @@ fn assist_on_existing_node_adapts_prompt_for_ongoing_configuration() {
         .expect("bootstrap node");
     assert_eq!(bootstrap.status.code(), Some(0));
 
-    let expected_skill = home.join(".claude/skills/hyphae-setup/SKILL.md");
+    let expected_skill = home.join(".claude/skills/hyp-setup/SKILL.md");
     write_executable_shim(&bin_dir, "claude", &expected_skill, &capture, 0);
 
     let isolated_path = format!("{}:/usr/bin:/bin", bin_dir.display());
@@ -688,7 +705,7 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&bin_dir).unwrap();
 
-        let primary_skill = home.join(".claude/skills/hyphae-setup/SKILL.md");
+        let primary_skill = home.join(".claude/skills/hyp-setup/SKILL.md");
         let hc_script = bin_dir.join("hc");
         let script = format!(
             "#!/bin/sh\n\
@@ -753,7 +770,7 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
         assert_eq!(
             lines.first().copied(),
             Some("SKILL_PREEXISTED=1"),
-            "hyphae-setup/SKILL.md must be installed BEFORE `hc run` executes"
+            "hyp-setup/SKILL.md must be installed BEFORE `hc run` executes"
         );
         assert_eq!(
             lines.get(1).copied(),
@@ -797,7 +814,7 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
         );
         let prompt_line = lines.get(9).copied().unwrap_or("");
         assert!(
-            prompt_line.contains("hyphae-setup")
+            prompt_line.contains("hyp-setup")
                 && prompt_line.contains(&primary_skill.display().to_string()),
             "prompt missing skill reference: {prompt_line}"
         );
@@ -848,8 +865,8 @@ fn assist_herdr_template_installs_skill_and_invokes_hc_run() {
         assert!(stdout.contains("hc attach t9m"), "stdout={stdout}");
 
         for rel in [
-            ".codex/skills/hyphae-setup/SKILL.md",
-            ".agents/skills/hyphae-setup/SKILL.md",
+            ".codex/skills/hyp-setup/SKILL.md",
+            ".agents/skills/hyp-setup/SKILL.md",
         ] {
             let p = home.join(rel);
             assert!(p.is_file(), "missing {}", p.display());
@@ -936,10 +953,10 @@ fn assist_openclaw_and_t3_install_skill_and_emit_structured_manual_guide() {
     assert!(
         oc_json["data"]["prompt"]
             .as_str()
-            .is_some_and(|p| p.contains("hyphae-setup")),
+            .is_some_and(|p| p.contains("hyp-setup")),
         "missing prompt in JSON: {oc_json}"
     );
-    let oc_skill = home_oc.join(".openclaw/skills/hyphae-setup/SKILL.md");
+    let oc_skill = home_oc.join(".openclaw/skills/hyp-setup/SKILL.md");
     assert!(
         oc_skill.is_file(),
         "expected OpenClaw skill at {}",
@@ -963,7 +980,7 @@ fn assist_openclaw_and_t3_install_skill_and_emit_structured_manual_guide() {
     assert_eq!(oc_plain.status.code(), Some(0));
     let oc_stdout = String::from_utf8_lossy(&oc_plain.stdout);
     assert!(oc_stdout.contains("Open OpenClaw"), "stdout={oc_stdout}");
-    assert!(oc_stdout.contains("hyphae-setup"), "stdout={oc_stdout}");
+    assert!(oc_stdout.contains("hyp-setup"), "stdout={oc_stdout}");
 
     // 2. T3 Code `--json` manual guide flow (installs into .agents, .claude, and .codex!).
     let tmp_t3 = TempDir::new().expect("tempdir");
@@ -995,14 +1012,14 @@ fn assist_openclaw_and_t3_install_skill_and_emit_structured_manual_guide() {
     assert!(
         t3_json["data"]["prompt"]
             .as_str()
-            .is_some_and(|p| p.contains("hyphae-setup")),
+            .is_some_and(|p| p.contains("hyp-setup")),
         "missing prompt in JSON: {t3_json}"
     );
 
     for rel in [
-        ".agents/skills/hyphae-setup/SKILL.md",
-        ".claude/skills/hyphae-setup/SKILL.md",
-        ".codex/skills/hyphae-setup/SKILL.md",
+        ".agents/skills/hyp-setup/SKILL.md",
+        ".claude/skills/hyp-setup/SKILL.md",
+        ".codex/skills/hyp-setup/SKILL.md",
     ] {
         let path = home_t3.join(rel);
         assert!(path.is_file(), "expected T3 skill at {}", path.display());
@@ -1042,7 +1059,7 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
     assert_eq!(cd_json["data"]["displayName"], "Claude Desktop");
     assert_eq!(
         cd_json["data"]["prompt"],
-        "Set up Hyphae on this machine using the hyphae-setup skill"
+        "Set up Hyphae on this machine using the hyp-setup skill"
     );
     assert!(
         cd_json["data"]["mcpSnippet"]
@@ -1050,7 +1067,7 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
             .is_some_and(|s| s.contains("mcpServers") && s.contains("hyphae")),
         "expected claude_desktop_config.json MCP snippet: {cd_json}"
     );
-    let cd_skill = home_cd.join(".claude/skills/hyphae-setup/SKILL.md");
+    let cd_skill = home_cd.join(".claude/skills/hyp-setup/SKILL.md");
     assert!(cd_skill.is_file());
     assert_eq!(fs::read_to_string(&cd_skill).unwrap(), canonical);
 
@@ -1077,11 +1094,11 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
     assert_eq!(cx_json["data"]["displayName"], "Codex Desktop");
     assert_eq!(
         cx_json["data"]["prompt"],
-        "Set up Hyphae on this machine using the hyphae-setup skill"
+        "Set up Hyphae on this machine using the hyp-setup skill"
     );
     for rel in [
-        ".codex/skills/hyphae-setup/SKILL.md",
-        ".agents/skills/hyphae-setup/SKILL.md",
+        ".codex/skills/hyp-setup/SKILL.md",
+        ".agents/skills/hyp-setup/SKILL.md",
     ] {
         let p = home_cx.join(rel);
         assert!(p.is_file(), "missing {}", p.display());
@@ -1112,9 +1129,9 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
     assert_eq!(cu_json["data"]["displayName"], "Cursor (IDE)");
     assert_eq!(
         cu_json["data"]["prompt"],
-        "Set up Hyphae on this machine using the hyphae-setup skill"
+        "Set up Hyphae on this machine using the hyp-setup skill"
     );
-    let cu_skill = home_cu.join(".cursor/skills/hyphae-setup/SKILL.md");
+    let cu_skill = home_cu.join(".cursor/skills/hyp-setup/SKILL.md");
     assert!(cu_skill.is_file());
     assert_eq!(fs::read_to_string(&cu_skill).unwrap(), canonical);
     assert!(
@@ -1158,8 +1175,8 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
         "expected opencode deeplink: {ocd_json}"
     );
     for rel in [
-        ".config/opencode/skills/hyphae-setup/SKILL.md",
-        ".agents/skills/hyphae-setup/SKILL.md",
+        ".config/opencode/skills/hyp-setup/SKILL.md",
+        ".agents/skills/hyp-setup/SKILL.md",
     ] {
         let p = home_ocd.join(rel);
         assert!(p.is_file(), "missing {}", p.display());
