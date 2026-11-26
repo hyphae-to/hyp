@@ -12,8 +12,8 @@ This runbook provides step-by-step instructions for an operator or autonomous ag
 - **Fail-closed GitHub visibility lint**: `PUT /v1/subscriptions` verifies every requested `exact.repo` via `GET /repos/{owner}/{repo}` before persisting. Private or missing repos are rejected fail-closed with HTTP `422 subscription_rejected`.
 - **Demand-driven deduplicated ETag polling**: Exactly **one** poller runs per distinct `owner/repo` regardless of subscriber count (1 or 5,000). Conditional `If-None-Match` polls returning `304 Not Modified` consume **0** GitHub API quota, adaptively back off (`1x -> 2x -> 5x`), snap back on `200`, and tear down cleanly after the grace window once subscriber refcount drops to `0`.
 - **Anti-recon unauthenticated `/v1/manifest`**: Unauthenticated `GET /v1/manifest` returns a signed manifest with `audience: "public"`, strictly empty `advertised` arrays, and no `escalation` text.
-- **Unauthenticated health telemetry**: `GET /v1/health` exposes only aggregate operational counters (`ok`, `nodeId`, `profile`, `guestPairingEnabled`, `githubPublic.activePollers`, `pollsTotal`, `polls200`, `polls304`, `appWebhooksPublished`) — zero private data or repo names.
-- **Zero plaintext secrets**: Optional `github-public-token` (5,000 req/hr instead of 60 req/hr) and `github-app-webhook-secret` (for `<1s` GitHub App push on `POST /v1/webhooks/github-app`) are stored strictly in `SecretStore` (`0600` files when `HYPHAE_SECRET_BACKEND=file`), referenced in `node.json` only as `{ "secret": "<name>" }`.
+- **Unauthenticated health telemetry**: `GET /v1/health` exposes only aggregate operational counters (`ok`, `nodeId`, `profile`, `guestPairingEnabled`, `githubPublic.activePollers`, `pollsTotal`, `polls200`, `polls304`) — zero private data or repo names.
+- **Zero plaintext secrets**: An optional `github-public-token` (5,000 req/hr instead of 60 req/hr) is stored strictly in `SecretStore` (`0600` files when `HYPHAE_SECRET_BACKEND=file`), referenced in `node.json` only as `{ "secret": "<name>" }`.
 
 ---
 
@@ -156,9 +156,12 @@ rm -rf "$SMOKE_DIR"
 
 ---
 
-## Optional: `<1s` GitHub App Push & Co-Hosted RAM-Only Drop Relay
+## Repository webhooks
 
-- **GitHub App Push (`POST /v1/webhooks/github-app`):** Add `"appWebhookSecret": { "secret": "github-app-webhook-secret" }` to the `github-public` entry in `sources[]`, store the secret via `sudo -u hyphae HYPHAE_SECRET_BACKEND=file hyp secret set github-app-webhook-secret --state-dir /var/lib/hyphae`, and restart `hyphae-node`.
+This public node uses the GitHub Events API for polling. For signed push delivery from a repository you manage, configure the [repository webhook receiver](../plugins.md#repository-webhook-setup) on your own node. The unfinished hosted App route was removed. You can remove any old `appWebhookSecret` reference from the polling source.
+
+## Optional: Co-Hosted RAM-Only Drop Relay
+
 - **Co-hosted RAM-only Drop Relay:** Pass `--enable-drop-relay --max-memory-mb 256` to `hyp deploy init public-node` (see [Deploying Nodes](../operations/deploying.md#27-self-hostable-blind-drop-relay-drop-relay)). Default `guest-ro` grants strictly exclude `drop:create`.
 
 ---

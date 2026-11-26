@@ -77,7 +77,6 @@ use crate::engine::peer_link::{
 
 const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_UNAUTH_CONTROL_BODY_BYTES: usize = 64 * 1024;
-const MAX_GITHUB_APP_WEBHOOK_BODY_BYTES: usize = 1024 * 1024;
 const MAX_DROP_CONTROL_BODY_BYTES: usize = 16 * 1024;
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 const MAX_CONCURRENT_LINGERING_CLOSES: usize = 64;
@@ -442,8 +441,7 @@ async fn route_request(
     let headers = req.headers().clone();
 
     if let Some(receiver) = path.strip_prefix("/v1/webhooks/") {
-        let github =
-            receiver == "github" || receiver.starts_with("github/") || receiver == "github-app";
+        let github = receiver == "github" || receiver.starts_with("github/");
         if !github {
             return Err(NodeError::NotFound(
                 "Webhook receiver is not configured on this node".into(),
@@ -495,7 +493,6 @@ async fn route_request(
                     "pollsTotal": stats.polls_total,
                     "polls200": stats.polls_200,
                     "polls304": stats.polls_304,
-                    "appWebhooksPublished": stats.app_webhooks_published,
                 })
             }
             None => json!({
@@ -504,7 +501,6 @@ async fn route_request(
                 "pollsTotal": 0,
                 "polls200": 0,
                 "polls304": 0,
-                "appWebhooksPublished": 0,
             }),
         };
         return Ok(json_response(
@@ -569,19 +565,6 @@ async fn route_request(
         let pair_req: DelegatedPairRequest = serde_json::from_slice(&body_bytes)?;
         let reply = node.handle_delegated_pair_request(&pair_req)?;
         return Ok(json_response(StatusCode::OK, &reply));
-    }
-
-    if method == Method::POST && path == "/v1/webhooks/github-app" {
-        let Some(adapter) = node
-            .github_public_adapter()
-            .filter(|a| a.has_app_webhook_secret())
-        else {
-            return Err(NodeError::NotFound(
-                "github-app webhook endpoint is disabled on this node".into(),
-            ));
-        };
-        let outcome = adapter.handle_app_webhook(&headers, &body_bytes).await;
-        return webhook_outcome_response(outcome);
     }
 
     if method == Method::POST && path == "/v1/webhooks/github" {
@@ -1298,19 +1281,6 @@ fn resolve_pre_read_body_limit(
             ));
         }
         return Ok(MAX_UNAUTH_CONTROL_BODY_BYTES);
-    }
-
-    if method == Method::POST && path == "/v1/webhooks/github-app" {
-        if node
-            .github_public_adapter()
-            .filter(|a| a.has_app_webhook_secret())
-            .is_none()
-        {
-            return Err(NodeError::NotFound(
-                "github-app webhook endpoint is disabled on this node".into(),
-            ));
-        }
-        return Ok(MAX_GITHUB_APP_WEBHOOK_BODY_BYTES);
     }
 
     if method == Method::POST && path == "/v1/webhooks/github" {

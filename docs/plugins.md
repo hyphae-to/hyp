@@ -12,7 +12,7 @@ Hyphae unifies event sources and chat bridges onto the single Rust `Node` CloudE
 
 | Layer | Implementation | Routing Model | Secrets Location | Best For |
 | --- | --- | --- | --- | --- |
-| **Compiled-In Rust Event Sources & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure Rust wired directly into `hyp node start` (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus default-enabled socket-only `localIngest` on `ingest.sock` / `ingest.addr`) — zero Node/Python needed | **1-to-many Pub/Sub** via standard `hyp_stream` with server-side CloudEvents filter pushdown (including `local.schedule` / `local.<topic>` triggered via `hyp emit` or raw NDJSON) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + `github-webhook` / GitHub App push), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and OS-scheduled **Local Ingest & Cron triggers** |
+| **Compiled-In Rust Event Sources & Local Ingest** (`crates/hyp-node/src/adapters/`, `engine/local_ingest.rs`) | Pure Rust wired directly into `hyp node start` (`github-public`, `github-webhook`, `prometheus-webhook`, `webhook-stream`, plus default-enabled socket-only `localIngest` on `ingest.sock` / `ingest.addr`) — zero Node/Python needed | **1-to-many Pub/Sub** via standard `hyp_stream` with server-side CloudEvents filter pushdown (including `local.schedule` / `local.<topic>` triggered via `hyp emit` or raw NDJSON) | Node's `SecretStore` (`{ "secret": "<name>" }` in `node.json`) | Public or org **GitHub** streams (`github-public` ETag poller + `github-webhook`), **Prometheus Alertmanager v4**, signed **HTTP webhooks**, and OS-scheduled **Local Ingest & Cron triggers** |
 | **External Subprocess Bridges & Custom Sources** (`plugins/`) | Optional self-contained scripts (`plugins/slack`, `plugins/telegram`, `plugins/whatsapp`, `plugins/webhook`, `plugins/prometheus`, or custom executables) supervised by `SubprocessSupervisor` (Unix fd 3 / Windows loopback TCP) | **Thread-owned + multi-thread fan-in + outbound replies** via `hyp_bridge` and `hyp_send({ to: "<plugin>:<target>", text })`; bridge topics stay **local-only by default** (`exposeTopic: true` opt-in) | Local machine's `SecretStore` — scrubbed subprocess env, never sent to remote hubs | Personal **Slack / Telegram / WhatsApp** bridges, local callbacks, and custom scripts in any language |
 
 ---
@@ -61,7 +61,7 @@ Pick the transport that matches your node topology:
 
 > **Rule of thumb:** **Hub Nodes (`profile: router`) are the natural place to terminate `github-webhook` deliveries** once and fan normalized CloudEvents out over E2EE streams to every paired laptop. Use **`github-public` + `repoTokens`** as the zero-infra fallback on a **Local Node (`profile: local`)** behind NAT when you don't have (or don't want to expose) a hub or public HTTPS endpoint yet.
 
-### A. `github-public` — Demand-Driven Deduplicated ETag Poller (+ Multi-Owner `repoTokens` & Optional `<1s` GitHub App Push)
+### A. `github-public` — Demand-Driven Deduplicated ETag Poller with Multi-Owner `repoTokens`
 
 Compiled directly into `hyp` (`crates/hyp-node/src/adapters/github_public.rs`). Used both on read-only public nodes (`hyp deploy init public-node`) and locally on developer machines behind NAT.
 
@@ -89,8 +89,7 @@ hyp secret set github-acme-token --web
         "alice/*": { "secret": "github-alice-token" },
         "acme/*": { "secret": "github-acme-token" },
         "acme/special": { "secret": "github-acme-special-token" }
-      },
-      "appWebhookSecret": { "secret": "github-app-webhook-secret" }
+      }
     }
   ]
 }
@@ -100,7 +99,6 @@ hyp secret set github-acme-token --web
 - **Single `github-public` source**: Consolidate all GitHub tokens into `sources[0].repoTokens`; if multiple enabled `github-public` entries exist, only the first is active and Hyphae emits a startup warning.
 - **1 poller per distinct `owner/repo` + bounded rate-limit hardening**: Regardless of subscriber count, conditional `If-None-Match` polls returning `304 Not Modified` consume **0** GitHub API quota, adaptively back off on idle repos, enforce bounded backoff on HTTP `403`/`429` (`Retry-After` and `X-RateLimit-Remaining: 0` + `X-RateLimit-Reset`), cap concurrent active pollers at `maxActivePollers` (default `100`), and tear down after `graceWindowSeconds` when active subscribers drop to `0`.
 - **Private repo access**: On non-`publicReadOnly` local/private nodes, setting `"allowPrivateWithToken": true` permits watching a private repo **only** when `token_for_repo(repo)` resolves a matching token (unmatched orgs/private repos still fail closed!).
-- **Optional `<1s` GitHub App webhooks**: Setting `appWebhookSecret` enables HMAC-verified `POST /v1/webhooks/github-app` (returns `404` when unconfigured, `401` on invalid `X-Hub-Signature-256`).
 
 ### B. Compiled-In Pure-Rust Webhooks: `github-webhook`, `prometheus-webhook` & `webhook-stream` (`crates/hyp-node/src/adapters/webhooks.rs`)
 
@@ -130,6 +128,13 @@ All three webhook adapters are compiled in pure Rust and wired directly into `hy
   ]
 }
 ```
+
+#### Repository webhook setup
+
+1. Add a `github-webhook` source to `node.json`. Give it a unique `id`, set `allowedRepos` to the repository slug, and use a private topic such as `github-webhooks`. Limit subscription grants on that topic to the intended peers.
+2. Store a unique shared secret with `hyp secret set github-webhook-secret --web` on the node that runs the receiver. Reference it as `"secret": { "secret": "github-webhook-secret" }` and restart the node.
+3. Expose `POST /v1/webhooks/github/<id>` through your public HTTPS proxy or tunnel. Route only the webhook endpoint if the node also serves private peer or admin routes.
+4. In the repository's **Settings → Webhooks → Add webhook**, enter the public payload URL, for example `https://hooks.example.com/v1/webhooks/github/org-github`. Choose **application/json**, enter the same secret, and select the events to deliver. Check **Recent Deliveries** to verify GitHub reached the receiver.
 
 ### C. `localIngest` — Default Socket-Only Local Event Ingest Route (`ingest.sock` & `hyp emit`)
 
@@ -252,7 +257,7 @@ External scripts under `plugins/` run as optional child processes managed by the
 - **Scrubbed environment**: Inherits only safe OS runtime paths (`PATH`, `HOME`, `TMPDIR`, `LANG`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, plus Windows OS/temp/profile paths on Windows) plus explicitly configured env vars/secrets and protocol headers (`HYPHAE_FD=3` on Unix or `HYPHAE_PLUGIN_TRANSPORT=tcp` / `HYPHAE_PLUGIN_ADDR` / `HYPHAE_PLUGIN_TOKEN` on Windows, along with `HYPHAE_PLUGIN=<id>` and `HYPHAE_PROTOCOL=2`). Plaintext secret-like values in `plugins[].env` (instead of `{ "secret": "<name>" }`) emit a startup warning without logging the secret.
 - **Local-only bridge topics by default (`exposeTopic: true` opt-in)**: Topics emitted by local chat bridges (`slack`, `telegram`, `whatsapp`, `webhook`) are kept strictly local by default — paired remote peers (even holding `stream:subscribe=*`) never see them in `/v1/manifest` and cannot subscribe to them unless the operator explicitly sets **`"exposeTopic": true`** on that entry in `plugins[]` (or lists the topic explicitly in `topics[]`).
 - **Bounded framing, crash-loop circuit breaker & secret-redacted logs**: Enforces a strict 64 KiB `LineSplitter`, exponential restart backoff (`1s -> 60s`), and clean `SIGTERM -> SIGKILL` shutdown. After **5 consecutive rapid crashes**, the circuit breaker trips into **`CrashLoopBackOff`** (`status: "crash_loop_backoff"` in `node.status.json` and `hyp doctor`), stopping runaway respawns while keeping the rest of the daemon up. Subprocess stderr is captured into **`<state_dir>/logs/plugin-<id>.log`** with user-only **`0600`** permissions and automatic secret redaction (`[REDACTED]`).
-- **Dual wire protocol auto-detection**: Speaks **JSON-RPC 2.0 v2** (`hyphae/hello`, `hyphae/publish`, `hyphae/post`, `hyphae/status`, `hyphae/deliveryFailed`) and automatically detects unmodified **legacy fd-3 v1** plugins (`hello`, `event`, `ack`, `nack`, `request`, `response`, `status`, `delivery_failed`).
+- **One deterministic wire protocol**: Speaks **JSON-RPC 2.0 v2** (`hyphae/hello`, `hyphae/publish`, `hyphae/post`, `hyphae/status`, `hyphae/deliveryFailed`). The host sends its hello immediately after transport authentication. Legacy v1 frames are rejected; migrate custom plugins to the bundled v2 SDKs.
 
 ### Managing Bridges from MCP (`hyp_bridge` + `hyp_send`)
 
@@ -464,21 +469,21 @@ Scopes requested: `gmail.readonly` and `calendar.events.readonly`. Google's devi
 
 ---
 
-## 6. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2 or v1 SDK)
+## 6. Writing a Custom Subprocess Plugin (JSON-RPC 2.0 v2)
 
 Any language that can read/write newline-delimited JSON (≤ 64 KiB/line) over Unix fd 3 (or authenticated loopback TCP via `HYPHAE_PLUGIN_ADDR` + `HYPHAE_PLUGIN_TOKEN` on Windows) works directly.
 
-### Option A: JSON-RPC 2.0 (`HYPHAE_PROTOCOL=2`, recommended for new plugins)
+### Wire contract: JSON-RPC 2.0 (`HYPHAE_PROTOCOL=2`)
 
 - Host <-> Plugin notifications & requests on the IPC channel:
   - `hyphae/hello` (notification: `{ protocol: 2, plugin, targets }`)
-  - `hyphae/publish` (request from plugin: `{ target, event: <CloudEvent v1.0> }` -> JSON-RPC result `{ status: "stored" | "duplicate" }`)
+  - `hyphae/publish` (request from plugin: `{ to, event: <CloudEvent v1.0> }` -> JSON-RPC result `{ status: "stored" | "duplicate" }`)
   - `hyphae/post` (request from host to plugin: `{ target, params: { text, replyTo?, ... } }` -> JSON-RPC result `{ ... }`)
   - `hyphae/status` & `hyphae/deliveryFailed` (notifications)
 
-### Option B: Bundled Zero-Dependency v1 SDKs
+### Bundled Zero-Dependency v2 SDKs
 
-Use [plugins/sdk/client.mjs](../plugins/sdk/client.mjs) (Node) or [plugins/sdk/client.py](../plugins/sdk/client.py) (Python 3 stdlib) — both automatically handle Unix fd 3 and Windows loopback TCP, and `SubprocessSupervisor` auto-detects v1 framing automatically:
+Use [plugins/sdk/client.mjs](../plugins/sdk/client.mjs) (Node) or [plugins/sdk/client.py](../plugins/sdk/client.py) (Python 3 stdlib) — both automatically handle Unix fd 3 and Windows loopback TCP, and require the host-first JSON-RPC v2 hello:
 
 ```js
 #!/usr/bin/env node

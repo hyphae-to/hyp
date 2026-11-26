@@ -18,7 +18,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { MeshPluginClient } from "../sdk/client.mjs";
+import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
 import { envInt } from "../sdk/source-kit.mjs";
 
 const maxBodyBytes = envInt("PROMETHEUS_MAX_BODY_BYTES", 1024 * 1024, { min: 1 });
@@ -299,20 +299,14 @@ const server = createServer(async (req, res) => {
     };
 
     try {
-      const reply = await mesh.send(topic, event);
-      if (reply.type === "ack") {
-        count += 1;
-      } else {
-        console.error(`prometheus mesh nack id=${eventId} error=${reply.error ?? reply.reason ?? "unknown"}`);
-        if (reply.error === "unavailable" || reply.reason === "unavailable") {
-          sendJson(res, 503, { ok: false, error: "mesh_unavailable", alerts: count });
-          return;
-        }
-      }
+      await mesh.send(topic, event);
+      count += 1;
     } catch (error) {
       console.error(`prometheus mesh send error: ${error instanceof Error ? error.message : String(error)}`);
-      sendJson(res, 503, { ok: false, error: "mesh_error", alerts: count });
-      return;
+      if (!(error instanceof PluginRpcError) || error.code === RPC_UNAVAILABLE) {
+        sendJson(res, 503, { ok: false, error: error instanceof PluginRpcError ? "mesh_unavailable" : "mesh_error", alerts: count });
+        return;
+      }
     }
   }
 

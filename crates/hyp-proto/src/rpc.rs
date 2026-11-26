@@ -1,5 +1,4 @@
-//! JSON-RPC 2.0 over NDJSON plugin frame codec (`HYPHAE_PROTOCOL=2`) + automatic
-//! detection of legacy fd-3 v1 frames (`src/core/plugins/protocol.ts`, §6.4),
+//! JSON-RPC 2.0 over NDJSON plugin frame codec (`HYPHAE_PROTOCOL=2`),
 //! bounded strictly at `MAX_FRAME_BYTES` (64 KiB).
 
 use serde::{Deserialize, Serialize};
@@ -44,8 +43,6 @@ pub enum FrameError {
     InvalidJson(String),
     #[error("invalid plugin frame: {0}")]
     InvalidFrame(String),
-    #[error("unsupported legacy v1 frame type {0:?}")]
-    UnsupportedLegacyType(String),
 }
 
 /// JSON-RPC 2.0 request/response identifier.
@@ -107,9 +104,16 @@ pub struct JsonRpcResponse {
     pub jsonrpc: String,
     pub id: Option<RpcId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present_result")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+}
+
+fn present_result<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 impl JsonRpcResponse {
@@ -190,94 +194,15 @@ pub struct SystemWakeParams {
     pub slept_ms: u64,
 }
 
-// ---- Legacy fd-3 v1 Frame Types (`src/core/plugins/protocol.ts`) ----
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LegacyAckStatus {
-    Stored,
-    Duplicate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyNackError {
-    InvalidEvent,
-    TooLarge,
-    UnknownTarget,
-    IdConflict,
-    Unavailable,
-    UnsupportedType,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum LegacyV1Frame {
-    Hello {
-        protocol: u32,
-        plugin: String,
-        targets: Vec<String>,
-    },
-    Event {
-        to: String,
-        event: Value,
-    },
-    Ack {
-        id: String,
-        source: String,
-        status: LegacyAckStatus,
-    },
-    Nack {
-        id: Option<String>,
-        source: Option<String>,
-        error: LegacyNackError,
-        message: String,
-    },
-    #[serde(rename_all = "camelCase")]
-    Status {
-        target: String,
-        pending: u64,
-        oldest_age_seconds: u64,
-        t3_connected: bool,
-    },
-    DeliveryFailed {
-        target: String,
-        events: Vec<EventKeyRef>,
-        reason: String,
-    },
-    Request {
-        id: String,
-        method: String,
-        target: String,
-        params: BTreeMap<String, Value>,
-    },
-    Response {
-        id: String,
-        ok: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-    },
-}
-
-/// Auto-detected plugin IPC frame (either JSON-RPC 2.0 v2 or legacy fd-3 v1).
+/// JSON-RPC 2.0 plugin IPC frame. Protocol v1 is deliberately unsupported.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PluginFrame {
     JsonRpcRequest(JsonRpcRequest),
     JsonRpcNotification(JsonRpcNotification),
     JsonRpcResponse(JsonRpcResponse),
-    LegacyV1(LegacyV1Frame),
 }
 
-impl PluginFrame {
-    pub fn is_legacy_v1(&self) -> bool {
-        matches!(self, Self::LegacyV1(_))
-    }
-}
-
-/// Decodes a single NDJSON line (enforcing `MAX_FRAME_BYTES` = 64 KiB) and automatically
-/// detects JSON-RPC 2.0 (`"jsonrpc": "2.0"`) vs legacy fd-3 v1 (`"type": ...`).
+/// Decodes one bounded JSON-RPC 2.0 NDJSON line. No legacy negotiation or fallback.
 pub fn decode_frame(line: &str) -> Result<PluginFrame, FrameError> {
     let trimmed = line
         .strip_suffix('\n')
@@ -341,28 +266,19 @@ pub fn decode_frame(line: &str) -> Result<PluginFrame, FrameError> {
                 "JSON-RPC response must contain an id field".to_string(),
             ));
         }
+        if has_error && !map.get("error").is_some_and(Value::is_object) {
+            return Err(FrameError::InvalidFrame(
+                "JSON-RPC error must be an object".into(),
+            ));
+        }
         let resp: JsonRpcResponse =
             serde_json::from_value(val).map_err(|e| FrameError::InvalidFrame(e.to_string()))?;
         return Ok(PluginFrame::JsonRpcResponse(resp));
     }
 
-    // Legacy fd-3 v1 fallback (`{ "type": "event" | "ack" | ... }`).
-    let Some(legacy_type) = map.get("type").and_then(Value::as_str) else {
-        return Err(FrameError::InvalidFrame(
-            "frame must be JSON-RPC 2.0 or a legacy v1 object with string \"type\"".to_string(),
-        ));
-    };
-    if !matches!(
-        legacy_type,
-        "hello" | "event" | "ack" | "nack" | "status" | "delivery_failed" | "request" | "response"
-    ) {
-        let preview: String = legacy_type.chars().take(64).collect();
-        return Err(FrameError::UnsupportedLegacyType(preview));
-    }
-
-    let legacy: LegacyV1Frame =
-        serde_json::from_value(val).map_err(|e| FrameError::InvalidFrame(e.to_string()))?;
-    Ok(PluginFrame::LegacyV1(legacy))
+    Err(FrameError::InvalidFrame(
+        "plugin frames require jsonrpc=\"2.0\"; protocol v1 is not supported".into(),
+    ))
 }
 
 /// Encodes a `PluginFrame` as compact single-line NDJSON terminated by `\n`,
@@ -372,7 +288,6 @@ pub fn encode_frame(frame: &PluginFrame) -> Result<String, FrameError> {
         PluginFrame::JsonRpcRequest(r) => serde_json::to_string(r),
         PluginFrame::JsonRpcNotification(n) => serde_json::to_string(n),
         PluginFrame::JsonRpcResponse(r) => serde_json::to_string(r),
-        PluginFrame::LegacyV1(l) => serde_json::to_string(l),
     }
     .map_err(|e| FrameError::InvalidFrame(e.to_string()))?;
 
@@ -492,7 +407,6 @@ mod tests {
         assert!(wire.ends_with('\n'));
         let decoded = decode_frame(&wire).unwrap();
         assert_eq!(decoded, req);
-        assert!(!decoded.is_legacy_v1());
 
         let notif = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
             METHOD_STATUS,
@@ -527,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_frames_auto_detected() {
+    fn retired_plugin_v1_frames_are_rejected() {
         let legacy_lines = [
             r#"{"type":"hello","protocol":1,"plugin":"slack","targets":["ops"]}"#,
             r#"{"type":"event","to":"ops","event":{"id":"1","source":"slack"}}"#,
@@ -540,23 +454,17 @@ mod tests {
         ];
 
         for line in legacy_lines {
-            let frame = decode_frame(line).unwrap();
-            assert!(frame.is_legacy_v1());
-            let reencoded = encode_frame(&frame).unwrap();
-            assert_eq!(decode_frame(&reencoded).unwrap(), frame);
+            assert!(matches!(
+                decode_frame(line),
+                Err(FrameError::InvalidFrame(_))
+            ));
         }
-
-        // Unknown legacy type yields UnsupportedLegacyType (not generic crash).
-        assert!(matches!(
-            decode_frame(r#"{"type":"future_v9"}"#),
-            Err(FrameError::UnsupportedLegacyType(ref t)) if t == "future_v9"
-        ));
     }
 
     #[test]
     fn enforces_64kib_cap_and_bounded_line_splitter() {
         let huge = format!(
-            r#"{{"type":"event","to":"a","event":"{}"}}"#,
+            r#"{{"jsonrpc":"2.0","id":"huge","method":"hyphae/publish","params":{{"to":"a","event":"{}"}}}}"#,
             "x".repeat(MAX_FRAME_BYTES)
         );
         assert!(matches!(

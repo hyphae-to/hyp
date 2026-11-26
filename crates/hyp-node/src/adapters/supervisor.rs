@@ -14,10 +14,7 @@
 //!     constant-time token verification, and automatic token redaction from stderr/logs.
 //! - Clean environment allowlist (never leaks arbitrary host secrets).
 //! - Strictly bounded 64 KiB `hyp_proto::rpc::LineSplitter` on incoming IPC frames.
-//! - Per-frame protocol auto-detection via `hyp_proto::rpc::decode_frame`, seamlessly supporting
-//!   BOTH JSON-RPC 2.0 v2 (`hyphae/hello`, `hyphae/publish`, `hyphae/post`, `hyphae/status`,
-//!   `hyphae/deliveryFailed`) AND legacy fd-3 v1 (`hello`, `event`, `ack`, `nack`, `request`,
-//!   `response`, `status`, `delivery_failed`).
+//! - Host-first JSON-RPC 2.0 v2 framing only, with no negotiation timer or v1 fallback.
 //! - Outbound `post()` request/response correlation with timeouts, exponential restart backoff on
 //!   unexpected child exit, and clean shutdown on both Unix and Windows.
 
@@ -28,9 +25,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use hyp_proto::rpc::{
-    DeliveryFailedParams, JsonRpcNotification, JsonRpcRequest, LegacyV1Frame,
-    METHOD_DELIVERY_FAILED, METHOD_POST, METHOD_STATUS, METHOD_SYSTEM_WAKE, PluginFrame,
-    PostParams, RpcId, StatusParams, SystemWakeParams, encode_frame,
+    DeliveryFailedParams, JsonRpcNotification, JsonRpcRequest, METHOD_DELIVERY_FAILED, METHOD_POST,
+    METHOD_STATUS, METHOD_SYSTEM_WAKE, PluginFrame, PostParams, RpcId, StatusParams,
+    SystemWakeParams, encode_frame,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -63,10 +60,6 @@ pub const ALLOWED_PARENT_ENV: &[&str] = &[
     "LOCALAPPDATA",
 ];
 
-const PROTO_UNKNOWN: u8 = 0;
-const PROTO_LEGACY_V1: u8 = 1;
-const PROTO_JSONRPC_V2: u8 = 2;
-
 /// IPC transport used between `SubprocessSupervisor` and supervised plugin subprocesses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginTransportMode {
@@ -88,27 +81,6 @@ impl Default for PluginTransportMode {
             Self::LoopbackTcp
         }
     }
-}
-
-/// Detected or configured wire protocol on the child's IPC channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WireProtocol {
-    Auto,
-    LegacyV1,
-    JsonRpcV2,
-}
-
-/// Controls the initial greeting sent by the supervisor when a child starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelloMode {
-    /// Waits up to `auto_hello_grace` for a v2 child to initiate `hyphae/hello` or `hyphae/publish`;
-    /// if the child stays silent waiting for a host greeting (as unmodified v1 plugins do),
-    /// sends a legacy v1 `hello` frame automatically.
-    Auto,
-    /// Immediately sends a JSON-RPC 2.0 `hyphae/hello` notification upon spawn.
-    JsonRpcV2,
-    /// Immediately sends a legacy fd-3 v1 `{"type":"hello","protocol":1,...}` upon spawn.
-    LegacyV1,
 }
 
 /// Per-spawn environment resolver invoked before every child spawn/respawn to freshly resolve
@@ -136,10 +108,6 @@ pub struct SubprocessConfig {
     pub transport_mode: PluginTransportMode,
     /// Bounded startup/handshake timeout for `PluginTransportMode::LoopbackTcp` (default: 10 s).
     pub startup_timeout: Duration,
-    /// Protocol negotiation mode (`Auto` supports both JSON-RPC 2.0 v2 and legacy v1).
-    pub hello_mode: HelloMode,
-    /// Grace window in `HelloMode::Auto` before sending a legacy v1 hello to silent children.
-    pub auto_hello_grace: Duration,
     /// Initial exponential restart backoff delay.
     pub initial_backoff: Duration,
     /// Maximum exponential restart backoff delay.
@@ -175,8 +143,6 @@ impl std::fmt::Debug for SubprocessConfig {
             .field("has_env_resolver", &self.env_resolver.is_some())
             .field("transport_mode", &self.transport_mode)
             .field("startup_timeout", &self.startup_timeout)
-            .field("hello_mode", &self.hello_mode)
-            .field("auto_hello_grace", &self.auto_hello_grace)
             .field("initial_backoff", &self.initial_backoff)
             .field("max_backoff", &self.max_backoff)
             .field("reset_after", &self.reset_after)
@@ -230,8 +196,6 @@ impl SubprocessConfig {
             env_resolver: None,
             transport_mode: PluginTransportMode::default(),
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
-            hello_mode: HelloMode::Auto,
-            auto_hello_grace: Duration::from_millis(50),
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             reset_after: Duration::from_secs(60),
@@ -303,7 +267,7 @@ pub fn build_isolated_env_with(
     env.insert("HYPHAE_PROTOCOL".to_string(), "2".to_string());
     env.insert("AGENTS_MESH_PLUGIN".to_string(), config.id.clone());
     env.insert("T3_MESH_PLUGIN".to_string(), config.id.clone());
-    env.insert("T3_MESH_PROTOCOL".to_string(), "1".to_string());
+    env.insert("T3_MESH_PROTOCOL".to_string(), "2".to_string());
     if config.kind == AdapterKind::Source {
         env.insert("HYPHAE_STREAM".to_string(), config.id.clone());
         env.insert("AGENTS_MESH_STREAM".to_string(), config.id.clone());
@@ -317,9 +281,23 @@ pub fn build_isolated_env_with(
 
 type PendingMap = HashMap<String, oneshot::Sender<Result<Value, AdapterError>>>;
 
-struct ActiveConnection {
+#[derive(Clone)]
+struct PluginWriter {
     tx: mpsc::Sender<String>,
-    detected_protocol: Arc<AtomicU8>,
+    failed: Arc<Notify>,
+}
+
+impl PluginWriter {
+    fn send(&self, wire: String) -> Result<(), mpsc::error::TrySendError<String>> {
+        self.tx.try_send(wire).inspect_err(|_| {
+            // notify_one retains a permit even before the connection starts polling it.
+            self.failed.notify_one();
+        })
+    }
+}
+
+struct ActiveConnection {
+    tx: PluginWriter,
     pending_requests: Arc<Mutex<PendingMap>>,
 }
 
@@ -334,13 +312,12 @@ struct SupervisorInner {
     restart_count: AtomicU64,
     oversized_frames_rejected: AtomicU64,
     last_status: RwLock<Option<StatusParams>>,
-    last_detected_protocol: AtomicU8,
     recent_stderr: RwLock<VecDeque<String>>,
     last_error: RwLock<Option<String>>,
     crash_loop_backoff: AtomicBool,
 }
 
-/// Unified fd-3 subprocess supervisor supporting both JSON-RPC 2.0 v2 and legacy fd-3 v1 plugins.
+/// Unified subprocess supervisor using JSON-RPC 2.0 v2 on both private transports.
 #[derive(Clone)]
 pub struct SubprocessSupervisor {
     inner: Arc<SupervisorInner>,
@@ -360,7 +337,6 @@ impl SubprocessSupervisor {
                 restart_count: AtomicU64::new(0),
                 oversized_frames_rejected: AtomicU64::new(0),
                 last_status: RwLock::new(None),
-                last_detected_protocol: AtomicU8::new(PROTO_UNKNOWN),
                 recent_stderr: RwLock::new(VecDeque::new()),
                 last_error: RwLock::new(None),
                 crash_loop_backoff: AtomicBool::new(false),
@@ -413,22 +389,12 @@ impl SubprocessSupervisor {
         self.inner.last_status.read().expect("status lock").clone()
     }
 
-    /// Returns the most recently detected wire protocol for the running/last child.
-    pub fn detected_protocol(&self) -> WireProtocol {
-        match self.inner.last_detected_protocol.load(Ordering::Acquire) {
-            PROTO_LEGACY_V1 => WireProtocol::LegacyV1,
-            PROTO_JSONRPC_V2 => WireProtocol::JsonRpcV2,
-            _ => WireProtocol::Auto,
-        }
-    }
-
     /// Returns `true` when a child process is live and its fd-3 writer is active.
     pub async fn is_connected(&self) -> bool {
         self.inner.active.lock().await.is_some()
     }
 
-    /// Sends an outbound `post` request (`hyphae/post` in v2 or `{"type":"request","method":"post",...}`
-    /// in v1) and awaits the correlated response up to `timeout`.
+    /// Sends a `hyphae/post` request and awaits the correlated JSON-RPC response up to `timeout`.
     pub async fn post(
         &self,
         target: &str,
@@ -438,38 +404,23 @@ impl SubprocessSupervisor {
         let req_num = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
         let req_id = format!("req-{req_num}");
 
-        let (tx, detected, pending_map) = {
+        let (tx, pending_map) = {
             let guard = self.inner.active.lock().await;
             let Some(conn) = guard.as_ref() else {
                 return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
             };
-            (
-                conn.tx.clone(),
-                conn.detected_protocol.load(Ordering::Acquire),
-                Arc::clone(&conn.pending_requests),
-            )
+            (conn.tx.clone(), Arc::clone(&conn.pending_requests))
         };
-
-        let frame = if detected == PROTO_LEGACY_V1 {
-            PluginFrame::LegacyV1(LegacyV1Frame::Request {
-                id: req_id.clone(),
-                method: "post".to_string(),
-                target: target.to_string(),
-                params,
-            })
-        } else {
-            let post_params = PostParams {
-                target: target.to_string(),
-                params,
-            };
-            let params_val = serde_json::to_value(post_params)
-                .map_err(|e| AdapterError::Protocol(e.to_string()))?;
-            PluginFrame::JsonRpcRequest(JsonRpcRequest::new(
-                RpcId::String(req_id.clone()),
-                METHOD_POST,
-                Some(params_val),
-            ))
-        };
+        let params_val = serde_json::to_value(PostParams {
+            target: target.to_string(),
+            params,
+        })
+        .map_err(|e| AdapterError::Protocol(e.to_string()))?;
+        let frame = PluginFrame::JsonRpcRequest(JsonRpcRequest::new(
+            RpcId::String(req_id.clone()),
+            METHOD_POST,
+            Some(params_val),
+        ));
 
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
 
@@ -479,7 +430,7 @@ impl SubprocessSupervisor {
             map.insert(req_id.clone(), resp_tx);
         }
 
-        if tx.send(wire).await.is_err() {
+        if tx.send(wire).is_err() {
             pending_map.lock().await.remove(&req_id);
             return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
         }
@@ -502,33 +453,20 @@ impl SubprocessSupervisor {
 
     /// Sends a `status` notification to the running subprocess using its active wire protocol.
     pub async fn send_status(&self, status: StatusParams) -> Result<(), AdapterError> {
-        let (tx, detected) = {
+        let tx = {
             let guard = self.inner.active.lock().await;
             let Some(conn) = guard.as_ref() else {
                 return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
             };
-            (
-                conn.tx.clone(),
-                conn.detected_protocol.load(Ordering::Acquire),
-            )
+            conn.tx.clone()
         };
-
-        let frame = if detected == PROTO_LEGACY_V1 {
-            PluginFrame::LegacyV1(LegacyV1Frame::Status {
-                target: status.target,
-                pending: status.pending,
-                oldest_age_seconds: status.oldest_age_seconds,
-                t3_connected: status.t3_connected,
-            })
-        } else {
-            let val =
-                serde_json::to_value(status).map_err(|e| AdapterError::Protocol(e.to_string()))?;
-            PluginFrame::JsonRpcNotification(JsonRpcNotification::new(METHOD_STATUS, Some(val)))
-        };
+        let value =
+            serde_json::to_value(status).map_err(|e| AdapterError::Protocol(e.to_string()))?;
+        let frame =
+            PluginFrame::JsonRpcNotification(JsonRpcNotification::new(METHOD_STATUS, Some(value)));
 
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         tx.send(wire)
-            .await
             .map_err(|_| AdapterError::NotRunning(self.inner.config.id.clone()))
     }
 
@@ -537,35 +475,22 @@ impl SubprocessSupervisor {
         &self,
         params: DeliveryFailedParams,
     ) -> Result<(), AdapterError> {
-        let (tx, detected) = {
+        let tx = {
             let guard = self.inner.active.lock().await;
             let Some(conn) = guard.as_ref() else {
                 return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
             };
-            (
-                conn.tx.clone(),
-                conn.detected_protocol.load(Ordering::Acquire),
-            )
+            conn.tx.clone()
         };
-
-        let frame = if detected == PROTO_LEGACY_V1 {
-            PluginFrame::LegacyV1(LegacyV1Frame::DeliveryFailed {
-                target: params.target,
-                events: params.events,
-                reason: params.reason,
-            })
-        } else {
-            let val =
-                serde_json::to_value(params).map_err(|e| AdapterError::Protocol(e.to_string()))?;
-            PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
-                METHOD_DELIVERY_FAILED,
-                Some(val),
-            ))
-        };
+        let value =
+            serde_json::to_value(params).map_err(|e| AdapterError::Protocol(e.to_string()))?;
+        let frame = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
+            METHOD_DELIVERY_FAILED,
+            Some(value),
+        ));
 
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         tx.send(wire)
-            .await
             .map_err(|_| AdapterError::NotRunning(self.inner.config.id.clone()))
     }
 
@@ -593,7 +518,6 @@ impl SubprocessSupervisor {
         ));
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         tx.send(wire)
-            .await
             .map_err(|_| AdapterError::NotRunning(self.inner.config.id.clone()))
     }
 
@@ -685,7 +609,7 @@ mod runtime {
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::path::Path;
     use std::process::Stdio;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -694,10 +618,9 @@ mod runtime {
         DeliveryFailedParams, ERR_ID_CONFLICT, ERR_INTERNAL_ERROR, ERR_INVALID_EVENT,
         ERR_INVALID_PARAMS, ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ERR_PARSE_ERROR,
         ERR_TOO_LARGE, ERR_UNAVAILABLE, ERR_UNKNOWN_TARGET, FrameError, HelloParams,
-        JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LegacyAckStatus, LegacyNackError,
-        LegacyV1Frame, LineSplitter, MAX_FRAME_BYTES, METHOD_DELIVERY_FAILED, METHOD_HELLO,
-        METHOD_PUBLISH, METHOD_STATUS, PluginFrame, PublishParams, RpcId, StatusParams,
-        decode_frame, encode_frame,
+        JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, LineSplitter, MAX_FRAME_BYTES,
+        METHOD_DELIVERY_FAILED, METHOD_HELLO, METHOD_PUBLISH, METHOD_STATUS, PluginFrame,
+        PublishParams, RpcId, StatusParams, decode_frame, encode_frame,
     };
     use ring::hmac;
     use ring::rand::{SecureRandom, SystemRandom};
@@ -716,14 +639,12 @@ mod runtime {
     };
 
     use super::{
-        ActiveConnection, HelloMode, PROTO_JSONRPC_V2, PROTO_LEGACY_V1, PROTO_UNKNOWN, PendingMap,
-        PluginTransportMode, SubprocessConfig, SupervisorInner, build_isolated_env_with,
-        is_secret_like_env_key,
+        ActiveConnection, PendingMap, PluginTransportMode, PluginWriter, SubprocessConfig,
+        SupervisorInner, build_isolated_env_with, is_secret_like_env_key,
     };
 
     const MAX_OUTPUT_LINE_BYTES: usize = 2 * 1024;
     const MAX_AUTH_LINE_BYTES: usize = 4 * 1024;
-    const MAX_ECHO_CHARS: usize = 256;
     const OUTBOUND_QUEUE_CAPACITY: usize = 256;
     const MAX_RECENT_STDERR_LINES: usize = 32;
     const MAX_RUN_STDERR_TAIL: usize = 4;
@@ -1197,26 +1118,18 @@ mod runtime {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE_CAPACITY);
-
-        let initial_proto = match inner.config.hello_mode {
-            HelloMode::LegacyV1 => PROTO_LEGACY_V1,
-            HelloMode::JsonRpcV2 => PROTO_JSONRPC_V2,
-            HelloMode::Auto => PROTO_UNKNOWN,
+        let (tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE_CAPACITY);
+        let writer_failed = Arc::new(Notify::new());
+        let out_tx = PluginWriter {
+            tx,
+            failed: Arc::clone(&writer_failed),
         };
-        let detected_protocol = Arc::new(AtomicU8::new(initial_proto));
-        if initial_proto != PROTO_UNKNOWN {
-            inner
-                .last_detected_protocol
-                .store(initial_proto, Ordering::Release);
-        }
 
         let pending_requests: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         {
             let mut active_guard = inner.active.lock().await;
             *active_guard = Some(ActiveConnection {
                 tx: out_tx.clone(),
-                detected_protocol: Arc::clone(&detected_protocol),
                 pending_requests: Arc::clone(&pending_requests),
             });
         }
@@ -1225,7 +1138,7 @@ mod runtime {
         host.update_status(&inner.config.id, AdapterHealth::Healthy)
             .await;
 
-        let writer_task = tokio::spawn(async move {
+        let mut writer_task = tokio::spawn(async move {
             while let Some(line) = out_rx.recv().await {
                 if write_half.write_all(line.as_bytes()).await.is_err() {
                     break;
@@ -1236,78 +1149,30 @@ mod runtime {
             }
         });
 
-        let hello_cancel = Arc::new(Notify::new());
-        let hello_task = match inner.config.hello_mode {
-            HelloMode::LegacyV1 => {
-                let hello_frame = PluginFrame::LegacyV1(LegacyV1Frame::Hello {
-                    protocol: 1,
-                    plugin: inner.config.id.clone(),
-                    targets: inner.config.targets.clone(),
-                });
-                if let Ok(wire) = encode_frame(&hello_frame) {
-                    let _ = out_tx.send(wire).await;
-                }
-                None
-            }
-            HelloMode::JsonRpcV2 => {
-                let params = serde_json::to_value(HelloParams {
+        // The host always greets first, immediately, on both authenticated transports.
+        // Existing v2 clients may still send a discovery hello request; no protocol negotiation
+        // or timer chooses a different wire format.
+        let hello = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
+            METHOD_HELLO,
+            Some(
+                serde_json::to_value(HelloParams {
                     protocol: 2,
                     plugin: inner.config.id.clone(),
                     targets: inner.config.targets.clone(),
                 })
-                .ok();
-                let hello_frame = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
-                    METHOD_HELLO,
-                    params,
-                ));
-                if let Ok(wire) = encode_frame(&hello_frame) {
-                    let _ = out_tx.send(wire).await;
-                }
-                None
-            }
-            HelloMode::Auto => {
-                let grace = inner.config.auto_hello_grace;
-                let tx_clone = out_tx.clone();
-                let proto_clone = Arc::clone(&detected_protocol);
-                let last_proto_inner = Arc::clone(inner);
-                let cancel_clone = Arc::clone(&hello_cancel);
-                let plugin_id = inner.config.id.clone();
-                let targets = inner.config.targets.clone();
-                Some(tokio::spawn(async move {
-                    tokio::select! {
-                        () = cancel_clone.notified() => {}
-                        () = tokio::time::sleep(grace) => {
-                            if proto_clone
-                                .compare_exchange(
-                                    PROTO_UNKNOWN,
-                                    PROTO_LEGACY_V1,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_ok()
-                            {
-                                last_proto_inner
-                                    .last_detected_protocol
-                                    .store(PROTO_LEGACY_V1, Ordering::Release);
-                                let hello_frame = PluginFrame::LegacyV1(LegacyV1Frame::Hello {
-                                    protocol: 1,
-                                    plugin: plugin_id,
-                                    targets,
-                                });
-                                if let Ok(wire) = encode_frame(&hello_frame) {
-                                    let _ = tx_clone.send(wire).await;
-                                }
-                            }
-                        }
-                    }
-                }))
-            }
-        };
+                .expect("hello serializes"),
+            ),
+        ));
+        if let Ok(wire) = encode_frame(&hello) {
+            let _ = out_tx.send(wire);
+        }
 
         if let Some(n) = first_ready.take() {
             n.notify_waiters();
         }
 
+        let mut channel_closed = false;
+        let mut request_tasks = tokio::task::JoinSet::new();
         let mut splitter = LineSplitter::new(MAX_FRAME_BYTES, false);
         if !initial_bytes.is_empty() {
             let mut completed: Vec<(String, bool)> = Vec::new();
@@ -1315,28 +1180,39 @@ mod runtime {
                 completed.push((line, truncated));
             });
             for (line, truncated) in completed {
-                hello_cancel.notify_waiters();
-                handle_incoming_line(
+                if handle_incoming_line(
                     inner,
                     host,
                     &out_tx,
-                    &detected_protocol,
                     &pending_requests,
+                    &mut request_tasks,
                     line,
                     truncated,
                 )
-                .await;
+                .await
+                {
+                    channel_closed = true;
+                    break;
+                }
             }
         }
 
         let mut buf = [0u8; 4096];
-        let mut channel_closed = false;
 
         loop {
-            if inner.stopping.load(Ordering::Acquire) != 0 {
+            if channel_closed || inner.stopping.load(Ordering::Acquire) != 0 {
                 break;
             }
             tokio::select! {
+                () = writer_failed.notified() => {
+                    channel_closed = true;
+                    break;
+                }
+                _ = &mut writer_task => {
+                    channel_closed = true;
+                    break;
+                }
+                _ = request_tasks.join_next(), if !request_tasks.is_empty() => {}
                 () = inner.stop_notify.notified() => {
                     break;
                 }
@@ -1352,17 +1228,21 @@ mod runtime {
                                 completed.push((line, truncated));
                             });
                             for (line, truncated) in completed {
-                                hello_cancel.notify_waiters();
-                                handle_incoming_line(
+
+                                if handle_incoming_line(
                                     inner,
                                     host,
                                     &out_tx,
-                                    &detected_protocol,
+
                                     &pending_requests,
+                                    &mut request_tasks,
                                     line,
                                     truncated,
                                 )
-                                .await;
+                                .await {
+                                    channel_closed = true;
+                                    break;
+                                }
                             }
                         }
                         Err(_) => {
@@ -1372,10 +1252,6 @@ mod runtime {
                     }
                 }
             }
-        }
-
-        if let Some(ht) = hello_task {
-            ht.abort();
         }
 
         {
@@ -1388,8 +1264,13 @@ mod runtime {
                 ))));
             }
         }
+        request_tasks.abort_all();
+        while request_tasks.join_next().await.is_some() {}
         drop(out_tx);
-        let _ = writer_task.await;
+        if !writer_task.is_finished() {
+            writer_task.abort();
+            let _ = writer_task.await;
+        }
         drop(read_half);
 
         channel_closed
@@ -1834,325 +1715,162 @@ mod runtime {
         })
     }
 
-    async fn send_frame(out_tx: &mpsc::Sender<String>, frame: &PluginFrame) {
+    async fn send_frame(out_tx: &PluginWriter, frame: &PluginFrame) {
         if let Ok(wire) = encode_frame(frame) {
-            let _ = out_tx.send(wire).await;
+            let _ = out_tx.send(wire);
         }
     }
 
-    fn truncate_echo(value: Option<&Value>) -> Option<String> {
-        value
-            .and_then(Value::as_str)
-            .map(|s| s.chars().take(MAX_ECHO_CHARS).collect())
-    }
-
-    fn map_publish_error(err: &AdapterError) -> (LegacyNackError, i32, String) {
+    fn map_publish_error(err: &AdapterError) -> (i32, String) {
         match err {
-            AdapterError::PublishFailed { code, message } => match code {
-                PublishErrorCode::InvalidEvent => (
-                    LegacyNackError::InvalidEvent,
-                    ERR_INVALID_EVENT,
-                    message.clone(),
-                ),
-                PublishErrorCode::TooLarge => {
-                    (LegacyNackError::TooLarge, ERR_TOO_LARGE, message.clone())
-                }
-                PublishErrorCode::UnknownTarget => (
-                    LegacyNackError::UnknownTarget,
-                    ERR_UNKNOWN_TARGET,
-                    message.clone(),
-                ),
-                PublishErrorCode::IdConflict => (
-                    LegacyNackError::IdConflict,
-                    ERR_ID_CONFLICT,
-                    message.clone(),
-                ),
-                PublishErrorCode::Unavailable => (
-                    LegacyNackError::Unavailable,
-                    ERR_UNAVAILABLE,
-                    message.clone(),
-                ),
-            },
-            other => (
-                LegacyNackError::Unavailable,
-                ERR_INTERNAL_ERROR,
-                other.to_string(),
+            AdapterError::PublishFailed { code, message } => (
+                match code {
+                    PublishErrorCode::InvalidEvent => ERR_INVALID_EVENT,
+                    PublishErrorCode::TooLarge => ERR_TOO_LARGE,
+                    PublishErrorCode::UnknownTarget => ERR_UNKNOWN_TARGET,
+                    PublishErrorCode::IdConflict => ERR_ID_CONFLICT,
+                    PublishErrorCode::Unavailable => ERR_UNAVAILABLE,
+                },
+                message.clone(),
             ),
+            other => (ERR_INTERNAL_ERROR, other.to_string()),
         }
     }
 
-    fn map_cloudevent_error(err: &CloudEventError) -> (LegacyNackError, i32, String) {
+    fn map_cloudevent_error(err: &CloudEventError) -> (i32, String) {
         match err {
-            CloudEventError::InvalidEvent(msg) => (
-                LegacyNackError::InvalidEvent,
-                ERR_INVALID_EVENT,
-                msg.clone(),
-            ),
-            CloudEventError::TooLarge(msg) => {
-                (LegacyNackError::TooLarge, ERR_TOO_LARGE, msg.clone())
-            }
+            CloudEventError::InvalidEvent(message) => (ERR_INVALID_EVENT, message.clone()),
+            CloudEventError::TooLarge(message) => (ERR_TOO_LARGE, message.clone()),
         }
     }
 
     async fn handle_incoming_line(
-        inner: &SupervisorInner,
+        inner: &Arc<SupervisorInner>,
         host: &Arc<dyn NodeAdapterHost>,
-        out_tx: &mpsc::Sender<String>,
-        detected_protocol: &Arc<AtomicU8>,
+        out_tx: &PluginWriter,
         pending_requests: &Arc<Mutex<PendingMap>>,
+        request_tasks: &mut tokio::task::JoinSet<()>,
         line: String,
         truncated: bool,
-    ) {
+    ) -> bool {
         if truncated {
             inner
                 .oversized_frames_rejected
                 .fetch_add(1, Ordering::Relaxed);
-            let proto = detected_protocol.load(Ordering::Acquire);
-            let msg = format!("frame exceeds {MAX_FRAME_BYTES} byte limit");
-            if proto == PROTO_JSONRPC_V2 {
-                send_frame(
-                    out_tx,
-                    &PluginFrame::JsonRpcResponse(JsonRpcResponse::err(
-                        None,
-                        ERR_TOO_LARGE,
-                        msg,
-                        Some(json!({ "limit": MAX_FRAME_BYTES })),
-                    )),
-                )
-                .await;
-            } else {
-                send_frame(
-                    out_tx,
-                    &PluginFrame::LegacyV1(LegacyV1Frame::Nack {
-                        id: None,
-                        source: None,
-                        error: LegacyNackError::TooLarge,
-                        message: msg,
-                    }),
-                )
-                .await;
-            }
-            return;
+            send_frame(
+                out_tx,
+                &PluginFrame::JsonRpcResponse(JsonRpcResponse::err(
+                    None,
+                    ERR_TOO_LARGE,
+                    format!("frame exceeds {MAX_FRAME_BYTES} byte limit"),
+                    Some(json!({"limit":MAX_FRAME_BYTES})),
+                )),
+            )
+            .await;
+            return false;
         }
 
         if line.trim().is_empty() {
-            return;
+            return false;
         }
 
         let decoded = match decode_frame(&line) {
             Ok(frame) => frame,
             Err(err) => {
-                let proto = detected_protocol.load(Ordering::Acquire);
-                if proto == PROTO_JSONRPC_V2 {
-                    let code = match err {
-                        FrameError::FrameTooLarge { .. } => ERR_TOO_LARGE,
-                        FrameError::InvalidJson(_) => ERR_PARSE_ERROR,
-                        _ => ERR_INVALID_REQUEST,
-                    };
+                let code = match err {
+                    FrameError::FrameTooLarge { .. } => ERR_TOO_LARGE,
+                    FrameError::InvalidJson(_) => ERR_PARSE_ERROR,
+                    _ => ERR_INVALID_REQUEST,
+                };
+                send_frame(
+                    out_tx,
+                    &PluginFrame::JsonRpcResponse(JsonRpcResponse::err(
+                        None,
+                        code,
+                        err.to_string(),
+                        None,
+                    )),
+                )
+                .await;
+                return false;
+            }
+        };
+
+        match decoded {
+            PluginFrame::JsonRpcRequest(req) => {
+                if request_tasks.len() >= 32 {
                     send_frame(
                         out_tx,
                         &PluginFrame::JsonRpcResponse(JsonRpcResponse::err(
-                            None,
-                            code,
-                            err.to_string(),
+                            Some(req.id),
+                            ERR_UNAVAILABLE,
+                            "too many pending plugin requests",
                             None,
                         )),
                     )
                     .await;
-                } else {
-                    let nack_err = match err {
-                        FrameError::FrameTooLarge { .. } => LegacyNackError::TooLarge,
-                        FrameError::UnsupportedLegacyType(_) => LegacyNackError::UnsupportedType,
-                        _ => LegacyNackError::InvalidEvent,
-                    };
-                    send_frame(
-                        out_tx,
-                        &PluginFrame::LegacyV1(LegacyV1Frame::Nack {
-                            id: None,
-                            source: None,
-                            error: nack_err,
-                            message: err.to_string(),
-                        }),
-                    )
-                    .await;
+                    return false;
                 }
-                return;
-            }
-        };
-
-        let frame_proto = if decoded.is_legacy_v1() {
-            PROTO_LEGACY_V1
-        } else {
-            PROTO_JSONRPC_V2
-        };
-        detected_protocol.store(frame_proto, Ordering::Release);
-        inner
-            .last_detected_protocol
-            .store(frame_proto, Ordering::Release);
-
-        match decoded {
-            PluginFrame::LegacyV1(legacy) => {
-                handle_legacy_v1_frame(inner, host, out_tx, pending_requests, legacy).await;
-            }
-            PluginFrame::JsonRpcRequest(req) => {
-                handle_jsonrpc_request(inner, host, out_tx, req).await;
+                let inner = Arc::clone(inner);
+                let host = Arc::clone(host);
+                let out_tx = out_tx.clone();
+                request_tasks.spawn(async move {
+                    let id = req.id.clone();
+                    if tokio::time::timeout(
+                        Duration::from_secs(60),
+                        handle_jsonrpc_request(&inner, &host, &out_tx, req),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        send_frame(
+                            &out_tx,
+                            &PluginFrame::JsonRpcResponse(JsonRpcResponse::err(
+                                Some(id),
+                                ERR_UNAVAILABLE,
+                                "plugin request timed out",
+                                None,
+                            )),
+                        )
+                        .await;
+                    }
+                });
             }
             PluginFrame::JsonRpcNotification(notif) => {
-                handle_jsonrpc_notification(inner, host, notif).await;
+                // Keep cheap status snapshots ordered; only host operations need workers.
+                if notif.method == METHOD_STATUS || notif.method == METHOD_HELLO {
+                    handle_jsonrpc_notification(inner, host, notif).await;
+                    return false;
+                }
+                if notif.method != METHOD_PUBLISH && notif.method != METHOD_DELIVERY_FAILED {
+                    return false;
+                }
+                // Notifications have no response ID. Close on overload instead of silently
+                // dropping an operation or blocking the response reader behind slow work.
+                if request_tasks.len() >= 32 {
+                    return true;
+                }
+                let inner = Arc::clone(inner);
+                let host = Arc::clone(host);
+                request_tasks.spawn(async move {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(60),
+                        handle_jsonrpc_notification(&inner, &host, notif),
+                    )
+                    .await;
+                });
             }
             PluginFrame::JsonRpcResponse(resp) => {
                 handle_jsonrpc_response(pending_requests, resp).await;
             }
         }
-    }
-
-    async fn handle_legacy_v1_frame(
-        inner: &SupervisorInner,
-        host: &Arc<dyn NodeAdapterHost>,
-        out_tx: &mpsc::Sender<String>,
-        pending_requests: &Arc<Mutex<PendingMap>>,
-        frame: LegacyV1Frame,
-    ) {
-        match frame {
-            LegacyV1Frame::Hello { .. } => {
-                send_frame(
-                    out_tx,
-                    &PluginFrame::LegacyV1(LegacyV1Frame::Hello {
-                        protocol: 1,
-                        plugin: inner.config.id.clone(),
-                        targets: inner.config.targets.clone(),
-                    }),
-                )
-                .await;
-            }
-            LegacyV1Frame::Event { to, event } => {
-                let echo_id = truncate_echo(event.get("id"));
-                let echo_source = truncate_echo(event.get("source"));
-
-                if !inner.config.targets.is_empty() && !inner.config.targets.contains(&to) {
-                    send_frame(
-                        out_tx,
-                        &PluginFrame::LegacyV1(LegacyV1Frame::Nack {
-                            id: echo_id,
-                            source: echo_source,
-                            error: LegacyNackError::UnknownTarget,
-                            message: format!("unknown target '{to}'"),
-                        }),
-                    )
-                    .await;
-                    return;
-                }
-
-                let parsed = match check_cloudevent_v2(&event) {
-                    Ok((ev, _)) => ev,
-                    Err(err) => {
-                        let (nack_err, _, msg) = map_cloudevent_error(&err);
-                        send_frame(
-                            out_tx,
-                            &PluginFrame::LegacyV1(LegacyV1Frame::Nack {
-                                id: echo_id,
-                                source: echo_source,
-                                error: nack_err,
-                                message: msg,
-                            }),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-
-                let ev_id = parsed.id.clone();
-                let ev_source = parsed.source.clone();
-                match host.publish_event(&to, parsed).await {
-                    Ok(outcome) => {
-                        let status = match outcome.status {
-                            PublishStatus::Stored => LegacyAckStatus::Stored,
-                            PublishStatus::Duplicate => LegacyAckStatus::Duplicate,
-                        };
-                        send_frame(
-                            out_tx,
-                            &PluginFrame::LegacyV1(LegacyV1Frame::Ack {
-                                id: ev_id,
-                                source: ev_source,
-                                status,
-                            }),
-                        )
-                        .await;
-                    }
-                    Err(err) => {
-                        let (nack_err, _, msg) = map_publish_error(&err);
-                        send_frame(
-                            out_tx,
-                            &PluginFrame::LegacyV1(LegacyV1Frame::Nack {
-                                id: Some(ev_id),
-                                source: Some(ev_source),
-                                error: nack_err,
-                                message: msg,
-                            }),
-                        )
-                        .await;
-                    }
-                }
-            }
-            LegacyV1Frame::Response {
-                id,
-                ok,
-                result,
-                error,
-            } => {
-                if let Some(sender) = pending_requests.lock().await.remove(&id) {
-                    let resolved = if ok {
-                        Ok(result.unwrap_or(Value::Null))
-                    } else {
-                        Err(AdapterError::RequestFailed(
-                            error.unwrap_or_else(|| "plugin_request_failed".to_string()),
-                        ))
-                    };
-                    let _ = sender.send(resolved);
-                }
-            }
-            LegacyV1Frame::Status {
-                target,
-                pending,
-                oldest_age_seconds,
-                t3_connected,
-            } => {
-                *inner.last_status.write().expect("status lock") = Some(StatusParams {
-                    target,
-                    pending,
-                    oldest_age_seconds,
-                    t3_connected,
-                });
-            }
-            LegacyV1Frame::DeliveryFailed {
-                target,
-                events,
-                reason,
-            } => {
-                host.report_delivery_failed(&inner.config.id, &target, events, &reason)
-                    .await;
-            }
-            LegacyV1Frame::Ack { .. }
-            | LegacyV1Frame::Nack { .. }
-            | LegacyV1Frame::Request { .. } => {
-                send_frame(
-                    out_tx,
-                    &PluginFrame::LegacyV1(LegacyV1Frame::Nack {
-                        id: None,
-                        source: None,
-                        error: LegacyNackError::UnsupportedType,
-                        message: "unexpected legacy frame direction from plugin".to_string(),
-                    }),
-                )
-                .await;
-            }
-        }
+        false
     }
 
     async fn handle_jsonrpc_request(
         inner: &SupervisorInner,
         host: &Arc<dyn NodeAdapterHost>,
-        out_tx: &mpsc::Sender<String>,
+        out_tx: &PluginWriter,
         req: JsonRpcRequest,
     ) {
         match req.method.as_str() {
@@ -2216,7 +1934,7 @@ mod runtime {
                 let parsed = match check_cloudevent_v2(&params.event) {
                     Ok((ev, _)) => ev,
                     Err(err) => {
-                        let (_, code, msg) = map_cloudevent_error(&err);
+                        let (code, msg) = map_cloudevent_error(&err);
                         send_frame(
                             out_tx,
                             &PluginFrame::JsonRpcResponse(JsonRpcResponse::err(
@@ -2254,7 +1972,7 @@ mod runtime {
                         .await;
                     }
                     Err(err) => {
-                        let (_, code, msg) = map_publish_error(&err);
+                        let (code, msg) = map_publish_error(&err);
                         send_frame(
                             out_tx,
                             &PluginFrame::JsonRpcResponse(JsonRpcResponse::err(
@@ -2411,5 +2129,44 @@ mod runtime {
             };
             let _ = sender.send(resolved);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saturated_writer_retains_failure_and_rejects_post_before_its_deadline() {
+        let supervisor = SubprocessSupervisor::new(SubprocessConfig::new(
+            "stalled",
+            AdapterKind::Bridge,
+            "unused",
+            Vec::new(),
+            vec!["ops".into()],
+        ));
+        let (tx, _receiver) = mpsc::channel(1);
+        tx.try_send("occupied".into()).unwrap();
+        let failed = Arc::new(Notify::new());
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        *supervisor.inner.active.lock().await = Some(ActiveConnection {
+            tx: PluginWriter {
+                tx,
+                failed: Arc::clone(&failed),
+            },
+            pending_requests: Arc::clone(&pending_requests),
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.post("ops", BTreeMap::new(), Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(AdapterError::NotRunning(_))));
+        assert!(pending_requests.lock().await.is_empty());
+        // The enqueue failed before any waiter existed. The close signal must still be live.
+        tokio::time::timeout(Duration::from_secs(1), failed.notified())
+            .await
+            .unwrap();
     }
 }

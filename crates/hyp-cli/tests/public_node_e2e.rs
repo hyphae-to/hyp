@@ -6,8 +6,7 @@
 //!   grace-window teardown to `activePollers == 0`, and clean `SIGTERM` shutdown
 //! - Fail-closed security invariants: `403 not_granted` on DM/unconfined subscriptions,
 //!   `422 subscription_rejected` on private/404 repos, `409 peer_key_mismatch` anti-hijack,
-//!   `429 rate_limited` burst guard, `404` when disabled, and `POST /v1/webhooks/github-app`
-//!   HMAC-SHA256 verification.
+//!   `429 rate_limited` burst guard and `404` for the retired GitHub App route.
 //!
 //! 100% isolated (`HYPHAE_SECRET_BACKEND=file`, `tempfile::TempDir`, `127.0.0.1:0`, zero external calls).
 
@@ -25,7 +24,7 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyp_crypto::keys::NodeIdentityKeys;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
-use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig, compute_hmac_sha256_header};
+use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig};
 use hyp_node::engine::http_util::SseParser;
 use hyp_node::engine::{
     GuestPairRequest, GuestPairingConfig, NodeConfig, UnifiedNode, guest_pair_proof_canonical,
@@ -1002,11 +1001,11 @@ async fn public_node_turnkey_deploy_join_live_github_stream_and_confinement() {
 
 // ============================================================================
 // E2E Test 2: Mutated-Valid Security Checks (404 Disabled, 429 Rate Limit,
-//             Cumulative Guest Repo Cap, GitHub App Webhook 404/401/200)
+//             Cumulative Guest Repo Cap, Retired App Route 404)
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webhook() {
+async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_retired_app_route() {
     let mock_gh = MockGitHubServer::start().await;
     let client = make_full_client();
 
@@ -1057,8 +1056,7 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
     disabled_node.shutdown();
     disabled_srv.abort();
 
-    // 2. Hardened public hub with `max_repos_per_guest: 2`, `max_joins_per_minute: 2`,
-    //    and GitHub App webhook secret configured!
+    // 2. Hardened public hub with guest repository and rate limits.
     let pub_dir = tempfile::tempdir().unwrap();
     let mut pub_cfg = NodeConfig::router(NodeId::new("pub-sec.local").unwrap(), pub_dir.path());
     pub_cfg.secret_backend = Some(SecretBackend::File);
@@ -1073,27 +1071,16 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
         max_joins_per_minute: 3,
     };
     let pub_node = UnifiedNode::open(pub_cfg).unwrap();
-    let app_secret = "gh-app-super-secret-2026";
-    let wh_store = SecretStore::new(pub_dir.path(), SecretBackend::File);
-    wh_store
-        .set("github-app-webhook-secret", app_secret)
-        .unwrap();
-    let app_secret_val = wh_store.get("github-app-webhook-secret").unwrap();
     let adapter = Arc::new(
         GitHubPublicAdapter::new(GitHubPublicConfig {
             api_base_url: mock_gh.base_url(),
             min_poll_interval: Duration::from_secs(60),
             base_poll_interval: Duration::from_secs(60),
             teardown_grace: Duration::ZERO,
-            app_webhook_secret: Some(app_secret_val),
             ..GitHubPublicConfig::default()
         })
         .unwrap(),
     );
-    adapter
-        .register_app_installation("acme/open")
-        .await
-        .unwrap();
     pub_node
         .attach_github_public(Arc::clone(&adapter))
         .await
@@ -1252,73 +1239,23 @@ async fn guest_pair_disabled_rate_limit_cumulative_repo_cap_and_github_app_webho
     assert_eq!(s3, StatusCode::FORBIDDEN, "expected 403 on 3rd repo: {b3}");
     assert_eq!(b3["error"], "not_granted");
 
-    // 2e. `POST /v1/webhooks/github-app`: bad HMAC -> 401; valid HMAC -> 200 published!
-    let wh_payload = json!({
-        "action": "opened",
-        "number": 77,
-        "repository": { "full_name": "acme/open" },
-        "sender": { "login": "octocat", "type": "User" },
-        "issue": {
-            "number": 77,
-            "title": "Sub-second App push works",
-            "html_url": "https://github.com/acme/open/issues/77",
-            "state": "open",
-            "user": { "login": "octocat", "type": "User" },
-            "labels": []
-        }
-    });
-    let wh_bytes = serde_json::to_vec(&wh_payload).unwrap();
-    let valid_sig = compute_hmac_sha256_header(app_secret.as_bytes(), &wh_bytes);
-    let mut bad_sig = valid_sig.clone();
-    let last_ch = if bad_sig.ends_with('0') { '1' } else { '0' };
-    bad_sig.pop();
-    bad_sig.push(last_ch);
-
-    let (bad_wh_status, _, _) = send_json_request(
-        &client,
-        &pub_url,
-        Method::POST,
+    for path in [
         "/v1/webhooks/github-app",
-        Some(wh_payload.clone()),
-        None,
-        &[
-            ("x-hub-signature-256", &bad_sig),
-            ("x-github-event", "issues"),
-            ("x-github-delivery", "app-deliv-1"),
-        ],
-    )
-    .await;
-    assert_eq!(bad_wh_status, StatusCode::UNAUTHORIZED);
-
-    let (ok_wh_status, _, ok_wh_body) = send_json_request(
-        &client,
-        &pub_url,
-        Method::POST,
-        "/v1/webhooks/github-app",
-        Some(wh_payload),
-        None,
-        &[
-            ("x-hub-signature-256", &valid_sig),
-            ("x-github-event", "issues"),
-            ("x-github-delivery", "app-deliv-1"),
-        ],
-    )
-    .await;
-    assert_eq!(ok_wh_status, StatusCode::OK, "webhook body: {ok_wh_body}");
-    assert_eq!(ok_wh_body["ok"], true);
-    assert_eq!(ok_wh_body["status"], "published");
-
-    let (_, _, h) = send_json_request(
-        &client,
-        &pub_url,
-        Method::GET,
-        "/v1/health",
-        None,
-        None,
-        &[],
-    )
-    .await;
-    assert_eq!(h["githubPublic"]["appWebhooksPublished"], 1);
+        "/v1/webhooks/prometheus",
+        "/v1/webhooks/stream/ci",
+    ] {
+        let (status, _, body) = send_json_request(
+            &client,
+            &pub_url,
+            Method::POST,
+            path,
+            Some(json!({})),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
 
     pub_node.shutdown_adapters().await;
     pub_node.shutdown();

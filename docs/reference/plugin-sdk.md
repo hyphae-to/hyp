@@ -16,18 +16,18 @@ Write custom chat bridges or event sources in any language that can read and wri
 
 ---
 
-## 2. Option A: JSON-RPC 2.0 (`HYPHAE_PROTOCOL=2`, Recommended)
+## 2. JSON-RPC 2.0 (`HYPHAE_PROTOCOL=2`)
 
 - **`hyphae/hello`** *(notification, host -> plugin)*: `{ "protocol": 2, "plugin": "<id>", "targets": ["..."] }`
-- **`hyphae/publish`** *(request, plugin -> host)*: `{ "target": "<target>", "event": <CloudEvent v1.0> }` -> result `{ "status": "stored" | "duplicate" }`
+- **`hyphae/publish`** *(request, plugin -> host)*: `{ "to": "<target>", "event": <CloudEvent v1.0> }` -> result `{ "status": "stored" | "duplicate" }`
 - **`hyphae/post`** *(request, host -> plugin)*: `{ "target": "<target>", "params": { "text": "...", "replyTo"?: "...", "reaction"?: "..." } }` -> JSON-RPC result `{ ... }`
 - **`hyphae/status`** & **`hyphae/deliveryFailed`** *(notifications)*
 
 ---
 
-## 3. Option B: Zero-Dependency v1 SDKs (Node & Python)
+## 3. Zero-Dependency v2 SDKs (Node & Python)
 
-`SubprocessSupervisor` auto-detects legacy v1 framing seamlessly. Use [plugins/sdk/client.mjs](../../plugins/sdk/client.mjs) (Node 24+) or [plugins/sdk/client.py](../../plugins/sdk/client.py) (Python 3 stdlib) — both automatically handle Unix fd 3 and Windows authenticated loopback TCP with zero platform-specific code in your plugin:
+`SubprocessSupervisor` sends a JSON-RPC v2 `hyphae/hello` notification immediately after transport authentication. Protocol v1 frames are rejected; there is no grace timer, auto-detection, or fallback. Use [plugins/sdk/client.mjs](../../plugins/sdk/client.mjs) (Node 24+) or [plugins/sdk/client.py](../../plugins/sdk/client.py) (Python 3 stdlib) — both automatically handle Unix fd 3 and Windows authenticated loopback TCP with zero platform-specific code in your plugin:
 
 ```js
 #!/usr/bin/env node
@@ -51,3 +51,5 @@ await mesh.send(targets[0], {
 ```
 
 See [docs/plugins.md](../plugins.md) for wiring custom or official plugins in `node.json`.
+
+Publish requests use unique RPC IDs independent of CloudEvent IDs, so concurrent duplicate events and out-of-order replies remain correlated. `send` returns the durable result and raises `PluginRpcError` for JSON-RPC failures: `-32001` too large, `-32002` invalid event, `-32003` unknown target, `-32004` ID conflict, and `-32005` temporarily unavailable. Node callers catch these errors; Python preserves its optional `retry_unavailable` behavior. Both SDKs dispatch posts and notifications while publish replies are pending, bound frames and pending work, and fail pending calls promptly on disconnect. `system.wake` remains a notification and never produces a reply.
