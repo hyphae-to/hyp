@@ -13,14 +13,16 @@
  *   PROMETHEUS_WEBHOOK_SECRET_FILE or PROMETHEUS_WEBHOOK_SECRET     - HMAC-SHA256 secret for X-Webhook-Signature-256
  *   PROMETHEUS_ALLOW_UNSIGNED                                       - Set to "1" to explicitly allow unsigned loopback-only webhooks (NEVER permitted on non-loopback binds)
  */
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { MeshPluginClient } from "../sdk/client.mjs";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SAFE_DATA_BYTES = 7_500;
+const MAX_ATTRIBUTE_CHARS = 256;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+const COMPARE_HMAC_KEY = randomBytes(32);
 
 function isLoopbackHost(h) {
   const normalized = String(h ?? "").trim().toLowerCase().replace(/^\[|\]$/g, "");
@@ -39,10 +41,9 @@ function readOptionalSecret(fileEnv, valEnv) {
 
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
-  const bufA = Buffer.from(a, "utf8");
-  const bufB = Buffer.from(b, "utf8");
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
+  const tagA = createHmac("sha256", COMPARE_HMAC_KEY).update(a, "utf8").digest();
+  const tagB = createHmac("sha256", COMPARE_HMAC_KEY).update(b, "utf8").digest();
+  return timingSafeEqual(tagA, tagB);
 }
 
 function isPlainObject(value) {
@@ -169,19 +170,21 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  if (bearerToken) {
-    const authHeader = req.headers["authorization"];
-    const match = typeof authHeader === "string" ? /^Bearer\s+(.+)$/i.exec(authHeader) : null;
-    if (!match || !safeEqual(match[1], bearerToken)) {
-      sendJson(res, 401, { error: "unauthorized" });
-      return;
+  // When both Bearer and Basic are configured, both read the single HTTP Authorization header:
+  // accept if EITHER configured scheme matches in constant time (matching Rust PrometheusWebhookAdapter).
+  if (bearerToken || expectedBasicB64) {
+    const authHeader = typeof req.headers["authorization"] === "string" ? req.headers["authorization"] : "";
+    let bearerOk = false;
+    if (bearerToken) {
+      const match = /^Bearer\s+(.+)$/i.exec(authHeader);
+      bearerOk = Boolean(match && safeEqual(match[1], bearerToken));
     }
-  }
-
-  if (expectedBasicB64) {
-    const authHeader = req.headers["authorization"];
-    const match = typeof authHeader === "string" ? /^Basic\s+(.+)$/i.exec(authHeader) : null;
-    if (!match || !safeEqual(match[1].trim(), expectedBasicB64)) {
+    let basicOk = false;
+    if (expectedBasicB64) {
+      const match = /^Basic\s+(.+)$/i.exec(authHeader);
+      basicOk = Boolean(match && safeEqual(match[1].trim(), expectedBasicB64));
+    }
+    if (!bearerOk && !basicOk) {
       sendJson(res, 401, { error: "unauthorized" });
       return;
     }
@@ -276,6 +279,9 @@ const server = createServer(async (req, res) => {
       source: "prometheus/alertmanager",
       subject,
       time: eventTime,
+      ...(alertname && Buffer.byteLength(alertname, "utf8") <= MAX_ATTRIBUTE_CHARS ? { alertname } : {}),
+      ...(severity && Buffer.byteLength(severity, "utf8") <= MAX_ATTRIBUTE_CHARS ? { severity } : {}),
+      ...(service && Buffer.byteLength(service, "utf8") <= MAX_ATTRIBUTE_CHARS ? { service } : {}),
       datacontenttype: "application/json",
       data: fitDataBytes(rawData),
     };
