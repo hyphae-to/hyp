@@ -1858,8 +1858,7 @@ impl UnifiedNode {
     // ========================================================================
 
     /// Authenticates an incoming peer HTTP request via `Authorization: Bearer <token>`,
-    /// `Authorization: Hyphae-Ed25519 ...`, or standalone Ed25519 signature headers
-    /// (`X-Hyphae-Node`, `X-Hyphae-Timestamp`, `X-Hyphae-Nonce`, `X-Hyphae-Sig`).
+    /// or `Authorization: Hyphae-Ed25519 ...`.
     /// Returns `Ok(None)` if no authentication headers are present; fails closed with
     /// `NodeError::Unauthorized` on any invalid, malformed, replayed, or revoked credential.
     pub fn authenticate_request(
@@ -1869,54 +1868,8 @@ impl UnifiedNode {
         path_and_query: &str,
         body_sha256: &str,
     ) -> Result<Option<AuthenticatedPeer>, NodeError> {
-        let sig_hdr = headers
-            .get("x-hyphae-sig")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let ts_hdr = headers
-            .get("x-hyphae-timestamp")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let nonce_hdr = headers
-            .get("x-hyphae-nonce")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let node_hdr = headers
-            .get("x-hyphae-node")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let has_any_ed25519_hdr = sig_hdr.is_some() || ts_hdr.is_some() || nonce_hdr.is_some();
-
         let Some(raw_auth) = headers.get(AUTHORIZATION) else {
-            if !has_any_ed25519_hdr {
-                return Ok(None);
-            }
-            let peer_id = node_hdr.ok_or_else(|| {
-                NodeError::Unauthorized("missing X-Hyphae-Node header for Ed25519 auth".into())
-            })?;
-            let ts_str = ts_hdr.ok_or_else(|| {
-                NodeError::Unauthorized("missing X-Hyphae-Timestamp header for Ed25519 auth".into())
-            })?;
-            let nonce = nonce_hdr.ok_or_else(|| {
-                NodeError::Unauthorized("missing X-Hyphae-Nonce header for Ed25519 auth".into())
-            })?;
-            let sig = sig_hdr.ok_or_else(|| {
-                NodeError::Unauthorized("missing X-Hyphae-Sig header for Ed25519 auth".into())
-            })?;
-            let peer = self.verify_ed25519_http_auth(
-                peer_id,
-                ts_str,
-                nonce,
-                sig,
-                method,
-                path_and_query,
-                body_sha256,
-            )?;
-            return Ok(Some(peer));
+            return Ok(None);
         };
         let auth_str = raw_auth
             .to_str()
@@ -1959,33 +1912,6 @@ impl UnifiedNode {
                 }
                 active_peer
             };
-            // Defense-in-depth: if the caller also supplied X-Hyphae-Sig headers alongside Bearer,
-            // verify the Ed25519 signature and confirm it binds to the same peer identity.
-            if has_any_ed25519_hdr {
-                let claimed_node = node_hdr.unwrap_or(&peer.peer_id);
-                if claimed_node != peer.peer_id {
-                    return Err(NodeError::Unauthorized(
-                        "X-Hyphae-Node does not match Bearer credential peer".into(),
-                    ));
-                }
-                let ts_str = ts_hdr.ok_or_else(|| {
-                    NodeError::Unauthorized("missing X-Hyphae-Timestamp header".into())
-                })?;
-                let nonce = nonce_hdr.ok_or_else(|| {
-                    NodeError::Unauthorized("missing X-Hyphae-Nonce header".into())
-                })?;
-                let sig = sig_hdr
-                    .ok_or_else(|| NodeError::Unauthorized("missing X-Hyphae-Sig header".into()))?;
-                let _ = self.verify_ed25519_http_auth(
-                    claimed_node,
-                    ts_str,
-                    nonce,
-                    sig,
-                    method,
-                    path_and_query,
-                    body_sha256,
-                )?;
-            }
             return Ok(Some(peer));
         }
 
