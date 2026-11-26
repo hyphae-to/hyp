@@ -557,10 +557,18 @@ fn run_status_or_doctor(
         .and_then(|d| d.events().list_subscriptions(None).ok())
         .map(|v| v.len())
         .unwrap_or(0);
-    let kv_namespaces = db
+    let kv_namespaces: BTreeSet<String> = db
         .as_ref()
-        .and_then(|d| d.kv().list_namespaces("local", now_ms()).ok())
-        .unwrap_or_default();
+        .into_iter()
+        .flat_map(|d| {
+            let now = now_ms();
+            let kv = d.kv();
+            kv.list_namespaces(&node_id, now)
+                .unwrap_or_default()
+                .into_iter()
+                .chain(kv.list_namespaces("local", now).unwrap_or_default())
+        })
+        .collect();
     let peers: Vec<PeerRecord> = db
         .as_ref()
         .and_then(|d| d.peers().list_peers(None).ok())

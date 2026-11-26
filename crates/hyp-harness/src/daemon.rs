@@ -7826,6 +7826,11 @@ async fn handle_connection<R, W>(
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
+                    "kv.local" => {
+                        let resp = handle_local_kv(&daemon, &packet);
+                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
+                        break;
+                    }
                     "daemon.status" => {
                         let resp = handle_daemon_status(&daemon).await;
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
@@ -9613,6 +9618,37 @@ async fn handle_session_status(
             "transportKind": transport_kind,
         }
     })
+}
+
+fn handle_local_kv(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> Value {
+    use crate::local_kv::{LocalKvError, LocalKvRequest, LocalKvResponse};
+
+    let Some(request) = packet.get("request") else {
+        return json!({ "ok": false, "error": "Missing local KV request" });
+    };
+    let request = match serde_json::from_value::<LocalKvRequest>(request.clone()) {
+        Ok(request) => request,
+        Err(err) => return json!({ "ok": false, "error": err.to_string() }),
+    };
+    let result = request.execute(&daemon.node.db(), daemon.node.node_id().as_str());
+    if matches!(
+        result,
+        Ok(LocalKvResponse::Set(_) | LocalKvResponse::Delete { deleted: true, .. })
+    ) {
+        daemon.node.notify_local_kv_change();
+    }
+    let response = json!({ "ok": true, "result": { "response": result } });
+    if matches!(result, Ok(LocalKvResponse::List { .. }))
+        && serde_json::to_vec(&response)
+            .is_ok_and(|bytes| bytes.len() > crate::sock::MAX_SOCKET_LINE_BYTES)
+    {
+        let result = Err::<LocalKvResponse, _>(LocalKvError::ListTooLarge {
+            state_dir: daemon.node.config().state_dir.clone(),
+            node_id: daemon.node.node_id().to_string(),
+        });
+        return json!({ "ok": true, "result": { "response": result } });
+    }
+    response
 }
 
 async fn handle_daemon_status(daemon: &Arc<LocalDaemonInner>) -> Value {

@@ -152,3 +152,111 @@ async fn source_plugin_event_reaches_matching_local_sessions_only_after_the_flus
         0
     );
 }
+
+#[tokio::test]
+async fn compiled_in_source_drains_backlog_without_skipping_holds_or_caps() {
+    use http::HeaderMap;
+    use hyp_node::adapters::{
+        GenericWebhookAdapter, GenericWebhookConfig, WebhookIngestOutcome,
+        compute_hmac_sha256_header,
+    };
+    use hyp_store::{AckOutcome, BatchState, SubscriptionSpec};
+
+    let tmp = TempDir::new().unwrap();
+    let topic = "ci";
+    let node = open_node_with_source_topic(&tmp, topic);
+    let secret = "test-secret";
+    let mut config = GenericWebhookConfig::new(topic, topic);
+    config.secret = Some(secret.to_string().into());
+    let adapter = Arc::new(GenericWebhookAdapter::new(config));
+    node.attach_generic_webhook(Arc::clone(&adapter))
+        .await
+        .unwrap();
+
+    for (session, cap) in [("free", 90), ("held", 90), ("capped", 2)] {
+        let db = node.db();
+        db.local()
+            .register_session(session, "{}", now_ms())
+            .unwrap();
+        db.events()
+            .upsert_subscription(
+                &SubscriptionSpec {
+                    id: session.to_string(),
+                    origin_node: node.node_id().to_string(),
+                    topic: topic.to_string(),
+                    subscriber: session.to_string(),
+                    filters: vec![],
+                    coalesce_seconds: 0,
+                    max_batch_age_ms: None,
+                    max_wakes_per_hour: Some(cap),
+                    mode: DeliveryMode::Full,
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+
+    // Let the startup scheduler sweep an empty inbox, then seed a backlog without
+    // invoking the native adapter. 70 batches exceed the node's 64-round pass.
+    tokio::task::yield_now().await;
+    for n in 0..70 {
+        let result = node
+            .publish_event("local.ci", mail_event(&format!("stored-{n}"), "Backlog"))
+            .await
+            .unwrap();
+        assert_eq!(result.matched, 3);
+    }
+    {
+        let db = node.db();
+        let held = &db.events().list_batches("held").unwrap()[0];
+        assert!(
+            db.events()
+                .ack_batch(
+                    "held",
+                    &held.id,
+                    &AckOutcome::Hold {
+                        reason: "test_hold".into(),
+                        retry_after_ms: Some(60_000),
+                    },
+                    now_ms(),
+                )
+                .unwrap()
+        );
+    }
+
+    let body = br#"{"label":"final-publish"}"#;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-webhook-signature-256",
+        compute_hmac_sha256_header(secret.as_bytes(), body)
+            .parse()
+            .unwrap(),
+    );
+    let result = adapter.ingest_webhook(&headers, body).await.unwrap();
+    let WebhookIngestOutcome::Published { outcome, .. } = result else {
+        panic!("webhook did not publish: {result:?}");
+    };
+    assert_eq!(outcome.matched, 3);
+    let db = node.db();
+    let received = db.local().peek_inbox_ex("free", 100).unwrap();
+    assert_eq!(received.len(), 71);
+    assert!(
+        received
+            .iter()
+            .any(|entry| entry.entry.text.contains("final-publish"))
+    );
+    for (session, delivered_count) in [("held", 0), ("capped", 2)] {
+        assert_eq!(
+            db.local().peek_inbox_ex(session, 100).unwrap().len(),
+            delivered_count
+        );
+        let batches = db.events().list_batches(session).unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .filter(|batch| batch.state == BatchState::Pending)
+                .count(),
+            71 - delivered_count
+        );
+    }
+}

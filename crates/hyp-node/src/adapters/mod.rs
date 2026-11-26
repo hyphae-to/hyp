@@ -33,10 +33,8 @@ pub use webhooks::{
 /// `UnifiedNode::publish_event` only stores the event and opens batches, so without this flush a
 /// plugin's events reach paired remote subscribers but never a session on the same node.
 ///
-/// One pass of the node's flush hands over only the oldest pending batch per subscription. A
-/// backlog (events stored while a flush failed or the node was restarting) would then drain one
-/// batch per new event and the newest would always lag by one, so this drains until a pass
-/// delivers nothing. Per-subscription wake caps and holds still apply: a capped subscription
+/// The node drains each subscription in bounded passes. Repeat while sessions are reached so one
+/// publish also clears a larger backlog left by a failed flush or restart. Per-subscription wake caps and holds still apply: a capped subscription
 /// simply stops contributing, which ends the loop.
 pub fn deliver_source_topic_to_local_sessions(
     node: &crate::engine::UnifiedNode,

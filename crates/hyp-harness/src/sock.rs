@@ -499,46 +499,38 @@ fn daemon_rpc_sync_on_stream<S: Read + Write>(mut stream: S, packet: &Value) -> 
     }
 }
 
-/// Ultra-fast synchronous single-shot daemon RPC for hooks (zero Tokio overhead!).
-/// Uses `std::os::unix::net::UnixStream` or loopback `std::net::TcpStream` (`connector.addr` /
-/// `tcp://127.0.0.1:<port>`) on Unix, and loopback `std::net::TcpStream` on Windows.
-/// Always fails closed on non-loopback IPs and fails open (`ok: false`) when daemon is offline,
-/// timed out, or returns malformed data.
-#[cfg(unix)]
-pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
-    match detect_loopback_tcp_target(socket_path) {
-        Ok(Some(addr)) => {
-            let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
-                return DaemonRpcResult::fail();
-            };
+/// Synchronous single-shot daemon RPC. Returns a transport error if the endpoint could not be
+/// resolved or the connection could not be established. Once connected, the result may be
+/// ambiguous if the daemon stopped responding after receiving the operation.
+pub fn daemon_rpc_sync_checked(
+    socket_path: &Path,
+    packet: &Value,
+    timeout: Duration,
+) -> io::Result<DaemonRpcResult> {
+    #[cfg(unix)]
+    let addr = match detect_loopback_tcp_target(socket_path)? {
+        Some(addr) => addr,
+        None => {
+            let stream = StdUnixStream::connect(socket_path)?;
             let _ = stream.set_read_timeout(Some(timeout));
             let _ = stream.set_write_timeout(Some(timeout));
-            daemon_rpc_sync_on_stream(stream, packet)
+            return Ok(daemon_rpc_sync_on_stream(stream, packet));
         }
-        Ok(None) => {
-            let Ok(stream) = StdUnixStream::connect(socket_path) else {
-                return DaemonRpcResult::fail();
-            };
-            let _ = stream.set_read_timeout(Some(timeout));
-            let _ = stream.set_write_timeout(Some(timeout));
-            daemon_rpc_sync_on_stream(stream, packet)
-        }
-        Err(_) => DaemonRpcResult::fail(),
-    }
-}
+    };
+    #[cfg(not(unix))]
+    let addr = resolve_loopback_addr(socket_path)?;
 
-/// Ultra-fast synchronous single-shot loopback TCP RPC for hooks on Windows (zero Tokio overhead!).
-#[cfg(not(unix))]
-pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
-    let Ok(addr) = resolve_loopback_addr(socket_path) else {
-        return DaemonRpcResult::fail();
-    };
-    let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
-        return DaemonRpcResult::fail();
-    };
+    let stream = std::net::TcpStream::connect_timeout(&addr, timeout)?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
-    daemon_rpc_sync_on_stream(stream, packet)
+    Ok(daemon_rpc_sync_on_stream(stream, packet))
+}
+
+/// Synchronous single-shot daemon RPC for hooks. Treats connection and protocol errors
+/// as a failed RPC so hooks can continue if the daemon is offline.
+pub fn daemon_rpc_sync(socket_path: &Path, packet: &Value, timeout: Duration) -> DaemonRpcResult {
+    daemon_rpc_sync_checked(socket_path, packet, timeout)
+        .unwrap_or_else(|_| DaemonRpcResult::fail())
 }
 
 /// Async single-shot daemon RPC (Unix domain socket on Unix, loopback TCP on Windows).

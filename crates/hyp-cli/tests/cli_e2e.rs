@@ -761,3 +761,233 @@ fn node_start_parses_kv_namespaces_advertises_manifest_and_mcp_hyp_kv() {
     peer_proc.shutdown_gracefully();
     hub_proc.shutdown_gracefully();
 }
+
+#[test]
+fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
+    use common::parse_json_stdout;
+
+    let mut daemon = start_native_rust_daemon();
+    let home = daemon.tmp.path();
+    let state = daemon.state_dir.to_str().unwrap();
+    let socket = daemon.socket_path.as_deref().unwrap();
+    let sessions = ["kv-first", "kv-coalesced"];
+    let mut mcp = McpSubprocess::spawn(home, socket);
+    mcp.initialize(RPC_TIMEOUT);
+
+    let call = |mcp: &mut McpSubprocess, session: &str, tool, args: Value| {
+        let (text, is_error) =
+            mcp.call_verified_claude(home, socket, session, tool, args, RPC_TIMEOUT);
+        assert!(!is_error, "{tool}: {text}");
+        serde_json::from_str::<Value>(&text).unwrap()
+    };
+    for (session, coalesce_seconds) in [(sessions[0], 0), (sessions[1], 1)] {
+        call(
+            &mut mcp,
+            session,
+            "hyp_mesh",
+            json!({"action":"join", "handle": session}),
+        );
+        let subscription = call(
+            &mut mcp,
+            session,
+            "hyp_stream",
+            json!({"action":"subscribe", "topic":"local.kv", "coalesceSeconds":coalesce_seconds}),
+        );
+        assert_eq!(subscription["topic"], "kv");
+    }
+
+    let kv = |args: &[&str]| {
+        let output = isolated_cmd(home)
+            .arg("kv")
+            .args(args)
+            .args(["--ns", "shared", "--state-dir", state, "--json"])
+            .output()
+            .unwrap();
+        (output.status.code(), parse_json_stdout(&output))
+    };
+    let arm_waiters = || {
+        sessions.map(|session| {
+            let full_id = format!("claude:{session}");
+            let mut cmd = isolated_cmd(home);
+            cmd.args([
+                "wait",
+                "--session",
+                &full_id,
+                "--socket",
+                socket.to_str().unwrap(),
+                "--timeout",
+                "8",
+                "--json",
+            ])
+            .stdin(Stdio::null());
+            let waiter = ManagedProcess::spawn("hyp wait (KV subscription)", &mut cmd);
+            wait_for_session_live(socket, &full_id, Duration::from_secs(5));
+            waiter
+        })
+    };
+    let assert_wakes =
+        |mcp: &mut McpSubprocess, waiters: [ManagedProcess; 2], key: &str, event_type| {
+            for (session, mut waiter) in sessions.into_iter().zip(waiters) {
+                let (status, wake) = waiter.wait_json_output(RPC_TIMEOUT);
+                assert!(status.success(), "{session} missed the wake: {wake}");
+                let digest = wake["data"]["items"][0]["text"].as_str().unwrap();
+                assert!(
+                    digest.contains("<hyphae-inbox") && digest.contains("topic=\"local.kv\""),
+                    "{wake}"
+                );
+                assert!(!digest.contains(key), "{wake}");
+                let inbox = call(mcp, session, "hyp_inbox", json!({}));
+                let payload: Value =
+                    serde_json::from_str(inbox["items"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(payload["originNode"], "cli@local");
+                assert_eq!(payload["topic"], "kv");
+                assert_eq!(payload["events"].as_array().unwrap().len(), 1);
+                assert_eq!(payload["events"][0]["type"], event_type);
+                assert_eq!(payload["events"][0]["key"], key);
+            }
+        };
+
+    let waiters = arm_waiters();
+    let (status, set) = kv(&[
+        "set",
+        "--key",
+        "cli-key",
+        "--value",
+        "42",
+        "--write-model",
+        "shared",
+        "--ttl-seconds",
+        "120",
+    ]);
+    assert_eq!(status, Some(0), "{set}");
+    assert_eq!(set["data"]["hostNode"], "cli@local");
+    assert_eq!(
+        set["data"]["expiresAt"].as_i64().unwrap() - set["data"]["updatedAt"].as_i64().unwrap(),
+        120_000
+    );
+    assert_wakes(&mut mcp, waiters, "cli-key", "to.hyphae.kv.set");
+
+    let (status, conflict) = kv(&[
+        "set",
+        "--key",
+        "cli-key",
+        "--value",
+        "0",
+        "--expected-version",
+        "0",
+    ]);
+    assert_eq!(status, Some(1));
+    assert_eq!(conflict["error"]["code"], "VERSION_CONFLICT");
+    assert_eq!(conflict["data"]["currentVersion"], 1);
+    let (status, get) = kv(&["get", "--key", "cli-key", "--node", "local"]);
+    assert_eq!(status, Some(0), "{get}");
+    assert_eq!(get["data"]["hostNode"], "cli@local");
+    assert_eq!(get["data"]["value"], 42);
+    let (status, list) = kv(&["list", "--prefix", "cli-"]);
+    assert_eq!(status, Some(0), "{list}");
+    assert_eq!(list["data"]["entries"][0]["key"], "cli-key");
+
+    let waiters = arm_waiters();
+    let (status, delete) = kv(&["delete", "--key", "cli-key", "--expected-version", "1"]);
+    assert_eq!(status, Some(0), "{delete}");
+    assert_eq!(delete["data"]["deleted"], true);
+    assert_wakes(&mut mcp, waiters, "cli-key", "to.hyphae.kv.deleted");
+
+    let waiters = arm_waiters();
+    let set = call(
+        &mut mcp,
+        sessions[0],
+        "hyp_kv",
+        json!({"action":"set","node":"local","namespace":"shared","key":"mcp-key","value":true,"writeModel":"shared"}),
+    );
+    assert_eq!(set["entry"]["host_node"], "cli@local");
+    assert_wakes(&mut mcp, waiters, "mcp-key", "to.hyphae.kv.set");
+
+    let waiters = arm_waiters();
+    call(
+        &mut mcp,
+        sessions[1],
+        "hyp_kv",
+        json!({"action":"delete","node":"local","namespace":"shared","key":"mcp-key","expectedVersion":1}),
+    );
+    assert_wakes(&mut mcp, waiters, "mcp-key", "to.hyphae.kv.deleted");
+
+    assert_eq!(mcp.close(RPC_TIMEOUT), Some(0));
+    daemon.proc.shutdown_gracefully();
+    let (status, offline) = kv(&["set", "--key", "offline-key", "--value", "1"]);
+    assert_eq!(status, Some(0), "{offline}");
+    assert_eq!(offline["data"]["hostNode"], "cli@local");
+    let (status, offline) = kv(&["get", "--key", "offline-key"]);
+    assert_eq!(status, Some(0), "{offline}");
+    assert_eq!(offline["data"]["value"], 1);
+
+    {
+        use hyp_store::{KvSetInput, NodeDb, WriteModel, now_ms};
+
+        let db = NodeDb::open(daemon.state_dir.join("node.sqlite")).unwrap();
+        db.kv()
+            .set(
+                &KvSetInput {
+                    host_node: "local".into(),
+                    namespace: "legacy".into(),
+                    key: "old-key".into(),
+                    value: json!(0),
+                    content_type: None,
+                    write_model: WriteModel::Owner,
+                    owner_id: None,
+                    allowlist: None,
+                    writer_id: "cli@local".into(),
+                    expected_version: None,
+                    e2ee_epoch: None,
+                    signature: None,
+                    ttl_ms: None,
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+    let status = isolated_cmd(home)
+        .args(["status", "--state-dir", state, "--json"])
+        .output()
+        .unwrap();
+    let status = parse_json_stdout(&status);
+    assert_eq!(
+        status["data"]["node"]["kvNamespaces"],
+        json!(["legacy", "shared"])
+    );
+
+    // A connection confirmed a daemon is present, but a lost reply leaves the
+    // write outcome unknown. The CLI must not retry a mutation in SQLite.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_file = daemon.state_dir.join("connector.addr");
+    fs::write(&addr_file, listener.local_addr().unwrap().to_string()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let fake_daemon = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, ErrorKind};
+        use std::time::Instant;
+
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(err) if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("failed to accept KV request: {err}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(RPC_TIMEOUT)).unwrap();
+        let mut request = String::new();
+        BufReader::new(stream).read_line(&mut request).unwrap();
+        assert!(request.contains("ambiguous-key"));
+    });
+    let (status, error) = kv(&["set", "--key", "ambiguous-key", "--value", "1"]);
+    assert_eq!(status, Some(1), "{error}");
+    assert_eq!(error["error"]["code"], "DAEMON_ERROR");
+    fake_daemon.join().unwrap();
+    fs::remove_file(addr_file).unwrap();
+    let (status, missing) = kv(&["get", "--key", "ambiguous-key"]);
+    assert_eq!(status, Some(1), "{missing}");
+    assert_eq!(missing["error"]["code"], "NOT_FOUND");
+}
