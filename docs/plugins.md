@@ -295,7 +295,7 @@ You do **not** need to clone the Hyphae git repository to install or update offi
 
 - **Bridges & SDK (`kind: "bridge"`)**: `sdk` (`sdk/client.mjs`, `sdk/client.py`), `telegram`, `slack`, `whatsapp`, `webhook`, `prometheus` -> installed under `~/.config/hyphae/plugins/` (`0700`/`0600`).
 - **Harness UI mods & plugins (`kind: "harness"`)**:
-  - `claude-panel` (`claude-code/hooks/{register.tsx,state.ts}` + minimal UI-only `.claude-plugin/plugin.json` & `hooks/hooks.json`) -> installed into `~/.claude/skills/hyphae-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyphae-panel/`, symlink-safe).
+  - `claude-panel` (`claude-code/hooks/{register.tsx,state.ts}` + minimal UI-only `.claude-plugin/plugin.json` & `hooks/hooks.json`) -> installed into `~/.claude/skills/hyp-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyp-panel/`, symlink-safe).
   - `claude-code` (full 12-file Claude Code plugin bundle including raw-hashed binary `icon.png`) -> installed under `~/.config/hyphae/plugins/claude-code/`.
   - `herdr-mod` (`hyphae-pane` + `hyphae-panel` GPUI mods, 9 files) -> installed as real directories under `~/.config/herdr-app/mods/` (FSEvents hot-reload friendly; never touches `keys.json` or custom/symlinked layouts unless run via `hyp setup --harness herdr --mod`).
 

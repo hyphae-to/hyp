@@ -163,7 +163,8 @@ fn install_skill_detects_fake_harnesses_and_writes_exact_skill_files() {
         stock
             .replace("hyp-setup", "hyphae-setup")
             .replace("skills/hyp-mesh/", "skills/hyphae/")
-            .replace("skills/hyp-schedule/", "skills/hyphae-schedule/"),
+            .replace("skills/hyp-schedule/", "skills/hyphae-schedule/")
+            .replace("/skills/hyp-panel/", "/skills/hyphae-panel/"),
     )
     .unwrap();
     fs::write(&legacy_custom, "# Custom setup").unwrap();
