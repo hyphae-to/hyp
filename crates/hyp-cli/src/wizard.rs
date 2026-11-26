@@ -15,8 +15,8 @@ use crate::config_file::{
     load_node_or_legacy_config, resolve_config_path_for_read, write_atomic_file,
 };
 use crate::setup::{
-    HarnessDiagnostic, OnboardArgs, OpenClawDeliveryMode, apply_openclaw_config,
-    canonical_dedup_key, default_node_id, detect_harness_statuses,
+    CodexMcpConfig, HarnessDiagnostic, OnboardArgs, OpenClawDeliveryMode, apply_openclaw_config,
+    canonical_dedup_key, codex_mcp_config_path, default_node_id, detect_harness_statuses,
     read_openclaw_hyphae_preferences, resolve_claude_profiles,
 };
 use crate::ui::{
@@ -444,16 +444,16 @@ impl ManualGuideHarness {
     }
 
     /// Optional MCP config hint & snippet (used for Claude Desktop & Codex Desktop).
-    pub fn mcp_config_note(self, home: &Path) -> Option<(PathBuf, &'static str)> {
+    pub fn mcp_config_note(self, home: &Path, cli_bin: &str) -> Option<(PathBuf, String)> {
         match self {
             Self::ClaudeDesktop => {
                 let path = claude_desktop_config_path(home);
                 let snippet = r#"{ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp", "--backend", "claude", "--ephemeral"] } } }"#;
-                Some((path, snippet))
+                Some((path, snippet.to_owned()))
             }
             Self::CodexDesktop => {
-                let path = codex_desktop_config_path(home);
-                let snippet = "[mcp_servers.hyphae]\ncommand = \"hyp\"\nargs = [\"mcp\"]";
+                let path = codex_mcp_config_path(home);
+                let snippet = CodexMcpConfig::read(&path, cli_bin, None).ok()?.block;
                 Some((path, snippet))
             }
             _ => None,
@@ -492,11 +492,6 @@ pub fn claude_desktop_config_path(home: &Path) -> PathBuf {
             .join("Claude")
             .join("claude_desktop_config.json")
     }
-}
-
-/// Codex Desktop / CLI TOML config path (`~/.codex/config.toml`).
-pub fn codex_desktop_config_path(home: &Path) -> PathBuf {
-    home.join(".codex").join("config.toml")
 }
 
 /// Preview plan for an interactive confirm-before-write Desktop MCP configuration update.
@@ -566,109 +561,6 @@ fn claude_mcp_servers_has_hyphae(
         })
 }
 
-fn codex_toml_is_hyphae_table_header(line: &str) -> bool {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('[') || trimmed.starts_with("[[") {
-        return false;
-    }
-    let Some(close_idx) = trimmed.find(']') else {
-        return false;
-    };
-    let trailing = trimmed[close_idx + 1..].trim();
-    if !trailing.is_empty() && !trailing.starts_with('#') {
-        return false;
-    }
-    let inner: String = trimmed[1..close_idx]
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    matches!(
-        inner.as_str(),
-        "mcp_servers.hyphae" | "mcp_servers.\"hyphae\"" | "mcp_servers.'hyphae'"
-    )
-}
-
-fn codex_toml_has_hyphae_mcp(raw: &str) -> bool {
-    raw.lines().any(codex_toml_is_hyphae_table_header)
-}
-
-fn upsert_toml_block_local(source: &str, marker: &str, block: &str) -> String {
-    let begin = format!("# >>> {marker} >>>");
-    let end = format!("# <<< {marker} <<<");
-    let wrapped = format!("{begin}\n{}\n{end}\n", block.trim());
-    if let (Some(start_idx), Some(end_idx)) = (source.find(&begin), source.find(&end)) {
-        if end_idx > start_idx {
-            let after_end = &source[end_idx + end.len()..];
-            let after = after_end
-                .strip_prefix("\r\n")
-                .or_else(|| after_end.strip_prefix('\n'))
-                .unwrap_or(after_end);
-            return format!("{}{}{}", &source[..start_idx], wrapped, after);
-        }
-    }
-    let sep = if source.is_empty() || source.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    let blank = if source.trim().is_empty() { "" } else { "\n" };
-    format!("{source}{sep}{blank}{wrapped}")
-}
-
-fn upsert_codex_hyphae_toml(source: &str, cli_bin: &str) -> String {
-    let cmd_toml = serde_json::to_string(cli_bin).unwrap_or_else(|_| "\"hyp\"".to_string());
-    let toml_block = format!(
-        "[mcp_servers.hyphae]\ncommand = {cmd_toml}\nargs = [\"mcp\"]\nenv_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]"
-    );
-
-    let begin = "# >>> hyphae >>>";
-    let end = "# <<< hyphae <<<";
-    if let (Some(start_idx), Some(end_idx)) = (source.find(begin), source.find(end)) {
-        if end_idx > start_idx {
-            return upsert_toml_block_local(source, "hyphae", &toml_block);
-        }
-    }
-
-    // If an unmarked `[mcp_servers.hyphae]` table already exists, replace it cleanly in place
-    // so we never write duplicate TOML table headers.
-    let lines: Vec<&str> = source.lines().collect();
-    if let Some(start_line) = lines
-        .iter()
-        .position(|line| codex_toml_is_hyphae_table_header(line))
-    {
-        let mut end_line = lines.len();
-        for (idx, line) in lines.iter().enumerate().skip(start_line + 1) {
-            if line.trim_start().starts_with('[') {
-                end_line = idx;
-                break;
-            }
-        }
-        let mut before = lines[..start_line].to_vec();
-        while before.last().is_some_and(|l| l.trim().is_empty()) {
-            before.pop();
-        }
-        let mut after = lines[end_line..].to_vec();
-        while after.first().is_some_and(|l| l.trim().is_empty()) {
-            after.remove(0);
-        }
-
-        let mut out = String::new();
-        if !before.is_empty() {
-            out.push_str(&before.join("\n"));
-            out.push_str("\n\n");
-        }
-        out.push_str(&format!("{begin}\n{toml_block}\n{end}\n"));
-        if !after.is_empty() {
-            out.push('\n');
-            out.push_str(&after.join("\n"));
-            out.push('\n');
-        }
-        return out;
-    }
-
-    upsert_toml_block_local(source, "hyphae", &toml_block)
-}
-
 /// Inspects the target Desktop app MCP configuration file and builds a safe confirm-before-write
 /// preview plan for Claude Desktop (`claude_desktop_config.json`) and Codex Desktop (`~/.codex/config.toml`).
 pub fn inspect_desktop_mcp_plan(
@@ -711,22 +603,20 @@ pub fn inspect_desktop_mcp_plan(
             })
         }
         ManualGuideHarness::CodexDesktop => {
-            let config_path = codex_desktop_config_path(home);
-            let already_configured = if config_path.exists() {
-                fs::read_to_string(&config_path)
-                    .ok()
-                    .is_some_and(|raw| codex_toml_has_hyphae_mcp(&raw))
-            } else {
-                false
+            let config_path = codex_mcp_config_path(home);
+            let config = CodexMcpConfig::read(&config_path, cli_bin, None);
+            let already_configured = config
+                .as_ref()
+                .is_ok_and(|config| config.already_configured);
+            let preview_lines = match config {
+                Ok(config) => std::iter::once(
+                    "Configure [mcp_servers.hyphae] (preserves existing Codex settings):"
+                        .to_string(),
+                )
+                .chain(config.block.lines().map(ToOwned::to_owned))
+                .collect(),
+                Err(err) => vec![err],
             };
-            let cmd_toml = serde_json::to_string(cli_bin).unwrap_or_else(|_| "\"hyp\"".to_string());
-            let preview_lines = vec![
-                "Add [mcp_servers.hyphae] section (preserves existing Codex settings):".to_string(),
-                "[mcp_servers.hyphae]".to_string(),
-                format!("command = {cmd_toml}"),
-                "args = [\"mcp\"]".to_string(),
-                "env_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]".to_string(),
-            ];
             Some(DesktopMcpPlan {
                 harness,
                 config_path,
@@ -805,22 +695,13 @@ pub fn apply_desktop_mcp_config(
             })
         }
         ManualGuideHarness::CodexDesktop => {
-            let config_path = codex_desktop_config_path(home);
-            let existed = config_path.exists();
-            let existing_toml = if existed {
-                fs::read_to_string(&config_path)
-                    .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?
-            } else {
-                String::new()
-            };
-            let already_configured = codex_toml_has_hyphae_mcp(&existing_toml);
-            let next_toml = upsert_codex_hyphae_toml(&existing_toml, cli_bin);
-            write_atomic_file(&config_path, next_toml.as_bytes(), false)?;
-
+            let config_path = codex_mcp_config_path(home);
+            let config = CodexMcpConfig::read(&config_path, cli_bin, None)?;
+            config.write(&config_path, false)?;
             Ok(DesktopMcpApplyResult {
                 config_path,
-                created: !existed,
-                already_configured,
+                created: config.created,
+                already_configured: config.already_configured,
             })
         }
         other => Err(format!(
@@ -5055,9 +4936,11 @@ fn install_manual_guide_skills(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_manual_guide_plain(
     harness: ManualGuideHarness,
     home: &Path,
+    cli_bin: &str,
     primary_skill: &Path,
     installed: &[InstalledSkillEntry],
     prompt: &str,
@@ -5085,7 +4968,7 @@ fn print_manual_guide_plain(
             );
         }
         DesktopMcpStatus::Skipped | DesktopMcpStatus::NotApplicable => {
-            if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
+            if let Some((cfg_path, snippet)) = harness.mcp_config_note(home, cli_bin) {
                 println!();
                 println!("MCP config ({}):", cfg_path.display());
                 for line in snippet.lines() {
@@ -5150,7 +5033,7 @@ fn install_and_emit_manual_guide(
         Some(_) => DesktopMcpStatus::Skipped,
         None => DesktopMcpStatus::NotApplicable,
     };
-    let mcp_note = harness.mcp_config_note(home);
+    let mcp_note = harness.mcp_config_note(home, cli_bin);
     let mut steps = vec![harness.open_instruction()];
     if !matches!(mcp_status, DesktopMcpStatus::AlreadyConfigured(_)) {
         if let Some((ref cfg_path, _)) = mcp_note {
@@ -5211,6 +5094,7 @@ fn install_and_emit_manual_guide(
     print_manual_guide_plain(
         harness,
         home,
+        cli_bin,
         &primary_skill,
         &installed,
         &prompt,
@@ -6131,6 +6015,7 @@ fn render_desktop_mcp_confirm_screen(
 pub fn render_manual_guide(
     harness: ManualGuideHarness,
     home: &Path,
+    cli_bin: &str,
     primary_skill: &Path,
     installed: &[InstalledSkillEntry],
     prompt: &str,
@@ -6273,7 +6158,7 @@ pub fn render_manual_guide(
         mcp_status,
         DesktopMcpStatus::Skipped | DesktopMcpStatus::NotApplicable
     ) {
-        if let Some((cfg_path, snippet)) = harness.mcp_config_note(home) {
+        if let Some((cfg_path, snippet)) = harness.mcp_config_note(home, cli_bin) {
             lines.push(card_row("", RGB_UI_MUTED, false));
             let cfg_hdr = format!("MCP config ({}):", display_compact_path(&cfg_path, home));
             for wrapped in wrap_words(&cfg_hdr, inner_card_w) {
@@ -6368,6 +6253,7 @@ pub fn render_manual_guide(
 fn render_manual_guide_screen(
     harness: ManualGuideHarness,
     home: &Path,
+    cli_bin: &str,
     primary_skill: &Path,
     installed: &[InstalledSkillEntry],
     prompt: &str,
@@ -6383,6 +6269,7 @@ fn render_manual_guide_screen(
     let lines = render_manual_guide(
         harness,
         home,
+        cli_bin,
         primary_skill,
         installed,
         prompt,
@@ -8177,6 +8064,7 @@ fn run_fullscreen_tui_loop(
                 render_manual_guide_screen(
                     *harness,
                     home,
+                    cli_bin,
                     primary_skill,
                     installed,
                     prompt,
@@ -8685,6 +8573,7 @@ fn execute_tui_resolution(
             print_manual_guide_plain(
                 harness,
                 home,
+                cli_bin,
                 &primary_skill,
                 &installed,
                 &prompt,
@@ -8939,6 +8828,7 @@ fn run_plain_tty_manual_guide(
     print_manual_guide_plain(
         harness,
         home,
+        cli_bin,
         &primary_skill,
         &installed,
         &prompt,
@@ -10417,7 +10307,7 @@ mod tests {
         let plan0 = inspect_desktop_mcp_plan(ManualGuideHarness::CodexDesktop, home, cli_bin)
             .expect("codex desktop plan");
         assert!(!plan0.already_configured);
-        assert_eq!(plan0.config_path, codex_desktop_config_path(home));
+        assert_eq!(plan0.config_path, codex_mcp_config_path(home));
         assert!(
             plan0
                 .preview_lines
@@ -10448,7 +10338,7 @@ mod tests {
         assert!(written.contains("# >>> hyphae >>>"));
         assert!(written.contains("[mcp_servers.hyphae]"));
         assert!(written.contains("command = \"/opt/homebrew/bin/hyp\""));
-        assert!(written.contains("args = [\"mcp\"]"));
+        assert!(written.contains("args = [\"mcp\", \"--backend\", \"codex\"]"));
         assert!(written.contains("env_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]"));
         assert!(written.contains("# <<< hyphae <<<"));
 
@@ -10470,16 +10360,29 @@ mod tests {
         assert_eq!(
             written2
                 .lines()
-                .filter(|l| codex_toml_is_hyphae_table_header(l))
+                .filter(|l| l.trim() == "[mcp_servers.hyphae]")
                 .count(),
             1
         );
 
-        // Replacing an unmarked existing `[mcp_servers.hyphae]` section preserves neighbors without duplicates.
-        let unmarked = "model = \"o3\"\n\n[mcp_servers.hyphae]\ncommand = \"old-hyp\"\nargs = [\"mcp\"]\n\n[mcp_servers.other]\ncommand = \"other\"\n";
+        // An old unmarked table keeps its socket and neighboring settings.
+        let unmarked = r#"model = "o3"
+
+[mcp_servers.hyphae]
+command = "old-hyp"
+args = [
+    'mcp',
+    '/tmp/custom connector.sock',
+]
+startup_timeout_sec = 25 # Keep this.
+env_vars = ['CUSTOM']
+
+[mcp_servers.other]
+command = "other"
+"#;
         fs::write(&plan0.config_path, unmarked).unwrap();
         assert!(
-            inspect_desktop_mcp_plan(ManualGuideHarness::CodexDesktop, home, cli_bin)
+            !inspect_desktop_mcp_plan(ManualGuideHarness::CodexDesktop, home, cli_bin)
                 .unwrap()
                 .already_configured
         );
@@ -10491,13 +10394,115 @@ mod tests {
         assert!(replaced.contains("[mcp_servers.other]"));
         assert!(replaced.contains("command = \"/opt/homebrew/bin/hyp\""));
         assert!(!replaced.contains("old-hyp"));
+        assert!(replaced.contains(
+            "args = [\"mcp\", \"/tmp/custom connector.sock\", \"--backend\", \"codex\"]"
+        ));
+        assert!(replaced.contains("startup_timeout_sec = 25 # Keep this."));
+        assert!(replaced.contains("env_vars = [\"CUSTOM\", \"CODEX_HOME\", \"HYPHAE_SOCKET\"]"));
         assert_eq!(
             replaced
                 .lines()
-                .filter(|l| codex_toml_is_hyphae_table_header(l))
+                .filter(|l| l.trim() == "[mcp_servers.hyphae]")
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn codex_cli_and_desktop_setup_share_one_idempotent_config_with_custom_socket() {
+        use clap::Parser;
+        use std::fs::{FileTimes, OpenOptions};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = "/opt/hyphae/bin/hyp";
+        let socket = "/tmp/Hyphae Dev/connector.sock";
+        let desktop = ManualGuideHarness::CodexDesktop;
+        let original = concat!(
+            "# Keep the model and neighboring MCP server.\n",
+            "model = 'o3'\n\n",
+            "[mcp_servers.other]\n",
+            "command = 'other'\n"
+        );
+        let mut configs = Vec::new();
+        for cli_first in [true, false] {
+            let home = tmp.path().join(if cli_first {
+                "cli-first"
+            } else {
+                "desktop-first"
+            });
+            let path = codex_mcp_config_path(&home);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, original).unwrap();
+
+            let run_cli_setup = |socket: Option<&str>| {
+                let state = home.join("state");
+                let mut argv = vec![
+                    "hyp",
+                    "setup",
+                    "--harness",
+                    "codex",
+                    "--home",
+                    home.to_str().unwrap(),
+                    "--state-dir",
+                    state.to_str().unwrap(),
+                    "--bin",
+                    bin,
+                    "--no-skills",
+                    "--no-commands",
+                    "--json",
+                ];
+                if let Some(socket) = socket {
+                    argv.extend(["--socket", socket]);
+                }
+                let crate::Commands::Setup(args) =
+                    crate::Cli::try_parse_from(argv).unwrap().command
+                else {
+                    panic!("expected setup command");
+                };
+                assert_eq!(crate::setup::run_setup(args), ExitCode::SUCCESS);
+            };
+
+            if !cli_first {
+                let applied = apply_desktop_mcp_config(desktop, &home, bin).unwrap();
+                assert!(!applied.already_configured);
+            }
+            run_cli_setup(Some(socket));
+
+            let plan = inspect_desktop_mcp_plan(desktop, &home, bin).unwrap();
+            assert!(plan.already_configured);
+            assert!(plan.preview_lines.iter().any(|line| line.contains(socket)));
+
+            let stamp = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(stamp))
+                .unwrap();
+            let applied = apply_desktop_mcp_config(desktop, &home, bin).unwrap();
+            assert!(applied.already_configured);
+            run_cli_setup(None);
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), stamp);
+
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(content.starts_with(original));
+            let parsed = content.parse::<toml_edit::DocumentMut>().unwrap();
+            let args = parsed["mcp_servers"]["hyphae"]["args"].as_array().unwrap();
+            assert_eq!(
+                args.iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["mcp", socket, "--backend", "codex"]
+            );
+            assert!(
+                fs::read_to_string(path.with_file_name("hooks.json"))
+                    .unwrap()
+                    .contains(socket)
+            );
+            configs.push(content);
+        }
+        assert_eq!(configs[0], configs[1]);
     }
 
     #[test]
@@ -10678,6 +10683,7 @@ mod tests {
         let guide_lines = render_manual_guide(
             ManualGuideHarness::ClaudeDesktop,
             &home,
+            "/opt/hyp",
             &ManualGuideHarness::ClaudeDesktop.primary_skill_path(&home),
             &[],
             "Set up Hyphae on this machine using the hyphae-setup skill",

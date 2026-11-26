@@ -1213,12 +1213,34 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
     );
     let cx_cfg_path = home_cx.join(".codex/config.toml");
     assert!(!cx_cfg_path.exists());
+    let fresh_snippet: toml_edit::DocumentMut = cx_json["data"]["mcpSnippet"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let fresh_entry = &fresh_snippet["mcp_servers"]["hyphae"];
+    assert_eq!(
+        fresh_entry["args"].as_array().unwrap().to_string().trim(),
+        r#"["mcp", "--backend", "codex"]"#
+    );
+    assert_eq!(
+        fresh_entry["env_vars"]
+            .as_array()
+            .unwrap()
+            .to_string()
+            .trim(),
+        r#"["CODEX_HOME", "HYPHAE_SOCKET"]"#
+    );
+    assert!(Path::new(fresh_entry["command"].as_str().unwrap()).is_absolute());
     fs::create_dir_all(cx_cfg_path.parent().unwrap()).unwrap();
-    fs::write(
-        &cx_cfg_path,
-        "model = \"gpt-5\"\n\n[mcp_servers.hyphae]\ncommand = \"hyp\"\nargs = [\"mcp\"]\n",
-    )
-    .unwrap();
+    let existing_cx = r#"model = "gpt-5"
+
+[mcp_servers.hyphae]
+command = "hyp"
+args = ["mcp", "custom socket"]
+env_vars = ["CUSTOM_ENV"]
+"#;
+    fs::write(&cx_cfg_path, existing_cx).unwrap();
     let cx_out2 = isolated_cmd(home_cx)
         .args([
             "onboard",
@@ -1233,5 +1255,32 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
         .expect("re-run assist codex-desktop --json");
     assert_eq!(cx_out2.status.code(), Some(0));
     let cx_json2 = parse_json_stdout(&cx_out2);
-    assert_eq!(cx_json2["data"]["mcpAlreadyConfigured"], true);
+    assert_eq!(cx_json2["data"]["mcpAlreadyConfigured"], false);
+    let existing_snippet: toml_edit::DocumentMut = cx_json2["data"]["mcpSnippet"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let existing_entry = &existing_snippet["mcp_servers"]["hyphae"];
+    assert_eq!(
+        existing_entry["command"].as_str(),
+        fresh_entry["command"].as_str()
+    );
+    assert_eq!(
+        existing_entry["args"]
+            .as_array()
+            .unwrap()
+            .to_string()
+            .trim(),
+        r#"["mcp", "custom socket", "--backend", "codex"]"#
+    );
+    assert_eq!(
+        existing_entry["env_vars"]
+            .as_array()
+            .unwrap()
+            .to_string()
+            .trim(),
+        r#"["CUSTOM_ENV", "CODEX_HOME", "HYPHAE_SOCKET"]"#
+    );
+    assert_eq!(fs::read_to_string(cx_cfg_path).unwrap(), existing_cx);
 }

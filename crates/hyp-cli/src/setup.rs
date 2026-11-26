@@ -2399,27 +2399,154 @@ fn merge_hook_groups(existing: Option<&Value>, new_entry: Value) -> Value {
     Value::Array(list)
 }
 
-fn upsert_toml_block(source: &str, marker: &str, block: &str) -> String {
-    let begin = format!("# >>> {marker} >>>");
-    let end = format!("# <<< {marker} <<<");
-    let wrapped = format!("{begin}\n{}\n{end}\n", block.trim());
-    if let (Some(start_idx), Some(end_idx)) = (source.find(&begin), source.find(&end)) {
-        if end_idx > start_idx {
-            let after_end = &source[end_idx + end.len()..];
-            let after = after_end
-                .strip_prefix("\r\n")
-                .or_else(|| after_end.strip_prefix('\n'))
-                .unwrap_or(after_end);
-            return format!("{}{}{}", &source[..start_idx], wrapped, after);
-        }
+pub(crate) fn codex_mcp_config_path(home: &Path) -> PathBuf {
+    home.join(".codex").join("config.toml")
+}
+
+pub(crate) struct CodexMcpConfig {
+    pub block: String,
+    pub created: bool,
+    pub already_configured: bool,
+    socket: Option<String>,
+    updated: String,
+}
+
+impl CodexMcpConfig {
+    pub(crate) fn read(path: &Path, bin: &str, socket: Option<&str>) -> Result<Self, String> {
+        let (source, created) = match fs::read_to_string(path) {
+            Ok(source) => (source, false),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (String::new(), true),
+            Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+        };
+        let mut config = Self::plan(&source, bin, socket)
+            .map_err(|err| format!("failed to configure {}: {err}", path.display()))?;
+        config.created = created;
+        Ok(config)
     }
-    let sep = if source.is_empty() || source.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    let blank = if source.trim().is_empty() { "" } else { "\n" };
-    format!("{source}{sep}{blank}{wrapped}")
+
+    fn plan(source: &str, bin: &str, socket: Option<&str>) -> Result<Self, String> {
+        use toml_edit::{Array, DocumentMut, Table, value};
+
+        let mut doc = source
+            .parse::<DocumentMut>()
+            .map_err(|err| match err.span() {
+                Some(span) => format!("invalid TOML near byte {}", span.start),
+                None => "invalid TOML".to_string(),
+            })?;
+        let servers = doc
+            .get("mcp_servers")
+            .and_then(toml_edit::Item::as_table_like);
+        if doc.contains_key("mcp_servers") && servers.is_none() {
+            return Err("mcp_servers must be a TOML table".into());
+        }
+        let entry = servers.and_then(|servers| servers.get("hyphae"));
+        let existing = entry.and_then(toml_edit::Item::as_table_like);
+        if entry.is_some() && existing.is_none() {
+            return Err("mcp_servers.hyphae must be a TOML table".into());
+        }
+        let existing_args = existing
+            .and_then(|table| table.get("args"))
+            .and_then(toml_edit::Item::as_array);
+        let socket = socket
+            .or_else(|| {
+                let args = existing_args?;
+                if args.get(0)?.as_str()? != "mcp" {
+                    return None;
+                }
+                args.get(1)?.as_str().filter(|arg| !arg.starts_with('-'))
+            })
+            .map(ToOwned::to_owned);
+        let args: Array = mcp_args(socket.as_deref(), &["--backend", "codex"])
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let existing_env = existing
+            .and_then(|table| table.get("env_vars"))
+            .and_then(toml_edit::Item::as_array);
+        let mut env: Array = existing_env
+            .into_iter()
+            .flat_map(Array::iter)
+            .filter_map(toml_edit::Value::as_str)
+            .collect();
+        for key in ["CODEX_HOME", "HYPHAE_SOCKET"] {
+            if !env.iter().any(|item| item.as_str() == Some(key)) {
+                env.push(key);
+            }
+        }
+        let block = format!(
+            "[mcp_servers.hyphae]\ncommand = {}\nargs = {args}\nenv_vars = {env}",
+            toml_edit::Value::from(bin)
+        );
+        let command_matches = existing
+            .and_then(|table| table.get("command"))
+            .and_then(toml_edit::Item::as_str)
+            == Some(bin);
+        let args_match = existing_args.is_some_and(|current| {
+            current
+                .iter()
+                .map(toml_edit::Value::as_str)
+                .eq(args.iter().map(toml_edit::Value::as_str))
+        });
+        let env_matches = existing_env.is_some_and(|current| {
+            current
+                .iter()
+                .map(toml_edit::Value::as_str)
+                .eq(env.iter().map(toml_edit::Value::as_str))
+        });
+        let already_configured = command_matches && args_match && env_matches;
+        let updated = if already_configured {
+            source.to_owned()
+        } else if existing.is_some()
+            || doc
+                .get("mcp_servers")
+                .is_some_and(toml_edit::Item::is_inline_table)
+        {
+            let servers = doc["mcp_servers"]
+                .as_table_like_mut()
+                .expect("validated table");
+            if let Some(table) = servers.get_mut("hyphae") {
+                let table = table.as_table_like_mut().expect("validated table");
+                if !command_matches {
+                    table.insert("command", value(bin));
+                }
+                if !args_match {
+                    table.insert("args", value(args));
+                }
+                if !env_matches {
+                    table.insert("env_vars", value(env));
+                }
+            } else {
+                let mut table = Table::new();
+                table.insert("command", value(bin));
+                table.insert("args", value(args));
+                table.insert("env_vars", value(env));
+                servers.insert("hyphae", value(table.into_inline_table()));
+            }
+            doc.to_string()
+        } else {
+            let newline = if source.is_empty() || source.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            let blank = if source.trim().is_empty() { "" } else { "\n" };
+            format!("{source}{newline}{blank}# >>> hyphae >>>\n{block}\n# <<< hyphae <<<\n")
+        };
+        Ok(Self {
+            block,
+            created: false,
+            already_configured,
+            socket,
+            updated,
+        })
+    }
+
+    pub(crate) fn write(&self, path: &Path, dry_run: bool) -> Result<(), String> {
+        if self.already_configured {
+            return Ok(());
+        }
+        maybe_write_text(path, &self.updated, false, dry_run)
+    }
 }
 
 fn maybe_write_json(path: &Path, val: &Value, private: bool, dry_run: bool) -> Result<(), String> {
@@ -3509,32 +3636,12 @@ fn setup_codex(
     opts: SetupOptions<'_>,
     skill_ctx: &SetupSkillContext,
 ) -> Result<HarnessSetupOutcome, String> {
-    let socket = opts.socket;
     let dry_run = opts.dry_run;
-    let base_dir = home.join(".codex");
-    let config_toml = base_dir.join("config.toml");
-    let hooks_file = base_dir.join("hooks.json");
-
-    let args_vec: Vec<String> = mcp_args(socket, &["--backend", "codex"])
-        .into_iter()
-        .filter_map(|v| {
-            v.as_str()
-                .map(|s| serde_json::to_string(s).unwrap_or_default())
-        })
-        .collect();
-    let toml_block = format!(
-        "[mcp_servers.hyphae]\ncommand = {}\nargs = [{}]\nenv_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]",
-        serde_json::to_string(bin).unwrap_or_else(|_| "\"hyp\"".to_string()),
-        args_vec.join(", ")
-    );
-    let existing_toml = if config_toml.exists() {
-        fs::read_to_string(&config_toml)
-            .map_err(|e| format!("failed to read {}: {e}", config_toml.display()))?
-    } else {
-        String::new()
-    };
-    let next_toml = upsert_toml_block(&existing_toml, "hyphae", &toml_block);
-    maybe_write_text(&config_toml, &next_toml, false, dry_run)?;
+    let config_toml = codex_mcp_config_path(home);
+    let hooks_file = config_toml.with_file_name("hooks.json");
+    let mcp = CodexMcpConfig::read(&config_toml, bin, opts.socket)?;
+    mcp.write(&config_toml, dry_run)?;
+    let socket = mcp.socket.as_deref();
 
     let mut hooks_doc = read_json_object_or_empty(&hooks_file)?;
     let mut hooks = hooks_doc
