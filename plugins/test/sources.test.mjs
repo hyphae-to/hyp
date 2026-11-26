@@ -702,7 +702,7 @@ test("agentmail: on connect, mail received while disconnected is caught up over 
     { after: "2025-11-24T15:00:00.000Z", ascending: "true", labels: "received" },
   );
   await until(() => JSON.parse(readFileSync(stateFile, "utf8")).cursors["billing@agentmail.to"] === "2025-11-24T15:30:00.000Z", "agentmail cursor advanced to the newest caught-up message");
-  assert.match(plugin.stderr(), /caught up on 3 message\(s\)/);
+  await until(() => /caught up on 3 message\(s\)/.test(plugin.stderr()), "agentmail catch-up completion log");
   assert.ok(!ids.includes(id("m0")), "the message already delivered at the cursor instant must not be replayed");
   assert.deepEqual(JSON.parse(readFileSync(stateFile, "utf8")).atCursor["billing@agentmail.to"], ["<m3@mail>"]);
   assert.ok(!plugin.stderr().includes("am_test_key"));
