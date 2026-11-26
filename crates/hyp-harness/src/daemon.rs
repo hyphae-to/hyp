@@ -76,8 +76,9 @@ use crate::transport::codex::{
     codex_queue_supported, default_codex_home, is_valid_codex_uuid, verify_codex_rollout_thread,
 };
 use crate::transport::herdr::{
-    DEFAULT_HERDR_BIN, DEFAULT_SPAWN_TIMEOUT, HerdrTransport, is_valid_herdr_template,
-    is_valid_terminal_id, probe_herdr_terminal, spawn_herdr_template,
+    DEFAULT_HERDR_BIN, DEFAULT_SPAWN_TIMEOUT, HerdrProbeOutcome, HerdrTransport,
+    is_valid_herdr_template, is_valid_terminal_id, probe_herdr_terminal_detailed,
+    spawn_herdr_template,
 };
 use crate::transport::openclaw::{
     DEFAULT_OPENCLAW_AGENT_ID, DEFAULT_OPENCLAW_PROBE_TIMEOUT, OpenClawNodeConfig,
@@ -144,6 +145,9 @@ pub const DEFAULT_INTERRUPT_HOOK_GRACE: Duration = Duration::from_secs(2);
 /// Default sliding activity lease duration after the last hook call before a hooked session
 /// without a TurnEnd (`Stop` / `agent_end`) event decays to `Idle` and flushes held `Queue` batches.
 pub const DEFAULT_QUEUE_ACTIVITY_LEASE: Duration = Duration::from_secs(15);
+/// Bounded cooldown between lazy transport rehydration probes for the same session inside
+/// `flush_session_inner` so permanently dead targets never trigger probe loops.
+const LAZY_HYDRATE_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Boxed `Send` future alias used by [`BridgePoster`] and [`PeersReloader`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -304,11 +308,13 @@ struct TransportHints {
     harness: Option<HarnessKind>,
     herdr_terminal_id: Option<String>,
     herdr_created_ms: Option<i64>,
+    herdr_template: Option<String>,
     codex_thread_id: Option<String>,
     codex_home: Option<PathBuf>,
     codex_remote: Option<String>,
     codex_resume: bool,
     explicit_codex_queue: bool,
+    t3_thread_id: Option<String>,
     t3_base_dir: Option<PathBuf>,
     t3_url: Option<String>,
     openclaw_session_key: Option<String>,
@@ -338,6 +344,9 @@ impl TransportHints {
             .get("herdrCreatedMs")
             .or_else(|| packet.get("herdr_created_ms"))
             .and_then(Value::as_i64);
+        let herdr_template = non_empty_str("herdrTemplate")
+            .or_else(|| non_empty_str("herdr_template"))
+            .filter(|tpl| is_valid_herdr_template(tpl));
         let explicit_thread = non_empty_str("threadId");
         let codex_thread_id = explicit_thread
             .clone()
@@ -347,6 +356,8 @@ impl TransportHints {
         let codex_resume = packet.get("resume").and_then(Value::as_bool) == Some(true);
         let explicit_codex_queue =
             explicit_thread.is_some() || codex_remote.is_some() || codex_resume;
+        let t3_thread_id = non_empty_str("t3ThreadId")
+            .filter(|s| s.len() <= 256 && !s.chars().any(char::is_control));
         let t3_base_dir = non_empty_str("t3BaseDir").map(PathBuf::from);
         let t3_url = non_empty_str("t3Url");
         let openclaw_session_key = non_empty_str("openclawSessionKey")
@@ -372,11 +383,13 @@ impl TransportHints {
             harness,
             herdr_terminal_id,
             herdr_created_ms,
+            herdr_template,
             codex_thread_id,
             codex_home,
             codex_remote,
             codex_resume,
             explicit_codex_queue,
+            t3_thread_id,
             t3_base_dir,
             t3_url,
             openclaw_session_key,
@@ -402,6 +415,7 @@ impl TransportHints {
 
     fn has_any_hint(&self) -> bool {
         self.herdr_terminal_id.is_some()
+            || self.t3_thread_id.is_some()
             || self.t3_base_dir.is_some()
             || self.t3_url.is_some()
             || self.harness == Some(HarnessKind::T3)
@@ -423,8 +437,36 @@ impl TransportHints {
         if let Some(created_ms) = self.herdr_created_ms {
             patch.insert("herdrCreatedMs".into(), json!(created_ms));
         }
+        if let Some(ref tpl) = self.herdr_template {
+            patch.insert("herdrTemplate".into(), json!(tpl));
+        }
         if let Some(ref codex_tid) = self.codex_thread_id {
             patch.insert("codexThreadId".into(), json!(codex_tid));
+        }
+        if let Some(ref codex_home) = self.codex_home {
+            if !codex_home.as_os_str().is_empty() {
+                patch.insert(
+                    "codexHome".into(),
+                    json!(codex_home.to_string_lossy().as_ref()),
+                );
+            }
+        }
+        if let Some(ref codex_remote) = self.codex_remote {
+            patch.insert("codexRemote".into(), json!(codex_remote));
+        }
+        if let Some(ref t3_tid) = self.t3_thread_id {
+            patch.insert("t3ThreadId".into(), json!(t3_tid));
+        }
+        if let Some(ref t3_base_dir) = self.t3_base_dir {
+            if !t3_base_dir.as_os_str().is_empty() {
+                patch.insert(
+                    "t3BaseDir".into(),
+                    json!(t3_base_dir.to_string_lossy().as_ref()),
+                );
+            }
+        }
+        if let Some(ref t3_url) = self.t3_url {
+            patch.insert("t3Url".into(), json!(t3_url));
         }
         if let Some(ref sk) = self.openclaw_session_key {
             patch.insert("openclawSessionKey".into(), json!(sk));
@@ -539,6 +581,10 @@ enum DrainScope {
     /// TurnStart hook (`UserPromptSubmit` / `BeforeAgent` / `beforeSubmitPrompt` / `PreInvocation` / `before_prompt_build`):
     /// drains `Interrupt` + `Queue` + `NudgePending` + 1-line `Notify` digests.
     PreTurn,
+    /// Out-of-band push wakeup flush (`flush_session_inner`): when Focus Mode is ON and a VIP
+    /// (`Interrupt`) bypasses Focus Mode, strictly excludes Focus-buffered `Notify` items so they
+    /// are NEVER folded into the VIP wake nudge count or stamped `notified = true`.
+    PushFlush,
 }
 
 impl DrainScope {
@@ -603,6 +649,12 @@ struct LocalDaemonInner {
     herdr_terminal_index: Mutex<HashMap<String, Vec<String>>>,
     /// Active background auto-detection probe watchers keyed by `session_id`.
     pending_probes: Mutex<HashMap<String, watch::Receiver<bool>>>,
+    /// Sessions whose Herdr probe proved a live bare shell (`status == null` / `status.app == null`):
+    /// maps `session_id -> terminal_id` so `--backend herdr` enrollment fails closed explicitly.
+    herdr_bare_shell_rejections: Mutex<HashMap<String, String>>,
+    /// Per-session cooldown timestamps for lazy transport rehydration inside `flush_session_inner`
+    /// so permanently dead persisted targets never cause probe loops.
+    lazy_hydrate_cooldowns: Mutex<HashMap<String, Instant>>,
     flushing: Mutex<HashSet<String>>,
     /// Per-session classified metadata for `Pending` receipts (`receipt -> meta`).
     item_meta: Mutex<HashMap<String, HashMap<String, ClassifiedItemMeta>>>,
@@ -734,14 +786,16 @@ impl LocalDaemon {
         sweep_approved_local_ingest_on_startup(&inner).await;
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
         let startup_pending = inner.collect_pending_sessions_for_flush();
-        let startup_flush_task = if startup_pending.is_empty() {
+        let startup_rehydrate = inner.collect_sessions_for_transport_rehydration(&startup_pending);
+        let startup_flush_task = if startup_pending.is_empty() && startup_rehydrate.is_empty() {
             None
         } else {
             let flush_inner = Arc::clone(&inner);
             Some(tokio::spawn(async move {
-                flush_inner
-                    .flush_pending_session_list(startup_pending)
-                    .await;
+                tokio::join!(
+                    flush_inner.rehydrate_persisted_transports(startup_rehydrate),
+                    flush_inner.flush_pending_session_list(startup_pending),
+                );
             }))
         };
         let _ = inner.write_ui_state_snapshot();
@@ -838,14 +892,16 @@ impl LocalDaemon {
         sweep_approved_local_ingest_on_startup(&inner).await;
         let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
         let startup_pending = inner.collect_pending_sessions_for_flush();
-        let startup_flush_task = if startup_pending.is_empty() {
+        let startup_rehydrate = inner.collect_sessions_for_transport_rehydration(&startup_pending);
+        let startup_flush_task = if startup_pending.is_empty() && startup_rehydrate.is_empty() {
             None
         } else {
             let flush_inner = Arc::clone(&inner);
             Some(tokio::spawn(async move {
-                flush_inner
-                    .flush_pending_session_list(startup_pending)
-                    .await;
+                tokio::join!(
+                    flush_inner.rehydrate_persisted_transports(startup_rehydrate),
+                    flush_inner.flush_pending_session_list(startup_pending),
+                );
             }))
         };
         let _ = inner.write_ui_state_snapshot();
@@ -1643,6 +1699,8 @@ impl LocalDaemonInner {
             hook_registered_sessions: Mutex::new(HashSet::new()),
             herdr_terminal_index: Mutex::new(hydrated_herdr_index),
             pending_probes: Mutex::new(HashMap::new()),
+            herdr_bare_shell_rejections: Mutex::new(HashMap::new()),
+            lazy_hydrate_cooldowns: Mutex::new(HashMap::new()),
             flushing: Mutex::new(HashSet::new()),
             item_meta: Mutex::new(HashMap::new()),
             sub_meta: Mutex::new(HashMap::new()),
@@ -2229,6 +2287,8 @@ impl LocalDaemonInner {
         if let Some(ref tid) = herdr_tid {
             self.record_herdr_terminal(tid, session_id);
         }
+        self.clear_herdr_bare_shell_rejection(session_id);
+        self.clear_lazy_hydrate_cooldown(session_id);
         if target_meta.is_object() {
             let db = self.node.db();
             if db.local().get_session(session_id).ok().flatten().is_some() {
@@ -2366,6 +2426,24 @@ impl LocalDaemonInner {
                     .hook_registered_sessions
                     .lock()
                     .expect("hook_registered_sessions lock poisoned");
+                for sid in &pruned {
+                    guard.remove(sid);
+                }
+            }
+            {
+                let mut guard = self
+                    .herdr_bare_shell_rejections
+                    .lock()
+                    .expect("herdr_bare_shell_rejections lock poisoned");
+                for sid in &pruned {
+                    guard.remove(sid);
+                }
+            }
+            {
+                let mut guard = self
+                    .lazy_hydrate_cooldowns
+                    .lock()
+                    .expect("lazy_hydrate_cooldowns lock poisoned");
                 for sid in &pruned {
                     guard.remove(sid);
                 }
@@ -2702,10 +2780,61 @@ impl LocalDaemonInner {
         self.active_transport_kind(session_id).is_some()
     }
 
+    fn record_herdr_bare_shell_rejection(&self, session_id: &str, terminal_id: &str) {
+        self.herdr_bare_shell_rejections
+            .lock()
+            .expect("herdr_bare_shell_rejections lock poisoned")
+            .insert(session_id.to_string(), terminal_id.to_string());
+    }
+
+    fn clear_herdr_bare_shell_rejection(&self, session_id: &str) {
+        self.herdr_bare_shell_rejections
+            .lock()
+            .expect("herdr_bare_shell_rejections lock poisoned")
+            .remove(session_id);
+    }
+
+    fn herdr_bare_shell_rejection(&self, session_id: &str) -> Option<String> {
+        self.herdr_bare_shell_rejections
+            .lock()
+            .expect("herdr_bare_shell_rejections lock poisoned")
+            .get(session_id)
+            .cloned()
+    }
+
+    fn clear_lazy_hydrate_cooldown(&self, session_id: &str) {
+        self.lazy_hydrate_cooldowns
+            .lock()
+            .expect("lazy_hydrate_cooldowns lock poisoned")
+            .remove(session_id);
+    }
+
+    fn record_lazy_hydrate_attempt(&self, session_id: &str) {
+        self.lazy_hydrate_cooldowns
+            .lock()
+            .expect("lazy_hydrate_cooldowns lock poisoned")
+            .insert(session_id.to_string(), Instant::now());
+    }
+
+    fn is_lazy_hydrate_in_cooldown(&self, session_id: &str) -> bool {
+        self.lazy_hydrate_cooldowns
+            .lock()
+            .expect("lazy_hydrate_cooldowns lock poisoned")
+            .get(session_id)
+            .is_some_and(|last| last.elapsed() < LAZY_HYDRATE_COOLDOWN)
+    }
+
     fn transport_summary_json(&self, session_id: &str) -> Value {
         match self.active_transport_kind(session_id) {
             Some(kind) => json!({ "live": true, "kind": kind }),
-            None => json!({ "live": false, "kind": "none" }),
+            None => match self.herdr_bare_shell_rejection(session_id) {
+                Some(_) => json!({
+                    "live": false,
+                    "kind": "none",
+                    "rejected": "herdr_bare_shell"
+                }),
+                None => json!({ "live": false, "kind": "none" }),
+            },
         }
     }
 
@@ -2718,7 +2847,7 @@ impl LocalDaemonInner {
             .cloned();
         if let Some(mut rx) = rx_opt {
             let _ =
-                tokio::time::timeout(Duration::from_millis(1_500), rx.wait_for(|done| *done)).await;
+                tokio::time::timeout(Duration::from_millis(2_500), rx.wait_for(|done| *done)).await;
         }
     }
 
@@ -3255,7 +3384,7 @@ impl LocalDaemonInner {
         self: &Arc<Self>,
         session_id: &str,
     ) -> Option<PackedDeliveryBatch> {
-        self.build_batch_for_session_scoped(session_id, false, DrainScope::All)
+        self.build_batch_for_session_scoped(session_id, false, DrainScope::PushFlush)
             .await
     }
 
@@ -3393,6 +3522,16 @@ impl LocalDaemonInner {
         if scope == DrainScope::TurnBoundary && !any_deliverable_non_notify {
             return None;
         }
+        // Issue #32: When Focus Mode is ON and a VIP (`Interrupt`) triggers an out-of-band push
+        // wake (`DrainScope::PushFlush`), strictly exclude Focus-buffered `Notify` items from the
+        // VIP wake batch so they are NEVER folded into `<hyphae-wake count="...">` or stamped
+        // `notified = true` in SQLite / `item_meta`.
+        if scope == DrainScope::PushFlush && policy.focus_mode && any_deliverable_non_notify {
+            packable.retain(|item| !item.is_notify_tier());
+            if packable.is_empty() {
+                return None;
+            }
+        }
 
         let mut batch = pack_delivery_batch(&packable, muted, &policy)?;
         if scope == DrainScope::TurnBoundary && batch.notify_only {
@@ -3418,7 +3557,13 @@ impl LocalDaemonInner {
                 let _ = record_delivered_receipts(&db, session_id, &batch.inline_ids);
             }
             if !batch.spilled_ids.is_empty() || !batch.truncated_ids.is_empty() {
-                let _ = db.local().mark_mailbox_notified(session_id);
+                let notified_ids: Vec<&str> = batch
+                    .spilled_ids
+                    .iter()
+                    .chain(batch.truncated_ids.iter())
+                    .map(String::as_str)
+                    .collect();
+                mark_receipts_notified(&db, session_id, &notified_ids);
             }
         }
 
@@ -3488,15 +3633,23 @@ impl LocalDaemonInner {
             .merge_session_backend(session_id, &Value::Object(patch), now);
     }
 
-    /// Records a metadata-only wake nudge (e.g. OpenClaw Gateway hooks): marks pending items as
-    /// `notified = 1` AND `nudge_pending = true` so `flush_session` never re-nudges in a loop,
+    /// Records a metadata-only wake nudge (e.g. OpenClaw Gateway hooks): marks ONLY the pending
+    /// receipts included in `batch` as `notified = 1` AND `nudge_pending = true` so `flush_session`
+    /// never re-nudges in a loop (and NEVER stamps unrelated Focus-buffered `Notify` rows!),
     /// while preserving all items as `unread` in SQLite so the woken agent either drains them via
     /// `before_prompt_build` (`includeNudged: true`) or reads and acknowledges them via `hyp_inbox`.
     fn mark_batch_notified(&self, session_id: &str, batch: &PackedDeliveryBatch) {
         let now = now_ms();
+        let batch_ids: Vec<&str> = batch
+            .inline_ids
+            .iter()
+            .chain(batch.spilled_ids.iter())
+            .chain(batch.truncated_ids.iter())
+            .map(String::as_str)
+            .collect();
         {
             let db = self.node.db();
-            let _ = db.local().mark_mailbox_notified(session_id);
+            mark_receipts_notified(&db, session_id, &batch_ids);
         }
         let mut sources_notified: HashSet<String> = HashSet::new();
         {
@@ -3522,6 +3675,76 @@ impl LocalDaemonInner {
         }
         self.cancel_hold_retry(session_id);
         self.bump_ui_rev();
+    }
+
+    /// Restores Focus-buffered `Notify` pending items when Focus Mode turns OFF (`focus off` /
+    /// `mode: queue`): re-evaluates every pending item under the updated non-Focus policy,
+    /// clears any stale `notified = 1` flag in SQLite for promoted items that were never delivered
+    /// or actively nudged, and evicts their stale `item_meta` entries so the immediate
+    /// `flush_session` re-classifies them to `Queue`/`Interrupt` and delivers them cleanly.
+    fn restore_focus_buffered_items(&self, session_id: &str) -> usize {
+        let gate_active = self.current_gate().is_some();
+        let meta_snapshot: HashMap<String, ClassifiedItemMeta> = self
+            .item_meta
+            .lock()
+            .expect("item_meta lock poisoned")
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+
+        let promoted: Vec<String> = {
+            let db = self.node.db();
+            let Ok(policy) = self.delivery.policy(&db, session_id) else {
+                return 0;
+            };
+            if policy.focus_mode {
+                return 0;
+            }
+            let pending = if gate_active {
+                db.local()
+                    .peek_inbox_gate_cleared(session_id, 500)
+                    .unwrap_or_default()
+            } else {
+                db.local().peek_inbox(session_id, 500).unwrap_or_default()
+            };
+            let mut receipts = Vec::new();
+            for entry in pending {
+                if let Some(meta) = meta_snapshot.get(&entry.receipt) {
+                    // Never re-clear an item that was already actively push-nudged (e.g. an unacked
+                    // VIP wake) or burst-demoted.
+                    if meta.nudge_pending || meta.burst_demoted {
+                        continue;
+                    }
+                }
+                let parsed = hyp_node::delivery::ParsedMailboxSource::from_entry(&entry);
+                let sub_mode =
+                    self.lookup_subscription_urgency(session_id, &entry.origin_node, &entry.source);
+                let gate_downgraded = entry.gate_reason.as_deref() == Some("downgraded_to_notify");
+                let restored_urgency =
+                    policy.resolve_urgency(&parsed.as_context(), sub_mode, gate_downgraded);
+                if matches!(
+                    restored_urgency,
+                    DeliveryUrgency::Interrupt | DeliveryUrgency::Queue
+                ) {
+                    receipts.push(entry.receipt);
+                }
+            }
+            if !receipts.is_empty() {
+                let refs: Vec<&str> = receipts.iter().map(String::as_str).collect();
+                clear_receipts_notified(&db, session_id, &refs);
+            }
+            receipts
+        };
+
+        if !promoted.is_empty() {
+            let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+            if let Some(map) = guard.get_mut(session_id) {
+                for receipt in &promoted {
+                    map.remove(receipt);
+                }
+            }
+        }
+        promoted.len()
     }
 
     /// Deterministically derives `st_<base64url(HMAC-SHA256(k_session, "hyphae-session-token-v1:" || session_id))>`.
@@ -3660,6 +3883,154 @@ impl LocalDaemonInner {
             out.push((sid, backend_json));
         }
         out
+    }
+
+    /// Collects active sessions with persisted native push transport hints (`herdrTerminalId`,
+    /// `codexThreadId`, `t3ThreadId` / `t3Url` / `t3BaseDir`, OpenClaw hints) for non-blocking
+    /// startup rehydration — INCLUDING sessions with `pending_count == 0` so `hyp inspect`
+    /// immediately reports `hasLiveTransport: true` after daemon restart (Issue #34).
+    fn collect_sessions_for_transport_rehydration(
+        &self,
+        already_pending: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        if !self.config.auto_detect_transports || *self.shutdown_rx.borrow() {
+            return Vec::new();
+        }
+        let pending_set: HashSet<&str> =
+            already_pending.iter().map(|(id, _)| id.as_str()).collect();
+        let db = self.node.db();
+        let mut out = Vec::new();
+        for s in db.local().list_sessions().unwrap_or_default() {
+            if s.id.starts_with("local-ingest:") || pending_set.contains(s.id.as_str()) {
+                continue;
+            }
+            let hints = TransportHints::from_session_backend(&s.id, &s.backend_json);
+            if hints.has_any_hint()
+                || s.id.starts_with("codex:")
+                || s.id.starts_with("openclaw:")
+                || s.id.starts_with("t3:")
+            {
+                out.push((s.id, s.backend_json));
+            }
+        }
+        out
+    }
+
+    /// Re-probes & attaches persisted native push transports (`Herdr`, `T3`, `OpenClaw`, `CodexQueue`)
+    /// concurrently on daemon startup for sessions with `pending_count == 0` (Issue #34).
+    async fn rehydrate_persisted_transports(self: &Arc<Self>, sessions: Vec<(String, String)>) {
+        if sessions.is_empty() || !self.config.auto_detect_transports || *self.shutdown_rx.borrow()
+        {
+            return;
+        }
+        let mut join_set = tokio::task::JoinSet::new();
+        for (sid, backend_json) in sessions {
+            let daemon = Arc::clone(self);
+            join_set.spawn(async move {
+                if *daemon.shutdown_rx.borrow() || daemon.current_transport_priority(&sid) > 0 {
+                    return;
+                }
+                let hints = TransportHints::from_session_backend(&sid, &backend_json);
+                maybe_spawn_transport_probe(&daemon, &sid, hints);
+                daemon
+                    .await_pending_probe_bounded(&sid, Duration::from_secs(5))
+                    .await;
+            });
+        }
+
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        loop {
+            tokio::select! {
+                res = join_set.join_next() => {
+                    if res.is_none() {
+                        break;
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        join_set.abort_all();
+                        return;
+                    }
+                }
+            }
+        }
+        self.bump_ui_rev();
+    }
+
+    async fn await_pending_probe_bounded(&self, session_id: &str, timeout: Duration) {
+        let probe_rx = self
+            .pending_probes
+            .lock()
+            .expect("pending_probes lock poisoned")
+            .get(session_id)
+            .cloned();
+        if let Some(mut rx) = probe_rx {
+            let mut shutdown_rx = self.shutdown_rx.clone();
+            let wait_probe = async {
+                while !*rx.borrow() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = tokio::time::timeout(timeout, wait_probe) => {}
+                _ = shutdown_rx.changed() => {}
+            }
+        }
+    }
+
+    /// Lazily hydrates a persisted native push transport inside `flush_session_inner` when
+    /// `auto_detect_transports` is enabled and no push transport is currently attached (Issue #34).
+    ///
+    /// Bounded by [`LAZY_HYDRATE_COOLDOWN`] so permanently dead targets never enter a probe loop.
+    async fn maybe_lazy_hydrate_transport(self: &Arc<Self>, session_id: &str) {
+        if !self.config.auto_detect_transports
+            || self.current_transport_priority(session_id) > 0
+            || *self.shutdown_rx.borrow()
+        {
+            return;
+        }
+        // If a probe is already running (e.g. startup rehydration), simply await it!
+        let probe_in_flight = self
+            .pending_probes
+            .lock()
+            .expect("pending_probes lock poisoned")
+            .contains_key(session_id);
+        if probe_in_flight {
+            self.await_pending_probe_bounded(session_id, Duration::from_secs(5))
+                .await;
+            return;
+        }
+        if self.is_lazy_hydrate_in_cooldown(session_id) {
+            return;
+        }
+        let backend_json = {
+            let db = self.node.db();
+            db.local()
+                .get_session(session_id)
+                .ok()
+                .flatten()
+                .map(|s| s.backend_json)
+        };
+        let Some(backend_json) = backend_json else {
+            return;
+        };
+        let hints = TransportHints::from_session_backend(session_id, &backend_json);
+        let has_signal = hints.has_any_hint()
+            || session_id.starts_with("codex:")
+            || session_id.starts_with("openclaw:")
+            || session_id.starts_with("t3:");
+        if !has_signal {
+            return;
+        }
+        self.record_lazy_hydrate_attempt(session_id);
+        maybe_spawn_transport_probe(self, session_id, hints);
+        self.await_pending_probe_bounded(session_id, Duration::from_secs(5))
+            .await;
+        if self.current_transport_priority(session_id) > 0 {
+            self.clear_lazy_hydrate_cooldown(session_id);
+        }
     }
 
     /// Sweeps pending local topic batches into local mailboxes, reconciles every session with
@@ -4014,8 +4385,17 @@ impl LocalDaemonInner {
                 }
             }
 
-            // Priority 2: Attached native external PushTransport (Herdr > T3 Code > OpenClaw > Codex Queue)
+            // Priority 2: Attached native external PushTransport (Herdr > T3 Code > OpenClaw > Codex Queue).
+            // Issue #34: Lazily hydrate persisted push transport when none is attached yet (bounded
+            // by LAZY_HYDRATE_COOLDOWN so dead targets never enter a probe loop).
             let mut deferred_transient_hold = false;
+            if !batch.notify_only
+                && self.config.auto_detect_transports
+                && self.current_transport_priority(session_id) == 0
+                && terminal_error.is_none()
+            {
+                self.maybe_lazy_hydrate_transport(session_id).await;
+            }
             let push_transport = self
                 .session_transports
                 .lock()
@@ -4142,6 +4522,7 @@ impl LocalDaemonInner {
                                     | REASON_OPENCLAW_TOKEN_MISSING
                             ) {
                                 terminal_error = Some(reason.clone());
+                                self.record_lazy_hydrate_attempt(session_id);
                                 if self
                                     .unregister_matching_session_transport(session_id, &transport)
                                 {
@@ -4213,6 +4594,67 @@ impl LocalDaemonInner {
                     self.commit_delivered_batch(session_id, &batch);
                     delivered_any = true;
                     continue;
+                }
+            }
+
+            // Priority 4 (Issue #33): Opt-in Tier 4 allowlisted Herdr cold-spawn (`hc run <tpl> <nudge>`).
+            // Strictly fail-closed:
+            // - NEVER runs for Notify-only / Focus-buffered / muted batches (`batch.notify_only == true`).
+            // - NEVER runs when a live push transport or waiter exists, or a live transport is only
+            //   transiently holding (`deferred_transient_hold`).
+            // - NEVER runs when `herdr_spawn_allowlist` is empty or does not match the session's
+            //   persisted `herdrTemplate` verbatim.
+            // - Strictly enforces `maxConcurrentSpawns: 1` (`active_cold_spawns`) and uses a
+            //   metadata-only `<hyphae-wake>` nudge (zero untrusted DM body in argv).
+            if !batch.notify_only
+                && !deferred_transient_hold
+                && !self.config.delivery_retry.herdr_spawn_allowlist.is_empty()
+                && !self.has_live_transport(session_id)
+            {
+                let (herdr_template, handle) = {
+                    let db = self.node.db();
+                    let sess = db.local().get_session(session_id).ok().flatten();
+                    let tpl = sess.as_ref().and_then(|s| {
+                        extract_backend_str(&s.backend_json, "herdrTemplate")
+                            .or_else(|| extract_backend_str(&s.backend_json, "herdr_template"))
+                            .filter(|t| is_valid_herdr_template(t))
+                    });
+                    let handle = sess.and_then(|s| s.handle);
+                    (tpl, handle)
+                };
+                if let Some(template) = herdr_template {
+                    if self
+                        .config
+                        .delivery_retry
+                        .herdr_spawn_allowlist
+                        .iter()
+                        .any(|allowed| allowed == &template)
+                    {
+                        let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt {
+                            PushMode::Interrupt
+                        } else {
+                            PushMode::Queue
+                        };
+                        let msg_count = batch
+                            .inline_ids
+                            .len()
+                            .saturating_add(batch.spilled_ids.len())
+                            .saturating_add(batch.truncated_ids.len())
+                            .max(1);
+                        let nudge = format_push_wake_nudge(msg_count, handle.as_deref(), push_mode);
+                        let spawn_key = format!("herdr-cold:{session_id}:{template}");
+                        if self
+                            .try_herdr_cold_spawn(&spawn_key, &template, &nudge)
+                            .await
+                            .is_delivered()
+                        {
+                            self.mark_batch_notified(session_id, &batch);
+                            self.cancel_activity_grace(session_id);
+                            delivered_any = true;
+                            terminal_error = None;
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -4866,6 +5308,32 @@ impl LocalDaemonInner {
             .and_then(Value::as_str)
             .ok_or_else(|| ("invalid_request".into(), "Expected handle".into()))?;
         let description = args.get("description").and_then(Value::as_str);
+
+        // Wait for any in-flight transport probe BEFORE registering the handle so explicit
+        // `--backend herdr` on a bare shell (`hc get --json` proved `status == null` /
+        // `status.app == null`) fails closed cleanly without enrolling a silent dead handle (Issue #36).
+        self.wait_for_pending_probe(session_id).await;
+        let bare_shell_tid = self.herdr_bare_shell_rejection(session_id);
+        if let Some(ref terminal_id) = bare_shell_tid {
+            let explicit_herdr = session_id.starts_with("herdr:") || {
+                let db = self.node.db();
+                db.local()
+                    .get_session(session_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| extract_backend_str(&s.backend_json, "kind"))
+                    .is_some_and(|k| k.eq_ignore_ascii_case("herdr"))
+            };
+            if explicit_herdr {
+                return Err((
+                    "herdr_bare_shell_rejected".into(),
+                    format!(
+                        "Refusing --backend herdr enrollment on bare shell terminal '{terminal_id}' (no coding agent detected by `hc get --json`; status.app is null). Start a coding agent inside this Herdr terminal or omit --backend herdr."
+                    ),
+                ));
+            }
+        }
+
         let rec = self
             .node
             .register_handle_with_description(session_id, handle, description)
@@ -4880,7 +5348,6 @@ impl LocalDaemonInner {
             (p, u, m)
         };
 
-        self.wait_for_pending_probe(session_id).await;
         let has_live = self.has_live_transport(session_id);
         let transport_summary = self.transport_summary_json(session_id);
 
@@ -4897,6 +5364,15 @@ impl LocalDaemonInner {
         out.insert("muted".into(), json!(muted));
         out.insert("hasLiveTransport".into(), json!(has_live));
         out.insert("transport".into(), transport_summary);
+        if let Some(ref terminal_id) = bare_shell_tid {
+            out.insert("transportRejected".into(), json!("herdr_bare_shell"));
+            out.insert(
+                "warnings".into(),
+                json!([format!(
+                    "Herdr transport skipped for bare shell terminal '{terminal_id}' (status.app is null; no coding agent detected)"
+                )]),
+            );
+        }
 
         if let Some(include) = args.get("include").and_then(Value::as_array) {
             for item in include {
@@ -5111,8 +5587,11 @@ impl LocalDaemonInner {
         };
 
         self.bump_ui_rev();
-        if !focus_mode && unread > 0 {
-            self.flush_session(session_id).await;
+        if !focus_mode {
+            let restored = self.restore_focus_buffered_items(session_id);
+            if unread > 0 || restored > 0 {
+                self.flush_session(session_id).await;
+            }
         }
 
         Ok(json!({
@@ -5544,6 +6023,16 @@ impl LocalDaemonInner {
                 p
             };
             self.bump_ui_rev();
+            if focus_mode_opt == Some(false) {
+                let restored = self.restore_focus_buffered_items(session_id);
+                let unread_now = {
+                    let db = self.node.db();
+                    self.effective_pending_count(&db, session_id)
+                };
+                if unread_now > 0 || restored > 0 {
+                    self.flush_session(session_id).await;
+                }
+            }
 
             // If ONLY policy updates were provided (no read/query flags), return updated policy directly.
             let is_query = args.contains_key("state")
@@ -5613,7 +6102,7 @@ impl LocalDaemonInner {
             })
             .unwrap_or_default();
 
-        let query = InboxQuery {
+        let mut query = InboxQuery {
             state,
             filter,
             cursor,
@@ -5624,6 +6113,65 @@ impl LocalDaemonInner {
         };
 
         let gate_active = self.current_gate().is_some();
+        // Issue #32: While Focus Mode is ON, if an unfiltered `Unread` pull (`hyp_inbox({ ack: true })`)
+        // runs when BOTH VIP bypass (`Interrupt`) items AND Focus-buffered `Notify` items exist
+        // (e.g. a nudge-only harness like OpenClaw waking for `<hyphae-wake urgency="interrupt">`),
+        // scope the pull to ONLY the VIP items so Focus-buffered items are NEVER leaked or acked
+        // early while Focus Mode is still active. When zero VIP items exist (or an explicit filter
+        // / ids / state is passed), Focus-buffered items remain inspectable as usual.
+        if query.state == InboxStateFilter::Unread
+            && query.ids.is_empty()
+            && query.filter == InboxFilter::default()
+            && query.cursor.is_none()
+        {
+            let focus_on = {
+                let db = self.node.db();
+                self.delivery
+                    .policy(&db, session_id)
+                    .map(|p| p.focus_mode)
+                    .unwrap_or(false)
+            };
+            if focus_on {
+                let pending = {
+                    let db = self.node.db();
+                    if gate_active {
+                        db.local()
+                            .peek_inbox_gate_cleared(session_id, 500)
+                            .unwrap_or_default()
+                    } else {
+                        db.local().peek_inbox(session_id, 500).unwrap_or_default()
+                    }
+                };
+                let meta_map = self
+                    .item_meta
+                    .lock()
+                    .expect("item_meta lock poisoned")
+                    .get(session_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut vip_ids = Vec::new();
+                let mut has_focus_buffered = false;
+                for entry in pending {
+                    let urgency = meta_map
+                        .get(&entry.receipt)
+                        .map(|m| m.urgency)
+                        .unwrap_or(DeliveryUrgency::Notify);
+                    match urgency {
+                        DeliveryUrgency::Interrupt | DeliveryUrgency::Queue => {
+                            vip_ids.push(entry.receipt);
+                        }
+                        DeliveryUrgency::Notify => {
+                            has_focus_buffered = true;
+                        }
+                        DeliveryUrgency::Mute => {}
+                    }
+                }
+                if !vip_ids.is_empty() && has_focus_buffered {
+                    query.ids = vip_ids;
+                }
+            }
+        }
+
         let (result, policy) = {
             let db = self.node.db();
             let now = now_ms();
@@ -6734,12 +7282,12 @@ async fn handle_connection<R, W>(
                         break;
                     }
                     "session.start" => {
-                        let resp = handle_session_start(&daemon, &packet);
+                        let resp = handle_session_start(&daemon, &packet).await;
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
                     "session.register" => {
-                        let resp = handle_session_register(&daemon, &packet);
+                        let resp = handle_session_register(&daemon, &packet).await;
                         let _ = write_ndjson_line_async(&mut write_half, &resp).await;
                         break;
                     }
@@ -7368,6 +7916,7 @@ async fn resolve_tool_caller(
                     if hints.harness.is_none() {
                         hints.harness = Some(harness);
                     }
+                    daemon.clear_lazy_hydrate_cooldown(&session_id);
                     maybe_spawn_transport_probe(daemon, &session_id, hints);
                 }
                 return Ok(session_id);
@@ -7422,6 +7971,7 @@ async fn resolve_tool_caller(
             if hints.harness.is_none() {
                 hints.harness = Some(harness);
             }
+            daemon.clear_lazy_hydrate_cooldown(&session_id);
             maybe_spawn_transport_probe(daemon, &session_id, hints);
             return Ok(session_id);
         }
@@ -7604,6 +8154,40 @@ fn verify_session_token_ct(expected: &str, provided: Option<&str>) -> bool {
     diff == 0
 }
 
+/// Marks ONLY the specified `pending` mailbox receipts as `notified = 1` in SQLite without
+/// touching unrelated pending rows (e.g. Focus-buffered `Notify` items or `Queue` items held
+/// during a `MidTurn` interrupt).
+fn mark_receipts_notified(db: &hyp_store::NodeDb, session_id: &str, receipts: &[&str]) {
+    if receipts.is_empty() {
+        return;
+    }
+    let conn = db.connection();
+    for receipt in receipts {
+        let _ = conn.execute(
+            "UPDATE mailbox SET notified = 1
+             WHERE session_id = ?1 AND receipt = ?2 AND gate_state = 'pending' AND notified = 0",
+            rusqlite::params![session_id, receipt],
+        );
+    }
+}
+
+/// Clears `notified = 0` ONLY for the specified `pending` mailbox receipts in SQLite (used when
+/// Focus Mode turns OFF so Focus-buffered items that were never delivered promote cleanly back
+/// into active push delivery).
+fn clear_receipts_notified(db: &hyp_store::NodeDb, session_id: &str, receipts: &[&str]) {
+    if receipts.is_empty() {
+        return;
+    }
+    let conn = db.connection();
+    for receipt in receipts {
+        let _ = conn.execute(
+            "UPDATE mailbox SET notified = 0
+             WHERE session_id = ?1 AND receipt = ?2 AND gate_state = 'pending' AND notified = 1",
+            rusqlite::params![session_id, receipt],
+        );
+    }
+}
+
 fn compute_batch_idempotency_id(session_id: &str, batch: &PackedDeliveryBatch) -> String {
     let mut ids: Vec<&str> = batch
         .inline_ids
@@ -7681,7 +8265,10 @@ fn read_node_json_for_state_dir(state_dir: &Path) -> Option<Value> {
 /// Exclusive `SessionStart` hook handler returning the deterministic HMAC-derived `sessionToken`
 /// for writing into `$CLAUDE_ENV_FILE`. When `envFileExported: true` is passed, persists that
 /// flag so `wait.subscribe` / `inbox.wait` / `inbox.watch` require the matching `sessionToken`.
-fn handle_session_start(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Value>) -> Value {
+async fn handle_session_start(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+) -> Value {
     let Some(session_id) = packet
         .get("sessionId")
         .and_then(Value::as_str)
@@ -7700,6 +8287,31 @@ fn handle_session_start(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Val
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<HarnessKind>().ok());
     let hints = TransportHints::from_packet(packet, harness);
+
+    // Issue #36: If explicit Herdr enrollment probes a live bare shell (`hc get --json` succeeded
+    // and proved `status == null` / `status.app == null`), fail closed explicitly!
+    if harness == Some(HarnessKind::Herdr) && daemon.config.auto_detect_transports {
+        if let Some(ref tid) = hints.herdr_terminal_id {
+            let hc_bin = daemon
+                .config
+                .herdr_bin
+                .as_deref()
+                .unwrap_or(DEFAULT_HERDR_BIN);
+            if let HerdrProbeOutcome::BareShell { terminal_id, .. } =
+                probe_herdr_terminal_detailed(hc_bin, tid).await
+            {
+                daemon.record_herdr_bare_shell_rejection(session_id, &terminal_id);
+                return json!({
+                    "ok": false,
+                    "code": "herdr_bare_shell_rejected",
+                    "error": format!(
+                        "Refusing Herdr session start on bare shell terminal '{terminal_id}' (hc get --json reported status.app == null; no coding agent running)"
+                    ),
+                });
+            }
+        }
+    }
+
     let mut patch = hints.backend_patch(harness);
     if env_file_exported {
         patch.insert("envFileExported".into(), json!(true));
@@ -7722,6 +8334,7 @@ fn handle_session_start(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Val
             .expect("env_file_exported_sessions lock poisoned")
             .insert(session_id.to_string());
     }
+    daemon.clear_lazy_hydrate_cooldown(session_id);
     daemon.bump_ui_rev();
     maybe_spawn_transport_probe(daemon, session_id, hints);
 
@@ -7736,7 +8349,10 @@ fn handle_session_start(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Val
     })
 }
 
-fn handle_session_register(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Value>) -> Value {
+async fn handle_session_register(
+    daemon: &Arc<LocalDaemonInner>,
+    packet: &Map<String, Value>,
+) -> Value {
     let Some(session_id) = packet
         .get("sessionId")
         .and_then(Value::as_str)
@@ -7754,6 +8370,30 @@ fn handle_session_register(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, 
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<HarnessKind>().ok());
     let hints = TransportHints::from_packet(packet, harness);
+
+    // Issue #36: Reject explicit Herdr registration when `hc get --json` confirms a bare shell!
+    if harness == Some(HarnessKind::Herdr) && daemon.config.auto_detect_transports {
+        if let Some(ref tid) = hints.herdr_terminal_id {
+            let hc_bin = daemon
+                .config
+                .herdr_bin
+                .as_deref()
+                .unwrap_or(DEFAULT_HERDR_BIN);
+            if let HerdrProbeOutcome::BareShell { terminal_id, .. } =
+                probe_herdr_terminal_detailed(hc_bin, tid).await
+            {
+                daemon.record_herdr_bare_shell_rejection(session_id, &terminal_id);
+                return json!({
+                    "ok": false,
+                    "code": "herdr_bare_shell_rejected",
+                    "error": format!(
+                        "Refusing Herdr registration on bare shell terminal '{terminal_id}' (hc get --json reported status.app == null; no coding agent running)"
+                    ),
+                });
+            }
+        }
+    }
+
     let patch = hints.backend_patch(harness);
     let now = now_ms();
     if patch.is_empty() {
@@ -7766,6 +8406,7 @@ fn handle_session_register(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, 
     } else if let Err(e) = daemon.merge_session_backend_and_index(session_id, &patch, now) {
         return json!({ "ok": false, "error": e.to_string() });
     }
+    daemon.clear_lazy_hydrate_cooldown(session_id);
     daemon.bump_ui_rev();
     maybe_spawn_transport_probe(daemon, session_id, hints);
     json!({
@@ -7798,6 +8439,7 @@ fn handle_session_hint(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
         let _ = daemon.merge_session_backend_and_index(session_id, &patch, now_ms());
         daemon.bump_ui_rev();
     }
+    daemon.clear_lazy_hydrate_cooldown(session_id);
     maybe_spawn_transport_probe(daemon, session_id, hints);
 
     json!({ "ok": true, "result": {} })
@@ -7922,26 +8564,45 @@ fn maybe_spawn_transport_probe(
                     .herdr_bin
                     .as_deref()
                     .unwrap_or(DEFAULT_HERDR_BIN);
-                if let Some(target) = probe_herdr_terminal(hc_bin, tid).await {
-                    let mut herdr_patch = Map::new();
-                    herdr_patch.insert("herdrTerminalId".into(), json!(target.terminal_id));
-                    if let Some(created_ms) = target.created_ms {
-                        herdr_patch.insert("herdrCreatedMs".into(), json!(created_ms));
+                match probe_herdr_terminal_detailed(hc_bin, tid).await {
+                    HerdrProbeOutcome::LiveAgent(target) => {
+                        let pin_matches = match (hints.herdr_created_ms, target.created_ms) {
+                            (Some(expected), Some(actual)) => expected == actual,
+                            _ => true,
+                        };
+                        if pin_matches {
+                            daemon_arc.clear_herdr_bare_shell_rejection(&sid);
+                            let mut herdr_patch = Map::new();
+                            herdr_patch.insert("herdrTerminalId".into(), json!(target.terminal_id));
+                            if let Some(created_ms) = target.created_ms {
+                                herdr_patch.insert("herdrCreatedMs".into(), json!(created_ms));
+                            }
+                            if let Some(pid) = target.pid {
+                                herdr_patch.insert("herdrPid".into(), json!(pid));
+                            }
+                            if let Some(ref app) = target.app {
+                                herdr_patch.insert("herdrApp".into(), json!(app));
+                            }
+                            let _ = daemon_arc.merge_session_backend_and_index(
+                                &sid,
+                                &herdr_patch,
+                                now_ms(),
+                            );
+                            if daemon_arc.attach_transport_if_higher_priority(
+                                &sid,
+                                Arc::new(HerdrTransport::new(target)),
+                                PRIORITY_HERDR,
+                            ) {
+                                attached = true;
+                            }
+                        }
                     }
-                    if let Some(pid) = target.pid {
-                        herdr_patch.insert("herdrPid".into(), json!(pid));
+                    HerdrProbeOutcome::BareShell { terminal_id, .. } => {
+                        daemon_arc.record_herdr_bare_shell_rejection(&sid, &terminal_id);
+                        daemon_arc.bump_ui_rev();
                     }
-                    if let Some(ref app) = target.app {
-                        herdr_patch.insert("herdrApp".into(), json!(app));
-                    }
-                    let _ =
-                        daemon_arc.merge_session_backend_and_index(&sid, &herdr_patch, now_ms());
-                    if daemon_arc.attach_transport_if_higher_priority(
-                        &sid,
-                        Arc::new(HerdrTransport::new(target)),
-                        PRIORITY_HERDR,
-                    ) {
-                        attached = true;
+                    HerdrProbeOutcome::Unavailable => {
+                        daemon_arc.clear_herdr_bare_shell_rejection(&sid);
                     }
                 }
             }
@@ -7951,10 +8612,12 @@ fn maybe_spawn_transport_probe(
         // honors explicit hints/flags > LocalDaemonConfig defaults > node.json `"t3"` block!)
         if !attached && daemon_arc.current_transport_priority(&sid) < PRIORITY_T3 && has_t3_db {
             let raw_id = hints
-                .codex_thread_id
+                .t3_thread_id
                 .as_deref()
+                .or(hints.codex_thread_id.as_deref())
                 .unwrap_or_else(|| sid.split_once(':').map(|(_, r)| r).unwrap_or(sid.as_str()));
-            let resolved_t3_thread = if hints.harness == Some(HarnessKind::T3)
+            let resolved_t3_thread = if (hints.harness == Some(HarnessKind::T3)
+                || hints.t3_thread_id.is_some())
                 && verify_t3_thread_exists(raw_id, &t3_base_candidate)
             {
                 Some(raw_id.to_string())
@@ -8189,6 +8852,7 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
         return json!({ "ok": false, "error": e.to_string() });
     }
     daemon.clear_openclaw_session_missing(session_id);
+    daemon.clear_lazy_hydrate_cooldown(session_id);
     daemon
         .hook_registered_sessions
         .lock()
@@ -11008,8 +11672,11 @@ async fn handle_session_focus(
     };
 
     let rev = daemon.bump_ui_rev();
-    if !enabled && unread > 0 {
-        daemon.flush_session(&sess.id).await;
+    if !enabled {
+        let restored = daemon.restore_focus_buffered_items(&sess.id);
+        if unread > 0 || restored > 0 {
+            daemon.flush_session(&sess.id).await;
+        }
     }
 
     json!({

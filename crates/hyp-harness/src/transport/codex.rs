@@ -17,7 +17,7 @@
 //!   - Any other failure -> `PushOutcome::Reject("codex_queue_outcome_unknown")`
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
@@ -259,7 +259,22 @@ impl PushTransport for CodexQueueTransport {
     }
 
     fn target_metadata(&self) -> Value {
-        json!({ "codexThreadId": self.target.thread_id })
+        let mut obj = serde_json::Map::new();
+        obj.insert("codexThreadId".to_string(), json!(self.target.thread_id));
+        if let Some(ref home) = self.target.codex_home {
+            if !home.as_os_str().is_empty() {
+                obj.insert(
+                    "codexHome".to_string(),
+                    json!(home.to_string_lossy().as_ref()),
+                );
+            }
+        }
+        if let Some(ref remote) = self.target.remote {
+            if !remote.trim().is_empty() {
+                obj.insert("codexRemote".to_string(), json!(remote));
+            }
+        }
+        Value::Object(obj)
     }
 
     fn deliver<'a>(&'a self, text: &'a str, _mode: PushMode) -> TransportFuture<'a, PushOutcome> {
@@ -458,31 +473,33 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// Safely verifies whether `$CODEX_HOME/sessions/` contains a rollout JSONL file matching
-/// `thread_id` (e.g. `sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl`).
-///
-/// Security & safety invariants:
-/// - Rejects invalid/traversal/path-separator `thread_id`s fail-closed before touching disk.
-/// - Refuses symlinks (`symlink_metadata`) at every directory/file level so symlink escapes or
-///   cycles can never traverse outside `codex_home/sessions`.
-/// - Traverses directories and files newest-first (descending `YYYY/MM/DD` & rollout timestamp
-///   order) so long-time Codex users with >4,096 historical session files still find recent
-///   threads immediately within the bounded visit cap (`<= 4096`).
-pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
+/// Classification of a Codex CLI rollout JSONL thread file (`sessions/YYYY/MM/DD/rollout-*.jsonl`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexRolloutKind {
+    /// Interactive Codex CLI / TUI / IDE thread (`"source": "cli"` or minimal/legacy metadata)
+    /// — eligible for automatic `codex queue --thread` push wakeup attachment.
+    Interactive,
+    /// Non-interactive one-shot `codex exec` thread (`"source": "exec"` or `"originator": "codex_exec"`)
+    /// — MUST NOT auto-attach `codex queue` so queued pushes never collide with exited `codex exec`
+    /// runs or `codex exec resume`.
+    NonInteractiveExec,
+}
+
+/// Safely locates `$CODEX_HOME/sessions/` rollout JSONL file matching `thread_id`
+/// (e.g. `sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl`) without following symlinks.
+fn find_codex_rollout_file(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
     const MAX_WALK_DEPTH: usize = 4;
     const MAX_WALK_ENTRIES: usize = 4096;
     const MAX_DIR_COLLECT: usize = 16_384;
 
     if !is_safe_rollout_thread_id(thread_id) {
-        return false;
+        return None;
     }
 
     let sessions_dir = codex_home.join("sessions");
-    let Ok(root_meta) = std::fs::symlink_metadata(&sessions_dir) else {
-        return false;
-    };
+    let root_meta = std::fs::symlink_metadata(&sessions_dir).ok()?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
-        return false;
+        return None;
     }
 
     let tid_lower = thread_id.to_ascii_lowercase();
@@ -494,7 +511,7 @@ pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
             continue;
         };
         let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
-        let mut files: Vec<String> = Vec::new();
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
         for entry_res in entries {
             if subdirs.len() + files.len() >= MAX_DIR_COLLECT {
                 break;
@@ -515,19 +532,19 @@ pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
                     subdirs.push((name, path));
                 }
             } else if meta.is_file() {
-                files.push(name);
+                files.push((name, path));
             }
         }
 
         // Check files newest-first (descending lexicographical timestamp order).
-        files.sort_unstable_by(|a, b| b.cmp(a));
-        for name in files {
+        files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        for (name, path) in files {
             visited += 1;
             if visited > MAX_WALK_ENTRIES {
-                return false;
+                return None;
             }
             if filename_matches_codex_rollout(&name, &tid_lower) {
-                return true;
+                return Some(path);
             }
         }
 
@@ -537,13 +554,124 @@ pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
         for (_, path) in subdirs {
             visited += 1;
             if visited > MAX_WALK_ENTRIES {
-                return false;
+                return None;
             }
             stack.push((path, depth + 1));
         }
     }
 
-    false
+    None
+}
+
+/// Inspects a single JSONL header line (typically `{"type":"session_meta","payload":{...}}`)
+/// from a Codex rollout file to distinguish interactive CLI sessions (`"source": "cli"`) from
+/// non-interactive one-shot `codex exec` runs (`"source": "exec"` / `"originator": "codex_exec"`).
+pub fn classify_codex_rollout_header(line: &str) -> CodexRolloutKind {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return CodexRolloutKind::Interactive;
+    }
+    let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+        return CodexRolloutKind::Interactive;
+    };
+    let Some(obj) = val.as_object() else {
+        return CodexRolloutKind::Interactive;
+    };
+
+    // Inspect nested `payload` (real Codex v0.172+ `session_meta` shape) as well as top-level
+    // fields (compact/legacy fixtures).
+    let payload_obj = obj.get("payload").and_then(Value::as_object);
+    for scope in [payload_obj, Some(obj)].into_iter().flatten() {
+        if let Some(source_val) = scope.get("source") {
+            if let Some(src) = source_val.as_str() {
+                if src.trim().eq_ignore_ascii_case("exec") {
+                    return CodexRolloutKind::NonInteractiveExec;
+                }
+            } else if let Some(src_obj) = source_val.as_object() {
+                if src_obj
+                    .keys()
+                    .any(|k| k.trim().eq_ignore_ascii_case("exec"))
+                {
+                    return CodexRolloutKind::NonInteractiveExec;
+                }
+            }
+        }
+        if let Some(orig) = scope.get("originator").and_then(Value::as_str) {
+            let norm = orig.trim().to_ascii_lowercase();
+            if norm == "codex_exec" || norm.starts_with("codex_exec") {
+                return CodexRolloutKind::NonInteractiveExec;
+            }
+        }
+    }
+
+    CodexRolloutKind::Interactive
+}
+
+/// Inspects `$CODEX_HOME/sessions/` for a rollout JSONL file matching `thread_id` and classifies
+/// whether it belongs to an interactive Codex session or a non-interactive `codex exec` run.
+///
+/// Reads at most 4 header lines within a bounded 512 KiB window (handling long `base_instructions`
+/// payloads safely) and re-checks `symlink_metadata` before opening the file.
+pub fn inspect_codex_rollout_thread(
+    codex_home: &Path,
+    thread_id: &str,
+) -> Option<CodexRolloutKind> {
+    const MAX_HEADER_BYTES: u64 = 512 * 1024;
+    const MAX_HEADER_LINES: usize = 4;
+
+    let path = find_codex_rollout_file(codex_home, thread_id)?;
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+
+    let Ok(file) = std::fs::File::open(&path) else {
+        return None;
+    };
+    let mut reader = io::BufReader::new(std::io::Read::take(file, MAX_HEADER_BYTES));
+    for _ in 0..MAX_HEADER_LINES {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if classify_codex_rollout_header(&line) == CodexRolloutKind::NonInteractiveExec {
+                    return Some(CodexRolloutKind::NonInteractiveExec);
+                }
+                // If this line was explicitly `session_meta` and NOT `exec`, we're done!
+                if let Ok(val) = serde_json::from_str::<Value>(line.trim()) {
+                    if val.get("type").and_then(Value::as_str) == Some("session_meta") {
+                        return Some(CodexRolloutKind::Interactive);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    Some(CodexRolloutKind::Interactive)
+}
+
+/// Safely verifies whether `$CODEX_HOME/sessions/` contains an interactive rollout JSONL file
+/// matching `thread_id` (e.g. `sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl`).
+///
+/// Security & safety invariants:
+/// - Rejects invalid/traversal/path-separator `thread_id`s fail-closed before touching disk.
+/// - Refuses symlinks (`symlink_metadata`) at every directory/file level so symlink escapes or
+///   cycles can never traverse outside `codex_home/sessions`.
+/// - Traverses directories and files newest-first (descending `YYYY/MM/DD` & rollout timestamp
+///   order) so long-time Codex users with >4,096 historical session files still find recent
+///   threads immediately within the bounded visit cap (`<= 4096`).
+/// - Refuses non-interactive one-shot `codex exec` rollouts (`"source": "exec"` /
+///   `"originator": "codex_exec"`) so `codex queue` never auto-attaches to exited `codex exec`
+///   threads or collides with `codex exec resume`.
+pub fn verify_codex_rollout_thread(codex_home: &Path, thread_id: &str) -> bool {
+    matches!(
+        inspect_codex_rollout_thread(codex_home, thread_id),
+        Some(CodexRolloutKind::Interactive)
+    )
 }
 
 fn is_safe_rollout_thread_id(thread_id: &str) -> bool {
@@ -935,5 +1063,68 @@ mod tests {
             !codex_queue_supported(&tmp.path().join("nonexistent-codex").display().to_string())
                 .await
         );
+    }
+
+    #[test]
+    fn rollout_verification_distinguishes_interactive_cli_from_non_interactive_exec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day_dir = tmp.path().join("sessions/2026/11/26");
+        std::fs::create_dir_all(&day_dir).unwrap();
+
+        let cli_uuid = "01a217e1-c5f7-7720-a22b-888b924cc101";
+        let exec_uuid = "01a217e1-c5f7-7720-a22b-888b924cc102";
+        let exec_orig_only_uuid = "01a217e1-c5f7-7720-a22b-888b924cc103";
+
+        // 1. Real interactive Codex CLI rollout (`"source": "cli"`, `"originator": "codex_cli_rs"`).
+        std::fs::write(
+            day_dir.join(format!("rollout-2026-11-26T12-00-00-{cli_uuid}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-11-26T12:00:00Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{cli_uuid}\",\"originator\":\"codex_cli_rs\",\"cli_version\":\"0.172.0\",\"source\":\"cli\",\"base_instructions\":{{\"text\":\"{}\"}}}}}}\n",
+                "x".repeat(16_384)
+            ),
+        )
+        .unwrap();
+
+        // 2. Real non-interactive `codex exec` rollout (`"source": "exec"`, `"originator": "codex_exec"`).
+        std::fs::write(
+            day_dir.join(format!("rollout-2026-11-26T12-01-00-{exec_uuid}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-11-26T12:01:00Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"id\":\"{exec_uuid}\",\"originator\":\"codex_exec\",\"cli_version\":\"0.172.0\",\"source\":\"exec\",\"base_instructions\":{{\"text\":\"{}\"}}}}}}\n",
+                "y".repeat(16_384)
+            ),
+        )
+        .unwrap();
+
+        // 3. `originator: "codex_exec"` even without explicit `"source": "exec"`.
+        std::fs::write(
+            day_dir.join(format!(
+                "rollout-2026-11-26T12-02-00-{exec_orig_only_uuid}.jsonl"
+            )),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{exec_orig_only_uuid}\",\"originator\":\"codex_exec\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspect_codex_rollout_thread(tmp.path(), cli_uuid),
+            Some(CodexRolloutKind::Interactive)
+        );
+        assert!(verify_codex_rollout_thread(tmp.path(), cli_uuid));
+
+        assert_eq!(
+            inspect_codex_rollout_thread(tmp.path(), exec_uuid),
+            Some(CodexRolloutKind::NonInteractiveExec)
+        );
+        assert!(!verify_codex_rollout_thread(tmp.path(), exec_uuid));
+
+        assert_eq!(
+            inspect_codex_rollout_thread(tmp.path(), exec_orig_only_uuid),
+            Some(CodexRolloutKind::NonInteractiveExec)
+        );
+        assert!(!verify_codex_rollout_thread(
+            tmp.path(),
+            exec_orig_only_uuid
+        ));
     }
 }

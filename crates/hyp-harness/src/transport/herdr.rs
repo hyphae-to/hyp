@@ -100,6 +100,9 @@ impl HerdrTarget {
         if self.pid.is_some_and(|expected| info.pid != Some(expected)) {
             return false;
         }
+        if info.app.as_deref().is_none_or(str::is_empty) {
+            return false;
+        }
         if self
             .app
             .as_deref()
@@ -109,6 +112,24 @@ impl HerdrTarget {
         }
         true
     }
+}
+
+/// Structured outcome of probing a Herdr terminal via `hc get --json <terminal_id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HerdrProbeOutcome {
+    /// Live coding-agent terminal verified (`state == "live"` and non-empty `status.app` / `agent`).
+    LiveAgent(HerdrTarget),
+    /// `hc get --json` succeeded and proved the terminal is a live bare shell
+    /// (`status == null` or `status.app == null` / missing agent) — MUST NEVER attach
+    /// a push transport so mesh text can never be pasted into a raw shell.
+    BareShell {
+        terminal_id: String,
+        created_ms: Option<i64>,
+        pid: Option<u64>,
+    },
+    /// `hc` binary missing, timed out, exited non-zero, terminal exited/missing,
+    /// address mismatch, or invalid JSON.
+    Unavailable,
 }
 
 /// Parsed snapshot returned by `hc get --json <terminal_id>`.
@@ -422,7 +443,8 @@ async fn spawn_herdr_template_with_runner<R: CommandRunner + ?Sized>(
 /// and returns a pinned [`HerdrTarget`] capturing `created_ms`, `pid`, and `app`.
 ///
 /// Returns `None` if `hc` is missing, times out, returns a non-zero exit code,
-/// reports a mismatched `address` or non-`"live"` state, or outputs invalid JSON.
+/// reports a mismatched `address` or non-`"live"` state, reports a bare shell
+/// (`status == null` / `status.app == null`), or outputs invalid JSON.
 pub async fn probe_herdr_terminal(bin: &str, terminal_id: &str) -> Option<HerdrTarget> {
     probe_herdr_terminal_with_timeout(bin, terminal_id, DEFAULT_GET_TIMEOUT).await
 }
@@ -433,17 +455,37 @@ pub async fn probe_herdr_terminal_with_timeout(
     terminal_id: &str,
     timeout: Duration,
 ) -> Option<HerdrTarget> {
-    probe_with_runner(&ProcessRunner, bin, terminal_id, timeout).await
+    match probe_herdr_terminal_detailed_with_timeout(bin, terminal_id, timeout).await {
+        HerdrProbeOutcome::LiveAgent(target) => Some(target),
+        HerdrProbeOutcome::BareShell { .. } | HerdrProbeOutcome::Unavailable => None,
+    }
 }
 
-async fn probe_with_runner<R: CommandRunner + ?Sized>(
+/// Probes a Herdr terminal via `hc get --json <terminal_id>` (5s timeout) and distinguishes:
+/// - [`HerdrProbeOutcome::LiveAgent`]: live terminal running a detected coding agent (`app` set)
+/// - [`HerdrProbeOutcome::BareShell`]: live terminal with `status == null` or `status.app == null`
+/// - [`HerdrProbeOutcome::Unavailable`]: missing `hc`, timeout, non-zero exit, exited terminal, or bad JSON
+pub async fn probe_herdr_terminal_detailed(bin: &str, terminal_id: &str) -> HerdrProbeOutcome {
+    probe_herdr_terminal_detailed_with_timeout(bin, terminal_id, DEFAULT_GET_TIMEOUT).await
+}
+
+/// Same as [`probe_herdr_terminal_detailed`] with a caller-specified timeout.
+pub async fn probe_herdr_terminal_detailed_with_timeout(
+    bin: &str,
+    terminal_id: &str,
+    timeout: Duration,
+) -> HerdrProbeOutcome {
+    probe_detailed_with_runner(&ProcessRunner, bin, terminal_id, timeout).await
+}
+
+async fn probe_detailed_with_runner<R: CommandRunner + ?Sized>(
     runner: &R,
     bin: &str,
     terminal_id: &str,
     timeout: Duration,
-) -> Option<HerdrTarget> {
+) -> HerdrProbeOutcome {
     if bin.is_empty() || !is_valid_terminal_id(terminal_id) {
-        return None;
+        return HerdrProbeOutcome::Unavailable;
     }
     let args = ["get", "--json", terminal_id];
     let CommandOutcome::Completed {
@@ -452,20 +494,110 @@ async fn probe_with_runner<R: CommandRunner + ?Sized>(
         ..
     } = runner.run(bin, &args, timeout).await
     else {
-        return None;
+        return HerdrProbeOutcome::Unavailable;
     };
 
-    let info = parse_herdr_get_output(&stdout)?;
-    if info.address != terminal_id || info.state != "live" {
-        return None;
+    parse_herdr_probe_output(&stdout, terminal_id, bin)
+}
+
+#[cfg(test)]
+async fn probe_with_runner<R: CommandRunner + ?Sized>(
+    runner: &R,
+    bin: &str,
+    terminal_id: &str,
+    timeout: Duration,
+) -> Option<HerdrTarget> {
+    match probe_detailed_with_runner(runner, bin, terminal_id, timeout).await {
+        HerdrProbeOutcome::LiveAgent(target) => Some(target),
+        HerdrProbeOutcome::BareShell { .. } | HerdrProbeOutcome::Unavailable => None,
     }
-    Some(HerdrTarget {
-        terminal_id: info.address,
-        created_ms: info.created_ms,
-        pid: info.pid,
-        app: info.app,
-        bin: bin.to_string(),
-    })
+}
+
+/// Parses `hc get --json <terminal_id>` stdout into a structured [`HerdrProbeOutcome`],
+/// strictly distinguishing a live coding agent from a live bare shell (`status == null`,
+/// `status.app == null`, or missing `app`/`agent`) and from unavailable/exited/malformed responses.
+pub fn parse_herdr_probe_output(
+    stdout: &str,
+    expected_terminal_id: &str,
+    bin: &str,
+) -> HerdrProbeOutcome {
+    let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) else {
+        return HerdrProbeOutcome::Unavailable;
+    };
+    let Some(obj) = value.as_object() else {
+        return HerdrProbeOutcome::Unavailable;
+    };
+
+    let Some(address) = obj
+        .get("address")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return HerdrProbeOutcome::Unavailable;
+    };
+    let Some(state) = obj
+        .get("state")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return HerdrProbeOutcome::Unavailable;
+    };
+    if address != expected_terminal_id || state != "live" {
+        return HerdrProbeOutcome::Unavailable;
+    }
+
+    let created_ms = obj.get("created_ms").and_then(Value::as_i64);
+    let pid = obj.get("pid").and_then(Value::as_u64);
+
+    if let Some(info) = parse_herdr_get_output(stdout) {
+        if info.address == expected_terminal_id && info.state == "live" {
+            if info.app.as_deref().is_some_and(|a| !a.is_empty()) {
+                return HerdrProbeOutcome::LiveAgent(HerdrTarget {
+                    terminal_id: info.address,
+                    created_ms: info.created_ms,
+                    pid: info.pid,
+                    app: info.app,
+                    bin: bin.to_string(),
+                });
+            }
+            return HerdrProbeOutcome::BareShell {
+                terminal_id: info.address,
+                created_ms: info.created_ms,
+                pid: info.pid,
+            };
+        }
+    }
+
+    // Explicitly detect live bare-shell JSON shapes reported by `hc get --json`:
+    //   - `{"address":"t1","state":"live","status":null,...}`
+    //   - `{"address":"t1","state":"live","status":{"app":null,...},...}`
+    match obj.get("status") {
+        Some(Value::Null) => HerdrProbeOutcome::BareShell {
+            terminal_id: address.to_string(),
+            created_ms,
+            pid,
+        },
+        Some(Value::Object(status_obj)) => {
+            let has_app = status_obj
+                .get("app")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+                || obj
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty());
+            if !has_app {
+                HerdrProbeOutcome::BareShell {
+                    terminal_id: address.to_string(),
+                    created_ms,
+                    pid,
+                }
+            } else {
+                HerdrProbeOutcome::Unavailable
+            }
+        }
+        _ => HerdrProbeOutcome::Unavailable,
+    }
 }
 
 /// Parses `hc get --json <terminal_id>` output, supporting both:
@@ -988,6 +1120,83 @@ mod tests {
             probe_with_runner(&runner, "hc", "t6", DEFAULT_GET_TIMEOUT)
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_detailed_distinguishes_bare_shell_from_live_agent_and_unavailable() {
+        let runner = MockRunner::with_responses(vec![
+            ok_stdout(
+                serde_json::json!({
+                    "address": "t1",
+                    "created_ms": 1001,
+                    "pid": 555,
+                    "state": "live",
+                    "status": null
+                })
+                .to_string(),
+            ),
+            ok_stdout(
+                serde_json::json!({
+                    "address": "t2",
+                    "created_ms": 1002,
+                    "pid": 556,
+                    "state": "live",
+                    "status": { "app": null, "state": "idle" }
+                })
+                .to_string(),
+            ),
+            ok_stdout(
+                serde_json::json!({
+                    "address": "t3",
+                    "created_ms": 1003,
+                    "pid": 557,
+                    "state": "live",
+                    "status": "idle"
+                })
+                .to_string(),
+            ),
+            ok_stdout(nested_get_json("t4", 1004, 558, "claude", "idle")),
+            CommandOutcome::MissingBinary,
+        ]);
+
+        assert_eq!(
+            probe_detailed_with_runner(&runner, "hc", "t1", DEFAULT_GET_TIMEOUT).await,
+            HerdrProbeOutcome::BareShell {
+                terminal_id: "t1".into(),
+                created_ms: Some(1001),
+                pid: Some(555),
+            }
+        );
+        assert_eq!(
+            probe_detailed_with_runner(&runner, "hc", "t2", DEFAULT_GET_TIMEOUT).await,
+            HerdrProbeOutcome::BareShell {
+                terminal_id: "t2".into(),
+                created_ms: Some(1002),
+                pid: Some(556),
+            }
+        );
+        assert_eq!(
+            probe_detailed_with_runner(&runner, "hc", "t3", DEFAULT_GET_TIMEOUT).await,
+            HerdrProbeOutcome::BareShell {
+                terminal_id: "t3".into(),
+                created_ms: Some(1003),
+                pid: Some(557),
+            }
+        );
+        assert_eq!(
+            probe_detailed_with_runner(&runner, "hc", "t4", DEFAULT_GET_TIMEOUT).await,
+            HerdrProbeOutcome::LiveAgent(HerdrTarget {
+                terminal_id: "t4".into(),
+                created_ms: Some(1004),
+                pid: Some(558),
+                app: Some("claude".into()),
+                bin: "hc".into(),
+            })
+        );
+        assert_eq!(
+            probe_detailed_with_runner(&runner, "hc", "t5", DEFAULT_GET_TIMEOUT).await,
+            HerdrProbeOutcome::Unavailable
         );
     }
 

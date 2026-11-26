@@ -1864,6 +1864,27 @@ impl PushTransport for T3Transport {
         true
     }
 
+    fn target_metadata(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "t3ThreadId".to_string(),
+            serde_json::json!(self.target.thread_id),
+        );
+        obj.insert(
+            "t3Url".to_string(),
+            serde_json::json!(self.target.server_url),
+        );
+        if let Some(ref base_dir) = self.target.base_dir {
+            if !base_dir.as_os_str().is_empty() {
+                obj.insert(
+                    "t3BaseDir".to_string(),
+                    serde_json::json!(base_dir.to_string_lossy().as_ref()),
+                );
+            }
+        }
+        Value::Object(obj)
+    }
+
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         Box::pin(async move { self.deliver_detailed(text, mode).await.outcome })
     }
