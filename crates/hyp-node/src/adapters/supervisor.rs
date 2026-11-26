@@ -281,8 +281,24 @@ pub fn build_isolated_env_with(
 
 type PendingMap = HashMap<String, oneshot::Sender<Result<Value, AdapterError>>>;
 
-struct ActiveConnection {
+#[derive(Clone)]
+struct PluginWriter {
     tx: mpsc::Sender<String>,
+    failed: Arc<Notify>,
+}
+
+impl PluginWriter {
+    fn send(&self, wire: String) -> Result<(), mpsc::error::TrySendError<String>> {
+        self.tx.try_send(wire).map_err(|error| {
+            // notify_one retains a permit even before the connection starts polling it.
+            self.failed.notify_one();
+            error
+        })
+    }
+}
+
+struct ActiveConnection {
+    tx: PluginWriter,
     pending_requests: Arc<Mutex<PendingMap>>,
 }
 
@@ -415,7 +431,7 @@ impl SubprocessSupervisor {
             map.insert(req_id.clone(), resp_tx);
         }
 
-        if tx.send(wire).await.is_err() {
+        if tx.send(wire).is_err() {
             pending_map.lock().await.remove(&req_id);
             return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
         }
@@ -452,7 +468,6 @@ impl SubprocessSupervisor {
 
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         tx.send(wire)
-            .await
             .map_err(|_| AdapterError::NotRunning(self.inner.config.id.clone()))
     }
 
@@ -477,7 +492,6 @@ impl SubprocessSupervisor {
 
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         tx.send(wire)
-            .await
             .map_err(|_| AdapterError::NotRunning(self.inner.config.id.clone()))
     }
 
@@ -505,7 +519,6 @@ impl SubprocessSupervisor {
         ));
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         tx.send(wire)
-            .await
             .map_err(|_| AdapterError::NotRunning(self.inner.config.id.clone()))
     }
 
@@ -627,8 +640,8 @@ mod runtime {
     };
 
     use super::{
-        ActiveConnection, PendingMap, PluginTransportMode, SubprocessConfig, SupervisorInner,
-        build_isolated_env_with, is_secret_like_env_key,
+        ActiveConnection, PendingMap, PluginTransportMode, PluginWriter, SubprocessConfig,
+        SupervisorInner, build_isolated_env_with, is_secret_like_env_key,
     };
 
     const MAX_OUTPUT_LINE_BYTES: usize = 2 * 1024;
@@ -1106,7 +1119,12 @@ mod runtime {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (out_tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE_CAPACITY);
+        let (tx, mut out_rx) = mpsc::channel::<String>(OUTBOUND_QUEUE_CAPACITY);
+        let writer_failed = Arc::new(Notify::new());
+        let out_tx = PluginWriter {
+            tx,
+            failed: Arc::clone(&writer_failed),
+        };
 
         let pending_requests: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         {
@@ -1147,7 +1165,7 @@ mod runtime {
             ),
         ));
         if let Ok(wire) = encode_frame(&hello) {
-            let _ = out_tx.send(wire).await;
+            let _ = out_tx.send(wire);
         }
 
         if let Some(n) = first_ready.take() {
@@ -1187,6 +1205,10 @@ mod runtime {
                 break;
             }
             tokio::select! {
+                () = writer_failed.notified() => {
+                    channel_closed = true;
+                    break;
+                }
                 _ = &mut writer_task => {
                     channel_closed = true;
                     break;
@@ -1694,9 +1716,9 @@ mod runtime {
         })
     }
 
-    async fn send_frame(out_tx: &mpsc::Sender<String>, frame: &PluginFrame) {
+    async fn send_frame(out_tx: &PluginWriter, frame: &PluginFrame) {
         if let Ok(wire) = encode_frame(frame) {
-            let _ = out_tx.send(wire).await;
+            let _ = out_tx.send(wire);
         }
     }
 
@@ -1726,7 +1748,7 @@ mod runtime {
     async fn handle_incoming_line(
         inner: &Arc<SupervisorInner>,
         host: &Arc<dyn NodeAdapterHost>,
-        out_tx: &mpsc::Sender<String>,
+        out_tx: &PluginWriter,
         pending_requests: &Arc<Mutex<PendingMap>>,
         request_tasks: &mut tokio::task::JoinSet<()>,
         line: String,
@@ -1849,7 +1871,7 @@ mod runtime {
     async fn handle_jsonrpc_request(
         inner: &SupervisorInner,
         host: &Arc<dyn NodeAdapterHost>,
-        out_tx: &mpsc::Sender<String>,
+        out_tx: &PluginWriter,
         req: JsonRpcRequest,
     ) {
         match req.method.as_str() {
@@ -2108,5 +2130,44 @@ mod runtime {
             };
             let _ = sender.send(resolved);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn saturated_writer_retains_failure_and_rejects_post_before_its_deadline() {
+        let supervisor = SubprocessSupervisor::new(SubprocessConfig::new(
+            "stalled",
+            AdapterKind::Bridge,
+            "unused",
+            Vec::new(),
+            vec!["ops".into()],
+        ));
+        let (tx, _receiver) = mpsc::channel(1);
+        tx.try_send("occupied".into()).unwrap();
+        let failed = Arc::new(Notify::new());
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        *supervisor.inner.active.lock().await = Some(ActiveConnection {
+            tx: PluginWriter {
+                tx,
+                failed: Arc::clone(&failed),
+            },
+            pending_requests: Arc::clone(&pending_requests),
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.post("ops", BTreeMap::new(), Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(AdapterError::NotRunning(_))));
+        assert!(pending_requests.lock().await.is_empty());
+        // The enqueue failed before any waiter existed. The close signal must still be live.
+        tokio::time::timeout(Duration::from_secs(1), failed.notified())
+            .await
+            .unwrap();
     }
 }

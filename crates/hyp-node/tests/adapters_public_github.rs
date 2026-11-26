@@ -1378,6 +1378,41 @@ for line in reader:
     async fn supervisor_correlates_post_while_a_publish_notification_is_blocked() {
         assert_post_reply_during_blocked_publish(true).await;
     }
+
+    #[tokio::test]
+    async fn supervisor_closes_a_saturated_connection_and_stops_promptly() {
+        let host = RecordingHost::new();
+        let script = r#"
+import json, socket, time
+sock = socket.socket(fileno=3)
+# Never read the host greeting or responses. Valid requests generate large correlated errors.
+for i in range(1024):
+    sock.sendall((json.dumps({"jsonrpc":"2.0","id":"x"*32000+str(i),"method":"unsupported"})+"\n").encode())
+time.sleep(30)
+"#;
+        let mut cfg = SubprocessConfig::new(
+            "stalled-reader",
+            AdapterKind::Bridge,
+            python_bin(),
+            vec!["-u".into(), "-c".into(), script.into()],
+            vec!["ops".into()],
+        );
+        cfg.initial_backoff = Duration::from_secs(10);
+        cfg.max_backoff = Duration::from_secs(10);
+        let supervisor = SubprocessSupervisor::new(cfg);
+        supervisor.start(host).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while supervisor.is_connected().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("saturated connection must close without waiting for the peer");
+        tokio::time::timeout(Duration::from_secs(2), supervisor.stop())
+            .await
+            .expect("stalled writer must not prevent shutdown")
+            .unwrap();
+    }
 }
 
 #[cfg(not(unix))]
