@@ -156,6 +156,10 @@ rm -rf "$SMOKE_DIR"
 
 ---
 
+## Repository webhooks
+
+This public node uses the GitHub Events API for polling. For signed push delivery from a repository you manage, configure the [repository webhook receiver](../plugins.md#repository-webhook-setup) on your own node. The unfinished hosted App route was removed. You can remove any old `appWebhookSecret` reference from the polling source.
+
 ## Optional: Co-Hosted RAM-Only Drop Relay
 
 - **Co-hosted RAM-only Drop Relay:** Pass `--enable-drop-relay --max-memory-mb 256` to `hyp deploy init public-node` (see [Deploying Nodes](../operations/deploying.md#27-self-hostable-blind-drop-relay-drop-relay)). Default `guest-ro` grants strictly exclude `drop:create`.

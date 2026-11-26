@@ -1173,7 +1173,7 @@ pub fn diagnose_subscription(
                     "No webhook deliveries from '{repo_ref}' have been observed on topic '{topic}' yet (observed repos: {obs_str})."
                 ),
                 remediation: Some(format!(
-                    "Confirm a repository webhook is configured for '{repo_ref}' and send a ping delivery."
+                    "Confirm a repository webhook is configured for '{repo_ref}' and verify a recent delivery for a selected event."
                 )),
                 suggested_filter: None,
             });
