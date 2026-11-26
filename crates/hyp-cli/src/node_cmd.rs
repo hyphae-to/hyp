@@ -10,7 +10,7 @@ use crate::config_file::{
     resolve_config_path_for_read, resolve_state_dir, write_atomic_file, write_atomic_json,
 };
 use crate::drop_cmd::validate_relay_url;
-use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
+use crate::ui::{CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::keystore::SecretBackend;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
@@ -124,7 +124,7 @@ fn emit_already_running(
     socket: &Path,
     state_dir: &Path,
     probe_result: Option<&serde_json::Map<String, Value>>,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let summary = format!(
         "Hyphae daemon already running at {}; exiting cleanly (--if-not-running).",
         socket.display()
@@ -141,35 +141,35 @@ fn emit_already_running(
                     .ok()
                     .and_then(|raw| raw.trim().parse::<u64>().ok())
             });
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            summary,
+            json!({
                 "alreadyRunning": true,
                 "socketPath": socket.display().to_string(),
                 "nodeId": node_id,
                 "pid": pid,
-            })),
-            warnings: Vec::new(),
-            next: Vec::new(),
-            error: None,
-        };
+            }),
+        );
         print_json(&envelope);
     } else {
         println!("OK    {summary}");
         let _ = std::io::stdout().flush();
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
-pub fn run_node(command: NodeCommand) -> ExitCode {
+pub fn run_node(command: NodeCommand) -> CommandResult {
     match command {
         NodeCommand::Start(args) => run_node_start(args),
     }
 }
 
-pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
+pub fn run_node_start(args: NodeStartArgs) -> CommandResult {
+    CommandResult::new("node start", args.json, node_start(args))
+}
+
+fn node_start(args: NodeStartArgs) -> Result<ExitCode, CliError> {
     let cmd = "node start";
     let as_json = args.json;
     let explicit_config = args.config.or(args.config_pos);
@@ -181,25 +181,16 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         match load_node_or_legacy_config(&config_path) {
             Ok(cfg) => Some(cfg),
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "CONFIG_ERROR",
-                    e,
-                    Some("Verify node.json syntax or run `hyp onboard`.".to_string()),
-                );
+                return Err(CliError::error("CONFIG_ERROR", e)
+                    .with_fix("Verify node.json syntax or run `hyp onboard`.".to_string()));
             }
         }
     } else if explicit_config.is_some() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "CONFIG_NOT_FOUND",
             format!("Config file does not exist: {}", config_path.display()),
-            Some("Check --config path or run `hyp onboard`.".to_string()),
-        );
+        )
+        .with_fix("Check --config path or run `hyp onboard`.".to_string()));
     } else {
         None
     };
@@ -226,28 +217,14 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         .unwrap_or_else(default_node_id);
 
     if node_id_raw == LOCAL_NODE_ID || !is_valid_node_id(&node_id_raw) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "INVALID_NODE_ID",
-            format!(
+        return Err(CliError::usage("INVALID_NODE_ID", format!(
                 "Invalid nodeId '{node_id_raw}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and not be 'local'"
-            ),
-            Some("Pass --node-id <user@host> or fix nodeId in node.json.".to_string()),
-        );
+            )).with_fix("Pass --node-id <user@host> or fix nodeId in node.json.".to_string()));
     }
     let node_id = match NodeId::new(&node_id_raw) {
         Ok(id) => id,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_NODE_ID",
-                e.to_string(),
-                None,
-            );
+            return Err(CliError::usage("INVALID_NODE_ID", e.to_string()));
         }
     };
 
@@ -271,21 +248,19 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         {
             None
         }
-        Some(ref raw) => {
-            match raw.parse::<SocketAddr>() {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+        Some(ref raw) => match raw.parse::<SocketAddr>() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                return Err(CliError::usage(
                     "INVALID_BIND",
                     format!("Invalid --bind '{raw}': {e}"),
-                    Some("Use <ip>:<port>, e.g. 127.0.0.1:8790 (or 'none' for SSH-only peer.sock)".to_string()),
-                );
-                }
+                )
+                .with_fix(
+                    "Use <ip>:<port>, e.g. 127.0.0.1:8790 (or 'none' for SSH-only peer.sock)"
+                        .to_string(),
+                ));
             }
-        }
+        },
         None => loaded.as_ref().and_then(|c| c.bind_addr).or_else(|| {
             if !explicit_ssh_only_config
                 && matches!(profile, NodeProfile::Router | NodeProfile::P2p)
@@ -356,9 +331,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
     }
 
-    if let Err(e) = ensure_dir(&state_dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
 
     let mut node_cfg = NodeConfig::new(node_id, profile, &state_dir);
     node_cfg.bind_addr = bind_addr;
@@ -386,28 +359,22 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             E2eePolicy::Prefer
         };
 
-        if let Err(e) = cfg.file.apply_runtime_policies(&mut node_cfg) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "CONFIG_ERROR",
-                format!("Invalid runtime policy in {}: {e}", cfg.path.display()),
-                None,
-            );
-        }
+        cfg.file
+            .apply_runtime_policies(&mut node_cfg)
+            .map_err(|e| {
+                CliError::error(
+                    "CONFIG_ERROR",
+                    format!("Invalid runtime policy in {}: {e}", cfg.path.display()),
+                )
+            })?;
 
         enable_kv = match cfg.file.kv_tool_override() {
             Ok(enable_kv) => enable_kv,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "CONFIG_ERROR",
                     format!("Invalid KV tool setting in {}: {e}", cfg.path.display()),
-                    None,
-                );
+                ));
             }
         };
 
@@ -417,17 +384,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         match cfg.file.kv_namespaces(&mut startup_warnings) {
             Ok(namespaces) => node_cfg.kv_namespaces = namespaces,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "CONFIG_ERROR",
-                    format!("Invalid kvNamespaces config in {}: {e}", cfg.path.display()),
-                    Some(
+                return Err(CliError::error("CONFIG_ERROR", format!("Invalid kvNamespaces config in {}: {e}", cfg.path.display())).with_fix(
                         "Use strings like [\"shared\"] or objects like { \"namespace\": \"shared\", \"mode\": \"e2ee\", \"writeModel\": \"shared\" }."
                             .to_string(),
-                    ),
-                );
+                    ));
             }
         }
 
@@ -440,30 +400,22 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                         .strip_prefix("local.")
                         .unwrap_or(li.default_topic.as_str());
                     if !is_valid_topic(bare_default) {
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
+                        return Err(CliError::error(
                             "CONFIG_ERROR",
                             format!(
                                 "Invalid localIngest.defaultTopic '{}' in {}",
                                 li.default_topic,
                                 cfg.path.display()
                             ),
-                            None,
-                        );
+                        ));
                     }
                     node_cfg.local_ingest = li.clone();
                 }
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
+                    return Err(CliError::error(
                         "CONFIG_ERROR",
                         format!("Invalid localIngest config in {}: {e}", cfg.path.display()),
-                        None,
-                    );
+                    ));
                 }
             }
         }
@@ -472,17 +424,13 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         match cfg.file.delivery_retry() {
             Ok(dr_cfg) => delivery_retry_cfg = dr_cfg,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "CONFIG_ERROR",
                     format!(
                         "Invalid deliveryRetry config in {}: {e}",
                         cfg.path.display()
                     ),
-                    None,
-                );
+                ));
             }
         }
 
@@ -490,14 +438,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         match cfg.file.wake_recovery() {
             Ok(wr_cfg) => wake_recovery_cfg = wr_cfg,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "CONFIG_ERROR",
                     format!("Invalid wakeRecovery config in {}: {e}", cfg.path.display()),
-                    None,
-                );
+                ));
             }
         }
 
@@ -505,14 +449,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         match cfg.file.midturn_queue_digest_seconds() {
             Ok(secs) => midturn_queue_digest_seconds = secs,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "CONFIG_ERROR",
                     format!("Invalid delivery config in {}: {e}", cfg.path.display()),
-                    None,
-                );
+                ));
             }
         }
 
@@ -521,46 +461,31 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             match drop_relay {
                 Ok(dr) => {
                     if dr.max_memory_mb == 0 {
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
+                        return Err(CliError::error(
                             "CONFIG_ERROR",
                             format!(
                                 "dropRelay.maxMemoryMb in {} must be >= 1",
                                 cfg.path.display()
                             ),
-                            None,
-                        );
+                        ));
                     }
                     if dr
                         .allowed_origins
                         .iter()
                         .any(|o| o.trim() == "*" || o.trim().eq_ignore_ascii_case("null"))
                     {
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
-                            "CONFIG_ERROR",
-                            format!(
+                        return Err(CliError::error("CONFIG_ERROR", format!(
                                 "dropRelay.allowedOrigins in {} must not contain wildcard '*' or 'null'",
                                 cfg.path.display()
-                            ),
-                            Some("Set allowedOrigins to [\"https://hyphae.to\"].".to_string()),
-                        );
+                            )).with_fix("Set allowedOrigins to [\"https://hyphae.to\"].".to_string()));
                     }
                     node_cfg.drop_relay = dr.clone();
                 }
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
+                    return Err(CliError::error(
                         "CONFIG_ERROR",
                         format!("Invalid dropRelay config in {}: {e}", cfg.path.display()),
-                        None,
-                    );
+                    ));
                 }
             }
         }
@@ -568,14 +493,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             match validate_relay_url(raw_url) {
                 Ok(valid_url) => node_cfg.drop_relay_url = Some(valid_url),
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
+                    return Err(CliError::error(
                         "CONFIG_ERROR",
                         format!("Invalid dropRelayUrl in {}: {e}", cfg.path.display()),
-                        None,
-                    );
+                    ));
                 }
             }
         }
@@ -589,17 +510,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             {
                 Ok(valid_url) => node_cfg.drop_portal_url = Some(valid_url),
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "CONFIG_ERROR",
-                        format!("Invalid dropPortalUrl in {}: {e}", cfg.path.display()),
-                        Some(
+                    return Err(CliError::error("CONFIG_ERROR", format!("Invalid dropPortalUrl in {}: {e}", cfg.path.display())).with_fix(
                             "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
                                 .to_string(),
-                        ),
-                    );
+                        ));
                 }
             }
         }
@@ -609,14 +523,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             match escalation {
                 Ok(esc) => node_cfg.escalation = esc.clone(),
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
+                    return Err(CliError::error(
                         "CONFIG_ERROR",
                         format!("Invalid escalation config in {}: {e}", cfg.path.display()),
-                        None,
-                    );
+                    ));
                 }
             }
         }
@@ -625,14 +535,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         match cfg.file.guest_pairing() {
             Ok(gp) => node_cfg.guest_pairing = gp,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "CONFIG_ERROR",
                     format!("Invalid guestPairing config in {}: {e}", cfg.path.display()),
-                    None,
-                );
+                ));
             }
         }
 
@@ -644,17 +550,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             match parse_pairing_admin_key(admin_key_val, &secrets, &mut startup_warnings) {
                 Ok(maybe_jwk) => node_cfg.admin_jwk = maybe_jwk,
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "CONFIG_ERROR",
-                        format!("Invalid pairing.adminKey in {}: {e}", cfg.path.display()),
-                        Some(
+                    return Err(CliError::error("CONFIG_ERROR", format!("Invalid pairing.adminKey in {}: {e}", cfg.path.display())).with_fix(
                             "Set pairing.adminKey to a public OKP Ed25519 JWK object, a 43-char base64url Ed25519 public key, or { \"secret\": \"hyphae-admin-pubkey\" }."
                                 .to_string(),
-                        ),
-                    );
+                        ));
                 }
             }
         }
@@ -687,17 +586,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "CONFIG_ERROR",
-                        format!("Invalid github-public source in {}: {e}", cfg.path.display()),
-                        Some(
+                    return Err(CliError::error("CONFIG_ERROR", format!("Invalid github-public source in {}: {e}", cfg.path.display())).with_fix(
                             "Verify sources[] in node.json uses { \"secret\": \"<name>\" } references, never plaintext tokens."
                                 .to_string(),
-                        ),
-                    );
+                        ));
                 }
             }
 
@@ -727,14 +619,13 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                     webhook_sources = parsed;
                 }
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
+                    return Err(CliError::error(
                         "CONFIG_ERROR",
                         format!("Invalid webhook source in {}: {e}", cfg.path.display()),
-                        Some("Use SecretStore references for GitHub webhook sources.".to_string()),
-                    );
+                    )
+                    .with_fix(
+                        "Use SecretStore references for GitHub webhook sources.".to_string(),
+                    ));
                 }
             }
         }
@@ -768,14 +659,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     }
     if let Some(max_mb) = args.drop_max_memory_mb {
         if max_mb == 0 {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_DROP_MEMORY",
                 "--drop-max-memory-mb must be >= 1",
-                None,
-            );
+            ));
         }
         node_cfg.drop_relay.max_memory_mb = max_mb;
     }
@@ -792,14 +679,10 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RUNTIME_ERROR",
                 format!("Failed to start Tokio runtime: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -1125,23 +1008,15 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
         }
 
         if as_json {
-            let envelope = JsonEnvelope {
-                ok: true,
-                command: cmd.to_string(),
-                summary: Some(format!(
+            let envelope = JsonEnvelope::ok(cmd.to_string(), format!(
                     "Hyphae v2 Node '{}' ({}) started (pid {})",
                     node.node_id().as_str(),
                     profile_as_str(profile),
                     pid
-                )),
-                data: Some(status_doc),
-                warnings,
-                next: vec![
+                ), status_doc).warnings(warnings).next(vec![
                     format!("hyp status --state-dir {}", state_dir.display()),
                     format!("hyp doctor --state-dir {}", state_dir.display()),
-                ],
-                error: None,
-            };
+                ]);
             let line = serde_json::to_string(&envelope)
                 .map_err(|e| format!("Failed to serialize startup JSON envelope: {e}"))?;
             println!("{line}");
@@ -1273,7 +1148,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
     });
 
     match res {
-        Ok(NodeStartOutcome::Stopped) => ExitCode::from(EXIT_OK),
+        Ok(NodeStartOutcome::Stopped) => Ok(ExitCode::from(EXIT_OK)),
         Ok(NodeStartOutcome::AlreadyRunning { socket }) => {
             let probe = daemon_rpc_sync(
                 &socket,
@@ -1288,7 +1163,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
                 probe.result.as_ref(),
             )
         }
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "NODE_START_FAILED", e, None),
+        Err(e) => Err(CliError::error("NODE_START_FAILED", e)),
     }
 }
 

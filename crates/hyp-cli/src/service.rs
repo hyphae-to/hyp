@@ -9,7 +9,7 @@ use crate::config_file::{default_config_dir, resolve_home_dir, resolve_state_dir
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use crate::config_file::{ensure_dir, write_atomic_file};
 use crate::ui::{
-    EXIT_ERROR, EXIT_OK, JsonEnvelope, emit_error, print_json, print_next_steps, print_warnings,
+    CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
 use clap::Subcommand;
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync, default_socket_path};
@@ -2691,7 +2691,19 @@ pub fn install_and_start_default(
     }
 }
 
-pub fn run_service(command: ServiceCommand) -> ExitCode {
+pub fn run_service(command: ServiceCommand) -> CommandResult {
+    let (name, as_json) = match &command {
+        ServiceCommand::Install { json, .. } => ("service install", *json),
+        ServiceCommand::Uninstall { json, .. } => ("service uninstall", *json),
+        ServiceCommand::Start { json, .. } => ("service start", *json),
+        ServiceCommand::Stop { json, .. } => ("service stop", *json),
+        ServiceCommand::Restart { json, .. } => ("service restart", *json),
+        ServiceCommand::Status { json, .. } => ("service status", *json),
+    };
+    CommandResult::new(name, as_json, service(command))
+}
+
+fn service(command: ServiceCommand) -> Result<ExitCode, CliError> {
     match command {
         ServiceCommand::Install {
             bin,
@@ -2703,14 +2715,10 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
         } => {
             let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
-                return emit_error(
-                    "service install",
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "MISSING_HOME",
                     "Could not determine home directory (set HOME or pass --home <dir>)",
-                    None,
-                );
+                ));
             };
             let spec = match build_spec(
                 bin.as_deref(),
@@ -2722,14 +2730,7 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    return emit_error(
-                        "service install",
-                        as_json,
-                        EXIT_ERROR,
-                        "SERVICE_ERROR",
-                        e,
-                        None,
-                    );
+                    return Err(CliError::error("SERVICE_ERROR", e));
                 }
             };
             let probe_sock = resolve_probe_socket(
@@ -2740,14 +2741,7 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
             );
             match platform::install(&spec, &resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service install", &report, as_json),
-                Err(e) => emit_error(
-                    "service install",
-                    as_json,
-                    EXIT_ERROR,
-                    "SERVICE_INSTALL_FAILED",
-                    e,
-                    Some("Run `hyp daemon` directly in the foreground if no user service manager is available.".to_string()),
-                ),
+                Err(e) => Err(CliError::error("SERVICE_INSTALL_FAILED", e).with_fix("Run `hyp daemon` directly in the foreground if no user service manager is available.".to_string())),
             }
         }
         ServiceCommand::Uninstall {
@@ -2756,26 +2750,15 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
         } => {
             let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
-                return emit_error(
-                    "service uninstall",
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "MISSING_HOME",
                     "Could not determine home directory (set HOME or pass --home <dir>)",
-                    None,
-                );
+                ));
             };
             let probe_sock = resolve_probe_socket(None, None, &resolved_home, explicit_home);
             match platform::uninstall(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service uninstall", &report, as_json),
-                Err(e) => emit_error(
-                    "service uninstall",
-                    as_json,
-                    EXIT_ERROR,
-                    "SERVICE_UNINSTALL_FAILED",
-                    e,
-                    None,
-                ),
+                Err(e) => Err(CliError::error("SERVICE_UNINSTALL_FAILED", e)),
             }
         }
         ServiceCommand::Start {
@@ -2785,27 +2768,17 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
         } => {
             let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
-                return emit_error(
-                    "service start",
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "MISSING_HOME",
                     "Could not determine home directory (set HOME or pass --home <dir>)",
-                    None,
-                );
+                ));
             };
             let probe_sock =
                 resolve_probe_socket(socket.as_deref(), None, &resolved_home, explicit_home);
             match platform::start(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service start", &report, as_json),
-                Err(e) => emit_error(
-                    "service start",
-                    as_json,
-                    EXIT_ERROR,
-                    "SERVICE_START_FAILED",
-                    e,
-                    Some("Run `hyp service install`.".to_string()),
-                ),
+                Err(e) => Err(CliError::error("SERVICE_START_FAILED", e)
+                    .with_fix("Run `hyp service install`.".to_string())),
             }
         }
         ServiceCommand::Stop {
@@ -2814,26 +2787,15 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
         } => {
             let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
-                return emit_error(
-                    "service stop",
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "MISSING_HOME",
                     "Could not determine home directory (set HOME or pass --home <dir>)",
-                    None,
-                );
+                ));
             };
             let probe_sock = resolve_probe_socket(None, None, &resolved_home, explicit_home);
             match platform::stop(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service stop", &report, as_json),
-                Err(e) => emit_error(
-                    "service stop",
-                    as_json,
-                    EXIT_ERROR,
-                    "SERVICE_STOP_FAILED",
-                    e,
-                    None,
-                ),
+                Err(e) => Err(CliError::error("SERVICE_STOP_FAILED", e)),
             }
         }
         ServiceCommand::Restart {
@@ -2843,27 +2805,17 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
         } => {
             let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
-                return emit_error(
-                    "service restart",
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "MISSING_HOME",
                     "Could not determine home directory (set HOME or pass --home <dir>)",
-                    None,
-                );
+                ));
             };
             let probe_sock =
                 resolve_probe_socket(socket.as_deref(), None, &resolved_home, explicit_home);
             match platform::restart(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service restart", &report, as_json),
-                Err(e) => emit_error(
-                    "service restart",
-                    as_json,
-                    EXIT_ERROR,
-                    "SERVICE_RESTART_FAILED",
-                    e,
-                    Some("Run `hyp service install`.".to_string()),
-                ),
+                Err(e) => Err(CliError::error("SERVICE_RESTART_FAILED", e)
+                    .with_fix("Run `hyp service install`.".to_string())),
             }
         }
         ServiceCommand::Status {
@@ -2873,43 +2825,30 @@ pub fn run_service(command: ServiceCommand) -> ExitCode {
         } => {
             let explicit_home = home.is_some();
             let Some(resolved_home) = resolve_home_dir(home.as_deref()) else {
-                return emit_error(
-                    "service status",
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "MISSING_HOME",
                     "Could not determine home directory (set HOME or pass --home <dir>)",
-                    None,
-                );
+                ));
             };
             let probe_sock =
                 resolve_probe_socket(socket.as_deref(), None, &resolved_home, explicit_home);
             match platform::status(&resolved_home, &probe_sock, explicit_home) {
                 Ok(report) => emit_report("service status", &report, as_json),
-                Err(e) => emit_error(
-                    "service status",
-                    as_json,
-                    EXIT_ERROR,
-                    "SERVICE_STATUS_FAILED",
-                    e,
-                    None,
-                ),
+                Err(e) => Err(CliError::error("SERVICE_STATUS_FAILED", e)),
             }
         }
     }
 }
 
-fn emit_report(cmd: &str, report: &ServiceActionReport, as_json: bool) -> ExitCode {
+fn emit_report(
+    cmd: &str,
+    report: &ServiceActionReport,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(report.detail.clone()),
-            data: Some(report),
-            warnings: report.warnings.clone(),
-            next: report.next.clone(),
-            error: None,
-        };
+        let envelope = JsonEnvelope::ok(cmd.to_string(), report.detail.clone(), report)
+            .warnings(report.warnings.clone())
+            .next(report.next.clone());
         print_json(&envelope);
     } else {
         let tag = if report.daemon.alive || matches!(report.action, "stop" | "uninstall") {
@@ -2934,7 +2873,7 @@ fn emit_report(cmd: &str, report: &ServiceActionReport, as_json: bool) -> ExitCo
         print_warnings(&report.warnings);
         print_next_steps(&report.next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 // ============================================================================

@@ -175,10 +175,16 @@ pub struct JsonEnvelope<T: Serialize> {
 
 impl<T: Serialize> JsonEnvelope<T> {
     pub fn ok(command: impl Into<String>, summary: impl Into<String>, data: T) -> Self {
+        let mut envelope = Self::data(command, data);
+        envelope.summary = Some(summary.into());
+        envelope
+    }
+
+    pub fn data(command: impl Into<String>, data: T) -> Self {
         Self {
             ok: true,
             command: command.into(),
-            summary: Some(summary.into()),
+            summary: None,
             data: Some(data),
             warnings: Vec::new(),
             next: Vec::new(),
