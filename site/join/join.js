@@ -343,6 +343,7 @@ function showView(viewId) {
 }
 
 function showStage(stage) {
+  $("viewJoin").classList.toggle("is-joined", stage === 3);
   $("stageReview").classList.toggle("hidden", stage !== 1);
   $("stageConnect").classList.toggle("hidden", stage !== 2);
   $("stageDone").classList.toggle("hidden", stage !== 3);
@@ -457,7 +458,9 @@ async function renderReviewStage() {
   if (appState.expiresAtMs) {
     const updateCountdown = () => {
       const remaining = appState.expiresAtMs - Date.now();
-      $("metaExpires").textContent = formatCountdown(remaining);
+      const expEl = $("metaExpires");
+      expEl.textContent = formatCountdown(remaining);
+      expEl.className = remaining <= 0 ? "expiry-text danger" : "expiry-text";
       if (remaining <= 0) {
         $("btnContinuePasskey").disabled = true;
         setBanner(
@@ -474,6 +477,7 @@ async function renderReviewStage() {
     appState.countdownTimer = setInterval(updateCountdown, 1000);
   } else {
     $("metaExpires").textContent = "No expiry";
+    $("metaExpires").className = "expiry-text";
   }
 }
 

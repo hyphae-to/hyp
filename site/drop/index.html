@@ -12,540 +12,553 @@
   <meta name="description" content="Zero-knowledge end-to-end encrypted human directives and secret drops signed with Passkey+PRF Ed25519 and sealed with RFC 9180 HPKE." />
   <link rel="icon" type="image/svg+xml" href="../assets/logo-hyphae.svg?v=2" />
   <link rel="alternate icon" type="image/png" href="../assets/logo-hyphae.png?v=2" />
-  <link rel="stylesheet" href="./styles.css?v=4" />
+  <link rel="stylesheet" href="./styles.css?v=5" />
 </head>
 <body>
   <main class="shell">
-    <!-- Slim Single-Row Header -->
+    <!-- Calm Single-Row Header (Aligned with hyphae.to dark navbar) -->
     <header class="topbar">
       <a class="brand" href="https://hyphae.to" rel="noreferrer">
         <span class="brand-mark" aria-hidden="true">
           <img class="brand-logo" src="../assets/logo-hyphae.svg?v=2" alt="" />
         </span>
         <span class="brand-word">hyphae</span>
-        <span class="brand-pill">drop</span>
+        <span class="brand-cli">drop</span>
       </a>
       <div class="topbar-right">
         <a class="topbar-link" href="https://hyphae.to" rel="noreferrer">hyphae.to ↗</a>
-        <span class="e2ee-pill" title="Strict CSP · Zero CDN · Client-Side HPKE">
+        <span class="e2ee-indicator" title="Strict CSP · Zero CDN · Client-Side HPKE">
           <span class="pill-dot" aria-hidden="true"></span>
           E2EE
         </span>
       </div>
     </header>
 
-    <!-- =================================================================== -->
-    <!-- Error / Parse Failure View                                          -->
-    <!-- =================================================================== -->
-    <section id="viewError" class="card stage-in hidden" aria-live="polite">
-      <div class="status-hero">
-        <span class="hero-icon hero-icon-danger" aria-hidden="true">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="9" />
-            <path d="M12 8v4M12 16h.01" />
+    <div class="card-stage">
+      <!-- Smaller Animated Sitting Mushroom Buddy Perched on Card Ledge -->
+      <div class="card-sitter" aria-hidden="true">
+        <img class="sitter-layer sitter-leg-l" src="../assets/sitter-leg-l.webp?v=2" alt="" decoding="async" />
+        <img class="sitter-layer sitter-leg-r" src="../assets/sitter-leg-r.webp?v=2" alt="" decoding="async" />
+        <div class="sitter-upper">
+          <img class="sitter-layer sitter-body" src="../assets/sitter-body.webp?v=1" alt="" decoding="async" />
+          <img class="sitter-layer sitter-mug-arm" src="../assets/sitter-mug-arm.webp?v=1" alt="" decoding="async" />
+          <svg class="sitter-steam" viewBox="0 0 278 396" fill="none">
+            <path class="sitter-steam-wisp w1" d="M 134 218 C 130 208, 139 201, 135 190" />
+            <path class="sitter-steam-wisp w2" d="M 143 217 C 147 207, 139 199, 144 188" />
           </svg>
-        </span>
-        <h1 class="hero-title">Drop link could not be opened</h1>
-      </div>
-      <div class="banner danger">
-        <strong>Invalid Link</strong>
-        <span id="errorMessage">The drop invitation fragment is missing or malformed.</span>
-      </div>
-      <a class="btn-link btn-secondary" href="https://hyphae.to" rel="noreferrer">Return to hyphae.to</a>
-    </section>
-
-    <!-- =================================================================== -->
-    <!-- Landing View (No URL #fragment)                                     -->
-    <!-- =================================================================== -->
-    <section id="viewLanding" class="card stage-in hidden">
-      <div class="landing-head">
-        <p class="eyebrow">Zero-Knowledge Drop Portal</p>
-        <h1 class="card-title">Verified Human Drops</h1>
-        <p class="card-lead">
-          Sign high-trust directives and deliver secrets directly to your Hyphae nodes, never exposed to chat bridges, prompts, or relays.
-        </p>
+        </div>
       </div>
 
-      <ul class="feature-list">
-        <li>
-          <span class="feature-num">01</span>
-          <div>
-            <strong>Passkey + PRF Authority</strong>
-            Derives an ephemeral Ed25519 signing key in RAM via Face ID / Touch ID and wipes it right after sealing.
+      <!-- =================================================================== -->
+      <!-- Error / Parse Failure View                                          -->
+      <!-- =================================================================== -->
+      <section id="viewError" class="card stage-fade hidden" aria-live="polite">
+        <div class="status-hero">
+          <span class="hero-icon hero-icon-danger" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 8v4M12 16h.01" />
+            </svg>
+          </span>
+          <h1 class="hero-title">Drop link could not be opened</h1>
+        </div>
+        <div class="banner danger">
+          <strong>Invalid Link</strong>
+          <span id="errorMessage">The drop invitation fragment is missing or malformed.</span>
+        </div>
+        <a class="btn-link btn-secondary" href="https://hyphae.to" rel="noreferrer">Return to hyphae.to</a>
+      </section>
+
+      <!-- =================================================================== -->
+      <!-- Landing View (No URL #fragment)                                     -->
+      <!-- =================================================================== -->
+      <section id="viewLanding" class="card stage-fade hidden">
+        <div class="landing-head sitter-clear">
+          <p class="eyebrow">Zero-Knowledge Drop Portal</p>
+          <h1 class="card-title">Verified Human <em>Drops</em></h1>
+          <p class="card-lead">
+            Sign high-trust directives and deliver secrets directly to your Hyphae nodes — never exposed to chat bridges, prompts, or relays.
+          </p>
+        </div>
+
+        <ul class="feature-list">
+          <li>
+            <span class="feature-num">01</span>
+            <div>
+              <strong>Passkey + PRF Authority</strong>
+              Derives an ephemeral Ed25519 signing key in RAM via Face ID / Touch ID and wipes it right after sealing.
+            </div>
+          </li>
+          <li>
+            <span class="feature-num">02</span>
+            <div>
+              <strong>Node Certificate Guard</strong>
+              Verifies human-signed node certificates before sealing and hard-blocks secrets targeting uncertified keys.
+            </div>
+          </li>
+          <li>
+            <span class="feature-num">03</span>
+            <div>
+              <strong>RFC 9180 HPKE + Blind Relay</strong>
+              Ciphertext deleted within 15 min. Power-of-2 bucket padding sealed to your node's X25519 key, with 1-tap offline <code>hdrop1_</code> fallback.
+            </div>
+          </li>
+        </ul>
+
+        <div class="callout-note">
+          <strong>Waiting for a Drop Link</strong>
+          <span>Open a link from <code>hyp drop create</code> or scan an enrollment QR from <code>hyp auth init --web</code>.</span>
+        </div>
+
+        <a class="btn-link btn-primary" href="https://hyphae.to" rel="noreferrer">Explore Hyphae</a>
+      </section>
+
+      <!-- =================================================================== -->
+      <!-- Drop Mode View (#drop=...) — Calm Editorial Single Card             -->
+      <!-- =================================================================== -->
+      <section id="viewDrop" class="card drop-card stage-fade hidden">
+        <!-- Calm Borderless Hairline Header (Zero Nested Box-in-Box) -->
+        <header class="drop-header">
+          <div class="drop-eyebrow-row sitter-clear">
+            <span class="eyebrow-pair">
+              <span id="dropKindBadge" class="kind-label directive">DIRECTIVE</span>
+              <span class="inline-sep" aria-hidden="true">·</span>
+              <span id="metaExpires" class="expiry-text">—</span>
+            </span>
+            <span id="metaSecretStrip" class="secret-inline hidden">
+              <span class="inline-sep secret-sep" aria-hidden="true">·</span>
+              <code id="metaSecretName" class="secret-inline-name">—</code>
+            </span>
           </div>
-        </li>
-        <li>
-          <span class="feature-num">02</span>
-          <div>
-            <strong>Node Certificate Guard</strong>
-            Verifies human-signed node certificates before sealing and hard-blocks secrets targeting uncertified keys.
-          </div>
-        </li>
-        <li>
-          <span class="feature-num">03</span>
-          <div>
-            <strong>RFC 9180 HPKE + Blind Relay</strong>
-            Blind relay · ciphertext deleted within 15 min. Power-of-2 bucket padding sealed to your node's X25519 key, with 1-tap offline <code>hdrop1_</code> fallback.
-          </div>
-        </li>
-      </ul>
 
-      <div class="banner warn">
-        <strong>Waiting for a Drop Link</strong>
-        <span>Open a link from <code>hyp drop create</code> or scan an enrollment QR from <code>hyp auth init --web</code>.</span>
-      </div>
-
-      <a class="btn-link btn-primary" href="https://hyphae.to" rel="noreferrer">Explore Hyphae</a>
-    </section>
-
-    <!-- =================================================================== -->
-    <!-- Drop Mode View (#drop=...) — Single Focused Progressive Card        -->
-    <!-- =================================================================== -->
-    <section id="viewDrop" class="card drop-card stage-in hidden">
-      <!-- Compact 2-Row Context Strip (Never wraps mid-word) -->
-      <div class="context-strip">
-        <div class="context-row-primary">
-          <div class="target-identity">
+          <div class="drop-target-row">
             <span id="metaNodeId" class="target-node">—</span>
-            <span id="metaHandlePill" class="handle-pill hidden"></span>
-          </div>
-          <div class="context-badges">
-            <span id="dropKindBadge" class="kind-badge directive">DIRECTIVE</span>
-            <span id="metaExpires" class="countdown-pill">—</span>
-          </div>
-        </div>
-
-        <div class="context-row-meta">
-          <div class="relay-meta">
-            <span id="metaRelayHost" class="relay-host">—</span>
-            <span id="metaRelayTag" class="relay-tag hidden"></span>
-          </div>
-          <span id="metaCertBadge" class="cert-badge pending">Cert pending</span>
-        </div>
-
-        <!-- Highlighted Secret Name Strip (Shown ONLY for kind === "secret") -->
-        <div id="metaSecretStrip" class="secret-target-strip hidden">
-          <span class="secret-target-label">Secret</span>
-          <code id="metaSecretName" class="secret-target-name">—</code>
-        </div>
-      </div>
-
-      <!-- Collapsible Security & SAS Fingerprint Drawer (Collapsed by default when cert attached) -->
-      <details id="securityDrawer" class="security-drawer">
-        <summary class="drawer-summary">
-          <span class="drawer-summary-left">
-            <svg class="drawer-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-            </svg>
-            <span>Security &amp; SAS fingerprint</span>
-          </span>
-          <span class="drawer-summary-right">
-            <span id="securityDrawerPreview" class="drawer-preview">—</span>
-            <svg class="drawer-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M6 9l6 6 6-6" />
-            </svg>
-          </span>
-        </summary>
-
-        <div class="drawer-body">
-          <div class="sas-block">
-            <div class="sas-head">
-              <span class="meta-k">Target X25519 SAS</span>
-              <span id="metaCertHint" class="meta-hint">Cert pending</span>
-            </div>
-            <div id="sasHex" class="sas-hex">—</div>
-            <div id="sasWords" class="sas-words">—</div>
+            <span id="metaHandlePill" class="target-handle hidden"></span>
           </div>
 
-          <div id="drawerRelayRow" class="drawer-kv hidden">
-            <span class="meta-k">Full Relay URL</span>
-            <span id="drawerRelayUrl" class="drawer-mono">—</span>
+          <div class="drop-meta-row">
+            <span class="relay-meta">
+              <span id="metaRelayHost" class="relay-host">—</span>
+              <span id="metaRelayTag" class="relay-tag hidden"></span>
+            </span>
+            <span id="metaCertBadge" class="cert-badge pending">Cert pending</span>
           </div>
+        </header>
 
-          <div class="drawer-divider" aria-hidden="true"></div>
-
-          <div class="drawer-auth-head">
-            <span class="meta-k">Authority Parameters</span>
-            <span id="identitySummaryText" class="meta-hint"></span>
-          </div>
-
-          <div class="auth-grid">
-            <div class="field">
-              <label class="field-label-sm" for="inputHumanId">Human ID</label>
-              <input id="inputHumanId" type="text" autocomplete="off" aria-autocomplete="none" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="e.g. bogdan" />
-            </div>
-            <div class="field">
-              <label class="field-label-sm" for="inputAuthEpoch">Epoch</label>
-              <input id="inputAuthEpoch" type="number" min="1" step="1" value="1" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-type="other" />
-            </div>
-            <div class="field span-2">
-              <label class="field-label-sm" for="inputPrfSalt">PRF Salt (base64url)</label>
-              <input id="inputPrfSalt" type="text" autocomplete="off" aria-autocomplete="none" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="Saved at enrollment or embedded in link" />
-            </div>
-          </div>
-        </div>
-      </details>
-
-      <!-- Global Fatal Banner (Expired link / invalid or reserved secret name) -->
-      <div id="dropGlobalBanner" class="banner danger hidden" aria-live="polite">
-        <strong id="dropGlobalBannerTitle"></strong>
-        <span id="dropGlobalBannerBody"></span>
-      </div>
-
-      <!-- Progressive 3-Step Indicator -->
-      <nav id="dropStepper" class="stepper" aria-label="Drop progress">
-        <span id="stepDot1" class="step-pill active">
-          <span class="step-num">1</span>
-          <span>Unlock</span>
-        </span>
-        <span class="step-sep" aria-hidden="true"></span>
-        <span id="stepDot2" class="step-pill">
-          <span class="step-num">2</span>
-          <span id="stepDot2Label">Review</span>
-        </span>
-        <span class="step-sep" aria-hidden="true"></span>
-        <span id="stepDot3" class="step-pill">
-          <span class="step-num">3</span>
-          <span>Sent</span>
-        </span>
-      </nav>
-
-      <!-- ================================================================= -->
-      <!-- STATE 1: LOCKED (Single Focused Action, Above the Fold)           -->
-      <!-- ================================================================= -->
-      <div id="stageLocked" class="stage-panel stage-in">
-        <div class="stage-head">
-          <h1 id="lockedTitle" class="card-title">Unlock to Sign Directive</h1>
-          <p id="lockedSubtitle" class="card-lead">Authenticate with Face ID / Touch ID to verify target node.</p>
-        </div>
-
-        <div id="unlockBanner" class="banner hidden" aria-live="polite">
-          <strong id="unlockBannerTitle"></strong>
-          <span id="unlockBannerBody"></span>
-        </div>
-
-        <div class="btn-stack">
-          <button id="btnUnlockPrimary" class="btn-primary" type="button">
-            <span id="unlockSpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
-            <span id="btnUnlockPrimaryLabel">Unlock with Face ID / Touch ID</span>
-          </button>
-          <button id="btnSkipDraft" class="btn-ghost hidden" type="button">
-            Skip draft &amp; write from scratch
-          </button>
-        </div>
-      </div>
-
-      <!-- ================================================================= -->
-      <!-- STATE 2: UNLOCKED (Slim Verified Strip + Immediate Focal Input)   -->
-      <!-- ================================================================= -->
-      <div id="stageUnlocked" class="stage-panel stage-in hidden">
-        <!-- Collapsed Step 1: Slim 1-Line Verified Status Strip -->
-        <div id="verifiedStrip" class="verified-strip verified">
-          <span class="verified-strip-left">
-            <span id="verifiedStripIcon" class="verified-icon" aria-hidden="true">✓</span>
-            <span id="verifiedStripText" class="verified-strip-text">—</span>
-          </span>
-          <button id="btnLockClear" class="btn-lock-pill" type="button">Lock</button>
-        </div>
-
-        <!-- Uncertified Node Warning (Directives ONLY when cert missing/invalid) -->
-        <div id="uncertifiedBanner" class="banner danger hidden" aria-live="polite">
-          <strong id="uncertifiedBannerTitle"></strong>
-          <span id="uncertifiedBannerBody"></span>
-        </div>
-
-        <!-- Untrusted Agent Draft Warning Banner (ONLY when encDraft decrypted) -->
-        <div id="draftWarningBanner" class="banner warn compact hidden" aria-live="polite">
-          <strong>Untrusted Agent Draft</strong>
-          <span>Proposed by an agent — review every line before approving.</span>
-        </div>
-
-        <!-- Optional Untrusted Agent Context -->
-        <div id="draftContextRow" class="draft-context hidden">
-          <span class="meta-k">Agent Context (Untrusted)</span>
-          <span id="draftContextText" class="draft-context-text"></span>
-        </div>
-
-        <!-- Secret Input (ALWAYS empty — NEVER pre-filled!) -->
-        <div id="secretInputGroup" class="field hidden">
-          <div class="field-head">
-            <label class="field-label" for="inputSecretValue">Secret Value</label>
-            <span id="secretByteCount" class="field-counter">0 B</span>
-          </div>
-          <div class="input-row">
-            <input
-              id="inputSecretValue"
-              class="secret-masked"
-              type="text"
-              autocomplete="off"
-              aria-autocomplete="none"
-              autocorrect="off"
-              autocapitalize="off"
-              spellcheck="false"
-              data-1p-ignore="true"
-              data-lpignore="true"
-              data-bwignore="true"
-              data-protonpass-ignore="true"
-              data-form-type="other"
-              placeholder="Paste secret value…"
-              disabled
-            />
-            <button id="btnToggleReveal" class="btn-inline" type="button" disabled>Reveal</button>
-          </div>
-          <label class="checkbox-row">
-            <input id="chkOverwriteSecret" type="checkbox" disabled />
-            <span>Overwrite if this secret already exists on the node</span>
-          </label>
-          <p id="secretExistsHint" class="secret-exists-hint hidden" role="note"></p>
-        </div>
-
-        <!-- Directive Input (Auto-expanded no-scroll BiDi-safe textarea) -->
-        <div id="directiveInputGroup" class="field hidden">
-          <div class="field-head">
-            <label id="directiveFieldLabel" class="field-label" for="inputDirectiveValue">Verified Directive</label>
-            <span id="directiveByteCount" class="field-counter">0 chars · 0 lines</span>
-          </div>
-          <textarea
-            id="inputDirectiveValue"
-            class="auto-expand"
-            autocomplete="off"
-            placeholder="Write the exact instruction for your target agent…"
-            disabled
-          ></textarea>
-        </div>
-
-        <!-- Mandatory Draft Approval Checkbox (Directives unlocked from encDraft) -->
-        <label id="draftApproveRow" class="checkbox-row warn-confirm hidden">
-          <input id="draftApproveCheck" type="checkbox" />
-          <span>I have read and approve every line above</span>
-        </label>
-
-        <!-- Manual SAS Override Checkbox (Directives ONLY when NodeCert unverified) -->
-        <label id="sasConfirmRow" class="checkbox-row danger-confirm hidden">
-          <input id="chkManualSasConfirm" type="checkbox" />
-          <span id="sasConfirmText">
-            I manually verified the SAS fingerprint on the target node and accept sending this directive to an uncertified key.
-          </span>
-        </label>
-
-        <div id="sealActionBanner" class="banner hidden" aria-live="polite">
-          <strong id="sealActionTitle"></strong>
-          <span id="sealActionBody"></span>
-        </div>
-
-        <div class="btn-stack">
-          <button id="btnSealSend" class="btn-primary" type="button" disabled>
-            <span id="sealSendSpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
-            <span id="btnSealSendLabel">Sign, Seal &amp; Send</span>
-          </button>
-          <button id="btnSealOffline" class="btn-ghost" type="button" disabled>
-            Seal offline hdrop1_ token instead
-          </button>
-        </div>
-      </div>
-
-      <!-- ================================================================= -->
-      <!-- STATE 3: DELIVERED / OFFLINE FALLBACK                             -->
-      <!-- ================================================================= -->
-      <div id="stageDone" class="stage-panel stage-in hidden" aria-live="polite">
-        <!-- 3A: Clean Delivered End State (ZERO raw hdrop1_ ciphertext!) -->
-        <div id="doneDeliveredBlock" class="done-block hidden">
-          <div class="status-hero">
-            <span class="hero-icon hero-icon-verified" aria-hidden="true">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M20 6L9 17l-5-5" />
+        <!-- Quiet Inline Security & SAS Fingerprint Disclosure -->
+        <details id="securityDrawer" class="security-drawer">
+          <summary class="drawer-summary">
+            <span class="drawer-summary-left">
+              <svg class="drawer-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              </svg>
+              <span>Security &amp; SAS fingerprint</span>
+            </span>
+            <span class="drawer-summary-right">
+              <span id="securityDrawerPreview" class="drawer-preview">—</span>
+              <svg class="drawer-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M6 9l6 6 6-6" />
               </svg>
             </span>
-            <h1 id="doneTitle" class="hero-title">Directive Delivered</h1>
-            <p id="doneSubtitle" class="hero-subtitle">
-              Delivered end-to-end encrypted. Ephemeral keys wiped from memory — you can close this tab now.
+          </summary>
+
+          <div class="drawer-body">
+            <div class="sas-block">
+              <div class="sas-head">
+                <span class="meta-k">Target X25519 SAS</span>
+                <span id="metaCertHint" class="meta-hint">Cert pending</span>
+              </div>
+              <div id="sasHex" class="sas-hex">—</div>
+              <div id="sasWords" class="sas-words">—</div>
+            </div>
+
+            <div id="drawerRelayRow" class="drawer-kv hidden">
+              <span class="meta-k">Full Relay URL</span>
+              <span id="drawerRelayUrl" class="drawer-mono">—</span>
+            </div>
+
+            <div class="drawer-divider" aria-hidden="true"></div>
+
+            <div class="drawer-auth-head">
+              <span class="meta-k">Authority Parameters</span>
+              <span id="identitySummaryText" class="meta-hint"></span>
+            </div>
+
+            <div class="auth-grid">
+              <div class="field">
+                <label class="field-label-sm" for="inputHumanId">Human ID</label>
+                <input id="inputHumanId" type="text" autocomplete="off" aria-autocomplete="none" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="e.g. bogdan" />
+              </div>
+              <div class="field">
+                <label class="field-label-sm" for="inputAuthEpoch">Epoch</label>
+                <input id="inputAuthEpoch" type="number" min="1" step="1" value="1" autocomplete="off" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-form-type="other" />
+              </div>
+              <div class="field span-2">
+                <label class="field-label-sm" for="inputPrfSalt">PRF Salt (base64url)</label>
+                <input id="inputPrfSalt" type="text" autocomplete="off" aria-autocomplete="none" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" data-protonpass-ignore="true" data-form-type="other" placeholder="Saved at enrollment or embedded in link" />
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- Global Fatal Banner (Expired link / invalid or reserved secret name) -->
+        <div id="dropGlobalBanner" class="banner danger hidden" aria-live="polite">
+          <strong id="dropGlobalBannerTitle"></strong>
+          <span id="dropGlobalBannerBody"></span>
+        </div>
+
+        <!-- Ultra-Minimal Hairline 3-Step Indicator -->
+        <nav id="dropStepper" class="stepper" aria-label="Drop progress">
+          <span id="stepDot1" class="step-pill active">
+            <span class="step-num">1</span>
+            <span>Unlock</span>
+          </span>
+          <span class="step-sep" aria-hidden="true"></span>
+          <span id="stepDot2" class="step-pill">
+            <span class="step-num">2</span>
+            <span id="stepDot2Label">Review</span>
+          </span>
+          <span class="step-sep" aria-hidden="true"></span>
+          <span id="stepDot3" class="step-pill">
+            <span class="step-num">3</span>
+            <span>Sent</span>
+          </span>
+        </nav>
+
+        <!-- ================================================================= -->
+        <!-- STATE 1: LOCKED (Single Focused Action, Above the Fold)           -->
+        <!-- ================================================================= -->
+        <div id="stageLocked" class="stage-panel stage-in">
+          <div class="stage-head">
+            <h1 id="lockedTitle" class="card-title">Unlock to Sign Directive</h1>
+            <p id="lockedSubtitle" class="card-lead">Authenticate with Face ID / Touch ID to verify target node.</p>
+          </div>
+
+          <div id="unlockBanner" class="banner hidden" aria-live="polite">
+            <strong id="unlockBannerTitle"></strong>
+            <span id="unlockBannerBody"></span>
+          </div>
+
+          <div class="btn-stack">
+            <button id="btnUnlockPrimary" class="btn-primary" type="button">
+              <span id="unlockSpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
+              <span id="btnUnlockPrimaryLabel">Unlock with Face ID / Touch ID</span>
+            </button>
+            <button id="btnSkipDraft" class="btn-ghost hidden" type="button">
+              Skip draft &amp; write from scratch
+            </button>
+          </div>
+        </div>
+
+        <!-- ================================================================= -->
+        <!-- STATE 2: UNLOCKED (Calm Verified Row + Immediate Focal Input)     -->
+        <!-- ================================================================= -->
+        <div id="stageUnlocked" class="stage-panel stage-in hidden">
+          <!-- Slim 1-Line Verified Status Row -->
+          <div id="verifiedStrip" class="verified-strip verified">
+            <span class="verified-strip-left">
+              <span id="verifiedStripIcon" class="verified-icon" aria-hidden="true">✓</span>
+              <span id="verifiedStripText" class="verified-strip-text">—</span>
+            </span>
+            <button id="btnLockClear" class="btn-lock-pill" type="button">Lock</button>
+          </div>
+
+          <!-- Uncertified Node Warning (Directives ONLY when cert missing/invalid) -->
+          <div id="uncertifiedBanner" class="banner danger hidden" aria-live="polite">
+            <strong id="uncertifiedBannerTitle"></strong>
+            <span id="uncertifiedBannerBody"></span>
+          </div>
+
+          <!-- Untrusted Agent Draft Warning Banner (ONLY when encDraft decrypted) -->
+          <div id="draftWarningBanner" class="banner warn compact hidden" aria-live="polite">
+            <strong>Untrusted Agent Draft</strong>
+            <span>Proposed by an agent — review every line before approving.</span>
+          </div>
+
+          <!-- Optional Untrusted Agent Context -->
+          <div id="draftContextRow" class="draft-context hidden">
+            <span class="meta-k">Agent Context (Untrusted)</span>
+            <span id="draftContextText" class="draft-context-text"></span>
+          </div>
+
+          <!-- Secret Input (ALWAYS empty — NEVER pre-filled!) -->
+          <div id="secretInputGroup" class="field hidden">
+            <div class="field-head">
+              <label class="field-label" for="inputSecretValue">Secret Value</label>
+              <span id="secretByteCount" class="field-counter">0 B</span>
+            </div>
+            <div class="input-row">
+              <input
+                id="inputSecretValue"
+                class="secret-masked"
+                type="text"
+                autocomplete="off"
+                aria-autocomplete="none"
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck="false"
+                data-1p-ignore="true"
+                data-lpignore="true"
+                data-bwignore="true"
+                data-protonpass-ignore="true"
+                data-form-type="other"
+                placeholder="Paste secret value…"
+                disabled
+              />
+              <button id="btnToggleReveal" class="btn-inline" type="button" disabled>Reveal</button>
+            </div>
+            <label class="checkbox-row checkbox-quiet">
+              <input id="chkOverwriteSecret" type="checkbox" disabled />
+              <span>Overwrite if this secret already exists on the node</span>
+            </label>
+            <p id="secretExistsHint" class="secret-exists-hint hidden" role="note"></p>
+          </div>
+
+          <!-- Directive Input (Auto-expanded no-scroll BiDi-safe textarea) -->
+          <div id="directiveInputGroup" class="field hidden">
+            <div class="field-head">
+              <label id="directiveFieldLabel" class="field-label" for="inputDirectiveValue">Verified Directive</label>
+              <span id="directiveByteCount" class="field-counter">0 chars · 0 lines</span>
+            </div>
+            <textarea
+              id="inputDirectiveValue"
+              class="auto-expand"
+              autocomplete="off"
+              placeholder="Write the exact instruction for your target agent…"
+              disabled
+            ></textarea>
+          </div>
+
+          <!-- Mandatory Draft Approval Checkbox (Directives unlocked from encDraft) -->
+          <label id="draftApproveRow" class="checkbox-row warn-confirm hidden">
+            <input id="draftApproveCheck" type="checkbox" />
+            <span>I have read and approve every line above</span>
+          </label>
+
+          <!-- Manual SAS Override Checkbox (Directives ONLY when NodeCert unverified) -->
+          <label id="sasConfirmRow" class="checkbox-row danger-confirm hidden">
+            <input id="chkManualSasConfirm" type="checkbox" />
+            <span id="sasConfirmText">
+              I manually verified the SAS fingerprint on the target node and accept sending this directive to an uncertified key.
+            </span>
+          </label>
+
+          <div id="sealActionBanner" class="banner hidden" aria-live="polite">
+            <strong id="sealActionTitle"></strong>
+            <span id="sealActionBody"></span>
+          </div>
+
+          <div class="btn-stack">
+            <button id="btnSealSend" class="btn-primary" type="button" disabled>
+              <span id="sealSendSpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
+              <span id="btnSealSendLabel">Sign, Seal &amp; Send</span>
+            </button>
+            <button id="btnSealOffline" class="btn-ghost" type="button" disabled>
+              Seal offline hdrop1_ token instead
+            </button>
+          </div>
+        </div>
+
+        <!-- ================================================================= -->
+        <!-- STATE 3: DELIVERED / OFFLINE FALLBACK                             -->
+        <!-- ================================================================= -->
+        <div id="stageDone" class="stage-panel stage-in hidden" aria-live="polite">
+          <!-- 3A: Serene Delivered End State (Single Understated Hairline Receipt) -->
+          <div id="doneDeliveredBlock" class="done-block hidden">
+            <div class="status-hero">
+              <span class="hero-icon hero-icon-verified" aria-hidden="true">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M20 6L9 17l-5-5" />
+                </svg>
+              </span>
+              <h1 id="doneTitle" class="hero-title">Directive Delivered</h1>
+              <p id="doneSubtitle" class="hero-subtitle">
+                End-to-end encrypted. Ephemeral keys wiped from memory — you can close this tab now.
+              </p>
+            </div>
+
+            <dl class="receipt-list">
+              <div class="receipt-row">
+                <dt class="meta-k">Target</dt>
+                <dd id="doneTarget" class="summary-v">—</dd>
+              </div>
+              <div id="doneKindRow" class="receipt-row">
+                <dt id="doneKindLabel" class="meta-k">Type</dt>
+                <dd id="doneKindValue" class="summary-v">—</dd>
+              </div>
+              <div class="receipt-row">
+                <dt class="meta-k">Relay</dt>
+                <dd id="doneDelivery" class="summary-v">—</dd>
+              </div>
+              <div class="receipt-row">
+                <dt class="meta-k">Sent</dt>
+                <dd id="doneTimestamp" class="summary-v">—</dd>
+              </div>
+            </dl>
+          </div>
+
+          <!-- 3B: Offline / Relay-Failure Fallback (ONLY on failure or explicit offline) -->
+          <div id="doneOfflineBlock" class="done-block hidden">
+            <div id="doneOfflineBanner" class="banner warn">
+              <strong id="doneOfflineBannerTitle">Offline Token Sealed</strong>
+              <span id="doneOfflineBannerBody">Plaintext and ephemeral keys wiped from memory.</span>
+            </div>
+
+            <div class="field">
+              <div class="field-head">
+                <span class="field-label">Sealed <code>hdrop1_</code> Token</span>
+                <span class="field-counter">Safe to paste</span>
+              </div>
+              <div id="offlineTokenValue" class="token-box"></div>
+            </div>
+
+            <div class="btn-stack">
+              <button id="btnCopyHdrop1" class="btn-primary" type="button">Copy hdrop1_ Token</button>
+              <button id="btnRetryUpload" class="btn-secondary hidden" type="button">
+                <span id="retryUploadSpinner" class="spinner hidden" aria-hidden="true"></span>
+                <span id="btnRetryUploadLabel">Retry Upload</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =================================================================== -->
+      <!-- Enroll Mode View (#enroll=...) — Harmonized Single-Card Flow        -->
+      <!-- =================================================================== -->
+      <section id="viewEnroll" class="card drop-card stage-fade hidden">
+        <!-- Enroll Start State -->
+        <div id="enrollStageStart" class="stage-panel">
+          <div class="enroll-head sitter-clear">
+            <p class="eyebrow">Authority Enrollment · Passkey + PRF</p>
+            <h1 class="card-title">Enroll Phone Passkey</h1>
+            <p class="card-lead">
+              Create a synced Face ID / Touch ID passkey to derive your signing and draft-encryption keys in memory — zero private keys stored.
             </p>
           </div>
 
-          <div class="summary-grid">
-            <div class="summary-item">
-              <span class="meta-k">Target</span>
-              <span id="doneTarget" class="summary-v">—</span>
+          <dl class="receipt-list">
+            <div class="receipt-row">
+              <dt class="meta-k">Human ID</dt>
+              <dd id="enrollHumanId" class="summary-v">—</dd>
             </div>
-            <div id="doneKindRow" class="summary-item">
-              <span id="doneKindLabel" class="meta-k">Type</span>
-              <span id="doneKindValue" class="summary-v">—</span>
+            <div class="receipt-row">
+              <dt class="meta-k">Auth Epoch</dt>
+              <dd id="enrollAuthEpoch" class="summary-v">1</dd>
             </div>
-            <div class="summary-item">
-              <span class="meta-k">Delivery</span>
-              <span id="doneDelivery" class="summary-v">—</span>
+            <div class="receipt-row">
+              <dt class="meta-k">Relying Party</dt>
+              <dd id="enrollRpId" class="summary-v">—</dd>
             </div>
-            <div class="summary-item">
-              <span class="meta-k">Sent</span>
-              <span id="doneTimestamp" class="summary-v">—</span>
+          </dl>
+
+          <details class="security-drawer">
+            <summary class="drawer-summary">
+              <span class="drawer-summary-left">
+                <span>PRF Salt</span>
+              </span>
+              <span class="drawer-summary-right">
+                <span class="drawer-preview">View</span>
+                <svg class="drawer-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M6 9l6 6 6-6" />
+                </svg>
+              </span>
+            </summary>
+            <div class="drawer-body">
+              <span id="enrollPrfSalt" class="drawer-mono">—</span>
             </div>
+          </details>
+
+          <div id="enrollErrorBanner" class="banner danger hidden" aria-live="polite">
+            <strong id="enrollErrorBannerTitle"></strong>
+            <span id="enrollErrorBannerBody"></span>
           </div>
+
+          <button id="btnEnrollPasskey" class="btn-primary" type="button">
+            <span id="enrollSpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
+            <span id="btnEnrollPasskeyLabel">Create Passkey &amp; Enroll</span>
+          </button>
         </div>
 
-        <!-- 3B: Offline / Relay-Failure Fallback (ONLY on failure or explicit offline) -->
-        <div id="doneOfflineBlock" class="done-block hidden">
-          <div id="doneOfflineBanner" class="banner warn">
-            <strong id="doneOfflineBannerTitle">Offline Token Sealed</strong>
-            <span id="doneOfflineBannerBody">Plaintext and ephemeral keys wiped from memory.</span>
-          </div>
-
-          <div class="field">
-            <div class="field-head">
-              <span class="field-label">Sealed <code>hdrop1_</code> Token</span>
-              <span class="field-counter">Safe to paste</span>
-            </div>
-            <div id="offlineTokenValue" class="token-box"></div>
-          </div>
-
-          <div class="btn-stack">
-            <button id="btnCopyHdrop1" class="btn-primary" type="button">Copy hdrop1_ Token</button>
-            <button id="btnRetryUpload" class="btn-secondary hidden" type="button">
-              <span id="retryUploadSpinner" class="spinner hidden" aria-hidden="true"></span>
-              <span id="btnRetryUploadLabel">Retry Upload</span>
-            </button>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- =================================================================== -->
-    <!-- Enroll Mode View (#enroll=...) — Harmonized Single-Card Flow        -->
-    <!-- =================================================================== -->
-    <section id="viewEnroll" class="card drop-card stage-in hidden">
-      <!-- Enroll Start State -->
-      <div id="enrollStageStart" class="stage-panel">
-        <div class="enroll-head">
-          <div class="enroll-head-row">
-            <p class="eyebrow">Authority Enrollment</p>
-            <span class="kind-badge directive">PASSKEY + PRF</span>
-          </div>
-          <h1 class="card-title">Enroll Phone Passkey</h1>
-          <p class="card-lead">
-            Create a synced Face ID / Touch ID passkey to derive your signing and draft-encryption keys in memory — zero private keys stored.
-          </p>
-        </div>
-
-        <div class="summary-grid">
-          <div class="summary-item">
-            <span class="meta-k">Human ID</span>
-            <span id="enrollHumanId" class="summary-v">—</span>
-          </div>
-          <div class="summary-item">
-            <span class="meta-k">Auth Epoch</span>
-            <span id="enrollAuthEpoch" class="summary-v">1</span>
-          </div>
-          <div class="summary-item span-2">
-            <span class="meta-k">Relying Party</span>
-            <span id="enrollRpId" class="summary-v">—</span>
-          </div>
-        </div>
-
-        <details class="security-drawer">
-          <summary class="drawer-summary">
-            <span class="drawer-summary-left">
-              <span>PRF Salt</span>
-            </span>
-            <span class="drawer-summary-right">
-              <span class="drawer-preview">View</span>
-              <svg class="drawer-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M6 9l6 6 6-6" />
+        <!-- Enroll Result State (Done Hero OR Fallback) -->
+        <div id="enrollResultBlock" class="stage-panel stage-in hidden" aria-live="polite">
+          <!-- Clean Auto-Sent Completion Screen (ZERO raw JSON / Copy / Retry / Re-derive!) -->
+          <div id="enrollDoneHero" class="status-hero hidden">
+            <span class="hero-icon hero-icon-verified" aria-hidden="true">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 6L9 17l-5-5" />
               </svg>
             </span>
-          </summary>
-          <div class="drawer-body">
-            <span id="enrollPrfSalt" class="drawer-mono">—</span>
-          </div>
-        </details>
-
-        <div id="enrollErrorBanner" class="banner danger hidden" aria-live="polite">
-          <strong id="enrollErrorBannerTitle"></strong>
-          <span id="enrollErrorBannerBody"></span>
-        </div>
-
-        <button id="btnEnrollPasskey" class="btn-primary" type="button">
-          <span id="enrollSpinner" class="spinner spinner-dark hidden" aria-hidden="true"></span>
-          <span id="btnEnrollPasskeyLabel">Create Passkey &amp; Enroll</span>
-        </button>
-      </div>
-
-      <!-- Enroll Result State (Done Hero OR Fallback) -->
-      <div id="enrollResultBlock" class="stage-panel stage-in hidden" aria-live="polite">
-        <!-- Clean Auto-Sent Completion Screen (ZERO raw JSON / Copy / Retry / Re-derive!) -->
-        <div id="enrollDoneHero" class="status-hero hidden">
-          <span class="hero-icon hero-icon-verified" aria-hidden="true">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M20 6L9 17l-5-5" />
-            </svg>
-          </span>
-          <h1 class="hero-title">Return to Your Setup Now</h1>
-          <p class="hero-subtitle">
-            Your laptop <code>hyp</code> CLI received and saved your public keys. You can close this tab now.
-          </p>
-        </div>
-
-        <!-- Manual Fallback (ONLY when local callback fails or no callback URL) -->
-        <div id="enrollFallbackBlock" class="done-block hidden">
-          <div id="enrollFallbackBanner" class="banner warn">
-            <strong id="enrollFallbackBannerTitle"></strong>
-            <span id="enrollFallbackBannerBody"></span>
+            <h1 class="hero-title">Return to Your Setup Now</h1>
+            <p class="hero-subtitle">
+              Your laptop <code>hyp</code> CLI received and saved your public keys. You can close this tab now.
+            </p>
           </div>
 
-          <div class="field">
-            <div class="field-head">
-              <span class="field-label">Public Enrollment Bundle</span>
-              <span class="field-counter">Public JWKs &amp; salt</span>
+          <!-- Manual Fallback (ONLY when local callback fails or no callback URL) -->
+          <div id="enrollFallbackBlock" class="done-block hidden">
+            <div id="enrollFallbackBanner" class="banner warn">
+              <strong id="enrollFallbackBannerTitle"></strong>
+              <span id="enrollFallbackBannerBody"></span>
             </div>
-            <div id="enrollBundleBox" class="token-box"></div>
-          </div>
 
-          <div class="btn-stack">
-            <button id="btnCopyEnrollBundle" class="btn-primary" type="button">Copy Public JWKs &amp; Salt</button>
-            <button id="btnSendEnrollCallback" class="btn-secondary hidden" type="button">
-              <span id="enrollRetrySpinner" class="spinner hidden" aria-hidden="true"></span>
-              <span id="btnSendEnrollCallbackLabel">Retry Send to Local hyp CLI</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- Compact Collapsible Key Fingerprints (Collapsed by default) -->
-        <details id="enrollKeysDrawer" class="security-drawer">
-          <summary class="drawer-summary">
-            <span class="drawer-summary-left">
-              <svg class="drawer-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
-              </svg>
-              <span>Key fingerprints</span>
-            </span>
-            <span class="drawer-summary-right">
-              <span class="drawer-preview">Ed25519 · X25519</span>
-              <svg class="drawer-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M6 9l6 6 6-6" />
-              </svg>
-            </span>
-          </summary>
-          <div class="drawer-body">
-            <div class="drawer-kv">
-              <span class="meta-k">Ed25519 Signing Key (kid)</span>
-              <span id="enrollKid" class="drawer-mono accent">—</span>
-              <span id="enrollFingerprint" class="drawer-mono muted">—</span>
+            <div class="field">
+              <div class="field-head">
+                <span class="field-label">Public Enrollment Bundle</span>
+                <span class="field-counter">Public JWKs &amp; salt</span>
+              </div>
+              <div id="enrollBundleBox" class="token-box"></div>
             </div>
-            <div class="drawer-divider" aria-hidden="true"></div>
-            <div class="drawer-kv">
-              <span class="meta-k">X25519 Draft Key (encKid)</span>
-              <span id="enrollEncKid" class="drawer-mono accent">—</span>
-              <span id="enrollEncFingerprint" class="drawer-mono muted">—</span>
+
+            <div class="btn-stack">
+              <button id="btnCopyEnrollBundle" class="btn-primary" type="button">Copy Public JWKs &amp; Salt</button>
+              <button id="btnSendEnrollCallback" class="btn-secondary hidden" type="button">
+                <span id="enrollRetrySpinner" class="spinner hidden" aria-hidden="true"></span>
+                <span id="btnSendEnrollCallbackLabel">Retry Send to Local hyp CLI</span>
+              </button>
             </div>
           </div>
-        </details>
-      </div>
-    </section>
+
+          <!-- Compact Collapsible Key Fingerprints (Collapsed by default) -->
+          <details id="enrollKeysDrawer" class="security-drawer">
+            <summary class="drawer-summary">
+              <span class="drawer-summary-left">
+                <svg class="drawer-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+                </svg>
+                <span>Key fingerprints</span>
+              </span>
+              <span class="drawer-summary-right">
+                <span class="drawer-preview">Ed25519 · X25519</span>
+                <svg class="drawer-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M6 9l6 6 6-6" />
+                </svg>
+              </span>
+            </summary>
+            <div class="drawer-body">
+              <div class="drawer-kv">
+                <span class="meta-k">Ed25519 Signing Key (kid)</span>
+                <span id="enrollKid" class="drawer-mono accent">—</span>
+                <span id="enrollFingerprint" class="drawer-mono muted">—</span>
+              </div>
+              <div class="drawer-divider" aria-hidden="true"></div>
+              <div class="drawer-kv">
+                <span class="meta-k">X25519 Draft Key (encKid)</span>
+                <span id="enrollEncKid" class="drawer-mono accent">—</span>
+                <span id="enrollEncFingerprint" class="drawer-mono muted">—</span>
+              </div>
+            </div>
+          </details>
+        </div>
+      </section>
+    </div>
 
     <footer class="footer">
       <span>Blind relay · ciphertext deleted within 15 min · Fragment scrubbed on load · Zero analytics</span>
-      <a href="https://hyphae.to" rel="noreferrer">What is Hyphae? · hyphae.to</a>
+      <a href="https://hyphae.to" rel="noreferrer">hyphae.to</a>
     </footer>
   </main>
 
-  <script type="module" src="./drop.js?v=4"></script>
+  <script type="module" src="./drop.js?v=5"></script>
 </body>
 </html>

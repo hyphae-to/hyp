@@ -821,8 +821,8 @@ async function initDropMode(fragment) {
   }
 
   const kindBadge = $("dropKindBadge");
-  kindBadge.textContent = isSecret ? "SECRET" : "DIRECTIVE";
-  kindBadge.className = `kind-badge ${isSecret ? "secret" : "directive"}`;
+  kindBadge.textContent = isSecret ? "SECRET DROP" : "DIRECTIVE";
+  kindBadge.className = `kind-label ${isSecret ? "secret" : "directive"}`;
 
   $("metaRelayHost").textContent = relayDisplay.host;
   if (relayDisplay.tag) {
@@ -1000,6 +1000,9 @@ async function initDropMode(fragment) {
     $("stageLocked").classList.toggle("hidden", stage !== "locked");
     $("stageUnlocked").classList.toggle("hidden", stage !== "unlocked");
     $("stageDone").classList.toggle("hidden", stage !== "done");
+    if (stage !== "done") {
+      $("viewDrop").classList.remove("is-delivered", "is-offline-done");
+    }
     updateStepper(stage);
   }
 
@@ -1091,13 +1094,13 @@ async function initDropMode(fragment) {
     const pill = $("metaExpires");
     if (!fragment.expiresAtMs) {
       pill.textContent = "10m on seal";
-      pill.className = "countdown-pill";
+      pill.className = "expiry-text";
       return;
     }
     const rem = fragment.expiresAtMs - Date.now();
     pill.textContent = formatCountdown(rem);
     if (rem <= 0) {
-      pill.className = "countdown-pill danger";
+      pill.className = "expiry-text danger";
       if (!state.expired) {
         state.expired = true;
         setBanner(
@@ -1115,9 +1118,9 @@ async function initDropMode(fragment) {
         }
       }
     } else if (rem <= 2 * 60 * 1000) {
-      pill.className = "countdown-pill warn";
+      pill.className = "expiry-text warn";
     } else {
-      pill.className = "countdown-pill";
+      pill.className = "expiry-text";
     }
   }
   refreshExpiry();
@@ -1435,14 +1438,16 @@ async function initDropMode(fragment) {
     clearInterval(countdownTimer);
     clearBanner($("dropGlobalBanner"));
     $("metaExpires").textContent = "Delivered";
-    $("metaExpires").className = "countdown-pill done";
+    $("metaExpires").className = "expiry-text done";
     $("securityDrawer").open = false;
 
     $("doneTitle").textContent = isSecret ? "Secret Delivered" : "Directive Delivered";
     $("doneSubtitle").textContent =
-      `Delivered end-to-end encrypted to ${fragment.nodeId}. Ephemeral keys wiped from memory — you can close this tab now.`;
+      "End-to-end encrypted. Ephemeral keys wiped from memory — you can close this tab now.";
 
-    $("doneTarget").textContent = fragment.nodeId;
+    $("doneTarget").textContent = isSecret && fragment.handle
+      ? `${fragment.nodeId} · ${fragment.handle}`
+      : fragment.nodeId;
 
     if (isSecret) {
       $("doneKindLabel").textContent = "Secret";
@@ -1458,6 +1463,8 @@ async function initDropMode(fragment) {
 
     $("doneOfflineBlock").classList.add("hidden");
     $("doneDeliveredBlock").classList.remove("hidden");
+    $("viewDrop").classList.remove("is-offline-done");
+    $("viewDrop").classList.add("is-delivered");
     showStage("done");
   }
 
@@ -1467,7 +1474,7 @@ async function initDropMode(fragment) {
     clearInterval(countdownTimer);
     clearBanner($("dropGlobalBanner"));
     $("metaExpires").textContent = "Sealed";
-    $("metaExpires").className = "countdown-pill done";
+    $("metaExpires").className = "expiry-text done";
     $("securityDrawer").open = false;
 
     $("offlineTokenValue").textContent = state.lastHdrop1;
@@ -1500,6 +1507,8 @@ async function initDropMode(fragment) {
       retryBtn.classList.add("hidden");
     }
 
+    $("viewDrop").classList.remove("is-delivered");
+    $("viewDrop").classList.add("is-offline-done");
     showStage("done");
   }
 
