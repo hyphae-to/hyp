@@ -5,6 +5,9 @@
 //! Spawns the real compiled `hyp` binary in isolated temp dirs with `HYPHAE_SECRET_BACKEND=file`
 //! on BOTH Unix (fd-3) and Windows (authenticated loopback-TCP).
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 mod plugin_config_e2e {
     use http::{Method, Request, StatusCode, header};
     use http_body_util::{BodyExt, Full};
@@ -38,6 +41,9 @@ mod plugin_config_e2e {
     }
 
     fn find_binary(name: &str) -> Option<String> {
+        if name == "node" {
+            return crate::node_runtime::node_available().then(|| name.to_string());
+        }
         let out = Command::new(name).arg("--version").output().ok()?;
         if out.status.success() {
             Some(name.to_string())

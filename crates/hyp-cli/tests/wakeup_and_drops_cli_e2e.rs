@@ -10,6 +10,9 @@
 //! - Uses `tempfile::TempDir`, `HYPHAE_SECRET_BACKEND=file`, isolated `HOME`, and loopback `127.0.0.1:0`.
 //! - Never touches live `~/.config/hyphae` or OS Keychain, zero real external network calls.
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 mod common;
 
 use base64::Engine as _;
@@ -29,8 +32,6 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command;
 use std::process::{Output, Stdio};
@@ -113,34 +114,6 @@ fn run_hyp_with_stdin(home: &Path, args: &[&str], stdin_data: &str) -> Output {
         .write_all(stdin_data.as_bytes())
         .expect("write stdin to hyp");
     child.wait_with_output().expect("wait for hyp output")
-}
-
-#[cfg(unix)]
-fn find_node_v20_plus() -> Option<PathBuf> {
-    let candidates: Vec<PathBuf> = vec![
-        PathBuf::from("node"),
-        PathBuf::from("/Users/bogdan/.local/share/mise/installs/node/24.21.0/bin/node"),
-        PathBuf::from("/opt/homebrew/bin/node"),
-        PathBuf::from("/usr/local/bin/node"),
-    ];
-    for cand in candidates {
-        if let Ok(out) = Command::new(&cand).arg("--version").output() {
-            if out.status.success() {
-                let ver = String::from_utf8_lossy(&out.stdout);
-                let major: u32 = ver
-                    .trim()
-                    .trim_start_matches('v')
-                    .split('.')
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                if major >= 20 {
-                    return Some(cand);
-                }
-            }
-        }
-    }
-    None
 }
 
 // ============================================================================
@@ -578,9 +551,9 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
     assert_eq!(bidi_json["error"]["code"], "INVALID_DRAFT");
 
     // 6. LIVE CROSS-LANGUAGE RUST -> JS INTEROP TEST (`site/drop/drop.js` + `site/drop/crypto.js`)!
-    let Some(node_bin) = find_node_v20_plus() else {
+    if !node_runtime::node_available() {
         return;
-    };
+    }
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -624,7 +597,7 @@ process.stdout.write(JSON.stringify(opened));
         auth_epoch = auth_epoch,
     );
 
-    let js_out = Command::new(&node_bin)
+    let js_out = Command::new("node")
         .args(["--input-type=module", "-e", &script])
         .output()
         .expect("run node JS encDraft interop");
@@ -1406,10 +1379,10 @@ fn cli_drop_create_offline_and_cross_language_browser_js_to_rust_ingest() {
     assert!(frag.get("body").is_none());
 
     // 3. Cross-language browser JS (`site/drop/drop.js` + `site/drop/crypto.js`) -> Rust `hyp drop ingest`
-    let Some(node_bin) = find_node_v20_plus() else {
-        // Gracefully skip JS interop leg only if Node >= 20 is absent on host.
+    if !node_runtime::node_available() {
+        // Retain the optional JS interop leg only when Node is absent.
         return;
-    };
+    }
 
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1464,7 +1437,7 @@ process.stdout.write(JSON.stringify({{ publicJwk, kid, hdrop1: sealed.hdrop1 }})
         hash_str = serde_json::to_string(&format!("#{raw_hash}")).unwrap(),
     );
 
-    let js_out = Command::new(&node_bin)
+    let js_out = Command::new("node")
         .args(["--input-type=module", "-e", &script])
         .output()
         .expect("run node JS interop script");

@@ -7,6 +7,9 @@
 //!
 //! Individual Node/Python tests skip gracefully ONLY if `node` or Python 3 is missing from `PATH`.
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 mod common;
 
 #[cfg(unix)]
@@ -48,6 +51,9 @@ mod unix_tests {
     }
 
     fn find_binary(name: &str) -> Option<String> {
+        if name == "node" {
+            return crate::node_runtime::node_available().then(|| name.to_string());
+        }
         let output = std::process::Command::new(name)
             .arg("--version")
             .output()
@@ -2658,6 +2664,9 @@ mod loopback_tcp_parity_tests {
     }
 
     fn find_binary(name: &str) -> Option<String> {
+        if name == "node" {
+            return crate::node_runtime::node_available().then(|| name.to_string());
+        }
         let output = std::process::Command::new(name)
             .arg("--version")
             .output()

@@ -2,6 +2,9 @@
 //! unified fd-3 `SubprocessSupervisor` v1 + JSON-RPC 2.0 v2, and native Rust webhook
 //! adapters with HMAC mutation and McKeeman differential schema parity checks).
 
+#[path = "../../test-support/node_runtime.rs"]
+mod node_runtime;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1076,11 +1079,7 @@ while True:
     #[tokio::test]
     async fn supervisor_node_fs_fd3_child_uses_v2() {
         // Skip cleanly if `node` isn't installed in PATH on a minimal host.
-        if std::process::Command::new("node")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if !crate::node_runtime::node_available() {
             return;
         }
         let host = RecordingHost::new();

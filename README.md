@@ -89,6 +89,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Development
 
+Node-based tests and tooling require Node >=24. The root [.tool-versions](.tool-versions) pins the worktree runtime for asdf and is consumed by CI. Run `asdf install` once when that version is missing.
+
 ```sh
 cargo clippy --workspace --all-targets -- -D warnings
 HYPHAE_SECRET_BACKEND=file cargo test --workspace

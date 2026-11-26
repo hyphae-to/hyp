@@ -85,7 +85,7 @@ jobs:
             esac
 
             case "$path" in
-              plugins/*|site/*|workers/*|scripts/*|itest/*|install.sh|uninstall.sh|package.json|package-lock.json|.oxlintrc.json|.github/workflows/ci.yml|*.js|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.sh|*.ps1)
+              plugins/*|site/*|workers/*|scripts/*|itest/*|install.sh|uninstall.sh|package.json|package-lock.json|.tool-versions|.oxlintrc.json|.github/workflows/ci.yml|*.js|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.sh|*.ps1)
                 if [ "$RUN_JS" = "false" ]; then
                   echo "JS/TS/plugin/site/script/workflow change detected: $path"
                   RUN_JS="true"
@@ -111,7 +111,7 @@ jobs:
       - name: Set up Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version-file: ".tool-versions"
           cache: "npm"
 
       - name: Install JS/TS linter (oxlint)
@@ -187,11 +187,10 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Set up Node.js 24 (Linux plugin & JS interop E2E)
-        if: runner.os == 'Linux'
+      - name: Set up Node.js 24 (native plugin & JS interop E2E)
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version-file: ".tool-versions"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
