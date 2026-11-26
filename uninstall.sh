@@ -96,8 +96,9 @@ HERDR_APP_DIR="${HERDR_APP_HOME:-$CONFIG_HOME/herdr-app}"
 OS_NAME="$(uname -s)"
 
 # Determine whether HOME points to the real OS account home directory.
-# When running under an isolated test HOME, never touch live system daemons,
-# live launchctl/systemd sessions, or the live OS Keychain / Secret Service.
+# When running under an isolated test HOME (or if real-home lookup fails under a sandbox),
+# FAIL CLOSED to IS_REAL_HOME=0 so tests NEVER touch live system daemons, live launchctl/
+# systemd sessions, host CLAUDE_CONFIG_DIR outside HOME, or the live OS Keychain.
 detect_real_home() {
   _drh_user="$(id -un 2>/dev/null || printf '')"
   _drh_home=""
@@ -108,15 +109,33 @@ detect_real_home() {
   elif [ -n "$_drh_user" ] && [ -r /etc/passwd ]; then
     _drh_home="$(awk -F: -v u="$_drh_user" '$1 == u { print $6; exit }' /etc/passwd 2>/dev/null || true)"
   fi
-  if [ -z "$_drh_home" ]; then
-    _drh_home="$HOME"
-  fi
   printf '%s' "$_drh_home"
+}
+
+is_ephemeral_temp_home() {
+  _ieth_path="${1%/}"
+  case "$_ieth_path" in
+    /tmp|/tmp/*|/private/tmp|/private/tmp/*|/var/folders/*|/private/var/folders/*)
+      return 0
+      ;;
+  esac
+  if [ -n "${TMPDIR:-}" ]; then
+    _ieth_tmp="${TMPDIR%/}"
+    case "$_ieth_path" in
+      "$_ieth_tmp"|"$_ieth_tmp"/*)
+        return 0
+        ;;
+    esac
+  fi
+  return 1
 }
 
 REAL_HOME="$(detect_real_home)"
 IS_REAL_HOME=0
-if [ -n "$REAL_HOME" ] && [ "${HOME%/}" = "${REAL_HOME%/}" ]; then
+if [ "${HYPHAE_NO_SERVICE:-0}" != "1" ] \
+  && ! is_ephemeral_temp_home "$HOME" \
+  && [ -n "$REAL_HOME" ] \
+  && [ "${HOME%/}" = "${REAL_HOME%/}" ]; then
   IS_REAL_HOME=1
 fi
 

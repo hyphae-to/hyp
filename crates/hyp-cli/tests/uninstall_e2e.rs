@@ -1271,6 +1271,8 @@ fast_mode = true
             .env("XDG_STATE_HOME", h.join(".local/state"))
             .env("HYPHAE_INSTALL_DIR", h.join(".local/bin"))
             .env("HYPHAE_SECRET_BACKEND", "file")
+            .env("HYPHAE_NO_SERVICE", "1")
+            .env_remove("CLAUDE_CONFIG_DIR")
             .output()
             .expect("run hyp uninstall --dry-run");
         assert_eq!(
@@ -1294,6 +1296,8 @@ fast_mode = true
             .env("XDG_STATE_HOME", h.join(".local/state"))
             .env("HYPHAE_INSTALL_DIR", h.join(".local/bin"))
             .env("HYPHAE_SECRET_BACKEND", "file")
+            .env("HYPHAE_NO_SERVICE", "1")
+            .env_remove("CLAUDE_CONFIG_DIR")
             .output()
             .expect("run hyp uninstall --yes");
         assert_eq!(
