@@ -1022,6 +1022,7 @@ fn run_status_or_doctor(
             None
         } else {
             Some(CliError {
+                exit: EXIT_ERROR,
                 code: if gate_status.tampered {
                     "GATE_POLICY_TAMPERED".to_string()
                 } else if schema_downgrade {

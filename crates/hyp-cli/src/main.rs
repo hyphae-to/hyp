@@ -322,6 +322,13 @@ fn build_current_thread_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| format!("Failed to start async runtime: {e}"))
 }
 
+fn finish_command(outcome: ui::CommandResult) -> ExitCode {
+    match outcome.result {
+        Ok(exit) => exit,
+        Err(error) => ui::print_command_error(outcome.command, outcome.as_json, error),
+    }
+}
+
 fn main() -> ExitCode {
     if let Some(code) = try_hook_fast_path() {
         return code;
@@ -503,14 +510,14 @@ fn main() -> ExitCode {
         Commands::Inbox { command } => gate_cmd::run_inbox(command),
         Commands::Kv { command } => kv_cmd::run_kv(command),
         Commands::Emit(args) => emit_cmd::run_emit(args),
-        Commands::Auth { command } => auth_cmd::run_auth(command),
+        Commands::Auth { command } => finish_command(auth_cmd::run_auth(command)),
         Commands::Join(args) => join_cmd::run_join(args),
         Commands::Drop { command } => drop_cmd::run_drop(command),
         Commands::Relay { command } => drop_cmd::run_relay(command),
         Commands::Update(args) => update::run_update(args),
         Commands::Uninstall(args) => uninstall_cmd::run_uninstall(args),
         Commands::Deploy { command } => deploy::run_deploy(command),
-        Commands::Pair { command } => pair::run_pair(command),
+        Commands::Pair { command } => finish_command(pair::run_pair(command)),
         Commands::Plugin { command } => plugin_cmd::run_plugin(command),
         Commands::Statusline(args) => statusline_cmd::run_statusline(&args),
         Commands::Inspect(args) => inspect_cmd::run_inspect(&args),

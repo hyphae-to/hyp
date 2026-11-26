@@ -4113,6 +4113,7 @@ fn run_plugin_verify(
                 None
             } else {
                 Some(CliError {
+                    exit: EXIT_ERROR,
                     code: "PLUGIN_VERIFY_FAILED".to_string(),
                     message: summary,
                     fix: Some(

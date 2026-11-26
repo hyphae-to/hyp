@@ -21,12 +21,11 @@ use crate::config_file::{
     resolve_state_dir,
 };
 use crate::gate_cmd::{
-    ConfirmError, emit_confirm_error, require_controlling_tty_confirmation,
-    require_interactive_tty_confirmation, sanitize_tty_display,
+    ConfirmError, require_controlling_tty_confirmation, require_interactive_tty_confirmation,
+    sanitize_tty_display,
 };
 use crate::ui::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
-    print_warnings,
+    CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -377,7 +376,7 @@ pub enum AuthCommand {
     },
 }
 
-pub fn run_auth(command: AuthCommand) -> ExitCode {
+pub fn run_auth(command: AuthCommand) -> CommandResult {
     match command {
         AuthCommand::Init {
             human_id,
@@ -389,8 +388,12 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             state_dir,
             config,
             json,
-        } => run_auth_init(
-            human_id, label, web, port, timeout, no_open, state_dir, config, json,
+        } => CommandResult::new(
+            "auth init",
+            json,
+            run_auth_init(
+                human_id, label, web, port, timeout, no_open, state_dir, config, json,
+            ),
         ),
         AuthCommand::Add {
             human_id,
@@ -402,14 +405,18 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             config,
             ceremony,
             json,
-        } => run_auth_add(
-            human_id, label, role, prf_salt, auth_epoch, state_dir, config, ceremony, json,
+        } => CommandResult::new(
+            "auth add",
+            json,
+            run_auth_add(
+                human_id, label, role, prf_salt, auth_epoch, state_dir, config, ceremony, json,
+            ),
         ),
         AuthCommand::List {
             all,
             state_dir,
             json,
-        } => run_auth_list(all, state_dir, json),
+        } => CommandResult::new("auth list", json, run_auth_list(all, state_dir, json)),
         AuthCommand::Revoke {
             kid,
             bump_epoch,
@@ -421,9 +428,13 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             config,
             ceremony,
             json,
-        } => run_auth_revoke(
-            kid, bump_epoch, cascade, reason, issuer_kid, broadcast, state_dir, config, ceremony,
+        } => CommandResult::new(
+            "auth revoke",
             json,
+            run_auth_revoke(
+                kid, bump_epoch, cascade, reason, issuer_kid, broadcast, state_dir, config,
+                ceremony, json,
+            ),
         ),
         AuthCommand::Invite {
             human_id,
@@ -439,20 +450,24 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             state_dir,
             config,
             json,
-        } => run_auth_invite(
-            human_id,
-            hub,
-            endpoint,
-            hub_fingerprint,
-            node_prefix,
-            preset,
-            grant,
-            max_devices,
-            expires_hours,
-            portal_url,
-            state_dir,
-            config,
+        } => CommandResult::new(
+            "auth invite",
             json,
+            run_auth_invite(
+                human_id,
+                hub,
+                endpoint,
+                hub_fingerprint,
+                node_prefix,
+                preset,
+                grant,
+                max_devices,
+                expires_hours,
+                portal_url,
+                state_dir,
+                config,
+                json,
+            ),
         ),
         AuthCommand::Admit {
             human_id,
@@ -467,34 +482,48 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             config,
             ceremony,
             json,
-        } => run_auth_admit(
-            human_id,
-            id,
-            stdin,
-            label,
-            node_prefix,
-            preset,
-            grant,
-            max_devices,
-            state_dir,
-            config,
-            ceremony,
+        } => CommandResult::new(
+            "auth admit",
             json,
+            run_auth_admit(
+                human_id,
+                id,
+                stdin,
+                label,
+                node_prefix,
+                preset,
+                grant,
+                max_devices,
+                state_dir,
+                config,
+                ceremony,
+                json,
+            ),
         ),
         AuthCommand::Whoami {
             human_id,
             state_dir,
             config,
             json,
-        } => run_auth_whoami(human_id, state_dir, config, json),
-        AuthCommand::Join(args) => crate::join_cmd::run_join(args),
+        } => CommandResult::new(
+            "auth whoami",
+            json,
+            run_auth_whoami(human_id, state_dir, config, json),
+        ),
+        AuthCommand::Join(args) => {
+            CommandResult::new("join", args.json, Ok(crate::join_cmd::run_join(args)))
+        }
         AuthCommand::CertifyNode {
             ttl_days,
             kid,
             state_dir,
             config,
             json,
-        } => run_auth_certify_node(ttl_days, kid, state_dir, config, json),
+        } => CommandResult::new(
+            "auth certify-node",
+            json,
+            run_auth_certify_node(ttl_days, kid, state_dir, config, json),
+        ),
         AuthCommand::Sign {
             kind,
             node_id,
@@ -507,18 +536,22 @@ pub fn run_auth(command: AuthCommand) -> ExitCode {
             state_dir,
             config,
             json,
-        } => run_auth_sign(
-            kind,
-            node_id,
-            handle,
-            secret_name,
-            overwrite,
-            ttl,
-            drop_id,
-            kid,
-            state_dir,
-            config,
+        } => CommandResult::new(
+            "auth sign",
             json,
+            run_auth_sign(
+                kind,
+                node_id,
+                handle,
+                secret_name,
+                overwrite,
+                ttl,
+                drop_id,
+                kid,
+                state_dir,
+                config,
+                json,
+            ),
         ),
     }
 }
@@ -778,11 +811,9 @@ impl ApprovedPolicyUpdate {
 }
 
 /// Runs the Passkey ceremony for an `auth.add` / `auth.revoke` `action`, binding the re-seal of a
-/// locked gate into the same approval. `Err` carries the exit code to return (pending or failed).
+/// locked gate into the same approval.
 #[allow(clippy::too_many_arguments)]
 fn approve_authority_change(
-    cmd: &str,
-    as_json: bool,
     state_dir: &Path,
     config_read: &Path,
     db: &NodeDb,
@@ -791,7 +822,7 @@ fn approve_authority_change(
     reseal: Option<&ApprovedPolicyUpdate>,
     summary: &[String],
     ceremony: &ApprovalCeremonyArgs,
-) -> Result<Box<VerifiedApproval>, ExitCode> {
+) -> Result<Box<VerifiedApproval>, CliError> {
     if let Some(reseal) = reseal {
         action.seal_seq = reseal.seal_seq;
         action.policy_sha256 = Some(reseal.policy_sha.clone());
@@ -807,7 +838,7 @@ fn approve_authority_change(
         ceremony,
     ) {
         Ok(CeremonyOutcome::Approved(verified)) => Ok(verified),
-        Err(err) => Err(err.emit(cmd, as_json)),
+        Err(err) => Err(err.into_cli_error()),
     }
 }
 
@@ -1141,7 +1172,7 @@ fn run_auth_init(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "auth init";
     let human_id = human_id_arg
         .map(|s| s.trim().to_ascii_lowercase())
@@ -1149,28 +1180,17 @@ fn run_auth_init(
         .unwrap_or_else(default_human_id);
 
     if human_id == LOCAL_NODE_ID || !is_valid_node_id(&human_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "INVALID_HUMAN_ID",
-            format!(
+        return Err(CliError::usage("INVALID_HUMAN_ID", format!(
                 "Invalid --human-id '{human_id}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and not be 'local'"
-            ),
-            Some("Example: hyp auth init --human-id alice".to_string()),
-        );
+            )).with_fix("Example: hyp auth init --human-id alice".to_string()));
     }
 
     let trimmed_label = label.trim();
     if trimmed_label.is_empty() || trimmed_label.len() > 128 {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_LABEL",
             "--label must be 1..=128 printable characters",
-            None,
-        );
+        ));
     }
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
@@ -1185,20 +1205,13 @@ fn run_auth_init(
                     None | Some(Value::Null) => None,
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(_) => {
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
-                            "CONFIG_ERROR",
-                            format!(
+                        return Err(CliError::error("CONFIG_ERROR", format!(
                                 "Invalid dropPortalUrl in {}: must be a string",
                                 cfg.path.display()
-                            ),
-                            Some(
+                            )).with_fix(
                                 "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
                                     .to_string(),
-                            ),
-                        );
+                            ));
                     }
                 },
                 Err(_) => None,
@@ -1209,17 +1222,10 @@ fn run_auth_init(
         match resolve_drop_portal_url(configured_drop_portal_url.as_deref()) {
             Ok(u) => Some(u),
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "CONFIG_ERROR",
-                    format!("Invalid Drop Portal URL: {e}"),
-                    Some(
+                return Err(CliError::error("CONFIG_ERROR", format!("Invalid Drop Portal URL: {e}")).with_fix(
                         "Set HYPHAE_DROP_PORTAL_URL or node.json dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop) or loopback http://127.0.0.1."
                             .to_string(),
-                    ),
-                );
+                    ));
             }
         }
     } else {
@@ -1233,30 +1239,16 @@ fn run_auth_init(
     let lock_state = inspect_policy_integrity(&config_read, &state_dir, &secrets);
     let passkey_admin_present = has_passkey_history(&state_dir);
     if passkey_admin_present {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "PASSKEY_ADMIN_ENROLLED",
-            "A Passkey Admin authority is already enrolled on this node; `hyp auth init` refuses to bypass the Passkey human boundary.",
-            Some(format!(
+        return Err(CliError::error("PASSKEY_ADMIN_ENROLLED", "A Passkey Admin authority is already enrolled on this node; `hyp auth init` refuses to bypass the Passkey human boundary.").with_fix(format!(
                 "Enroll additional authorities via Passkey-approved `hyp auth add --human-id <id> --label <name> --state-dir {}`.",
                 state_dir.display()
-            )),
-        );
+            )));
     }
     if lock_state.approved && (!web || lock_state.tampered_reason.is_some()) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "GATE_LOCKED",
-            "An approved policy already exists; initialize cannot change authorities. Use live auth add.",
-            Some(format!(
+        return Err(CliError::error("GATE_LOCKED", "An approved policy already exists; initialize cannot change authorities. Use live auth add.").with_fix(format!(
                 "Enroll via Passkey-approved `hyp auth add --state-dir {}`.",
                 state_dir.display()
-            )),
-        );
+            )));
     }
 
     let db_path = state_dir.join("node.sqlite");
@@ -1290,25 +1282,20 @@ fn run_auth_init(
                 sanitize_tty_display(trimmed_label)
             )
         };
-        if let Err(err) = require_interactive_tty_confirmation(&summary, &prompt) {
-            return emit_confirm_error(cmd, as_json, err);
-        }
+        require_interactive_tty_confirmation(&summary, &prompt)
+            .map_err(|err| (err).into_cli_error(cmd))?;
     }
 
-    if let Err(e) = ensure_dir(&state_dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
 
-    let node = match open_local_unified_node(&state_dir, &config_read, &secrets) {
-        Ok(n) => n,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "NODE_OPEN_FAILED", e, None),
-    };
+    let node = open_local_unified_node(&state_dir, &config_read, &secrets)
+        .map_err(|e| CliError::error("NODE_OPEN_FAILED", e))?;
 
     let min_epoch = {
         let db = node.db();
         match db.human().min_auth_epoch() {
             Ok(e) => e,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+            Err(e) => return Err(CliError::error("DB_ERROR", e.to_string())),
         }
     };
 
@@ -1321,14 +1308,10 @@ fn run_auth_init(
         {
             Ok(rt) => rt,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "RUNTIME_ERROR",
                     format!("Failed to start async runtime: {e}"),
-                    None,
-                );
+                ));
             }
         };
         let node_sign_jwk = node.identity().signing_jwk();
@@ -1350,14 +1333,7 @@ fn run_auth_init(
         )) {
             Ok(e) => e,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "WEB_ENROLL_FAILED",
-                    e,
-                    Some("Run `hyp auth add --human-id <id> --label <name> --role admin` and pipe the Passkey enrollment bundle via stdin instead.".to_string()),
-                );
+                return Err(CliError::error("WEB_ENROLL_FAILED", e).with_fix("Run `hyp auth add --human-id <id> --label <name> --role admin` and pipe the Passkey enrollment bundle via stdin instead.".to_string()));
             }
         };
 
@@ -1383,15 +1359,14 @@ fn run_auth_init(
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None);
+                    return Err(CliError::error("DB_ERROR", e.to_string()));
                 }
             }
         };
         let passkey_hcert1 = if let Some(ref verified_cert) = enrolled.node_cert {
             let db = node.db();
-            if let Err(e) = persist_verified_node_cert(&db, verified_cert) {
-                return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
-            }
+            persist_verified_node_cert(&db, verified_cert)
+                .map_err(|e| CliError::error("DB_ERROR", e))?;
             Some(verified_cert.armored.clone())
         } else {
             None
@@ -1444,18 +1419,10 @@ fn run_auth_init(
                 "webEnrolled": web_enrolled,
                 "stateDir": state_dir.display().to_string(),
             });
-            let envelope = JsonEnvelope {
-                ok: true,
-                command: cmd.to_string(),
-                summary: Some(format!(
+            let envelope = JsonEnvelope::ok(cmd.to_string(), format!(
                     "Enrolled Passkey Admin authority '{}' (kid {}) with zero local private key on disk",
                     inserted.human_id, inserted.kid
-                )),
-                data: Some(data),
-                warnings: Vec::new(),
-                next,
-                error: None,
-            };
+                ), data).next(next);
             print_json(&envelope);
         } else {
             println!(
@@ -1471,41 +1438,31 @@ fn run_auth_init(
             }
             print_next_steps(&next);
         }
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     // Local non-web CLI init (unlocked dev/hub node with 0 Passkey Admins).
     let admin_kp = match Ed25519KeyPair::generate() {
         Ok(kp) => kp,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "KEYGEN_FAILED",
                 format!("Failed to generate Ed25519 admin keypair: {e}"),
-                None,
-            );
+            ));
         }
     };
     let kid = admin_kp.kid();
     let jwk = admin_kp.to_jwk();
-    let jwk_json = match to_canonical_json(&jwk) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
-    };
+    let jwk_json =
+        to_canonical_json(&jwk).map_err(|e| CliError::error("JSON_ERROR", e.to_string()))?;
     let secret_name = admin_secret_name_for_kid(&kid);
     let pkcs8_b64 = admin_kp.export_pkcs8_b64();
-    if let Err(e) = secrets.set(&secret_name, &pkcs8_b64) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+    secrets.set(&secret_name, &pkcs8_b64).map_err(|e| {
+        CliError::error(
             "SECRET_STORE_ERROR",
             format!("Failed to persist admin signing key in SecretStore: {e}"),
-            None,
-        );
-    }
+        )
+    })?;
     drop(pkcs8_b64);
 
     let inserted = {
@@ -1524,21 +1481,17 @@ fn run_auth_init(
             now_ms(),
         ) {
             Ok(rec) => rec,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+            Err(e) => return Err(CliError::error("DB_ERROR", e.to_string())),
         }
     };
 
     let hcert1 = match node.issue_node_cert(&admin_kp, &kid, 365) {
         Ok((_signed_cert, token)) => token,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "CERTIFY_FAILED",
                 format!("Failed to certify local node: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -1580,18 +1533,16 @@ fn run_auth_init(
             "webEnrolled": Value::Null,
             "stateDir": state_dir.display().to_string(),
         });
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Initialized local human admin authority '{}' (kid {}) and certified node '{}'",
                 inserted.human_id, inserted.kid, node_id_str
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error: None,
-        };
+            ),
+            data,
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -1609,7 +1560,7 @@ fn run_auth_init(
         print_next_steps(&next);
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1623,29 +1574,21 @@ fn run_auth_add(
     config_arg: Option<PathBuf>,
     ceremony: ApprovalCeremonyArgs,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "auth add";
     let human_id = human_id_raw.trim().to_ascii_lowercase();
     if human_id == LOCAL_NODE_ID || !is_valid_node_id(&human_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_HUMAN_ID",
             format!("Invalid --human-id '{human_id_raw}'"),
-            None,
-        );
+        ));
     }
     let trimmed_label = label.trim();
     if trimmed_label.is_empty() || trimmed_label.len() > 128 {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_LABEL",
             "--label must be 1..=128 printable characters",
-            None,
-        );
+        ));
     }
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
@@ -1656,69 +1599,43 @@ fn run_auth_add(
     let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
     let lock_state = inspect_policy_integrity(&config_read, &state_dir, &secrets);
     if let Some(reason) = lock_state.tampered_reason.as_deref() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "GATE_POLICY_TAMPERED",
-            format!(
+        return Err(CliError::error("GATE_POLICY_TAMPERED", format!(
                 "Security Gate lock failed verification ({reason}); `hyp {cmd}` refuses to re-seal an unverified policy on disk."
-            ),
-            Some(format!(
+            )).with_fix(format!(
                 "Inspect and explicitly re-lock the policy via `hyp gate apply --state-dir {}` before mutating human authorities.",
                 state_dir.display()
-            )),
-        );
+            )));
     }
 
     let mut raw = String::new();
-    if let Err(e) = io::stdin()
+    io::stdin()
         .lock()
         .take(MAX_JWK_STDIN_BYTES + 1)
         .read_to_string(&mut raw)
-    {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "STDIN_ERROR",
-            format!("Failed to read public JWK from stdin: {e}"),
-            None,
-        );
-    }
+        .map_err(|e| {
+            CliError::error(
+                "STDIN_ERROR",
+                format!("Failed to read public JWK from stdin: {e}"),
+            )
+        })?;
     if raw.len() as u64 > MAX_JWK_STDIN_BYTES {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "PAYLOAD_TOO_LARGE",
             format!("Stdin JWK payload exceeds {MAX_JWK_STDIN_BYTES} byte safety cap"),
-            None,
-        );
+        ));
     }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "EMPTY_STDIN",
-            "Expected OKP Ed25519 public JWK JSON on stdin",
-            Some("Pipe public JWK JSON: echo '{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"...\"}' | hyp auth add --human-id alice --label phone".to_string()),
-        );
+        return Err(CliError::usage("EMPTY_STDIN", "Expected OKP Ed25519 public JWK JSON on stdin").with_fix("Pipe public JWK JSON: echo '{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"x\":\"...\"}' | hyp auth add --human-id alice --label phone".to_string()));
     }
 
     let parsed: Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_JSON",
                 format!("Invalid JWK JSON on stdin: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -1753,87 +1670,61 @@ fn run_auth_add(
             (parsed, None, None, None, None, None)
         }
     } else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_JWK",
             "Expected a JSON object containing an OKP Ed25519 public JWK",
-            None,
-        );
+        ));
     };
 
     let jwk: OkpJwk = match serde_json::from_value(jwk_val) {
         Ok(j) => j,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_JWK",
                 format!("Malformed OKP JWK: {e}"),
-                None,
-            );
+            ));
         }
     };
     let authority_ed_pk = match jwk.to_ed25519() {
         Ok(pk) => pk,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_JWK",
                 format!("Public key must be a valid OKP Ed25519 JWK: {e}"),
-                None,
-            );
+            ));
         }
     };
     let (enc_jwk_json, enc_kid) = match parse_optional_enc_jwk(bundle_enc_jwk_val.as_ref()) {
         Ok(Some((canon, ekid))) => (Some(canon), Some(ekid)),
         Ok(None) => (None, None),
         Err(e) => {
-            return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_ENC_JWK", e, None);
+            return Err(CliError::usage("INVALID_ENC_JWK", e));
         }
     };
     let kid = match jwk.thumbprint() {
         Ok(k) => k,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_JWK",
                 format!("Failed to compute RFC 7638 kid: {e}"),
-                None,
-            );
+            ));
         }
     };
     if let Some(ref exp) = expected_kid {
         if exp != &kid {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "KID_MISMATCH",
                 format!("Bundle kid '{exp}' does not match JWK thumbprint '{kid}'"),
-                None,
-            );
+            ));
         }
     }
-    let canonical_jwk_json = match to_canonical_json(&jwk) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
-    };
+    let canonical_jwk_json =
+        to_canonical_json(&jwk).map_err(|e| CliError::error("JSON_ERROR", e.to_string()))?;
 
-    if let Err(e) = ensure_dir(&state_dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
 
-    let db = match NodeDb::open(state_dir.join("node.sqlite")) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(state_dir.join("node.sqlite"))
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
     let min_epoch = db.human().min_auth_epoch().unwrap_or(1);
     let effective_epoch = auth_epoch_arg
         .or(bundle_epoch)
@@ -1854,14 +1745,10 @@ fn run_auth_add(
         let local_identity = match secrets.load_or_create_node_keys(&local_node_id) {
             Ok(keys) => keys,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "NODE_KEY_ERROR",
                     format!("Failed to load local node identity keys: {e}"),
-                    None,
-                );
+                ));
             }
         };
         match validate_enrolled_node_cert(
@@ -1875,7 +1762,7 @@ fn run_auth_add(
         ) {
             Ok(cert) => Some(cert),
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_NODE_CERT", e, None);
+                return Err(CliError::usage("INVALID_NODE_CERT", e));
             }
         }
     } else {
@@ -1918,14 +1805,7 @@ fn run_auth_add(
             match prepared {
                 Ok(r) => reseal = Some(r),
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "GATE_POLICY_SYNC_FAILED",
-                        e,
-                        None,
-                    );
+                    return Err(CliError::error("GATE_POLICY_SYNC_FAILED", e));
                 }
             }
             summary.push(
@@ -1939,8 +1819,6 @@ fn run_auth_add(
         action.target_role = Some(role.to_store_role().as_str().to_string());
         action.parameters = Some(json!({"authority": auth_input}));
         match approve_authority_change(
-            cmd,
-            as_json,
             &state_dir,
             &config_read,
             &db,
@@ -1951,19 +1829,15 @@ fn run_auth_add(
             &ceremony,
         ) {
             Ok(verified) => approved = Some(verified),
-            Err(code) => return code,
+            Err(error) => return Err(error),
         }
     }
 
     let (Some(reseal), Some(verified)) = (reseal, approved.as_deref()) else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "PASSKEY_AUTHORITY_REQUIRED",
             "Live approval is required",
-            None,
-        );
+        ));
     };
     let approved_by_kid = Some(verified.kid.clone());
     let committed = execute_approved_operation(&config_read, &config_write, &db, verified, || {
@@ -1980,10 +1854,8 @@ fn run_auth_add(
         let seq = reseal.apply(&db, &config_write, verified)?;
         Ok((rec, node_cert_stored, Some(seq)))
     });
-    let (rec, node_cert_stored, approved_seal_seq) = match committed {
-        Ok(result) => result,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "APPROVAL_COMMIT_FAILED", e, None),
-    };
+    let (rec, node_cert_stored, approved_seal_seq) =
+        committed.map_err(|e| CliError::error("APPROVAL_COMMIT_FAILED", e))?;
     let gate_resigned = approved_seal_seq.is_some();
     let digest = db.human().authorities_digest().ok();
     drop(db);
@@ -2028,20 +1900,18 @@ fn run_auth_add(
         if let Some(ref err) = gate_reload_error {
             data["gateReloadError"] = json!(err);
         }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Enrolled human authority '{}' ({}) kid {}{via}",
                 rec.human_id,
                 rec.role.as_str(),
                 rec.kid
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error: None,
-        };
+            ),
+            data,
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -2066,7 +1936,7 @@ fn run_auth_add(
         print_warnings(&warnings);
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[derive(Debug, Serialize)]
@@ -2111,19 +1981,20 @@ impl From<HumanAuthorityRecord> for AuthListRow {
     }
 }
 
-fn run_auth_list(all: bool, state_dir_arg: Option<PathBuf>, as_json: bool) -> ExitCode {
+fn run_auth_list(
+    all: bool,
+    state_dir_arg: Option<PathBuf>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
     let cmd = "auth list";
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
     let db_path = state_dir.join("node.sqlite");
 
     let (rows, min_epoch, digest): (Vec<AuthListRow>, u64, Option<String>) = if db_path.exists() {
-        let db = match NodeDb::open(&db_path) {
-            Ok(db) => db,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-        };
+        let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
         let list = match db.human().list_authorities(all) {
             Ok(v) => v.into_iter().map(AuthListRow::from).collect(),
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+            Err(e) => return Err(CliError::error("DB_ERROR", e.to_string())),
         };
         let min_ep = db.human().min_auth_epoch().unwrap_or(1);
         let dig = db.human().authorities_digest().ok();
@@ -2133,29 +2004,26 @@ fn run_auth_list(all: bool, state_dir_arg: Option<PathBuf>, as_json: bool) -> Ex
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "{} human authority key(s) (minAuthEpoch={min_epoch})",
                 rows.len()
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "count": rows.len(),
                 "includeRevoked": all,
                 "minAuthEpoch": min_epoch,
                 "authoritiesDigest": digest,
                 "authorities": rows,
                 "stateDir": state_dir.display().to_string(),
-            })),
-            warnings: Vec::new(),
-            next: if rows.is_empty() {
-                vec![format!("hyp auth init --state-dir {}", state_dir.display())]
-            } else {
-                Vec::new()
-            },
-            error: None,
-        };
+            }),
+        )
+        .next(if rows.is_empty() {
+            vec![format!("hyp auth init --state-dir {}", state_dir.display())]
+        } else {
+            Vec::new()
+        });
         print_json(&envelope);
     } else {
         println!(
@@ -2189,7 +2057,7 @@ fn run_auth_list(all: bool, state_dir_arg: Option<PathBuf>, as_json: bool) -> Ex
             }
         }
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2204,18 +2072,14 @@ fn run_auth_revoke(
     config_arg: Option<PathBuf>,
     ceremony: ApprovalCeremonyArgs,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "auth revoke";
     let query = kid_arg.trim();
     if query.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_KID",
             "kid or humanId cannot be empty",
-            None,
-        );
+        ));
     }
 
     let explicit_state = state_dir_arg.is_some() || config_arg.is_some();
@@ -2227,47 +2091,31 @@ fn run_auth_revoke(
     let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
     let lock_state = inspect_policy_integrity(&config_read, &state_dir, &secrets);
     if let Some(reason) = lock_state.tampered_reason.as_deref() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "GATE_POLICY_TAMPERED",
-            format!(
+        return Err(CliError::error("GATE_POLICY_TAMPERED", format!(
                 "Security Gate lock failed verification ({reason}); `hyp {cmd}` refuses to re-seal an unverified policy on disk."
-            ),
-            Some(format!(
+            )).with_fix(format!(
                 "Inspect and explicitly re-lock the policy via `hyp gate apply --state-dir {}` before mutating human authorities.",
                 state_dir.display()
-            )),
-        );
+            )));
     }
 
     let db_path = state_dir.join("node.sqlite");
     if !db_path.exists() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "AUTHORITY_NOT_FOUND",
             format!("Authority '{query}' not found (database does not exist yet)"),
-            None,
-        );
+        ));
     }
 
-    let db = match NodeDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
-    let all = match db.human().list_authorities(true) {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
+    let all = db
+        .human()
+        .list_authorities(true)
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
 
     let targets: Vec<HumanAuthorityRecord> =
-        match resolve_authorities_for_revoke(&all, query, cascade) {
-            Ok(list) => list,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "AUTHORITY_NOT_FOUND", e, None),
-        };
+        resolve_authorities_for_revoke(&all, query, cascade)
+            .map_err(|e| CliError::error("AUTHORITY_NOT_FOUND", e))?;
     let target = targets[0].clone();
 
     let cascade_peer_ids: Vec<String> = if cascade {
@@ -2299,14 +2147,10 @@ fn run_auth_revoke(
             })
         });
     if !survivor {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "PASSKEY_ADMIN_REQUIRED_AFTER_REVOKE",
             "Revocation would leave no active Passkey Admin. Enroll another Passkey Admin at the resulting epoch before revoking.",
-            None,
-        );
+        ));
     }
 
     let now = now_ms();
@@ -2347,17 +2191,10 @@ fn run_auth_revoke(
     });
 
     if broadcast && signed_revocation.is_none() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "SIGNER_KEY_UNAVAILABLE",
-            "Cannot --broadcast revocation without an active local admin Ed25519 signing key to sign SignedHumanRevocationV1",
-            Some(
+        return Err(CliError::error("SIGNER_KEY_UNAVAILABLE", "Cannot --broadcast revocation without an active local admin Ed25519 signing key to sign SignedHumanRevocationV1").with_fix(
                 "Pass --issuer-kid <active-admin-kid> or run `hyp auth init` on an admin node."
                     .to_string(),
-            ),
-        );
+            ));
     }
 
     let mut summary = format_auth_revoke_confirm_summary(
@@ -2395,14 +2232,7 @@ fn run_auth_revoke(
             match prepared {
                 Ok(r) => reseal = Some(r),
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_ERROR,
-                        "GATE_POLICY_SYNC_FAILED",
-                        e,
-                        None,
-                    );
+                    return Err(CliError::error("GATE_POLICY_SYNC_FAILED", e));
                 }
             }
         }
@@ -2415,8 +2245,6 @@ fn run_auth_revoke(
         action.parameters =
             Some(json!({"targets": targets, "reason": reason, "newMinAuthEpoch": new_min}));
         match approve_authority_change(
-            cmd,
-            as_json,
             &state_dir,
             &config_read,
             &db,
@@ -2427,20 +2255,16 @@ fn run_auth_revoke(
             &ceremony,
         ) {
             Ok(verified) => approved = Some(verified),
-            Err(code) => return code,
+            Err(error) => return Err(error),
         }
     }
     let approved_by_kid = approved.as_ref().map(|v| v.kid.clone());
 
     let (Some(reseal), Some(verified)) = (reseal, approved.as_deref()) else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "PASSKEY_AUTHORITY_REQUIRED",
             "Live approval is required",
-            None,
-        );
+        ));
     };
     let committed = execute_approved_operation(&config_read, &config_write, &db, verified, || {
         let mut effective_min = current_min;
@@ -2491,10 +2315,8 @@ fn run_auth_revoke(
         let seq = reseal.apply(&db, &config_write, verified)?;
         Ok((effective_min, revoked_peers, Some(seq)))
     });
-    let (effective_min, revoked_peers, approved_seal_seq) = match committed {
-        Ok(result) => result,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "APPROVAL_COMMIT_FAILED", e, None),
-    };
+    let (effective_min, revoked_peers, approved_seal_seq) =
+        committed.map_err(|e| CliError::error("APPROVAL_COMMIT_FAILED", e))?;
     // External effects and live publication/reload happen only after the durable transaction.
     for pid in &revoked_peers {
         let cred = crate::pair::credential_secret_name("peer-auth", pid);
@@ -2545,14 +2367,10 @@ fn run_auth_revoke(
         ) {
             Ok(outcome) => Some(outcome),
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "BROADCAST_FAILED",
                     format!("Authority revoked locally, but --broadcast failed: {e}"),
-                    None,
-                );
+                ));
             }
         }
     } else {
@@ -2589,10 +2407,7 @@ fn run_auth_revoke(
             data["broadcastVia"] = json!(b.via);
             data["broadcastMatched"] = json!(b.matched);
         }
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(if cascade {
+        let envelope = JsonEnvelope::ok(cmd.to_string(), if cascade {
                 format!(
                     "Revoked human authority '{}' (minAuthEpoch={effective_min}) and cascaded revocation to {} admitted peer(s)",
                     target.human_id,
@@ -2603,12 +2418,7 @@ fn run_auth_revoke(
                     "Revoked human authority '{}' kid {} (minAuthEpoch={effective_min})",
                     target.human_id, target.kid
                 )
-            }),
-            data: Some(data),
-            warnings,
-            next,
-            error: None,
-        };
+            }, data).warnings(warnings).next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -2644,7 +2454,7 @@ fn run_auth_revoke(
         print_warnings(&warnings);
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn run_auth_certify_node(
@@ -2653,17 +2463,10 @@ fn run_auth_certify_node(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "auth certify-node";
     if ttl_days == 0 {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "INVALID_TTL",
-            "--ttl-days must be >= 1",
-            None,
-        );
+        return Err(CliError::usage("INVALID_TTL", "--ttl-days must be >= 1"));
     }
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
@@ -2671,22 +2474,15 @@ fn run_auth_certify_node(
         resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
     let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
 
-    let node = match open_local_unified_node(&state_dir, &config_read, &secrets) {
-        Ok(n) => n,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "NODE_OPEN_FAILED", e, None),
-    };
+    let node = open_local_unified_node(&state_dir, &config_read, &secrets)
+        .map_err(|e| CliError::error("NODE_OPEN_FAILED", e))?;
 
     let (admin_rec, admin_kp) =
         match select_local_signing_authority(&node.db(), &secrets, kid_arg.as_deref(), true) {
             Ok(pair) => pair,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "ADMIN_KEY_UNAVAILABLE",
-                    e,
-                    Some(format!(
+                return Err(
+                    CliError::error("ADMIN_KEY_UNAVAILABLE", e).with_fix(format!(
                         "Run `hyp auth init --state-dir {}` first.",
                         state_dir.display()
                     )),
@@ -2697,41 +2493,33 @@ fn run_auth_certify_node(
     let (signed, hcert1) = match node.issue_node_cert(&admin_kp, &admin_rec.kid, ttl_days) {
         Ok(res) => res,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "CERTIFY_FAILED",
                 format!("Failed to issue NodeCertV1: {e}"),
-                None,
-            );
+            ));
         }
     };
 
     let cert_payload: Value = serde_json::from_str(&signed.payload).unwrap_or(Value::Null);
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Certified node '{}' for {ttl_days} day(s) under human authority '{}' ({})",
                 node.node_id().as_str(),
                 admin_rec.human_id,
                 admin_rec.kid
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "nodeId": node.node_id().as_str(),
                 "humanId": admin_rec.human_id,
                 "humanKid": admin_rec.kid,
                 "ttlDays": ttl_days,
                 "token": hcert1,
                 "cert": cert_payload,
-            })),
-            warnings: Vec::new(),
-            next: Vec::new(),
-            error: None,
-        };
+            }),
+        );
         print_json(&envelope);
     } else {
         println!(
@@ -2741,7 +2529,7 @@ fn run_auth_certify_node(
         );
         println!("      Cert: {hcert1}");
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2757,67 +2545,47 @@ fn run_auth_sign(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "auth sign";
     if ttl_secs == 0 || ttl_secs > MAX_DROP_TTL_SECS {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_TTL",
             format!("--ttl must be in 1..={MAX_DROP_TTL_SECS} seconds"),
-            None,
-        );
+        ));
     }
 
     if let Some(ref h) = handle_arg {
         if !is_valid_handle(h) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_HANDLE",
                 format!("Invalid --handle '{h}'"),
-                None,
-            );
+            ));
         }
     }
 
     let secret_spec = match kind {
         CliDropKind::Secret => {
             let Some(ref raw_name) = secret_name_arg else {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "MISSING_SECRET_NAME",
                     "--secret-name <name> is required when --kind secret",
-                    None,
-                );
+                ));
             };
             let name = raw_name.trim();
             if is_reserved_secret_name(name) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "RESERVED_SECRET_NAME",
                     format!(
                         "Reserved system secret name '{name}' is permanently blocked for human drops"
                     ),
-                    None,
-                );
+                ));
             }
-            if let Err(e) = validate_secret_name(name) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+            validate_secret_name(name).map_err(|e| {
+                CliError::usage(
                     "INVALID_SECRET_NAME",
                     format!("Invalid --secret-name '{name}': {e}"),
-                    None,
-                );
-            }
+                )
+            })?;
             Some(SecretDropSpec {
                 name: name.to_string(),
                 overwrite,
@@ -2825,14 +2593,10 @@ fn run_auth_sign(
         }
         CliDropKind::Directive => {
             if secret_name_arg.is_some() {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "UNEXPECTED_SECRET_NAME",
                     "--secret-name is only allowed when --kind secret",
-                    None,
-                );
+                ));
             }
             None
         }
@@ -2841,46 +2605,34 @@ fn run_auth_sign(
     // P0: `hyp auth sign` signs with the local admin key and MUST require an interactive human
     // controlling terminal (blocking non-TTY agent subprocesses before reading stdin or SecretStore).
     if !io::stderr().is_terminal() {
-        return emit_confirm_error(cmd, as_json, ConfirmError::NotInteractiveTty);
+        return Err((ConfirmError::NotInteractiveTty).into_cli_error(cmd));
     }
 
     // Read body strictly from stdin (NEVER argv!) into a bounded buffer.
     let mut raw_body = String::new();
-    if let Err(e) = io::stdin()
+    io::stdin()
         .lock()
         .take(MAX_SIGN_BODY_BYTES + 1)
         .read_to_string(&mut raw_body)
-    {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "STDIN_ERROR",
-            format!("Failed to read body from stdin: {e}"),
-            None,
-        );
-    }
+        .map_err(|e| {
+            CliError::error(
+                "STDIN_ERROR",
+                format!("Failed to read body from stdin: {e}"),
+            )
+        })?;
     if raw_body.len() as u64 > MAX_SIGN_BODY_BYTES {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "BODY_TOO_LARGE",
             format!("Input exceeds {MAX_SIGN_BODY_BYTES} byte safety cap"),
-            None,
-        );
+        ));
     }
     let body = raw_body.trim_end_matches(['\r', '\n']).to_string();
     drop(raw_body);
     if body.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "EMPTY_BODY",
             "No body received on stdin (body must be piped via stdin, never CLI argv)",
-            None,
-        );
+        ));
     }
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
@@ -2894,35 +2646,24 @@ fn run_auth_sign(
 
     let db_path = state_dir.join("node.sqlite");
     if !db_path.exists() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "NOT_INITIALIZED",
             format!("No node.sqlite found at {}", db_path.display()),
-            Some(format!(
-                "Run `hyp auth init --state-dir {}` first.",
-                state_dir.display()
-            )),
-        );
+        )
+        .with_fix(format!(
+            "Run `hyp auth init --state-dir {}` first.",
+            state_dir.display()
+        )));
     }
-    let db = match NodeDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
     let secrets = open_secret_store(&state_dir, state_dir_arg.is_some());
 
     let (signer_rec, signer_kp) =
         match select_local_signing_authority(&db, &secrets, kid_arg.as_deref(), false) {
             Ok(pair) => pair,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "SIGNER_KEY_UNAVAILABLE",
-                    e,
-                    Some(format!(
+                return Err(
+                    CliError::error("SIGNER_KEY_UNAVAILABLE", e).with_fix(format!(
                         "Run `hyp auth init --state-dir {}` first.",
                         state_dir.display()
                     )),
@@ -2933,52 +2674,34 @@ fn run_auth_sign(
     let local_node_id = resolve_effective_node_id(loaded.as_ref(), Some(&db));
     let target_node_id = node_id_arg.unwrap_or_else(|| local_node_id.clone());
     if target_node_id == LOCAL_NODE_ID || !is_valid_node_id(&target_node_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_NODE_ID",
             format!("Invalid target --node-id '{target_node_id}'"),
-            None,
-        );
+        ));
     }
 
     let recipient_enc_pk: X25519PublicKey = if target_node_id == local_node_id {
         match secrets.load_or_create_node_keys(&local_node_id) {
             Ok(keys) => keys.encryption.public_key(),
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "NODE_KEY_ERROR",
                     format!("Failed to load local node encryption key: {e}"),
-                    None,
-                );
+                ));
             }
         }
     } else {
         match lookup_peer_encryption_key(&db, &target_node_id) {
             Ok(pk) => pk,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "PEER_KEY_NOT_FOUND",
-                    e,
-                    Some(format!(
+                return Err(CliError::error("PEER_KEY_NOT_FOUND", e).with_fix(format!(
                         "Ensure peer '{target_node_id}' is paired and has an active X25519 encryption key."
-                    )),
-                );
+                    )));
             }
         }
     };
 
-    let claim_id = match random_b64url(16) {
-        Ok(id) => id,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "RNG_ERROR", e, None),
-    };
+    let claim_id = random_b64url(16).map_err(|e| CliError::error("RNG_ERROR", e))?;
     let min_epoch = db.human().min_auth_epoch().unwrap_or(1);
     let auth_epoch = signer_rec.auth_epoch.max(min_epoch);
     let now = now_unix_ms();
@@ -3013,7 +2736,7 @@ fn run_auth_sign(
             }
         }
         body_wipe.clear();
-        return emit_confirm_error(cmd, as_json, err);
+        return Err((err).into_cli_error(cmd));
     }
 
     let mut claim = HumanClaimV1 {
@@ -3049,28 +2772,20 @@ fn run_auth_sign(
     let envelope = match seal_res {
         Ok(env) => env,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "SEAL_FAILED",
                 format!("Failed to seal human drop: {e}"),
-                None,
-            );
+            ));
         }
     };
 
     let token = match encode_hdrop1(&envelope) {
         Ok(t) => t,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "ENCODE_FAILED",
                 format!("Failed to encode hdrop1_ token: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -3080,14 +2795,13 @@ fn run_auth_sign(
     )];
 
     if as_json {
-        let env_out = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let env_out = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Sealed {} drop (claimId={claim_id}) for node '{target_node_id}'",
                 kind.to_crypto_kind().as_str()
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "token": token,
                 "claimId": claim_id,
                 "kind": kind.to_crypto_kind().as_str(),
@@ -3099,16 +2813,14 @@ fn run_auth_sign(
                 "secretName": secret_spec.as_ref().map(|s| s.name.as_str()),
                 "dropId": drop_id,
                 "expiresAt": expires_at,
-            })),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        };
+            }),
+        )
+        .next(next);
         print_json(&env_out);
     } else {
         println!("{token}");
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn resolve_authority_by_kid_or_prefix<'a>(
@@ -3205,78 +2917,55 @@ fn run_auth_invite(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "auth invite";
     let human_id = human_id_raw.trim().to_ascii_lowercase();
     if human_id == LOCAL_NODE_ID || !is_valid_node_id(&human_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_HUMAN_ID",
             format!("Invalid humanId '{human_id_raw}'"),
-            Some("Example: hyp auth invite philip --endpoint https://hub.example.com".to_string()),
-        );
+        )
+        .with_fix(
+            "Example: hyp auth invite philip --endpoint https://hub.example.com".to_string(),
+        ));
     }
     if max_devices == 0 || max_devices > MAX_DELEGATED_DEVICES_LIMIT {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_MAX_DEVICES",
             format!("--max-devices must be in 1..={MAX_DELEGATED_DEVICES_LIMIT}"),
-            None,
-        );
+        ));
     }
     if expires_hours == 0 || expires_hours > MAX_INVITE_EXPIRES_HOURS {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_EXPIRES_HOURS",
             format!("--expires-hours must be in 1..={MAX_INVITE_EXPIRES_HOURS}"),
-            None,
-        );
+        ));
     }
 
     let portal_url = portal_url_raw.trim().trim_end_matches('/').to_string();
-    if let Err(e) = validate_endpoint_origin(&portal_url) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+    validate_endpoint_origin(&portal_url).map_err(|e| {
+        CliError::usage(
             "INVALID_PORTAL_URL",
             format!("Invalid --portal-url '{portal_url_raw}': {e}"),
-            None,
-        );
-    }
+        )
+    })?;
 
     let node_prefix = node_prefix_arg
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{human_id}@*"));
-    if let Err(e) = validate_node_prefix_pattern(&node_prefix, false) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+    validate_node_prefix_pattern(&node_prefix, false).map_err(|e| {
+        CliError::usage(
             "INVALID_NODE_PREFIX",
             format!("Invalid --node-prefix '{node_prefix}': {e}"),
-            Some(format!("Example: --node-prefix {human_id}@*")),
-        );
-    }
+        )
+        .with_fix(format!("Example: --node-prefix {human_id}@*"))
+    })?;
 
     let scopes = match resolve_delegated_scopes(preset, &grant) {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_SCOPE",
-                format!("Invalid delegated scopes: {e}"),
-                Some("Use --preset member|observer|guest|full or concrete v2 scopes (never '*', bridge:post, or forward:via).".to_string()),
-            );
+            return Err(CliError::usage("INVALID_SCOPE", format!("Invalid delegated scopes: {e}")).with_fix("Use --preset member|observer|guest|full or concrete v2 scopes (never '*', bridge:post, or forward:via).".to_string()));
         }
     };
 
@@ -3284,9 +2973,7 @@ fn run_auth_invite(
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
     let config_read =
         resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
-    if let Err(e) = ensure_dir(&state_dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
 
     let loaded = if config_read.exists() {
         load_node_or_legacy_config(&config_read).ok()
@@ -3304,14 +2991,10 @@ fn run_auth_invite(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| local_node_id.clone());
     if hub_node_id == LOCAL_NODE_ID || !is_valid_node_id(&hub_node_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_HUB_NODE_ID",
             format!("Invalid --hub '{hub_node_id}'"),
-            None,
-        );
+        ));
     }
 
     let hub_endpoint = match endpoint_arg
@@ -3324,32 +3007,21 @@ fn run_auth_invite(
                 .map(|s| s.trim().trim_end_matches('/').to_string())
         }) {
         Some(ep) => {
-            if let Err(e) = validate_endpoint_origin(&ep) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+            validate_endpoint_origin(&ep).map_err(|e| {
+                CliError::usage(
                     "INVALID_ENDPOINT",
                     format!("Invalid --endpoint '{ep}': {e}"),
-                    Some(
-                        "Use https:// (or loopback http://127.0.0.1 for local testing)."
-                            .to_string(),
-                    ),
-                );
-            }
+                )
+                .with_fix(
+                    "Use https:// (or loopback http://127.0.0.1 for local testing).".to_string(),
+                )
+            })?;
             ep
         }
         None => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "MISSING_ENDPOINT",
-                "Hub endpoint is required (pass --endpoint https://... or configure listen.publicUrl in node.json)",
-                Some(format!(
+            return Err(CliError::usage("MISSING_ENDPOINT", "Hub endpoint is required (pass --endpoint https://... or configure listen.publicUrl in node.json)").with_fix(format!(
                     "Example: hyp auth invite {human_id} --hub {hub_node_id} --endpoint https://hub.example.com"
-                )),
-            );
+                )));
         }
     };
 
@@ -3360,14 +3032,10 @@ fn run_auth_invite(
     {
         Some(fp) => {
             if fp.len() != 16 || !fp.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "INVALID_HUB_FINGERPRINT",
                     "--hub-fingerprint must be exactly 16 hex characters",
-                    None,
-                );
+                ));
             }
             Some(fp)
         }
@@ -3386,14 +3054,10 @@ fn run_auth_invite(
     let admin_kp = match crate::pair::load_or_create_admin_key(&secrets, &hub_node_id) {
         Ok(kp) => kp,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "ADMIN_KEY_ERROR",
                 format!("Failed to load hub Admin-CA key for '{hub_node_id}': {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -3419,27 +3083,19 @@ fn run_auth_invite(
     let signed = match sign_human_invite(&invite, &admin_kp) {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "SIGN_FAILED",
                 format!("Failed to sign HumanInviteV1: {e}"),
-                None,
-            );
+            ));
         }
     };
     let token = match encode_hjoin1(&signed) {
         Ok(t) => t,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "ENCODE_FAILED",
                 format!("Failed to encode hjoin1_ token: {e}"),
-                None,
-            );
+            ));
         }
     };
     let join_url = format!("{portal_url}#{token}");
@@ -3452,13 +3108,9 @@ fn run_auth_invite(
     ];
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(cmd.to_string(), format!(
                 "Minted single-use hjoin1_ human invite for '{human_id}' on hub '{hub_node_id}' (prefix={node_prefix}, maxDevices={max_devices})"
-            )),
-            data: Some(json!({
+            ), json!({
                 "token": token,
                 "joinUrl": join_url,
                 "inviteId": invite_id,
@@ -3474,11 +3126,7 @@ fn run_auth_invite(
                 "adminKid": admin_kid,
                 "adminFingerprint": admin_fp,
                 "adminJwk": admin_jwk,
-            })),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        };
+            })).next(next);
         print_json(&envelope);
     } else {
         println!("OK    Minted human enrollment invite for '{human_id}'");
@@ -3499,7 +3147,7 @@ fn run_auth_invite(
         );
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3516,90 +3164,59 @@ fn run_auth_admit(
     config_arg: Option<PathBuf>,
     ceremony: ApprovalCeremonyArgs,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "auth admit";
     let human_id = human_id_raw.trim().to_ascii_lowercase();
     if human_id == LOCAL_NODE_ID || !is_valid_node_id(&human_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_HUMAN_ID",
             format!("Invalid humanId '{human_id_raw}'"),
-            None,
-        );
+        ));
     }
     let trimmed_label = label.trim();
     if trimmed_label.is_empty()
         || trimmed_label.len() > 128
         || trimmed_label.chars().any(char::is_control)
     {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_LABEL",
             "--label must be 1..=128 printable characters",
-            None,
-        );
+        ));
     }
     if max_devices == 0 || max_devices > MAX_DELEGATED_DEVICES_LIMIT {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_MAX_DEVICES",
             format!("--max-devices must be in 1..={MAX_DELEGATED_DEVICES_LIMIT}"),
-            None,
-        );
+        ));
     }
     if id_arg.is_none() && !from_stdin {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "MISSING_IDENTITY",
-            "Provide either --id <hpub1_...> or --stdin (with hpub1_ or public OKP Ed25519 JWK JSON)",
-            Some(format!("Example: hyp auth admit {human_id} --id hpub1_...")),
-        );
+        return Err(CliError::usage("MISSING_IDENTITY", "Provide either --id <hpub1_...> or --stdin (with hpub1_ or public OKP Ed25519 JWK JSON)").with_fix(format!("Example: hyp auth admit {human_id} --id hpub1_...")));
     }
     if id_arg.is_some() && from_stdin {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "--id and --stdin are mutually exclusive",
-            None,
-        );
+        ));
     }
 
     let node_prefix = node_prefix_arg
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{human_id}@*"));
-    if let Err(e) = validate_node_prefix_pattern(&node_prefix, false) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+    validate_node_prefix_pattern(&node_prefix, false).map_err(|e| {
+        CliError::usage(
             "INVALID_NODE_PREFIX",
             format!("Invalid --node-prefix '{node_prefix}': {e}"),
-            None,
-        );
-    }
+        )
+    })?;
 
     let scopes = match resolve_delegated_scopes(preset, &grant) {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_SCOPE",
                 format!("Invalid delegated scopes: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -3607,96 +3224,68 @@ fn run_auth_admit(
         id_val
     } else {
         let mut buf = String::new();
-        if let Err(e) = io::stdin()
+        io::stdin()
             .lock()
             .take(MAX_JWK_STDIN_BYTES + 1)
             .read_to_string(&mut buf)
-        {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "STDIN_ERROR",
-                format!("Failed to read public identity from stdin: {e}"),
-                None,
-            );
-        }
+            .map_err(|e| {
+                CliError::error(
+                    "STDIN_ERROR",
+                    format!("Failed to read public identity from stdin: {e}"),
+                )
+            })?;
         if buf.len() as u64 > MAX_JWK_STDIN_BYTES {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "PAYLOAD_TOO_LARGE",
                 format!("Stdin payload exceeds {MAX_JWK_STDIN_BYTES} byte safety cap"),
-                None,
-            );
+            ));
         }
         buf
     };
 
     let trimmed = raw_input.trim();
     if trimmed.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "EMPTY_INPUT",
             "Expected an hpub1_ identity card or OKP Ed25519 public JWK JSON",
-            None,
-        );
+        ));
     }
 
     let (signing_jwk, enc_jwk_opt, prf_salt_opt) = if trimmed.starts_with("hpub1_") {
         let card = match decode_hpub1(trimmed) {
             Ok(c) => c,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "INVALID_HPUB1",
                     format!("Invalid hpub1_ identity card: {e}"),
-                    None,
-                );
+                ));
             }
         };
         if card.human_id != human_id {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "HUMAN_ID_MISMATCH",
                 format!(
                     "hpub1_ card humanId '{}' does not match target '{human_id}'",
                     card.human_id
                 ),
-                None,
-            );
+            ));
         }
         (card.signing_jwk, card.enc_jwk, None)
     } else {
         let parsed: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "INVALID_JSON",
                     format!("Expected hpub1_ card or valid JSON JWK: {e}"),
-                    None,
-                );
+                ));
             }
         };
         let Some(obj) = parsed.as_object() else {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_JWK",
                 "Expected a JSON object containing an OKP Ed25519 public JWK",
-                None,
-            );
+            ));
         };
         let jwk_val = obj
             .get("signingJwk")
@@ -3707,14 +3296,10 @@ fn run_auth_admit(
         let jwk: OkpJwk = match serde_json::from_value(jwk_val) {
             Ok(j) => j,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "INVALID_JWK",
                     format!("Malformed OKP Ed25519 JWK: {e}"),
-                    None,
-                );
+                ));
             }
         };
         let enc_jwk = match obj.get("encJwk") {
@@ -3722,14 +3307,10 @@ fn run_auth_admit(
             Some(v) => match serde_json::from_value::<OkpJwk>(v.clone()) {
                 Ok(ej) => Some(ej),
                 Err(e) => {
-                    return emit_error(
-                        cmd,
-                        as_json,
-                        EXIT_USAGE,
+                    return Err(CliError::usage(
                         "INVALID_ENC_JWK",
                         format!("Malformed OKP X25519 encJwk: {e}"),
-                        None,
-                    );
+                    ));
                 }
             },
         };
@@ -3745,32 +3326,21 @@ fn run_auth_admit(
     let ed_pk = match signing_jwk.to_ed25519() {
         Ok(pk) => pk,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_JWK",
                 format!("Invalid Ed25519 public JWK: {e}"),
-                None,
-            );
+            ));
         }
     };
     let enc_jwk_json = match enc_jwk_opt {
         Some(ref ej) => {
-            if let Err(e) = ej.to_x25519() {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
-                    "INVALID_ENC_JWK",
-                    format!("Invalid X25519 encJwk: {e}"),
-                    None,
-                );
-            }
+            ej.to_x25519().map_err(|e| {
+                CliError::usage("INVALID_ENC_JWK", format!("Invalid X25519 encJwk: {e}"))
+            })?;
             match to_canonical_json(ej) {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None);
+                    return Err(CliError::error("JSON_ERROR", e.to_string()));
                 }
             }
         }
@@ -3778,39 +3348,26 @@ fn run_auth_admit(
     };
     let kid = ed_pk.kid();
     let fingerprint = ed_pk.fingerprint();
-    let jwk_json = match to_canonical_json(&signing_jwk) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
-    };
+    let jwk_json = to_canonical_json(&signing_jwk)
+        .map_err(|e| CliError::error("JSON_ERROR", e.to_string()))?;
 
     let explicit_state = state_dir_arg.is_some() || config_arg.is_some();
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
     let config_write =
         resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
-    if let Err(e) = ensure_dir(&state_dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
 
-    let db = match NodeDb::open(state_dir.join("node.sqlite")) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(state_dir.join("node.sqlite"))
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
     let secrets = open_secret_store(&state_dir, explicit_state);
     let integrity = inspect_policy_integrity(&config_write, &state_dir, &secrets);
     if let Some(reason) = integrity.tampered_reason {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "GATE_POLICY_TAMPERED",
-            reason,
-            None,
-        );
+        return Err(CliError::error("GATE_POLICY_TAMPERED", reason));
     }
-    let min_epoch = match db.human().min_auth_epoch() {
-        Ok(epoch) => epoch,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let min_epoch = db
+        .human()
+        .min_auth_epoch()
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
     let input = HumanAuthorityInput {
         human_id: human_id.clone(),
         kid: kid.clone(),
@@ -3826,10 +3383,7 @@ fn run_auth_admit(
         .projected_authorities_digest_after_upsert(&input)
         .map_err(|e| e.to_string())
         .and_then(|digest| ApprovedPolicyUpdate::prepare(&config_write, &db, &digest));
-    let reseal = match prepared {
-        Ok(r) => r,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None),
-    };
+    let reseal = prepared.map_err(|e| CliError::error("GATE_POLICY_SYNC_FAILED", e))?;
     let loaded = load_node_or_legacy_config(&config_write).ok();
     let node_id = resolve_effective_node_id(loaded.as_ref(), Some(&db));
     let mut action =
@@ -3841,9 +3395,7 @@ fn run_auth_admit(
         "humanId": human_id, "nodePrefix": node_prefix, "scopes": scopes,
         "maxDevices": max_devices, "delegationEnabled": true,
     }}));
-    let verified = match approve_authority_change(
-        cmd,
-        as_json,
+    let verified = approve_authority_change(
         &state_dir,
         &config_write,
         &db,
@@ -3852,10 +3404,7 @@ fn run_auth_admit(
         Some(&reseal),
         &[format!("Admit {human_id} with device prefix {node_prefix}")],
         &ceremony,
-    ) {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
+    )?;
     let now = now_ms();
     let committed =
         execute_approved_operation(&config_write, &config_write, &db, &verified, || {
@@ -3879,10 +3428,7 @@ fn run_auth_admit(
             reseal.apply(&db, &config_write, &verified)?;
             Ok((authority, policy))
         });
-    let (auth_rec, policy) = match committed {
-        Ok(result) => result,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "APPROVAL_COMMIT_FAILED", e, None),
-    };
+    let (auth_rec, policy) = committed.map_err(|e| CliError::error("APPROVAL_COMMIT_FAILED", e))?;
     let digest = db.human().authorities_digest().ok();
     drop(db);
 
@@ -3916,18 +3462,16 @@ fn run_auth_admit(
             "gateReloaded": gate_reloaded,
             "gateReloadError": gate_reload_error,
         });
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Admitted delegated human authority '{}' (prefix={}, maxDevices={})",
                 auth_rec.human_id, policy.node_prefix, policy.max_devices
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error: None,
-        };
+            ),
+            data,
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -3942,7 +3486,7 @@ fn run_auth_admit(
         print_warnings(&warnings);
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn run_auth_whoami(
@@ -3950,28 +3494,22 @@ fn run_auth_whoami(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "auth whoami";
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
     let db_path = state_dir.join("node.sqlite");
     if !db_path.exists() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "NO_HUMAN_AUTHORITY",
             "No human authority enrolled on this node yet",
-            Some("Run `hyp join` or `hyp auth init` to enroll a human authority.".to_string()),
-        );
+        )
+        .with_fix("Run `hyp join` or `hyp auth init` to enroll a human authority.".to_string()));
     }
-    let db = match NodeDb::open(&db_path) {
-        Ok(d) => d,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
-    let active = match db.human().list_active_authorities() {
-        Ok(v) => v,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
+    let db = NodeDb::open(&db_path).map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
+    let active = db
+        .human()
+        .list_active_authorities()
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
     let filter_norm = human_id_filter
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty());
@@ -3988,27 +3526,21 @@ fn run_auth_whoami(
     };
 
     let Some(rec) = selected else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "NO_HUMAN_AUTHORITY",
             match filter_norm {
                 Some(hid) => format!("No active human authority enrolled for '{hid}'"),
                 None => "No active human authority enrolled on this node".to_string(),
             },
-            Some("Run `hyp join` or `hyp auth init` to enroll a human authority.".to_string()),
-        );
+        )
+        .with_fix("Run `hyp join` or `hyp auth init` to enroll a human authority.".to_string()));
     };
 
-    let signing_jwk: OkpJwk = match serde_json::from_str(&rec.jwk_json) {
-        Ok(j) => j,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CORRUPT_JWK", e.to_string(), None),
-    };
-    let ed_pk = match signing_jwk.to_ed25519() {
-        Ok(pk) => pk,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CORRUPT_JWK", e.to_string(), None),
-    };
+    let signing_jwk: OkpJwk = serde_json::from_str(&rec.jwk_json)
+        .map_err(|e| CliError::error("CORRUPT_JWK", e.to_string()))?;
+    let ed_pk = signing_jwk
+        .to_ed25519()
+        .map_err(|e| CliError::error("CORRUPT_JWK", e.to_string()))?;
     let enc_jwk: Option<OkpJwk> = rec
         .enc_jwk_json
         .as_deref()
@@ -4025,26 +3557,15 @@ fn run_auth_whoami(
     let hpub1 = match encode_hpub1(&card) {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "ENCODE_FAILED",
-                e.to_string(),
-                None,
-            );
+            return Err(CliError::error("ENCODE_FAILED", e.to_string()));
         }
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
-                "Human authority '{}' (fp={fingerprint})",
-                rec.human_id
-            )),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!("Human authority '{}' (fp={fingerprint})", rec.human_id),
+            json!({
                 "humanId": rec.human_id,
                 "kid": rec.kid,
                 "fingerprint": fingerprint,
@@ -4055,14 +3576,12 @@ fn run_auth_whoami(
                 "hpub1": hpub1,
                 "signingJwk": signing_jwk,
                 "encJwk": enc_jwk,
-            })),
-            warnings: Vec::new(),
-            next: vec![format!(
-                "Hub admin can admit this identity directly: hyp auth admit {} --id {hpub1}",
-                rec.human_id
-            )],
-            error: None,
-        };
+            }),
+        )
+        .next(vec![format!(
+            "Hub admin can admit this identity directly: hyp auth admit {} --id {hpub1}",
+            rec.human_id
+        )]);
         print_json(&envelope);
     } else {
         println!("OK    Human Authority: {} ({})", rec.human_id, rec.label);
@@ -4073,7 +3592,7 @@ fn run_auth_whoami(
         }
         println!("      Identity:    {hpub1}");
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 pub(crate) fn select_local_signing_authority(

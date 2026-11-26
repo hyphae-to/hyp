@@ -327,35 +327,20 @@ pub(crate) fn require_controlling_tty_confirmation(
 }
 
 pub(crate) fn emit_confirm_error(cmd: &str, as_json: bool, err: ConfirmError) -> ExitCode {
-    match err {
-        ConfirmError::NotInteractiveTty => emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "INTERACTIVE_TTY_REQUIRED",
-            format!(
+    crate::ui::print_command_error(cmd, as_json, err.into_cli_error(cmd))
+}
+
+impl ConfirmError {
+    pub(crate) fn into_cli_error(self, cmd: &str) -> crate::ui::CliError {
+        match self {
+        ConfirmError::NotInteractiveTty => crate::ui::CliError::usage("INTERACTIVE_TTY_REQUIRED", format!(
                 "'{cmd}' is a security-sensitive operation and requires an interactive human terminal (non-TTY / automated agent invocations are blocked until Passkey confirmation ships in #2)."
-            ),
-            Some(format!(
+            )).with_fix(format!(
                 "Re-run `hyp {cmd} ...` directly in an interactive human terminal."
             )),
-        ),
-        ConfirmError::Aborted => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "CONFIRMATION_ABORTED",
-            format!("Aborted '{cmd}': interactive confirmation was declined (no changes made)."),
-            None,
-        ),
-        ConfirmError::Io(e) => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "TTY_IO_ERROR",
-            format!("Failed reading interactive TTY confirmation for '{cmd}': {e}"),
-            None,
-        ),
+        ConfirmError::Aborted => crate::ui::CliError::error("CONFIRMATION_ABORTED", format!("Aborted '{cmd}': interactive confirmation was declined (no changes made).")),
+        ConfirmError::Io(e) => crate::ui::CliError::error("TTY_IO_ERROR", format!("Failed reading interactive TTY confirmation for '{cmd}': {e}")),
+    }
     }
 }
 

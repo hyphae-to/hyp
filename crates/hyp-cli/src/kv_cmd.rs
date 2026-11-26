@@ -337,6 +337,7 @@ fn emit_version_conflict(
             warnings: Vec::new(),
             next: vec![fix.clone()],
             error: Some(CliError {
+                exit: EXIT_ERROR,
                 code: "VERSION_CONFLICT".to_string(),
                 message: msg,
                 fix: Some(fix),
