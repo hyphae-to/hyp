@@ -86,9 +86,6 @@ fn archive_muted_in_store(db: &NodeDb, insert: &MailboxInsert, now_ms: i64) -> M
     };
     let res = db.local().put_in_mailbox(&muted_insert, now_ms).unwrap();
     if let MailboxPutResult::Stored { ref receipt } = res {
-        db.local()
-            .record_delivery(&insert.origin_node, &insert.item_id, "muted", now_ms)
-            .unwrap();
         append_muted_index(db, &insert.session_id, receipt);
     }
     res
@@ -106,9 +103,6 @@ fn move_pending_to_muted_in_store(
         .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now_ms)
         .unwrap();
     assert_eq!(acked, 1);
-    db.local()
-        .record_delivery(&entry.origin_node, &entry.item_id, "muted", now_ms)
-        .unwrap();
     append_muted_index(db, session_id, &entry.receipt);
 }
 
@@ -1896,16 +1890,6 @@ fn run_differential_seed(seed: u64, steps: usize) {
                 assert!(
                     !real_pending.contains_key(muted_item_id),
                     "seed=0x{seed:016x} step={step}: muted item '{muted_item_id}' leaked into peek_inbox for '{sid}'"
-                );
-            }
-            for entry in &real_muted_entries {
-                assert_eq!(
-                    db.local()
-                        .get_delivery(&entry.origin_node, &entry.item_id)
-                        .unwrap()
-                        .as_deref(),
-                    Some("muted"),
-                    "seed=0x{seed:016x} step={step}: muted item missing delivery='muted' state"
                 );
             }
 

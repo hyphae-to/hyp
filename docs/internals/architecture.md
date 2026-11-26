@@ -43,7 +43,7 @@ flowchart LR
    - **Bus:** `handles`, `events`, `subscriptions`, `batches`, `batch_events`, `upstream_pushdowns`, `channel_members`, `channel_epochs`, `transfers`
    - **Shared KV:** `kv_entries`, `kv_epochs` (owner/shared CAS/allowlist write models + optional `kv.e2ee.v1`)
    - **Federation:** `peers`, `grants`, `revocations`, `peer_keys`, `directory_checkpoints` *(schema reserved for planned signed checkpoints)*
-   - **Local Runtime & Security:** `metadata`, `sessions`, `mailbox`, `deliveries`, `muted_sources`, `plugin_targets`, `bridge_links`, immutable `gate_audit` (SQLite triggers)
+   - **Local Runtime & Security:** `metadata`, `sessions`, `mailbox`, `muted_sources`, `plugin_targets`, `bridge_links`, immutable `gate_audit` (SQLite triggers)
    - **Human Authority:** `human_authorities` (with schema v5 `enc_jwk_json`), `human_nonces`, `human_node_certs`
 3. **Composable Adapters (`NodeAdapter` in `crates/hyp-node` & `crates/hyp-harness`):**
    - **Harnesses & LocalDaemon:** Private `0600` Unix socket (`connector.sock`) or Windows loopback TCP + bearer token (`connector.addr`), `CallRegistry` + per-session HMAC `sessionToken`, zero-Tokio ~2.7 ms `hyp hook` fast path, ~2.8 MB RSS stateless `hyp mcp` multiplexer, and live hot-reload IPC RPCs (`peers.reload`, `gate.reload`, `inbox.wake`).

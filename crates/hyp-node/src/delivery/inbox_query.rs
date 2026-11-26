@@ -276,9 +276,6 @@ pub fn archive_muted_entry(
     };
     let res = db.local().put_in_mailbox(&muted_insert, now_ms)?;
     if let MailboxPutResult::Stored { ref receipt } = res {
-        let _ = db
-            .local()
-            .record_delivery(&insert.origin_node, &insert.item_id, "muted", now_ms);
         append_receipt_index(
             db,
             META_MUTED_INDEX_PREFIX,
@@ -300,9 +297,6 @@ pub fn move_pending_to_muted(
     let _ = db
         .local()
         .acknowledge_inbox(session_id, &[entry.receipt.as_str()], now_ms)?;
-    let _ = db
-        .local()
-        .record_delivery(&entry.origin_node, &entry.item_id, "muted", now_ms);
     append_receipt_index(
         db,
         META_MUTED_INDEX_PREFIX,

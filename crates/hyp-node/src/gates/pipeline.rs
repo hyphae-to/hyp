@@ -1059,16 +1059,6 @@ impl SecurityGatePipeline {
                 cats.extend(outcome.categories);
                 if let Some(r) = existing_receipt {
                     let _ = self.reject_existing_in_mailbox(r, ctx, &reason, now_ms)?;
-                } else {
-                    let db_guard = self.db.lock().map_err(|_| {
-                        GateError::LockPoisoned("node_db mutex poisoned".to_string())
-                    })?;
-                    let _ = db_guard.local().record_delivery(
-                        &ctx.origin_node,
-                        &ctx.event.id,
-                        "rejected",
-                        now_ms,
-                    );
                 }
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
@@ -1433,19 +1423,13 @@ impl SecurityGatePipeline {
             .db
             .lock()
             .map_err(|_| GateError::LockPoisoned("node_db mutex poisoned".to_string()))?;
-        let transitioned = db.local().transition_mailbox_gate_state(
+        Ok(db.local().transition_mailbox_gate_state(
             &ctx.session_id,
             existing_receipt,
             GateState::Rejected,
             Some(reason),
             now_ms,
-        )?;
-        if !transitioned {
-            let _ = db
-                .local()
-                .record_delivery(&ctx.origin_node, &ctx.event.id, "rejected", now_ms);
-        }
-        Ok(transitioned)
+        )?)
     }
 
     #[allow(clippy::too_many_arguments)]

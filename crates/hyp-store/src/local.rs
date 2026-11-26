@@ -1,5 +1,5 @@
 //! Local runtime state (`metadata`, `sessions`, `mailbox` with Security Gate `gate_state`,
-//! `deliveries`, `muted_sources`, `plugin_targets`, `bridge_links`, and immutable `gate_audit`
+//! `muted_sources`, `plugin_targets`, `bridge_links`, and immutable `gate_audit`
 //! append log with human-only quarantine approval & rejection).
 
 use std::collections::HashSet;
@@ -627,8 +627,7 @@ impl<'a> LocalStateStore<'a> {
     /// Inserts an item into a session's mailbox (either `pending` for immediate agent visibility
     /// or `quarantined` awaiting human CLI review).
     ///
-    /// Enforces the per-session pending cap (default 100) for `GateState::Pending` items and
-    /// atomically records the delivery receipt in `deliveries`.
+    /// Enforces the per-session pending cap (default 100) for `GateState::Pending` items.
     pub fn put_in_mailbox(
         &self,
         input: &MailboxInsert,
@@ -769,11 +768,6 @@ impl<'a> LocalStateStore<'a> {
                             &receipt,
                         ],
                     )?;
-                    tx.conn().execute(
-                        "INSERT OR REPLACE INTO deliveries (origin_node, item_id, state, created_at)
-                         VALUES (?1, ?2, 'submitted', ?3)",
-                        params![&input.origin_node, &input.item_id, now_ms],
-                    )?;
                     tx.commit()?;
                     return Ok(MailboxPutResult::Stored { receipt });
                 }
@@ -821,16 +815,6 @@ impl<'a> LocalStateStore<'a> {
             return Ok(MailboxPutResult::Duplicate);
         }
 
-        let delivery_state = match input.gate_state {
-            GateState::Quarantined => "quarantined",
-            GateState::Rejected => "rejected",
-            _ => "submitted",
-        };
-        tx.conn().execute(
-            "INSERT OR REPLACE INTO deliveries (origin_node, item_id, state, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![&input.origin_node, &input.item_id, delivery_state, now_ms],
-        )?;
         tx.commit()?;
         Ok(MailboxPutResult::Stored { receipt })
     }
@@ -975,8 +959,7 @@ impl<'a> LocalStateStore<'a> {
     }
 
     /// Atomically transitions an existing `pending` mailbox row in place to `Quarantined` or
-    /// `Rejected` and updates `deliveries` accordingly (zero duplicate rows, zero leaked
-    /// `delivered` plaintext).
+    /// `Rejected`, returning whether the pending row was updated.
     ///
     /// Returns `true` if the row existed in `pending` state and was transitioned.
     pub fn transition_mailbox_gate_state(
@@ -993,26 +976,12 @@ impl<'a> LocalStateStore<'a> {
                 new_state.as_str()
             )));
         }
-        let tx = self.db.immediate_tx()?;
-        let origin_item: Option<(String, String)> = tx
-            .conn()
-            .query_row(
-                "SELECT origin_node, item_id FROM mailbox
-                 WHERE session_id = ?1 AND receipt = ?2 AND gate_state = 'pending'",
-                params![session_id, receipt],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((origin_node, item_id)) = origin_item else {
-            tx.commit()?;
-            return Ok(false);
-        };
         let reviewed_at: Option<i64> = if new_state == GateState::Rejected {
             Some(now_ms)
         } else {
             None
         };
-        tx.conn().execute(
+        let changed = self.db.conn().execute(
             "UPDATE mailbox
              SET gate_state = ?1,
                  gate_reason = ?2,
@@ -1021,18 +990,7 @@ impl<'a> LocalStateStore<'a> {
              WHERE session_id = ?4 AND receipt = ?5 AND gate_state = 'pending'",
             params![new_state.as_str(), reason, reviewed_at, session_id, receipt],
         )?;
-        let delivery_state = match new_state {
-            GateState::Quarantined => "quarantined",
-            GateState::Rejected => "rejected",
-            _ => unreachable!(),
-        };
-        tx.conn().execute(
-            "INSERT OR REPLACE INTO deliveries (origin_node, item_id, state, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![&origin_node, &item_id, delivery_state, now_ms],
-        )?;
-        tx.commit()?;
-        Ok(true)
+        Ok(changed > 0)
     }
 
     /// Atomically pops up to `limit` **pending** items for `session_id`, transitioning them to
@@ -1437,11 +1395,6 @@ impl<'a> LocalStateStore<'a> {
              WHERE receipt = ?2 AND gate_state = 'quarantined'",
             params![now_ms, receipt_id],
         )?;
-        tx.conn().execute(
-            "INSERT OR REPLACE INTO deliveries (origin_node, item_id, state, created_at)
-             VALUES (?1, ?2, 'approved', ?3)",
-            params![&entry.origin_node, &entry.item_id, now_ms],
-        )?;
 
         let payload_sha = entry
             .payload_sha256
@@ -1519,11 +1472,6 @@ impl<'a> LocalStateStore<'a> {
              WHERE receipt = ?3 AND gate_state = 'quarantined'",
             params![reason, now_ms, receipt_id],
         )?;
-        tx.conn().execute(
-            "INSERT OR REPLACE INTO deliveries (origin_node, item_id, state, created_at)
-             VALUES (?1, ?2, 'rejected', ?3)",
-            params![&entry.origin_node, &entry.item_id, now_ms],
-        )?;
 
         if let Some(mute) = optional_mute {
             let normalized = mute.pattern.trim().to_lowercase();
@@ -1569,52 +1517,6 @@ impl<'a> LocalStateStore<'a> {
         )??;
         tx.commit()?;
         Ok(updated)
-    }
-
-    // ---- Deliveries ----
-
-    pub fn get_delivery(&self, origin_node: &str, item_id: &str) -> StoreResult<Option<String>> {
-        let state: Option<String> = self
-            .db
-            .conn()
-            .query_row(
-                "SELECT state FROM deliveries WHERE origin_node = ?1 AND item_id = ?2",
-                params![origin_node, item_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(state)
-    }
-
-    pub fn record_delivery(
-        &self,
-        origin_node: &str,
-        item_id: &str,
-        state: &str,
-        now_ms: i64,
-    ) -> StoreResult<()> {
-        self.db.conn().execute(
-            "INSERT OR REPLACE INTO deliveries (origin_node, item_id, state, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![origin_node, item_id, state, now_ms],
-        )?;
-        Ok(())
-    }
-
-    pub fn clear_delivery(&self, origin_node: &str, item_id: &str) -> StoreResult<bool> {
-        let changed = self.db.conn().execute(
-            "DELETE FROM deliveries WHERE origin_node = ?1 AND item_id = ?2",
-            params![origin_node, item_id],
-        )?;
-        Ok(changed > 0)
-    }
-
-    pub fn prune_deliveries(&self, cutoff_ms: i64) -> StoreResult<usize> {
-        let changed = self.db.conn().execute(
-            "DELETE FROM deliveries WHERE created_at < ?1",
-            params![cutoff_ms],
-        )?;
-        Ok(changed)
     }
 
     // ---- Muted Sources ----

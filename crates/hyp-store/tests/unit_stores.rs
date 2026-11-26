@@ -108,7 +108,6 @@ fn db_open_pragmas_permissions_and_all_tables() {
         "metadata",
         "sessions",
         "mailbox",
-        "deliveries",
         "muted_sources",
         "plugin_targets",
         "bridge_links",
@@ -116,6 +115,8 @@ fn db_open_pragmas_permissions_and_all_tables() {
     ] {
         assert!(tables.contains(expected), "missing table '{expected}'");
     }
+
+    assert!(!tables.contains("deliveries"));
 
     // Idle DB must report None for next_deadline_ms.
     assert_eq!(db.next_deadline_ms(1_700_000_000_000).unwrap(), None);
