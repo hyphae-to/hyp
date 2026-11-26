@@ -227,6 +227,44 @@ impl ManagedProcess {
         })
     }
 
+    /// Waits for the loopback enrollment server's readiness URL on stderr.
+    /// This deadline covers CLI startup. The separate browser callback deadline
+    /// starts inside the child after it emits the URL.
+    pub fn read_web_enrollment_url(&mut self) -> Result<String, String> {
+        // Hosted Windows jobs have timed out before the first stderr line, even
+        // at 10 seconds. Keep the wait bounded while allowing slower startup.
+        let timeout = Duration::from_secs(if cfg!(windows) { 30 } else { 10 });
+        let deadline = Instant::now() + timeout;
+        let error = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break format!(
+                    "'{}' emitted no enrollment URL within {timeout:?}; stderr={}",
+                    self.label,
+                    self.stderr_snapshot(),
+                );
+            }
+            match self.try_read_stderr_line(remaining) {
+                Ok(line) => {
+                    if let Some(url) = line
+                        .split_whitespace()
+                        .find(|part| part.contains("#enroll="))
+                    {
+                        return Ok(url.to_owned());
+                    }
+                }
+                Err(error) => break error,
+            }
+        };
+        let status = match self.child.as_mut().map(Child::try_wait) {
+            Some(Ok(Some(status))) => format!("exited {status}"),
+            Some(Ok(None)) => "still running".to_owned(),
+            Some(Err(error)) => format!("status unavailable ({error})"),
+            None => "already reaped".to_owned(),
+        };
+        Err(format!("{error}; child {status}"))
+    }
+
     /// Waits up to `timeout` for the child to exit on its own.
     pub fn wait_timeout(&mut self, timeout: Duration) -> Option<ExitStatus> {
         let child = self.child.as_mut()?;
@@ -848,24 +886,11 @@ impl TestPasskeyAdmin {
         cmd.args(&args).stdin(Stdio::null());
         let mut proc = ManagedProcess::spawn("hyp auth init --web (TestPasskeyAdmin)", &mut cmd);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let enroll_b64 = loop {
-            let rem = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !rem.is_zero(),
-                "timed out waiting for #enroll= URL; stderr={}",
-                proc.stderr_snapshot()
-            );
-            let line = proc
-                .try_read_stderr_line(rem)
-                .unwrap_or_else(|e| panic!("failed reading enroll stderr: {e}"));
-            if let Some((_, frag)) = line.split_once("#enroll=") {
-                break frag.trim().to_string();
-            }
-        };
+        let enrollment_url = proc.read_web_enrollment_url().expect("read enrollment URL");
+        let (_, enroll_b64) = enrollment_url.split_once("#enroll=").unwrap();
 
         let payload_bytes = URL_SAFE_NO_PAD
-            .decode(&enroll_b64)
+            .decode(enroll_b64)
             .expect("valid base64url #enroll= payload");
         let payload: Value =
             serde_json::from_slice(&payload_bytes).expect("valid JSON #enroll= payload");
