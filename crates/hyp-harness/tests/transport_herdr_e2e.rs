@@ -852,5 +852,4 @@ esac
             PushOutcome::hold("herdr_target_unavailable")
         );
     }
-
 }

@@ -135,4 +135,3 @@ pub(crate) fn is_metadata_only_inbox_digest(text: &str) -> bool {
     trimmed.starts_with("<hyphae-inbox")
         && (trimmed.ends_with("</hyphae-inbox>") || trimmed.ends_with("/>"))
 }
-

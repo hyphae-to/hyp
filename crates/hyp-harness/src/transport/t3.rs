@@ -1898,7 +1898,6 @@ impl PushTransport for T3Transport {
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         Box::pin(async move { self.deliver_detailed(text, mode).await.outcome })
     }
-
 }
 
 // ============================================================================

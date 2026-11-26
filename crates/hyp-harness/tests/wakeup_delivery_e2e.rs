@@ -1836,7 +1836,6 @@ impl PushTransport for NudgeRecordingTransport {
             PushOutcome::delivered()
         })
     }
-
 }
 
 #[tokio::test]

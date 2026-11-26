@@ -8,40 +8,11 @@ use std::collections::BTreeMap;
 use hyp_node::delivery::{
     BurstProtectionConfig, BurstTracker, DeliveryEngine, DeliveryError, DeliveryUrgency,
     InboxFilter, InboxItemState, InboxQuery, InboxStateFilter, PackableItem, ParsedMailboxSource,
-    SessionDeliveryPolicy, archive_muted_entry, muted_count, pack_delivery_batch, query_inbox,
+    SessionDeliveryPolicy, archive_muted_entry, muted_count, pack_inbox_digest, query_inbox,
 };
 use hyp_proto::filter::Filter as ProtoFilter;
 use hyp_store::{GateState, MailboxInsert, MailboxKind, MailboxPutResult, NodeDb};
 use serde_json::json;
-
-#[allow(clippy::too_many_arguments)]
-fn make_packable(
-    id: &str,
-    urgency: DeliveryUrgency,
-    kind: MailboxKind,
-    source: &str,
-    channel: Option<&str>,
-    is_announcement: bool,
-    text: &str,
-    created_at_ms: i64,
-    burst_demoted: bool,
-) -> PackableItem {
-    PackableItem {
-        id: id.to_string(),
-        urgency,
-        kind,
-        source: source.to_string(),
-        channel: channel.map(ToString::to_string),
-        is_announcement,
-        text: text.to_string(),
-        created_at_ms,
-        burst_demoted,
-        is_system_notice: false,
-        topic: None,
-        subscription_key: None,
-        human_verified: false,
-    }
-}
 
 #[test]
 fn all_four_tiers_and_focus_mode_with_and_without_vip_interrupt() {
@@ -156,62 +127,36 @@ fn muted_items_never_wake_alone_and_piggyback_on_next_delivery() {
     assert_eq!(db.local().pending_count(sid).unwrap(), 0);
     assert_eq!(muted_count(&db, sid).unwrap(), 12);
 
-    // Strict mute invariant: ZERO pending unread + 12 muted => pack_delivery_batch returns None (ZERO wake!).
-    let policy = SessionDeliveryPolicy::default();
-    assert!(pack_delivery_batch(&[], 12, &policy).is_none());
+    // Strict mute invariant: ZERO pending unread + 12 muted => no digest (ZERO wake!).
+    assert!(pack_inbox_digest(None, &[], 12, &[]).is_none());
 
-    // Even if a Notify-only item arrives in Focus Mode, digest fires AND piggybacks `<muted count="12"/>`
-    // without EVER leaking the untrusted body text (RFC 0004).
-    let notify_item = make_packable(
-        "r-notify",
-        DeliveryUrgency::Notify,
-        MailboxKind::Message,
-        "bob@laptop/codex",
-        None,
-        false,
-        "FYI: PR #42 ready",
-        t0 + 2_000,
-        false,
+    // A real unread item emits the digest AND piggybacks `<muted count="12"/>`.
+    let dm = PackableItem {
+        id: "r-dm".into(),
+        urgency: DeliveryUrgency::Queue,
+        kind: MailboxKind::Message,
+        source: "alice@macbook/claude".into(),
+        channel: None,
+        is_announcement: false,
+        created_at_ms: t0 + 3_000,
+        burst_demoted: false,
+        is_system_notice: false,
+        topic: None,
+        subscription_key: None,
+        human_verified: false,
+    };
+    let batch = pack_inbox_digest(None, &[dm], 12, &[]).expect("DM digest must emit");
+    assert_eq!(batch.receipt_ids, vec!["r-dm"]);
+    assert_eq!(batch.muted_count, 12);
+    assert_eq!(
+        batch.rendered,
+        concat!(
+            "<hyphae-inbox unread=\"1\" urgency=\"queue\">\n",
+            "  <dm from=\"alice@macbook/claude\" count=\"1\"/>\n",
+            "  <muted count=\"12\"/>\n",
+            "</hyphae-inbox>"
+        )
     );
-    let notify_batch =
-        pack_delivery_batch(&[notify_item], 12, &SessionDeliveryPolicy::focus_mode())
-            .expect("notify item must still emit XML digest");
-    assert!(notify_batch.notify_only);
-    assert!(notify_batch.rendered.contains("unread=\"1\""));
-    assert!(notify_batch.rendered.contains("urgency=\"notify\""));
-    assert!(
-        notify_batch
-            .rendered
-            .contains("<dm from=\"bob@laptop/codex\" count=\"1\"/>")
-    );
-    assert!(notify_batch.rendered.contains("<muted count=\"12\"/>"));
-    assert!(!notify_batch.rendered.contains("PR #42 ready"));
-
-    // When a regular Queue DM arrives, metadata-only XML digest fires AND piggybacks `<muted count="12"/>`!
-    let dm = make_packable(
-        "r-dm",
-        DeliveryUrgency::Queue,
-        MailboxKind::Message,
-        "alice@macbook/claude",
-        None,
-        false,
-        "Can you review checkout PR?",
-        t0 + 3_000,
-        false,
-    );
-    let dm_batch = pack_delivery_batch(&[dm], 12, &policy).expect("DM batch must emit");
-    assert!(!dm_batch.notify_only);
-    assert!(dm_batch.inline_ids.is_empty());
-    assert_eq!(dm_batch.spilled_ids, vec!["r-dm"]);
-    assert!(dm_batch.rendered.contains("urgency=\"queue\""));
-    assert!(
-        dm_batch
-            .rendered
-            .contains("<dm from=\"alice@macbook/claude\" count=\"1\"/>")
-    );
-    assert!(dm_batch.rendered.contains("<muted count=\"12\"/>"));
-    assert!(!dm_batch.rendered.contains("Can you review checkout PR?"));
-    assert_eq!(dm_batch.muted_count, 12);
 }
 
 #[test]
@@ -278,156 +223,6 @@ fn burst_storm_auto_demotes_to_noisy_mode_and_recovers_after_cooldown() {
     assert!(!recovered.noisy_mode);
     assert!(!recovered.demoted);
     assert_eq!(recovered.effective_urgency, DeliveryUrgency::Queue);
-}
-
-#[test]
-fn token_budget_hybrid_packer_prioritizes_critical_dm_and_spills_twenty_noisy_events() {
-    let policy = SessionDeliveryPolicy {
-        max_batch_tokens: 400,
-        max_inline_items: 6,
-        max_single_item_share: 0.60,
-        ..SessionDeliveryPolicy::default()
-    };
-
-    let mut items = Vec::new();
-
-    // 20 noisy events arriving BEFORE the critical DM (testing priority sorting!).
-    for i in 0..20 {
-        items.push(make_packable(
-            &format!("ev-{i:02}"),
-            DeliveryUrgency::Queue,
-            MailboxKind::Event,
-            "acme-team.ci",
-            None,
-            false,
-            &format!("CI build #{i} failed on flaky integration test suite with verbose stack trace details {}", "x".repeat(260)),
-            1_000 + i as i64,
-            i >= 10, // second half burst-demoted
-        ));
-    }
-
-    // 1 critical Interrupt DM arriving last chronologically — MUST sort to #1 and pack inline VERBATIM!
-    let critical_body =
-        "PROD P0 ALERT: checkout-api 5xx spike on eu-west-1 — rollback v2.14.9 immediately!";
-    items.push(make_packable(
-        "dm-critical",
-        DeliveryUrgency::Interrupt,
-        MailboxKind::Message,
-        "ops@prod/oncall",
-        None,
-        false,
-        critical_body,
-        9_999,
-        false,
-    ));
-
-    let batch = pack_delivery_batch(&items, 4, &policy).expect("batch must emit");
-
-    // RFC 0004: Strictly metadata-only XML digest! Zero body text ever appears; all 21 receipts
-    // remain unread (`spilled_ids`) until `hyp_inbox` reads them, with `urgency="interrupt"`
-    // hoisted from the critical DM.
-    assert!(batch.inline_ids.is_empty());
-    assert!(batch.truncated_ids.is_empty());
-    assert_eq!(batch.spilled_ids.len(), 21);
-    assert!(batch.spilled_ids.contains(&"dm-critical".to_string()));
-    assert!(!batch.rendered.contains(critical_body));
-    assert!(!batch.rendered.contains("CI build #"));
-    assert!(
-        batch
-            .rendered
-            .contains("unread=\"21\" urgency=\"interrupt\"")
-    );
-    assert!(
-        batch
-            .rendered
-            .contains("<dm from=\"ops@prod/oncall\" count=\"1\"/>")
-    );
-    assert!(
-        batch
-            .rendered
-            .contains("<stream topic=\"acme-team.ci\" count=\"20\"/>")
-    );
-    assert!(batch.rendered.contains("<muted count=\"4\"/>"));
-
-    // Strict token budget ceiling!
-    assert!(
-        batch.estimated_tokens <= policy.max_batch_tokens,
-        "batch exceeded max_batch_tokens: {} > {}",
-        batch.estimated_tokens,
-        policy.max_batch_tokens
-    );
-
-    // Priority band verification: Interrupt (0) < Queue DM (1) == Queue #announcement (1) < Queue #channel (2) < Notify/burst (3)
-    let ann = make_packable(
-        "ann",
-        DeliveryUrgency::Queue,
-        MailboxKind::Message,
-        "acme-team/#announcements:ops/rel",
-        Some("#announcements"),
-        true,
-        "Release v2.2",
-        10,
-        false,
-    );
-    let ch = make_packable(
-        "ch",
-        DeliveryUrgency::Queue,
-        MailboxKind::Message,
-        "acme-team/#general:bob/codex",
-        Some("#general"),
-        false,
-        "Lunch?",
-        5,
-        false,
-    );
-    assert_eq!(ann.priority_band(), 1);
-    assert_eq!(ch.priority_band(), 2);
-}
-
-#[test]
-fn single_giant_payload_truncates_with_preview_and_inbox_ids_hint() {
-    let policy = SessionDeliveryPolicy {
-        max_batch_tokens: 300,
-        max_inline_items: 6,
-        max_single_item_share: 0.60, // 180 tokens (~720 chars) max for any single item
-        ..SessionDeliveryPolicy::default()
-    };
-
-    let giant_text = format!("HEADER-START: {}", "A".repeat(8_000));
-    let item = make_packable(
-        "rcpt-giant-42",
-        DeliveryUrgency::Interrupt,
-        MailboxKind::Message,
-        "alice@macbook/claude",
-        None,
-        false,
-        &giant_text,
-        1_000,
-        false,
-    );
-
-    let batch = pack_delivery_batch(&[item], 0, &policy).expect("giant item XML digest must emit");
-    assert!(batch.inline_ids.is_empty());
-    assert!(batch.truncated_ids.is_empty());
-    assert_eq!(batch.spilled_ids, vec!["rcpt-giant-42"]);
-    assert!(!batch.rendered.contains("HEADER-START:"));
-    assert!(!batch.rendered.contains("AAAA"));
-    assert!(
-        batch
-            .rendered
-            .contains("unread=\"1\" urgency=\"interrupt\"")
-    );
-    assert!(
-        batch
-            .rendered
-            .contains("<dm from=\"alice@macbook/claude\" count=\"1\"/>")
-    );
-    assert!(
-        batch.estimated_tokens <= policy.max_batch_tokens,
-        "giant item XML digest must stay <= max_batch_tokens ({} <= {})",
-        batch.estimated_tokens,
-        policy.max_batch_tokens
-    );
 }
 
 #[test]

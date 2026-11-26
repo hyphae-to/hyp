@@ -8,7 +8,7 @@
 //!   `ack: false` peek, stamps structured `trustTier` / `humanVerified` / `untrusted` / `provenance`,
 //!   and preserves Focus Mode VIP isolation (#32).
 //! - Decision #4: Tuneable long-turn `PostToolUse` `Queue` reminder (`midturn_queue_digest_seconds`,
-//!   default 1800s, `0` = disabled, per-session override, `max(last_midturn_digest_at_ms,
+//!   default 1800s, `0` = disabled, node-level only, `max(last_midturn_digest_at_ms,
 //!   oldest_unread_queue_received_at_ms)` anti-early-fire anchor, intermediate silence, `Stop` still
 //!   fires, reset on `hyp_inbox` queue drain / `Stop` / `Idle`).
 //! - Security Gate Stage 1 Policy: `ExternalWebhook` and `Guest` enforce `CapToQueue`
@@ -584,8 +584,8 @@ async fn rfc0004_decision1_and_2_zero_body_leak_across_all_nine_harnesses_all_ti
         "XML attribute injection must be strictly escaped: {rich_xml}"
     );
     assert!(
-        rich_xml.contains("<quarantined ") && rich_xml.contains("evil@peer/attacker"),
-        "quarantined notice must appear without incrementing unread: {rich_xml}"
+        rich_xml.contains("<quarantined count=\"1\"/>") && !rich_xml.contains("evil@peer/attacker"),
+        "quarantined count must appear without incrementing unread or naming the sender: {rich_xml}"
     );
     assert!(
         !rich_xml.contains("<muted"),
@@ -970,74 +970,32 @@ async fn rfc0004_decision4_tuneable_long_turn_post_tool_use_queue_reminder_and_a
     assert!(!read_err && read_txt.contains("LONG_TURN_QUEUE_SECRET_BODY"));
     assert_eq!(node.db().local().pending_count("claude:lt-1").unwrap(), 0);
 
-    // Per-session policy override (`midturn_queue_digest_seconds = Some(60)`) overrides daemon default 1800s!
-    {
-        let db = node.db();
-        let mut pol = daemon.delivery().policy(&db, "claude:lt-1").unwrap();
-        pol.midturn_queue_digest_seconds = Some(60);
-        daemon
-            .delivery()
-            .set_policy(&db, "claude:lt-1", pol)
-            .unwrap();
-    }
-    let arr2 = now_ms() + 89 * 60 * 1_000 + 10 * 1_000;
-    {
-        let db = node.db();
-        db.local()
-            .put_in_mailbox(
-                &hyp_store::MailboxInsert {
-                    session_id: "claude:lt-1".into(),
-                    origin_node: "peer@net".into(),
-                    item_id: "lt-q-2".into(),
-                    text: "OVERRIDE_60S_QUEUE_BODY".into(),
-                    kind: MailboxKind::Message,
-                    source: "peer@net/lead".into(),
-                    gate_state: hyp_store::GateState::Pending,
-                    gate_reason: None,
-                    traceparent: None,
-                },
-                arr2,
-            )
-            .unwrap();
-    }
-    daemon.advance_clock_ms(30 * 1_000);
-    assert_eq!(
-        run_hook(
-            &sock,
-            HarnessKind::Claude,
-            HookEvent::PostToolUse,
-            json!({ "session_id": "lt-1", "tool_name": "Bash", "tool_use_id": "t-ov-30s" }),
-        )
-        .await,
-        json!({})
-    );
-    daemon.advance_clock_ms(35 * 1_000);
-    let ov_rem = run_hook(
-        &sock,
-        HarnessKind::Claude,
-        HookEvent::PostToolUse,
-        json!({ "session_id": "lt-1", "tool_name": "Bash", "tool_use_id": "t-ov-65s" }),
+    // Node-level `midturn_queue_digest_seconds = 0` disables mid-turn Queue reminders completely.
+    daemon.stop().await;
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        None,
+        LocalDaemonConfig {
+            auto_detect_transports: false,
+            midturn_queue_digest_seconds: 0,
+            ..Default::default()
+        },
     )
-    .await;
-    assert!(
-        ov_rem["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .is_some_and(
-                |s| s.contains("urgency=\"queue\"") && !s.contains("OVERRIDE_60S_QUEUE_BODY")
-            ),
-        "per-session 60s override must fire after 65s: {ov_rem}"
-    );
-
-    // Setting `midturn_queue_digest_seconds = Some(0)` disables mid-turn Queue reminders completely!
-    {
-        let db = node.db();
-        let mut pol = daemon.delivery().policy(&db, "claude:lt-1").unwrap();
-        pol.midturn_queue_digest_seconds = Some(0);
-        daemon
-            .delivery()
-            .set_policy(&db, "claude:lt-1", pol)
-            .unwrap();
-    }
+    .await
+    .expect("restart LocalDaemon with reminders disabled");
+    let sock = daemon.socket_path().to_path_buf();
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: "claude:lt-1".into(),
+            origin_node: "peer@net".into(),
+            item_id: "lt-q-2".into(),
+            source: "peer@net/lead".into(),
+            text: "DISABLED_REMINDER_QUEUE_BODY".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
     daemon.advance_clock_ms(2 * 3_600 * 1_000);
     assert_eq!(
         run_hook(

@@ -9,13 +9,6 @@ use hyp_store::{DeliveryMode, MailboxEntry, MailboxKind, parse_address};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Default estimated token budget per delivered batch (~4800 chars, §2.5).
-pub const DEFAULT_MAX_BATCH_TOKENS: usize = 1_200;
-/// Default maximum items packed inline before spilling to a 1-line digest footer (§2.5).
-pub const DEFAULT_MAX_INLINE_ITEMS: usize = 6;
-/// Default maximum fraction of `max_batch_tokens` any single item may consume before preview truncation.
-pub const DEFAULT_MAX_SINGLE_ITEM_SHARE: f32 = 0.60;
-
 /// Default burst detection rolling window (seconds).
 pub const DEFAULT_BURST_WINDOW_SECS: u64 = 60;
 /// Default max arrivals per source inside `window_secs` before engaging Noisy Mode.
@@ -392,19 +385,9 @@ pub struct SessionDeliveryPolicy {
     /// with earlier rules breaking ties at equal specificity.
     #[serde(default)]
     pub overrides: Vec<DeliveryRule>,
-    /// Maximum estimated tokens per packed delivery batch (default `1200`, ~`chars / 4`).
-    pub max_batch_tokens: usize,
-    /// Maximum number of items packed inline before spilling remaining items to footer (default `6`).
-    pub max_inline_items: usize,
-    /// Maximum share of `max_batch_tokens` a single item may occupy before preview truncation (default `0.60`).
-    pub max_single_item_share: f32,
     /// Adaptive per-source burst protection ("Noisy Mode") settings.
     #[serde(default)]
     pub burst: BurstProtectionConfig,
-    /// Optional per-session override for periodic mid-turn `PostToolUse` `queue` digest reminders
-    /// (seconds; `0` disables). When `None`, falls back to the daemon's configured default (`1800`s).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub midturn_queue_digest_seconds: Option<u64>,
 }
 
 impl Default for SessionDeliveryPolicy {
@@ -414,11 +397,7 @@ impl Default for SessionDeliveryPolicy {
             focus_mode: false,
             focus_allow_interrupt_vips: true,
             overrides: Vec::new(),
-            max_batch_tokens: DEFAULT_MAX_BATCH_TOKENS,
-            max_inline_items: DEFAULT_MAX_INLINE_ITEMS,
-            max_single_item_share: DEFAULT_MAX_SINGLE_ITEM_SHARE,
             burst: BurstProtectionConfig::default(),
-            midturn_queue_digest_seconds: None,
         }
     }
 }
@@ -563,17 +542,6 @@ impl SessionDeliveryPolicy {
             }
         }
         resolved
-    }
-
-    /// Clamps and returns the effective single-item token ceiling.
-    pub fn max_single_item_tokens(&self) -> usize {
-        let share = if self.max_single_item_share.is_finite() {
-            self.max_single_item_share.clamp(0.10, 1.0)
-        } else {
-            DEFAULT_MAX_SINGLE_ITEM_SHARE
-        };
-        let cap = ((self.max_batch_tokens as f32) * share).floor() as usize;
-        cap.max(32).min(self.max_batch_tokens.max(32))
     }
 }
 

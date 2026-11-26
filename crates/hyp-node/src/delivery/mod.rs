@@ -19,17 +19,13 @@ pub use inbox_query::{
     archive_muted_entry, load_session_policy, move_pending_to_muted, muted_count, query_inbox,
     record_delivered_receipts, save_session_policy,
 };
-pub use packer::{
-    PackableItem, PackedDeliveryBatch, QuarantineDigestNotice, estimate_tokens,
-    pack_delivery_batch, pack_inbox_digest, xml_escape_attr,
-};
+pub use packer::{PackableItem, PackedDeliveryBatch, pack_inbox_digest};
 pub use policy::{
     BurstProtectionConfig, DEFAULT_BURST_MAX_EVENTS_PER_WINDOW,
     DEFAULT_BURST_MIN_DELIVERY_INTERVAL_SECS, DEFAULT_BURST_NOISY_COOLDOWN_SECS,
-    DEFAULT_BURST_WINDOW_SECS, DEFAULT_MAX_BATCH_TOKENS, DEFAULT_MAX_INLINE_ITEMS,
-    DEFAULT_MAX_SINGLE_ITEM_SHARE, DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryError,
-    DeliveryRule, DeliveryTargetContext, DeliveryUrgency, ParsedMailboxSource,
-    SessionDeliveryPolicy, gate_reason_urgency_cap,
+    DEFAULT_BURST_WINDOW_SECS, DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryError, DeliveryRule,
+    DeliveryTargetContext, DeliveryUrgency, ParsedMailboxSource, SessionDeliveryPolicy,
+    gate_reason_urgency_cap,
 };
 
 /// Result of classifying a single inbound item through [`DeliveryEngine`].

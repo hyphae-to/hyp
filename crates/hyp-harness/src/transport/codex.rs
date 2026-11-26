@@ -276,7 +276,6 @@ impl PushTransport for CodexQueueTransport {
     fn deliver<'a>(&'a self, text: &'a str, _mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         Box::pin(self.deliver_inner(text))
     }
-
 }
 
 /// Returns `true` iff `thread_id` is a canonical 36-character hyphenated UUID (`8-4-4-4-12` hex).

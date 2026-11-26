@@ -36,9 +36,9 @@ use hyp_crypto::rfc3339::format_rfc3339_millis;
 use hyp_node::delivery::{
     DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryEngine, DeliveryError, DeliveryRule,
     DeliveryUrgency, InboxFilter, InboxItemState, InboxItemView, InboxQuery, InboxQueryResult,
-    InboxStateFilter, PackableItem, PackedDeliveryBatch, QuarantineDigestNotice,
-    archive_muted_entry, gate_reason_urgency_cap, move_pending_to_muted, muted_count,
-    pack_inbox_digest, query_inbox, record_delivered_receipts,
+    InboxStateFilter, PackableItem, PackedDeliveryBatch, archive_muted_entry,
+    gate_reason_urgency_cap, move_pending_to_muted, muted_count, pack_inbox_digest, query_inbox,
+    record_delivered_receipts,
 };
 pub use hyp_node::engine::WakeRecoveryConfig;
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
@@ -578,12 +578,6 @@ struct ClassifiedItemMeta {
     channel: Option<String>,
     is_announcement: bool,
     notified: bool,
-    /// True when this pending item was only announced by a metadata-only wake nudge
-    /// (e.g. OpenClaw Gateway `/hooks/agent`) and has NOT yet been delivered inline or
-    /// digested as a Focus Mode `Notify` footer. Allows turn-start `before_prompt_build`
-    /// (`mailbox.drain` with `includeNudged: true`) to deliver it with its original urgency
-    /// while preventing `flush_session` (`include_nudged: false`) from re-nudging in a loop.
-    nudge_pending: bool,
     /// True ONLY for trusted daemon-generated host sleep/wake notices (`gate_reason == "wake_notice"`).
     /// Renders directly as `[hyphae notice] ...` and NEVER triggers Tier 4 Herdr cold spawns.
     is_wake_notice: bool,
@@ -1676,7 +1670,6 @@ impl LocalDaemon {
                 channel: classification.parsed.channel,
                 is_announcement,
                 notified: false,
-                nudge_pending: false,
                 is_wake_notice: false,
             },
         );
@@ -2807,7 +2800,7 @@ impl LocalDaemonInner {
     /// the rendered digest actually commits, so speculative flushes with no live transport
     /// never drop a notice before delivery. Never leaks message body text and never emits
     /// duplicate notices for the same receipt.
-    fn peek_unsurfaced_quarantine_notices(&self, session_id: &str) -> Vec<QuarantineDigestNotice> {
+    fn peek_unsurfaced_quarantine_receipts(&self, session_id: &str) -> Vec<String> {
         let still_quarantined: HashSet<String> = {
             let db = self.node.db();
             db.local()
@@ -2827,12 +2820,7 @@ impl LocalDaemonInner {
                 list.retain(|n| still_quarantined.contains(&n.receipt));
                 for n in list.iter() {
                     if !n.surfaced_in_batch {
-                        out.push(QuarantineDigestNotice {
-                            receipt: n.receipt.clone(),
-                            source: n.source.clone(),
-                            trust_tier: n.trust_tier.clone(),
-                            reason: n.reason.clone(),
-                        });
+                        out.push(n.receipt.clone());
                     }
                 }
                 if list.is_empty() {
@@ -2843,14 +2831,17 @@ impl LocalDaemonInner {
         out
     }
 
-    fn mark_surfaced_quarantine_notices(&self, session_id: &str, rendered: &str) {
+    fn mark_surfaced_quarantine_notices(&self, session_id: &str, receipts: &[String]) {
+        if receipts.is_empty() {
+            return;
+        }
         let mut guard = self
             .quarantine_notices
             .lock()
             .expect("quarantine_notices lock poisoned");
         if let Some(list) = guard.get_mut(session_id) {
             for n in list.iter_mut() {
-                if !n.surfaced_in_batch && rendered.contains(&n.receipt) {
+                if !n.surfaced_in_batch && receipts.contains(&n.receipt) {
                     n.surfaced_in_batch = true;
                 }
             }
@@ -3755,20 +3746,6 @@ impl LocalDaemonInner {
 
         let is_announcement =
             self.is_announcement_channel(classification.parsed.channel.as_deref());
-        // If the daemon restarted after a metadata-only wake nudge (`sessions.backend_json.nudgePending`),
-        // preserve `nudge_pending = true` for notified non-`Notify` items so the woken turn's
-        // `before_prompt_build` hook can still drain them cleanly with original urgency.
-        let nudge_pending =
-            if entry.notified && classification.effective_urgency != DeliveryUrgency::Notify {
-                let db = self.node.db();
-                db.local()
-                    .get_session(session_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|s| backend_json_flag_true(&s.backend_json, "nudgePending"))
-            } else {
-                false
-            };
         let is_wake_notice = self.is_trusted_wake_notice_entry(&entry);
         self.record_item_meta(
             session_id,
@@ -3782,7 +3759,6 @@ impl LocalDaemonInner {
                 channel: classification.parsed.channel,
                 is_announcement,
                 notified: entry.notified,
-                nudge_pending,
                 is_wake_notice,
             },
         );
@@ -3912,7 +3888,7 @@ impl LocalDaemonInner {
         self: &Arc<Self>,
         session_id: &str,
     ) -> Option<PackedDeliveryBatch> {
-        self.build_batch_for_session_scoped(session_id, false, DrainScope::PushFlush)
+        self.build_batch_for_session_scoped(session_id, DrainScope::PushFlush)
             .await
             .map(|built| built.batch)
     }
@@ -3935,7 +3911,6 @@ impl LocalDaemonInner {
     async fn build_batch_for_session_scoped(
         self: &Arc<Self>,
         session_id: &str,
-        include_nudged: bool,
         scope: DrainScope,
     ) -> Option<BuiltDigestBatch> {
         self.reconcile_session_inbox(session_id).await;
@@ -3994,9 +3969,8 @@ impl LocalDaemonInner {
                 continue;
             }
             let burst_demoted = meta.is_some_and(|m| m.burst_demoted);
-            let is_nudge_pending = meta.is_some_and(|m| m.nudge_pending);
             let already_notified = entry.notified || meta.is_some_and(|m| m.notified);
-            let treat_as_deliverable = !already_notified || (include_nudged && is_nudge_pending);
+            let treat_as_deliverable = !already_notified;
 
             let effective_urgency = if treat_as_deliverable {
                 urgency
@@ -4036,7 +4010,6 @@ impl LocalDaemonInner {
                 source: entry.source,
                 channel,
                 is_announcement,
-                text: entry.text,
                 created_at_ms: entry.received_at,
                 burst_demoted,
                 is_system_notice,
@@ -4079,20 +4052,15 @@ impl LocalDaemonInner {
             packable.push(item);
         }
 
-        let q_notices = self.peek_unsurfaced_quarantine_notices(session_id);
+        let q_notices = self.peek_unsurfaced_quarantine_receipts(session_id);
 
         if scope == DrainScope::MidTurn {
             if any_deliverable_interrupt {
                 if policy.focus_mode {
                     packable.retain(|item| !item.is_notify_tier());
                 }
-                let batch = pack_inbox_digest(
-                    session_handle.as_deref(),
-                    &packable,
-                    muted,
-                    &q_notices,
-                    &policy,
-                )?;
+                let batch =
+                    pack_inbox_digest(session_handle.as_deref(), &packable, muted, &q_notices)?;
                 return Some(BuiltDigestBatch {
                     batch,
                     is_midturn_queue_reminder: false,
@@ -4100,9 +4068,7 @@ impl LocalDaemonInner {
             }
 
             // RFC 0004 Decision #4: Tuneable periodic long-turn `PostToolUse` `Queue` reminder.
-            let interval_secs = policy
-                .midturn_queue_digest_seconds
-                .unwrap_or(self.config.midturn_queue_digest_seconds);
+            let interval_secs = self.config.midturn_queue_digest_seconds;
             if interval_secs > 0 {
                 if let Some(oldest_queue_ms) = oldest_unread_queue_ms {
                     let interval_ms = (interval_secs as i64).saturating_mul(1_000);
@@ -4120,7 +4086,6 @@ impl LocalDaemonInner {
                             &midturn_queue_reminder_items,
                             muted,
                             &q_notices,
-                            &policy,
                         )?;
                         return Some(BuiltDigestBatch {
                             batch,
@@ -4148,13 +4113,7 @@ impl LocalDaemonInner {
             }
         }
 
-        let batch = pack_inbox_digest(
-            session_handle.as_deref(),
-            &packable,
-            muted,
-            &q_notices,
-            &policy,
-        )?;
+        let batch = pack_inbox_digest(session_handle.as_deref(), &packable, muted, &q_notices)?;
         if scope == DrainScope::TurnBoundary && batch.notify_only {
             return None;
         }
@@ -4165,56 +4124,31 @@ impl LocalDaemonInner {
     }
 
     /// Commits a delivered [`PackedDeliveryBatch`]:
-    /// - Under RFC 0004, `inline_ids` & `truncated_ids` are always empty; all counted digest
-    ///   receipts are in `spilled_ids`, kept `unread` (`Pending`) in `NodeDb`, and marked
-    ///   `notified = 1` (`nudge_pending = false`) so neither hooks nor push transports duplicate
-    ///   the same digest until a new item arrives or the agent reads them via `hyp_inbox`.
+    /// - All counted digest receipts stay `unread` (`Pending`) in `NodeDb` and are marked
+    ///   `notified = 1`, so neither hooks nor push transports duplicate the same digest until a
+    ///   new item arrives or the agent reads them via `hyp_inbox`.
     fn commit_delivered_batch(&self, session_id: &str, batch: &PackedDeliveryBatch) {
         let now = self.current_time_ms();
         {
             let db = self.node.db();
-            if !batch.inline_ids.is_empty() {
-                let refs: Vec<&str> = batch.inline_ids.iter().map(String::as_str).collect();
-                let _ = db.local().acknowledge_inbox(session_id, &refs, now);
-                let _ = record_delivered_receipts(&db, session_id, &batch.inline_ids);
-            }
-            if !batch.spilled_ids.is_empty() || !batch.truncated_ids.is_empty() {
-                let notified_ids: Vec<&str> = batch
-                    .spilled_ids
-                    .iter()
-                    .chain(batch.truncated_ids.iter())
-                    .map(String::as_str)
-                    .collect();
-                mark_receipts_notified(&db, session_id, &notified_ids);
-            }
+            let notified_ids: Vec<&str> = batch.receipt_ids.iter().map(String::as_str).collect();
+            mark_receipts_notified(&db, session_id, &notified_ids);
         }
 
         // G10: Mark quarantine notices as surfaced only once their rendered digest actually commits.
-        self.mark_surfaced_quarantine_notices(session_id, &batch.rendered);
+        self.mark_surfaced_quarantine_notices(session_id, &batch.quarantined_receipts);
 
         let mut sources_delivered: HashSet<String> = HashSet::new();
-        let any_nudge_left = {
+        {
             let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
             if let Some(map) = guard.get_mut(session_id) {
-                for id in &batch.inline_ids {
-                    if let Some(m) = map.remove(id) {
-                        sources_delivered.insert(m.burst_source_key);
-                    }
-                }
-                for id in batch.spilled_ids.iter().chain(batch.truncated_ids.iter()) {
+                for id in &batch.receipt_ids {
                     if let Some(m) = map.get_mut(id) {
                         m.notified = true;
-                        m.nudge_pending = false;
                         sources_delivered.insert(m.burst_source_key.clone());
                     }
                 }
-                map.values().any(|m| m.nudge_pending)
-            } else {
-                false
             }
-        };
-        if !any_nudge_left {
-            self.set_session_nudge_pending_flag(session_id, false, now);
         }
         for src in sources_delivered {
             self.delivery.record_delivery(session_id, &src, now);
@@ -4222,69 +4156,6 @@ impl LocalDaemonInner {
         // Any successful delivery or hook drain cancels pending Tier 3 Hold retries immediately.
         self.cancel_hold_retry(session_id);
         self.cancel_activity_grace(session_id);
-        self.bump_ui_rev();
-    }
-
-    fn set_session_nudge_pending_flag(&self, session_id: &str, nudge_pending: bool, now: i64) {
-        let db = self.node.db();
-        let current = db
-            .local()
-            .get_session(session_id)
-            .ok()
-            .flatten()
-            .is_some_and(|s| backend_json_flag_true(&s.backend_json, "nudgePending"));
-        if current == nudge_pending {
-            return;
-        }
-        let mut patch = Map::new();
-        patch.insert("nudgePending".into(), json!(nudge_pending));
-        let _ = db
-            .local()
-            .merge_session_backend(session_id, &Value::Object(patch), now);
-    }
-
-    /// Records a metadata-only wake nudge (e.g. OpenClaw Gateway hooks): marks ONLY the pending
-    /// receipts included in `batch` as `notified = 1` AND `nudge_pending = true` so `flush_session`
-    /// never re-nudges in a loop (and NEVER stamps unrelated Focus-buffered `Notify` rows!),
-    /// while preserving all items as `unread` in SQLite so the woken agent either drains them via
-    /// `before_prompt_build` (`includeNudged: true`) or reads and acknowledges them via `hyp_inbox`.
-    #[allow(dead_code)]
-    fn mark_batch_notified(&self, session_id: &str, batch: &PackedDeliveryBatch) {
-        let now = now_ms();
-        let batch_ids: Vec<&str> = batch
-            .inline_ids
-            .iter()
-            .chain(batch.spilled_ids.iter())
-            .chain(batch.truncated_ids.iter())
-            .map(String::as_str)
-            .collect();
-        {
-            let db = self.node.db();
-            mark_receipts_notified(&db, session_id, &batch_ids);
-        }
-        let mut sources_notified: HashSet<String> = HashSet::new();
-        {
-            let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
-            if let Some(map) = guard.get_mut(session_id) {
-                for id in batch
-                    .inline_ids
-                    .iter()
-                    .chain(batch.spilled_ids.iter())
-                    .chain(batch.truncated_ids.iter())
-                {
-                    if let Some(m) = map.get_mut(id) {
-                        m.notified = true;
-                        m.nudge_pending = true;
-                        sources_notified.insert(m.burst_source_key.clone());
-                    }
-                }
-            }
-        }
-        self.set_session_nudge_pending_flag(session_id, true, now);
-        for src in sources_notified {
-            self.delivery.record_delivery(session_id, &src, now);
-        }
-        self.cancel_hold_retry(session_id);
         self.bump_ui_rev();
     }
 
@@ -4321,9 +4192,8 @@ impl LocalDaemonInner {
             let mut receipts = Vec::new();
             for entry in pending {
                 if let Some(meta) = meta_snapshot.get(&entry.receipt) {
-                    // Never re-clear an item that was already actively push-nudged (e.g. an unacked
-                    // VIP wake) or burst-demoted.
-                    if meta.nudge_pending || meta.burst_demoted {
+                    // Never re-clear a burst-demoted item.
+                    if meta.burst_demoted {
                         continue;
                     }
                 }
@@ -5178,7 +5048,7 @@ impl LocalDaemonInner {
             let has_non_wake_deliverable = {
                 let guard = self.item_meta.lock().expect("item_meta lock poisoned");
                 let map = guard.get(session_id);
-                batch.spilled_ids.iter().any(|receipt| {
+                batch.receipt_ids.iter().any(|receipt| {
                     !map.and_then(|m| m.get(receipt))
                         .is_some_and(|meta| meta.is_wake_notice)
                 })
@@ -6557,16 +6427,8 @@ impl LocalDaemonInner {
         let rules = parse_rules_arg(args)?;
         let focus_mode_opt = args.get("focusMode").and_then(Value::as_bool);
         let allow_vips_opt = args.get("focusAllowInterruptVips").and_then(Value::as_bool);
-        let midturn_secs_opt = args
-            .get("midturnQueueDigestSeconds")
-            .or_else(|| args.get("midturn_queue_digest_seconds"))
-            .and_then(Value::as_u64);
 
-        if !rules.is_empty()
-            || focus_mode_opt.is_some()
-            || allow_vips_opt.is_some()
-            || midturn_secs_opt.is_some()
-        {
+        if !rules.is_empty() || focus_mode_opt.is_some() || allow_vips_opt.is_some() {
             let now = now_ms();
             let policy = {
                 let db = self.node.db();
@@ -6583,9 +6445,6 @@ impl LocalDaemonInner {
                         }
                         if let Some(v) = allow_vips_opt {
                             pol.focus_allow_interrupt_vips = v;
-                        }
-                        if let Some(secs) = midturn_secs_opt {
-                            pol.midturn_queue_digest_seconds = Some(secs);
                         }
                         for r in &rules {
                             pol.upsert_rule(r.clone());
@@ -6781,24 +6640,16 @@ impl LocalDaemonInner {
         // Clean up in-memory item_meta for acknowledged receipts, reset the mid-turn queue
         // reminder timer when unread queue traffic clears, and cancel any pending Tier 3 Hold retries.
         if result.acked_count > 0 {
-            let (any_nudge_left, any_queue_left) = {
+            let any_queue_left = {
                 let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
-                if let Some(map) = guard.get_mut(session_id) {
+                guard.get_mut(session_id).is_some_and(|map| {
                     for item in &result.items {
                         map.remove(&item.receipt);
                     }
-                    (
-                        map.values().any(|m| m.nudge_pending),
-                        map.values()
-                            .any(|m| m.urgency == DeliveryUrgency::Queue && !m.burst_demoted),
-                    )
-                } else {
-                    (false, false)
-                }
+                    map.values()
+                        .any(|m| m.urgency == DeliveryUrgency::Queue && !m.burst_demoted)
+                })
             };
-            if result.unread_count == 0 || !any_nudge_left {
-                self.set_session_nudge_pending_flag(session_id, false, self.current_time_ms());
-            }
             if result.unread_count == 0 || !any_queue_left {
                 self.reset_midturn_digest_timer(session_id);
             }
@@ -8835,13 +8686,7 @@ fn clear_receipts_notified(db: &hyp_store::NodeDb, session_id: &str, receipts: &
 }
 
 fn compute_batch_idempotency_id(session_id: &str, batch: &PackedDeliveryBatch) -> String {
-    let mut ids: Vec<&str> = batch
-        .inline_ids
-        .iter()
-        .chain(batch.spilled_ids.iter())
-        .chain(batch.truncated_ids.iter())
-        .map(String::as_str)
-        .collect();
+    let mut ids: Vec<&str> = batch.receipt_ids.iter().map(String::as_str).collect();
     ids.sort_unstable();
     let material = format!("{session_id}:{}", ids.join(","));
     let digest = sha256_hex(material.as_bytes());
@@ -9672,10 +9517,6 @@ async fn handle_mailbox_drain(
     }
     daemon.clear_openclaw_session_missing(&target_session_id);
 
-    let include_nudged = packet
-        .get("includeNudged")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let scope = DrainScope::from_packet(packet);
     let mark_idle_if_empty = packet
         .get("markIdleIfEmpty")
@@ -9695,7 +9536,7 @@ async fn handle_mailbox_drain(
     }
 
     match daemon
-        .build_batch_for_session_scoped(&target_session_id, include_nudged, scope)
+        .build_batch_for_session_scoped(&target_session_id, scope)
         .await
     {
         None => {
@@ -9715,7 +9556,10 @@ async fn handle_mailbox_drain(
             if built.is_midturn_queue_reminder {
                 daemon
                     .record_midturn_digest_timestamp(&target_session_id, daemon.current_time_ms());
-                daemon.mark_surfaced_quarantine_notices(&target_session_id, &batch.rendered);
+                daemon.mark_surfaced_quarantine_notices(
+                    &target_session_id,
+                    &batch.quarantined_receipts,
+                );
             } else {
                 daemon.commit_delivered_batch(&target_session_id, &batch);
                 if scope == DrainScope::MidTurn {
@@ -9739,9 +9583,7 @@ async fn handle_mailbox_drain(
                         "text": batch.rendered,
                         "notifyOnly": batch.notify_only,
                         "mutedCount": batch.muted_count,
-                        "inlineIds": batch.inline_ids,
-                        "spilledIds": batch.spilled_ids,
-                        "truncatedIds": batch.truncated_ids,
+                        "receiptIds": batch.receipt_ids,
                     }]
                 }
             })

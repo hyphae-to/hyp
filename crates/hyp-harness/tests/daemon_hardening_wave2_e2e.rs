@@ -1564,11 +1564,11 @@ async fn g10_reconcile_quarantine_surfaces_coalesced_metadata_only_notice() {
     );
     assert!(rendered1.contains("<dm from=\"g10-notice@box/self\" count=\"1\"/>"));
     assert!(!rendered1.contains("BENIGN_MSG_1"));
-    assert!(rendered1.contains(&q_rcpt));
-    assert!(rendered1.contains("evil@ext/bot"));
     assert!(
-        rendered1.contains("ask the human to review via hyp gate review / hyp inbox approve"),
-        "G10: quarantine notice must direct agent to ask the human, not run gate review itself: {rendered1}"
+        rendered1.contains("<quarantined count=\"1\"/>")
+            && !rendered1.contains(&q_rcpt)
+            && !rendered1.contains("evil@ext/bot"),
+        "G10: digest must carry only a quarantined count: {rendered1}"
     );
     assert!(!rendered1.contains("SECRET_EXFIL_BODY_G10"));
 
@@ -1600,7 +1600,7 @@ async fn g10_reconcile_quarantine_surfaces_coalesced_metadata_only_notice() {
     assert!(rendered2.contains("<dm from=\"g10-notice@box/self\" count=\"2\"/>"));
     assert!(!rendered2.contains("BENIGN_MSG_2"));
     assert!(
-        !rendered2.contains(&q_rcpt),
+        !rendered2.contains("<quarantined"),
         "quarantine notice must be coalesced and never spam subsequent batches: {rendered2}"
     );
 

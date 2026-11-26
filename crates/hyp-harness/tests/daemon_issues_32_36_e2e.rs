@@ -120,7 +120,6 @@ impl PushTransport for RecordingNudgeTransport {
             PushOutcome::delivered()
         })
     }
-
 }
 
 // ============================================================================

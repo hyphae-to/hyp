@@ -585,7 +585,11 @@ async fn system_wake_ipc_rpc_triggers_recovery_hooks_and_fails_closed_on_bad_arg
     assert_eq!(*hook_slept.lock().unwrap(), vec![120_000]);
 
     let got = transport.wait_for_count(1, Duration::from_secs(2)).await;
-    assert!(got[0].0.contains("<system from=\"hyphae:system\" count=\"1\"/>"));
+    assert!(
+        got[0]
+            .0
+            .contains("<system from=\"hyphae:system\" count=\"1\"/>")
+    );
     assert!(unread_texts(&node, sid).contains("Host woke from sleep after 2m"));
 
     daemon.stop().await;
@@ -900,7 +904,11 @@ async fn notify_all_enrolled_opt_in_notifies_quiet_idle_enrolled_sessions_only()
     assert_eq!(report.notified_sessions, vec![sid_enrolled.to_string()]);
 
     let got = t_enrolled.wait_for_count(1, Duration::from_secs(2)).await;
-    assert!(got[0].0.contains("<system from=\"hyphae:system\" count=\"1\"/>"));
+    assert!(
+        got[0]
+            .0
+            .contains("<system from=\"hyphae:system\" count=\"1\"/>")
+    );
     assert!(
         unread_texts(&node, sid_enrolled)
             .contains("[hyphae notice] Host woke from sleep after 5m. Peer links reconnected.")

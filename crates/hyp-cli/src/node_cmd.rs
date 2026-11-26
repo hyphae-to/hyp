@@ -495,7 +495,7 @@ pub fn run_node_start(args: NodeStartArgs) -> ExitCode {
             }
         }
 
-        // Parse optional RFC 0004 `delivery.midturnQueueDigestSeconds` (or top-level key).
+        // Parse optional RFC 0004 `delivery.midturnQueueDigestSeconds`.
         match parse_midturn_queue_digest_seconds(&cfg.raw) {
             Ok(secs) => midturn_queue_digest_seconds = secs,
             Err(e) => {
@@ -2623,32 +2623,12 @@ fn parse_wake_recovery_config(raw: &Value) -> Result<WakeRecoveryConfig, String>
 }
 
 fn parse_midturn_queue_digest_seconds(raw: &Value) -> Result<u64, String> {
-    let mut secs = hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS;
-    let Some(root) = raw.as_object() else {
-        return Ok(secs);
-    };
-    if let Some(val) = root
-        .get("midturnQueueDigestSeconds")
-        .or_else(|| root.get("midturn_queue_digest_seconds"))
-    {
-        secs = val.as_u64().ok_or_else(|| {
-            "midturnQueueDigestSeconds must be a non-negative integer".to_string()
-        })?;
+    match raw.pointer("/delivery/midturnQueueDigestSeconds") {
+        None => Ok(hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS),
+        Some(val) => val.as_u64().ok_or_else(|| {
+            "delivery.midturnQueueDigestSeconds must be a non-negative integer".to_string()
+        }),
     }
-    if let Some(delivery_val) = root.get("delivery") {
-        let obj = delivery_val
-            .as_object()
-            .ok_or_else(|| "delivery must be a JSON object".to_string())?;
-        if let Some(val) = obj
-            .get("midturnQueueDigestSeconds")
-            .or_else(|| obj.get("midturn_queue_digest_seconds"))
-        {
-            secs = val.as_u64().ok_or_else(|| {
-                "delivery.midturnQueueDigestSeconds must be a non-negative integer".to_string()
-            })?;
-        }
-    }
-    Ok(secs)
 }
 
 const fn plugin_kind_str(kind: AdapterKind) -> &'static str {
@@ -4613,45 +4593,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_midturn_queue_digest_seconds_supports_nested_top_level_zero_and_rejects_bad_types() {
+    fn parse_midturn_queue_digest_seconds_defaults_accepts_zero_and_rejects_bad_types() {
+        let parse = |v: Value| parse_midturn_queue_digest_seconds(&v);
         assert_eq!(
-            parse_midturn_queue_digest_seconds(&json!({})).unwrap(),
+            parse(json!({})).unwrap(),
             hyp_node::delivery::DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS
         );
-        assert_eq!(
-            parse_midturn_queue_digest_seconds(&json!({
-                "delivery": { "midturnQueueDigestSeconds": 600 }
-            }))
-            .unwrap(),
-            600
-        );
-        assert_eq!(
-            parse_midturn_queue_digest_seconds(&json!({
-                "midturnQueueDigestSeconds": 0
-            }))
-            .unwrap(),
-            0
-        );
-        // Nested `delivery.midturnQueueDigestSeconds` takes precedence over top-level fallback.
-        assert_eq!(
-            parse_midturn_queue_digest_seconds(&json!({
-                "midturnQueueDigestSeconds": 900,
-                "delivery": { "midturnQueueDigestSeconds": 120 }
-            }))
-            .unwrap(),
-            120
-        );
-        assert!(
-            parse_midturn_queue_digest_seconds(&json!({
-                "delivery": { "midturnQueueDigestSeconds": -5 }
-            }))
-            .is_err()
-        );
-        assert!(
-            parse_midturn_queue_digest_seconds(&json!({
-                "delivery": { "midturnQueueDigestSeconds": "30m" }
-            }))
-            .is_err()
-        );
+        let nested = |v: Value| parse(json!({ "delivery": { "midturnQueueDigestSeconds": v } }));
+        assert_eq!(nested(json!(600)).unwrap(), 600);
+        assert_eq!(nested(json!(0)).unwrap(), 0);
+        assert!(nested(json!(-5)).is_err());
+        assert!(nested(json!("30m")).is_err());
     }
 }

@@ -1310,7 +1310,11 @@ mod tests {
         let transport = OpenClawTransport::new(target);
         assert_eq!(
             transport
-                .deliver_digest("<hyphae-inbox unread=\"1\" urgency=\"queue\"/>", "b1", PushMode::Queue)
+                .deliver_digest(
+                    "<hyphae-inbox unread=\"1\" urgency=\"queue\"/>",
+                    "b1",
+                    PushMode::Queue
+                )
                 .await,
             PushOutcome::reject(REASON_OPENCLAW_INVALID_SESSION_KEY)
         );

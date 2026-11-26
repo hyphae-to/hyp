@@ -103,7 +103,6 @@ impl PushTransport for RecordingTransport {
             PushOutcome::delivered()
         })
     }
-
 }
 
 /// 1. Restart flush (zero new messages) + strict at-most-once delivery for BOTH inline and

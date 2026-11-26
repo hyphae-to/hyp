@@ -336,7 +336,6 @@ impl PushTransport for HerdrTransport {
     fn deliver<'a>(&'a self, text: &'a str, mode: PushMode) -> TransportFuture<'a, PushOutcome> {
         Box::pin(async move { self.deliver_with_runner(&ProcessRunner, text, mode).await })
     }
-
 }
 
 /// Inspects `HC_TERMINAL_ID` from the current process environment.

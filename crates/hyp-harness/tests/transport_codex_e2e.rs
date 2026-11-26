@@ -615,5 +615,4 @@ mod unix_subprocess_e2e {
             "subprocess must not spawn when argv contains an interior NUL byte"
         );
     }
-
 }
