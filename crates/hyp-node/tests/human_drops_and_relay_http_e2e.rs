@@ -1602,6 +1602,29 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
         .unwrap();
     assert_eq!(revoked_rec.status, HumanAuthorityStatus::Revoked);
 
+    // Exact authenticated replay survives epoch invalidation; a fresh reduction does not.
+    node.ingest_human_revocation(&admin_rev).unwrap();
+    let stale_reduction = sign_human_revocation(
+        &HumanRevocationPayloadV1 {
+            revoked_kid: admin_kp.kid(),
+            reason: "new reduction from stale issuer".into(),
+            ..admin_rev_payload.clone()
+        },
+        &admin_kp,
+    )
+    .unwrap();
+    assert!(matches!(
+        node.ingest_human_revocation(&stale_reduction),
+        Err(NodeError::Unauthorized(_))
+    ));
+    assert!(
+        node.db()
+            .human()
+            .get_active_authority_by_kid(&admin_kp.kid())
+            .unwrap()
+            .is_some()
+    );
+
     // Subsequent drop from revoked signer fails closed (even at epoch 2)
     let c_revoked = build_directive_claim(
         "bogdan",

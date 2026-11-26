@@ -1294,10 +1294,15 @@ pub fn is_passkey_backed_admin(
     min_auth_epoch: u64,
     secrets: Option<&SecretStore>,
 ) -> bool {
-    if rec.status != HumanAuthorityStatus::Active
-        || rec.role != HumanAuthorityRole::Admin
-        || rec.auth_epoch < min_auth_epoch
-    {
+    rec.status == HumanAuthorityStatus::Active
+        && rec.auth_epoch >= min_auth_epoch
+        && is_enrolled_passkey_admin(rec, secrets)
+}
+
+/// Historical enrollment evidence; current status/epoch must be checked separately for live
+/// authority. Durable policy signatures are evidence of a previously accepted operation.
+fn is_enrolled_passkey_admin(rec: &HumanAuthorityRecord, secrets: Option<&SecretStore>) -> bool {
+    if rec.role != HumanAuthorityRole::Admin {
         return false;
     }
     if rec
@@ -1352,27 +1357,24 @@ fn verify_gate_lock_seal(
     let unverified: HumanClaimV1 = serde_json::from_str(&signed.payload)
         .map_err(|e| seal_err(format!("malformed gate_lock_seal claim payload: {e}")))?;
 
-    let min_epoch = db.human().min_auth_epoch()?;
+    // Only the fresh ceremony path may install this row. A subsequent authenticated reduction
+    // must not invalidate the already-persisted policy or turn historical evidence into current
+    // eligibility. A writer who can replace SQLite can backdate/restore signatures; that is
+    // outside the same-user database threat boundary, not solved by checking current status.
     let rec = db
         .human()
-        .get_active_authority_by_kid(&unverified.human_kid)?
-        .ok_or_else(|| {
-            seal_err(format!(
-                "gate_lock_seal signer kid '{}' is unknown or revoked",
-                unverified.human_kid
-            ))
-        })?;
-    if !is_passkey_backed_admin(&rec, min_epoch, secrets) {
-        return Err(seal_err(format!(
-            "gate_lock_seal signer '{}' ({}) is not an active Passkey-backed admin authority",
-            rec.human_id, rec.kid
-        )));
+        .get_authority(&unverified.human_id, &unverified.human_kid)?
+        .ok_or_else(|| seal_err("gate_lock_seal signer is not an enrolled authority"))?;
+    if !is_enrolled_passkey_admin(&rec, secrets) {
+        return Err(seal_err(
+            "gate_lock_seal signer is not an enrolled Passkey-backed admin",
+        ));
     }
     let pk = serde_json::from_str::<OkpJwk>(&rec.jwk_json)
         .map_err(|e| seal_err(format!("malformed authority jwk_json for lock seal: {e}")))?
         .to_ed25519()
         .map_err(|e| seal_err(format!("invalid Ed25519 authority key for lock seal: {e}")))?;
-    let (claim, action) = verify_signed_approval_claim(&signed, &pk, min_epoch)
+    let (claim, action) = verify_signed_approval_claim(&signed, &pk, rec.auth_epoch)
         .map_err(|e| seal_err(format!("gate_lock_seal Passkey signature invalid: {e}")))?;
 
     if claim.human_id != rec.human_id || claim.auth_epoch != rec.auth_epoch {

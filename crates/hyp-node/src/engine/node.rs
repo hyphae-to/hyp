@@ -8462,7 +8462,10 @@ impl UnifiedNode {
                 !db.human().list_authorities(true)?.is_empty()
             };
             if has_authorities {
-                self.ingest_human_revocation(&signed_rev)?;
+                self.apply_human_revocation(
+                    &signed_rev,
+                    caller_node == self.config.node_id.as_str(),
+                )?;
             }
         }
 
@@ -9551,92 +9554,54 @@ impl UnifiedNode {
         &self,
         signed: &SignedHumanRevocationV1,
     ) -> Result<(), NodeError> {
-        if self.db().human().requires_live_approval()? {
-            // A live-approved local revocation may be published back through this node. Permit
-            // only exact idempotent redelivery; this branch must never mutate authority state.
-            let payload: HumanRevocationPayloadV1 = serde_json::from_str(&signed.payload)?;
-            let signed_json = serde_json::to_string(signed)?;
-            let db = self.db();
-            let already_applied = db
-                .human()
-                .list_authorities_for_human(&payload.human_id, true)?
-                .iter()
-                .any(|record| {
-                    record.kid == payload.revoked_kid
-                        && record.status == HumanAuthorityStatus::Revoked
-                        && record.revocation_json.as_deref() == Some(signed_json.as_str())
-                });
-            if already_applied && db.human().min_auth_epoch()? >= payload.new_min_auth_epoch {
-                return Ok(());
-            }
-            return Err(NodeError::Unauthorized(
-                "Live local Passkey approval required for authority revocation".into(),
-            ));
-        }
+        self.apply_human_revocation(signed, false)
+    }
+
+    fn apply_human_revocation(
+        &self,
+        signed: &SignedHumanRevocationV1,
+        local_publication: bool,
+    ) -> Result<(), NodeError> {
         let preview: HumanRevocationPayloadV1 = serde_json::from_str(&signed.payload)?;
         let signed_json = serde_json::to_string(signed)?;
-        let active_issuer = {
-            let db = self.db();
-            db.human()
-                .get_active_authority_by_kid(&preview.issuer_kid)?
-        };
-        let issuer = match active_issuer {
-            Some(rec) => rec,
-            None => {
-                // Idempotent redelivery of an already-applied self-revocation by an admin key.
-                if preview.issuer_kid == preview.revoked_kid {
-                    let existing = {
-                        let db = self.db();
-                        db.human()
-                            .get_authority(&preview.human_id, &preview.revoked_kid)?
-                    };
-                    if let Some(prev) = existing {
-                        if prev.status == HumanAuthorityStatus::Revoked
-                            && prev.role == HumanAuthorityRole::Admin
-                            && prev.revocation_json.as_deref() == Some(signed_json.as_str())
-                        {
-                            let jwk: CryptoOkpJwk = serde_json::from_str(&prev.jwk_json)?;
-                            let issuer_pk = jwk.to_ed25519()?;
-                            verify_human_revocation(signed, &issuer_pk).map_err(|e| {
-                                NodeError::Unauthorized(format!(
-                                    "human revocation signature verification failed: {e}"
-                                ))
-                            })?;
-                            return Ok(());
-                        }
-                    }
-                }
-                return Err(NodeError::Unauthorized(format!(
-                    "unknown or inactive human revocation issuer kid '{}'",
-                    preview.issuer_kid
-                )));
-            }
-        };
-
-        if issuer.role != HumanAuthorityRole::Admin {
-            return Err(NodeError::Unauthorized(format!(
-                "human authority '{}' kid '{}' does not have admin role required for revocation",
-                issuer.human_id, issuer.kid
-            )));
-        }
-
-        let jwk: CryptoOkpJwk = serde_json::from_str(&issuer.jwk_json)?;
-        let issuer_pk = jwk.to_ed25519()?;
-        let verified = verify_human_revocation(signed, &issuer_pk).map_err(|e| {
-            NodeError::Unauthorized(format!(
-                "human revocation signature verification failed: {e}"
-            ))
-        })?;
-
         let db = self.db();
-        let _ = db.human().revoke_authority_monotonic(
-            &verified.human_id,
-            &verified.revoked_kid,
-            verified.new_min_auth_epoch,
-            &signed_json,
-            now_ms(),
-        )?;
-        Ok(())
+        db.with_write_transaction(|| {
+            let issuer = db.human().list_authorities(true)?.into_iter()
+                .find(|record| record.kid == preview.issuer_kid)
+                .ok_or_else(|| NodeError::Unauthorized("unknown human revocation issuer".into()))?;
+            if issuer.role != HumanAuthorityRole::Admin {
+                return Err(NodeError::Unauthorized("human revocation requires an admin issuer".into()));
+            }
+            let jwk: CryptoOkpJwk = serde_json::from_str(&issuer.jwk_json)?;
+            let verified = verify_human_revocation(signed, &jwk.to_ed25519()?).map_err(|e| {
+                NodeError::Unauthorized(format!("human revocation signature verification failed: {e}"))
+            })?;
+            let min_epoch = db.human().min_auth_epoch()?;
+            let target = db.human().get_authority(&verified.human_id, &verified.revoked_kid)?;
+            if target.as_ref().is_some_and(|record| {
+                record.status == HumanAuthorityStatus::Revoked
+                    && record.revocation_json.as_deref() == Some(signed_json.as_str())
+                    && min_epoch >= verified.new_min_auth_epoch
+            }) {
+                return Ok(());
+            }
+            if local_publication && db.human().requires_live_approval()? {
+                return Err(NodeError::Unauthorized(
+                    "local authority revocation requires fresh live approval; only an already-applied revocation may be broadcast".into(),
+                ));
+            }
+            if issuer.status != HumanAuthorityStatus::Active || issuer.auth_epoch < min_epoch {
+                return Err(NodeError::Unauthorized("inactive or stale human revocation issuer".into()));
+            }
+            db.human().revoke_authority_monotonic(
+                &verified.human_id,
+                &verified.revoked_kid,
+                verified.new_min_auth_epoch,
+                &signed_json,
+                now_ms(),
+            )?;
+            Ok(())
+        })
     }
 
     /// Signs, persists, and armors (`hcert1_`) a [`SignedNodeCertV1`] binding this node's Ed25519

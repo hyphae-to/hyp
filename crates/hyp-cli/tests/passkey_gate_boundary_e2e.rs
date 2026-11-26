@@ -1140,6 +1140,70 @@ fn live_auth_admit_binds_delegation_and_last_admin_cannot_be_revoked() {
             .unwrap()
             .is_some()
     );
+    // A verified remote self-revocation is a trust reduction even when the local CLI would
+    // refuse to retire its last approver. Historical policy evidence stays valid, not eligible.
+    let local_id = db.local().get_metadata("node_id").unwrap().unwrap();
+    let mut cfg = hyp_node::engine::NodeConfig::local(
+        hyp_proto::address::NodeId::new(local_id).unwrap(),
+        &state,
+    );
+    cfg.secret_backend = Some(SecretBackend::File);
+    let node = hyp_node::engine::UnifiedNode::open(cfg).unwrap();
+    let reduction = hyp_crypto::human::sign_human_revocation(
+        &hyp_crypto::human::HumanRevocationPayloadV1 {
+            v: 1,
+            human_id: admin.human_id.clone(),
+            revoked_kid: admin.kid(),
+            new_min_auth_epoch: 1,
+            revoked_at: hyp_crypto::rfc3339::format_rfc3339_millis(hyp_store::now_ms()),
+            reason: "retired remotely".into(),
+            issuer_kid: admin.kid(),
+        },
+        &admin.ed_kp,
+    )
+    .unwrap();
+    node.ingest_human_revocation(&reduction).unwrap();
+    let doctor = isolated_cmd(home)
+        .args([
+            "doctor",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let status = parse_json_stdout(&doctor);
+    assert_eq!(status["data"]["gate"]["gatePolicySig"], "OK");
+    assert!(
+        status["data"]["gate"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no eligible Passkey Admin")
+    );
+    let denied = isolated_cmd(home)
+        .args([
+            "gate",
+            "apply",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let denied = parse_json_stdout(&denied);
+    assert_eq!(denied["error"]["code"], "PASSKEY_AUTHORITY_REQUIRED");
+    assert!(
+        denied["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|next| !next.as_str().unwrap_or_default().contains("auth init"))
+    );
+    assert_eq!(db.human().get_gate_lock_seal().unwrap(), before);
 }
 
 #[test]
@@ -1257,4 +1321,164 @@ fn legacy_hmac_policy_migrates_through_first_web_enrollment_and_separate_live_ap
     );
     assert!(migrated["gate"]["policy_signature"].is_null());
     assert!(db.human().get_gate_lock_seal().unwrap().is_some());
+}
+
+#[test]
+fn final_writer_lock_rechecks_prestate_after_the_browser_ceremony() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let state = home.join("state");
+    let config = state.join("node.json");
+    let admin = TestPasskeyAdmin::generate("admin", "passkey");
+    admin.enroll_via_web(home, &state, Some(&config));
+    let member = Ed25519KeyPair::generate().unwrap();
+    let mut command = isolated_cmd(home);
+    command
+        .args([
+            "auth",
+            "add",
+            "--human-id",
+            "member",
+            "--label",
+            "member",
+            "--role",
+            "signer",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--local",
+            "--no-open",
+            "--ttl",
+            "30",
+            "--json",
+        ])
+        .stdin(Stdio::piped());
+    let mut process = ManagedProcess::spawn("serialized authority commit", &mut command);
+    process
+        .take_stdin()
+        .unwrap()
+        .write_all(serde_json::to_string(&member.to_jwk()).unwrap().as_bytes())
+        .unwrap();
+    let url = loop {
+        let line = process
+            .try_read_stderr_line(Duration::from_secs(10))
+            .unwrap();
+        if let Some((_, url)) = line.split_once("Hyphae Passkey approval URL: ") {
+            break url.to_owned();
+        }
+    };
+    let fragment = TestPasskeyAdmin::parse_approval_url(&url);
+    let action = admin.open_approval_from_fragment(&fragment);
+    let locker = NodeDb::open(state.join("node.sqlite")).unwrap();
+    let concurrent = Ed25519KeyPair::generate().unwrap();
+    locker
+        .with_write_transaction(|| {
+            let (token, _) = admin.seal_approval(&fragment, &action);
+            let (status, response) =
+                TestPasskeyAdmin::post_approval_to_fragment(&fragment, &token, "https://hyphae.to");
+            assert_eq!(status, 201, "{response}");
+            loop {
+                let line = process
+                    .try_read_stderr_line(Duration::from_secs(10))
+                    .unwrap();
+                if line.contains("Applying approved operation...") {
+                    break;
+                }
+            }
+            // The ceremony's after-check already passed. This commit occurs before its blocked final
+            // writer can proceed, so only the serialized final check can reject the stale request.
+            locker
+                .human()
+                .upsert_authority(
+                    &hyp_store::HumanAuthorityInput {
+                        human_id: "concurrent".into(),
+                        kid: concurrent.kid(),
+                        label: "concurrent".into(),
+                        role: hyp_store::HumanAuthorityRole::Signer,
+                        jwk_json: serde_json::to_string(&concurrent.to_jwk()).unwrap(),
+                        enc_jwk_json: None,
+                        prf_salt: None,
+                        auth_epoch: 1,
+                    },
+                    hyp_store::now_ms(),
+                )
+                .unwrap();
+            Ok::<(), hyp_store::StoreError>(())
+        })
+        .unwrap();
+
+    let (status, result) = process.wait_json_output(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(result["error"]["code"], "APPROVAL_COMMIT_FAILED");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("prestate changed before commit")
+    );
+    assert!(
+        locker
+            .human()
+            .get_active_authority_by_kid(&member.kid())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        locker
+            .human()
+            .get_active_authority_by_kid(&concurrent.kid())
+            .unwrap()
+            .is_some()
+    );
+    assert!(locker.human().get_gate_lock_seal().unwrap().is_none());
+    let replay_count: i64 = locker
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM human_claim_nonces WHERE kind='approval'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(replay_count, 0);
+}
+
+#[test]
+fn gate_apply_resolves_legacy_config_identity_from_sqlite() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let state = home.join("state");
+    let config = state.join("node.json");
+    let admin = TestPasskeyAdmin::generate("admin", "passkey");
+    admin.enroll_via_web(home, &state, Some(&config));
+    fs::write(
+        &config,
+        json!({"nodeId":"legacy@box", "gate":{}}).to_string(),
+    )
+    .unwrap();
+    let mut raw: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    let node_id = raw.as_object_mut().unwrap().remove("nodeId").unwrap();
+    NodeDb::open(state.join("node.sqlite"))
+        .unwrap()
+        .local()
+        .set_metadata("node_id", node_id.as_str().unwrap())
+        .unwrap();
+    fs::write(&config, serde_json::to_vec(&raw).unwrap()).unwrap();
+    let (code, result, stderr, action) = admin.run_and_approve_json(
+        home,
+        &[
+            "gate",
+            "apply",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--local",
+            "--no-open",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{result}: {stderr}");
+    assert_eq!(action.node_id, node_id.as_str().unwrap());
 }

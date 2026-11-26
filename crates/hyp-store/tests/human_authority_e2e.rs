@@ -1486,3 +1486,28 @@ fn pending_bootstrap_cannot_inject_after_first_passkey_enrollment_or_revocation(
     assert_eq!(records[0].kid, "passkey_key");
     assert_eq!(records[0].status, HumanAuthorityStatus::Revoked);
 }
+
+#[test]
+fn nested_store_savepoints_exist_only_inside_explicit_write_scope() {
+    let db = NodeDb::open_in_memory().unwrap();
+    let first = sample_authority("first", "first_key", HumanAuthorityRole::Signer, 1);
+    db.connection().execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        db.human().upsert_authority(&first, T0).is_err(),
+        "ordinary store calls must not silently join arbitrary transactions"
+    );
+    db.connection().execute_batch("ROLLBACK").unwrap();
+    db.with_write_transaction(|| {
+        db.human().upsert_authority(&first, T0)?;
+        db.with_write_transaction(|| {
+            db.human().upsert_authority(
+                &sample_authority("second", "second_key", HumanAuthorityRole::Signer, 1),
+                T0,
+            )?;
+            Ok::<(), StoreError>(())
+        })?;
+        Ok::<(), StoreError>(())
+    })
+    .unwrap();
+    assert_eq!(db.human().list_authorities(true).unwrap().len(), 2);
+}

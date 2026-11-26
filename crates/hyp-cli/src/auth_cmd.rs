@@ -12,8 +12,8 @@
 
 use crate::approval::{
     ApprovalCeremonyArgs, CeremonyOutcome, VerifiedApproval, base_approval_action,
-    has_passkey_history, inspect_policy_integrity, next_seal_seq, persist_passkey_gate_seal,
-    run_passkey_approval_ceremony,
+    execute_approved_operation, has_passkey_history, inspect_policy_integrity, next_seal_seq,
+    persist_passkey_gate_seal, run_passkey_approval_ceremony,
 };
 use crate::config_file::{
     ct_eq, default_node_id, ensure_dir, load_node_or_legacy_config, open_secret_store,
@@ -1954,29 +1954,34 @@ fn run_auth_add(
         }
     }
 
-    let rec = match db.human().upsert_authority(&auth_input, now_ms()) {
-        Ok(r) => r,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    let (Some(reseal), Some(verified)) = (reseal, approved.as_deref()) else {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "PASSKEY_AUTHORITY_REQUIRED",
+            "Live approval is required",
+            None,
+        );
     };
-
-    let node_cert_stored = if let Some(ref cert) = verified_bundle_cert {
-        if let Err(e) = persist_verified_node_cert(&db, cert) {
-            return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e, None);
-        }
-        true
-    } else {
-        false
-    };
-
-    let approved_by_kid = approved.as_ref().map(|v| v.kid.clone());
-    let approved_seal_seq = match (reseal, approved.as_deref()) {
-        (Some(reseal), Some(verified)) => match reseal.apply(&db, &config_write, verified) {
-            Ok(seq) => Some(seq),
-            Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
-            }
-        },
-        _ => None,
+    let approved_by_kid = Some(verified.kid.clone());
+    let committed = execute_approved_operation(&config_read, &config_write, &db, verified, || {
+        let rec = db
+            .human()
+            .upsert_authority(&auth_input, now_ms())
+            .map_err(|e| e.to_string())?;
+        let node_cert_stored = if let Some(ref cert) = verified_bundle_cert {
+            persist_verified_node_cert(&db, cert)?;
+            true
+        } else {
+            false
+        };
+        let seq = reseal.apply(&db, &config_write, verified)?;
+        Ok((rec, node_cert_stored, Some(seq)))
+    });
+    let (rec, node_cert_stored, approved_seal_seq) = match committed {
+        Ok(result) => result,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "APPROVAL_COMMIT_FAILED", e, None),
     };
     let gate_resigned = approved_seal_seq.is_some();
     let digest = db.human().authorities_digest().ok();
@@ -2426,12 +2431,35 @@ fn run_auth_revoke(
     }
     let approved_by_kid = approved.as_ref().map(|v| v.kid.clone());
 
-    let mut effective_min = current_min;
-    for t in &targets {
-        let rev_json = if t.kid == target.kid {
-            match &signed_revocation {
-                Some(sr) => serde_json::to_string(sr).unwrap_or_else(|_| "{}".to_string()),
-                None => json!({
+    let (Some(reseal), Some(verified)) = (reseal, approved.as_deref()) else {
+        return emit_error(
+            cmd,
+            as_json,
+            EXIT_ERROR,
+            "PASSKEY_AUTHORITY_REQUIRED",
+            "Live approval is required",
+            None,
+        );
+    };
+    let committed = execute_approved_operation(&config_read, &config_write, &db, verified, || {
+        let mut effective_min = current_min;
+        for t in &targets {
+            let rev_json = if t.kid == target.kid {
+                match &signed_revocation {
+                    Some(sr) => serde_json::to_string(sr).unwrap_or_else(|_| "{}".to_string()),
+                    None => json!({
+                        "v": 1,
+                        "humanId": t.human_id,
+                        "revokedKid": t.kid,
+                        "newMinAuthEpoch": new_min,
+                        "revokedAt": revoked_at,
+                        "reason": reason,
+                        "approvedByKid": approved_by_kid,
+                    })
+                    .to_string(),
+                }
+            } else {
+                json!({
                     "v": 1,
                     "humanId": t.human_id,
                     "revokedKid": t.kid,
@@ -2440,86 +2468,37 @@ fn run_auth_revoke(
                     "reason": reason,
                     "approvedByKid": approved_by_kid,
                 })
-                .to_string(),
-            }
-        } else {
-            json!({
-                "v": 1,
-                "humanId": t.human_id,
-                "revokedKid": t.kid,
-                "newMinAuthEpoch": new_min,
-                "revokedAt": revoked_at,
-                "reason": reason,
-                "approvedByKid": approved_by_kid,
-            })
-            .to_string()
-        };
-        match db
-            .human()
-            .revoke_authority_monotonic(&t.human_id, &t.kid, new_min, &rev_json, now)
-        {
-            Ok(m) => effective_min = effective_min.max(m),
-            Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "REVOKE_FAILED",
-                    e.to_string(),
-                    None,
-                );
-            }
-        }
-    }
-
-    let mut revoked_peers: Vec<String> = Vec::new();
-    if cascade {
-        if let Err(e) = db
-            .human()
-            .set_delegation_enabled(&target.human_id, false, now)
-        {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "REVOKE_FAILED",
-                e.to_string(),
-                None,
+                .to_string()
+            };
+            effective_min = effective_min.max(
+                db.human()
+                    .revoke_authority_monotonic(&t.human_id, &t.kid, new_min, &rev_json, now)
+                    .map_err(|e| e.to_string())?,
             );
         }
-        match db
-            .peers()
-            .revoke_peers_admitted_by_human(&target.human_id, now)
-        {
-            Ok(peers) => {
-                for pid in &peers {
-                    let cred = crate::pair::credential_secret_name("peer-auth", pid);
-                    let _ = secrets.delete(&cred);
-                }
-                revoked_peers = peers;
-            }
-            Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "REVOKE_FAILED",
-                    e.to_string(),
-                    None,
-                );
-            }
-        }
-    }
-
-    let approved_seal_seq = match (reseal, approved.as_deref()) {
-        (Some(reseal), Some(verified)) => match reseal.apply(&db, &config_write, verified) {
-            Ok(seq) => Some(seq),
-            Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
-            }
-        },
-        _ => None,
+        require_revocation_survivor(&db, effective_min, &secrets)?;
+        let revoked_peers = if cascade {
+            db.human()
+                .set_delegation_enabled(&target.human_id, false, now)
+                .map_err(|e| e.to_string())?;
+            db.peers()
+                .revoke_peers_admitted_by_human(&target.human_id, now)
+                .map_err(|e| e.to_string())?
+        } else {
+            Vec::new()
+        };
+        let seq = reseal.apply(&db, &config_write, verified)?;
+        Ok((effective_min, revoked_peers, Some(seq)))
+    });
+    let (effective_min, revoked_peers, approved_seal_seq) = match committed {
+        Ok(result) => result,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "APPROVAL_COMMIT_FAILED", e, None),
     };
+    // External effects and live publication/reload happen only after the durable transaction.
+    for pid in &revoked_peers {
+        let cred = crate::pair::credential_secret_name("peer-auth", pid);
+        let _ = secrets.delete(&cred);
+    }
     let gate_resigned = approved_seal_seq.is_some();
 
     let digest = db.human().authorities_digest().ok();
@@ -3877,28 +3856,32 @@ fn run_auth_admit(
         Err(code) => return code,
     };
     let now = now_ms();
-    let auth_rec = match db.human().upsert_authority(&input, now) {
-        Ok(r) => r,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
+    let committed =
+        execute_approved_operation(&config_write, &config_write, &db, &verified, || {
+            let authority = db
+                .human()
+                .upsert_authority(&input, now)
+                .map_err(|e| e.to_string())?;
+            let policy = db
+                .human()
+                .upsert_delegation_policy(
+                    &HumanDelegationPolicyInput {
+                        human_id: human_id.clone(),
+                        node_prefix: node_prefix.clone(),
+                        scopes: scopes.clone(),
+                        max_devices,
+                        delegation_enabled: true,
+                    },
+                    now,
+                )
+                .map_err(|e| e.to_string())?;
+            reseal.apply(&db, &config_write, &verified)?;
+            Ok((authority, policy))
+        });
+    let (auth_rec, policy) = match committed {
+        Ok(result) => result,
+        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "APPROVAL_COMMIT_FAILED", e, None),
     };
-
-    let policy = match db.human().upsert_delegation_policy(
-        &HumanDelegationPolicyInput {
-            human_id: human_id.clone(),
-            node_prefix: node_prefix.clone(),
-            scopes: scopes.clone(),
-            max_devices,
-            delegation_enabled: true,
-        },
-        now,
-    ) {
-        Ok(p) => p,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
-
-    if let Err(e) = reseal.apply(&db, &config_write, &verified) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "GATE_POLICY_SYNC_FAILED", e, None);
-    }
     let digest = db.human().authorities_digest().ok();
     drop(db);
 
@@ -4640,10 +4623,81 @@ async fn handle_enroll_callback(
     )
 }
 
+fn require_revocation_survivor(
+    db: &NodeDb,
+    min_epoch: u64,
+    secrets: &SecretStore,
+) -> Result<(), String> {
+    let survivor = db
+        .human()
+        .list_active_authorities()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|record| hyp_node::gates::is_passkey_backed_admin(record, min_epoch, Some(secrets)));
+    if survivor {
+        Ok(())
+    } else {
+        Err("Revocation would leave no active Passkey Admin at commit".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gate_cmd::confirm_interactive_with;
+
+    #[test]
+    fn revocation_rechecks_survivor_after_status_changes_excluded_from_digest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = NodeDb::open(tmp.path().join("node.sqlite")).unwrap();
+        let secrets = SecretStore::new(tmp.path(), hyp_crypto::keystore::SecretBackend::File);
+        for human in ["target", "survivor"] {
+            let key = Ed25519KeyPair::generate().unwrap();
+            db.human()
+                .upsert_authority(
+                    &HumanAuthorityInput {
+                        human_id: human.into(),
+                        kid: key.kid(),
+                        label: human.into(),
+                        role: HumanAuthorityRole::Admin,
+                        jwk_json: serde_json::to_string(&key.to_jwk()).unwrap(),
+                        enc_jwk_json: None,
+                        prf_salt: Some("passkey-fixture".into()),
+                        auth_epoch: 1,
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        let records = db.human().list_active_authorities().unwrap();
+        let target = records.iter().find(|a| a.human_id == "target").unwrap();
+        let survivor = records.iter().find(|a| a.human_id == "survivor").unwrap();
+        let projected_digest = db.human().authorities_digest().unwrap();
+        // The projected survivor disappears before the ceremony's snapshot. Status is
+        // deliberately excluded from the signed identity digest, so digest checks cannot help.
+        db.human()
+            .revoke_authority_monotonic("survivor", &survivor.kid, 1, "{}", now_ms())
+            .unwrap();
+        assert_eq!(db.human().authorities_digest().unwrap(), projected_digest);
+        let result = db.with_write_transaction(|| {
+            db.human()
+                .revoke_authority_monotonic("target", &target.kid, 1, "{}", now_ms())?;
+            require_revocation_survivor(&db, 1, &secrets)
+                .map_err(hyp_store::StoreError::InvalidState)
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no active Passkey Admin")
+        );
+        assert!(
+            db.human()
+                .get_active_authority_by_kid(&target.kid)
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn auth_add_and_revoke_confirm_summaries_include_key_fields_and_locked_warning() {

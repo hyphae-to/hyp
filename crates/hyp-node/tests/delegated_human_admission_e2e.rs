@@ -617,7 +617,7 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
 }
 
 #[tokio::test]
-async fn passkey_managed_nodes_reject_offline_authority_writers_with_unchanged_state() {
+async fn passkey_managed_nodes_allow_signed_reductions_but_reject_offline_grants() {
     use hyp_crypto::human::{HumanRevocationPayloadV1, sign_human_revocation};
     use hyp_store::{HumanAuthorityInput, HumanAuthorityRole};
     let legacy_dir = TempDir::new().unwrap();
@@ -687,11 +687,16 @@ async fn passkey_managed_nodes_reject_offline_authority_writers_with_unchanged_s
     )
     .unwrap();
     legacy.ingest_human_revocation(&revocation).unwrap();
+    managed.ingest_human_revocation(&revocation).unwrap();
+    assert!(
+        managed
+            .db()
+            .human()
+            .get_active_authority_by_kid(&target.kid())
+            .unwrap()
+            .is_none()
+    );
     let before = managed.db().human().list_authorities(true).unwrap();
-    assert!(matches!(
-        managed.ingest_human_revocation(&revocation),
-        Err(NodeError::Unauthorized(_))
-    ));
     assert!(matches!(
         managed
             .revoke_human_authority_cascade("member", None, false, "{}")
