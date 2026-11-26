@@ -84,7 +84,8 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     let legacy_command = config_root.join("commands/hyphae.md");
     let stock_command = include_str!("../../../plugins/opencode/commands/hyp.md");
     fs::create_dir_all(legacy_command.parent().unwrap()).unwrap();
-    fs::write(&legacy_command, stock_command.replace("\n", "\r\n")).unwrap();
+    let stock_crlf = stock_command.replace("\r\n", "\n").replace("\n", "\r\n");
+    fs::write(&legacy_command, stock_crlf).unwrap();
 
     // 1. `--dry-run` must NOT mutate existing config or write plugin/command/skill.
     let dry = isolated_cmd(&home)
