@@ -4119,7 +4119,7 @@ fn shared_setup_skill_path(home: &Path) -> PathBuf {
     home.join(".agents/skills/hyp-setup/SKILL.md")
 }
 
-fn write_setup_skill(home: &Path, path: &Path) -> Result<(), String> {
+fn is_stock_legacy_setup_skill(text: &str) -> bool {
     // The stock setup skill predates the managed runtime marker.
     const LEGACY_DIGESTS: &[&str] = &[
         "4a336e5b76253e513b4f57edae22cc9fbb2640080294c5cf0622912c1fb02186",
@@ -4134,15 +4134,50 @@ fn write_setup_skill(home: &Path, path: &Path) -> Result<(), String> {
         "ad2850fc1eff8fe439e8772156539b090ca2b81f3edcd2ffb31863b088d22959",
         "5eb5ad185bb59180311acdbf88e8db27bd98c8e86cb73250279e292c1f37a297",
     ];
-    crate::skill_render::write_managed_skill(path, HYPHAE_SETUP_SKILL_MD, true)?;
-    let stock =
-        |text: &str| LEGACY_DIGESTS.contains(&hyp_store::sha256_hex(text.as_bytes()).as_str());
-    crate::skill_render::retire_legacy_skill(path, "hyphae-setup", stock)?;
+    LEGACY_DIGESTS.contains(&hyp_store::sha256_hex(text.as_bytes()).as_str())
+}
+
+fn legacy_setup_skills(home: &Path, path: &Path) -> Vec<PathBuf> {
+    let local = crate::skill_render::legacy_skill_path(path, "hyphae-setup");
     if path == shared_setup_skill_path(home) {
-        let old_codex = home.join(".codex/skills/hyp-setup/SKILL.md");
-        crate::skill_render::retire_legacy_skill(&old_codex, "hyphae-setup", stock)?;
+        vec![local, home.join(".codex/skills/hyphae-setup/SKILL.md")]
+    } else {
+        vec![local]
+    }
+}
+
+fn write_setup_skill(home: &Path, path: &Path) -> Result<(), String> {
+    crate::skill_render::write_managed_skill(path, HYPHAE_SETUP_SKILL_MD, true)?;
+    for old in legacy_setup_skills(home, path) {
+        crate::skill_render::retire_legacy_skill(&old, is_stock_legacy_setup_skill)?;
     }
     Ok(())
+}
+
+pub(crate) fn migrate_installed_setup_skills(
+    home: &Path,
+    explicit_home: bool,
+    claude_config_dir: Option<&Path>,
+    warnings: &mut Vec<String>,
+) {
+    let mut seen = BTreeSet::new();
+    for kind in HarnessKind::ALL {
+        if let Some((primary, extras)) =
+            skill_paths_for_kind(kind, home, explicit_home, claude_config_dir)
+        {
+            for installed in std::iter::once(primary).chain(extras) {
+                if seen.insert(canonical_dedup_key(&installed)) {
+                    crate::skill_render::migrate_installed_skill(
+                        &installed,
+                        &legacy_setup_skills(home, &installed),
+                        is_stock_legacy_setup_skill,
+                        |_| HYPHAE_SETUP_SKILL_MD.to_owned(),
+                        warnings,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Entrypoint for `hyp onboard --install-skill`.

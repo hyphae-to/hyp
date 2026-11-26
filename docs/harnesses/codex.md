@@ -11,6 +11,8 @@ What this configures:
 - Hooks (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`) in `~/.codex/hooks.json`.
 - Tailored skill in `~/.agents/skills/hyp-mesh/SKILL.md`.
 
+Codex and T3 share the runtime and setup skills in `~/.agents/skills`. A normal `hyp update` moves managed older copies to these paths and reports customized copies that it preserves.
+
 For Codex Desktop, run `hyp onboard --assist codex-desktop` to preview and merge `~/.codex/config.toml`, then **restart Codex Desktop**. Both setup paths use the same MCP entry and keep any socket set by `hyp setup --harness codex --socket <path>`.
 
 ## Caller Identity & Wakeups

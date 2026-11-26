@@ -247,7 +247,9 @@ pub fn resolve_effective_node_id(loaded: Option<&LoadedNodeFile>, db: Option<&No
     default_node_id()
 }
 
-pub use hyp_node::atomic_file::{ensure_dir, write_atomic_file, write_atomic_json};
+pub use hyp_node::atomic_file::{
+    ensure_dir, write_atomic_file, write_atomic_file_new, write_atomic_json,
+};
 
 /// Ensures a baseline v2 `node.json` object has required top-level fields without clobbering
 /// existing user configuration.

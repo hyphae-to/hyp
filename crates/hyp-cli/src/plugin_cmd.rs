@@ -1204,7 +1204,8 @@ fn complete_harness_rename(
                 .try_for_each(|command| command.retire_legacy(&root.join("commands"), false))
                 .and_then(|()| {
                     let installed = root.join("skills/hyp-mesh/SKILL.md");
-                    crate::skill_render::retire_legacy_skill(&installed, "hyphae", |text| {
+                    let legacy = crate::skill_render::legacy_skill_path(&installed, "hyphae");
+                    crate::skill_render::retire_legacy_skill(&legacy, |text| {
                         const LEGACY_DIGESTS: &[&str] = &[
                             "866d50fa55e5c0a6c9f7814ba4400cd8f4de69e96ac7fa1f960ea7f53a14d597",
                             "78242d6f1d0fda4ad91547137353beb874e40cb06643d967f19ac6450fe275e4",
@@ -3277,6 +3278,18 @@ fn run_plugin_update(
     let mut warnings: Vec<String> = Vec::new();
     let mut next: Vec<String> = Vec::new();
 
+    // Older updaters call this command on the new binary after a successful swap.
+    if all_flag && !dry_run {
+        if let Some(home) = resolved_home.as_deref() {
+            crate::setup::migrate_installed_harness_skills(
+                home,
+                explicit_home,
+                claude_config_dir_arg,
+                &mut warnings,
+            );
+        }
+    }
+
     for spec in &target_specs {
         let insp = inspect_plugin(
             spec,
@@ -3381,7 +3394,7 @@ fn run_plugin_update(
         }
     }
 
-    // ZERO-NETWORK, ZERO-WRITE FAST PATH when nothing needs updating or on `--dry-run`!
+    // No plugin downloads when queued changes are absent or this is a dry run.
     if to_update.is_empty() || dry_run {
         let planned: Vec<String> = to_update.iter().map(|i| i.spec.id.to_string()).collect();
         let summary = if dry_run && !planned.is_empty() {
