@@ -14,11 +14,12 @@ use http::Uri;
 use http::{Method, Request, header};
 #[cfg(unix)]
 use http_body_util::{BodyExt, Empty};
+#[cfg(any(unix, test))]
+use hyp_proto::jcs::sha256_hex;
 #[cfg(unix)]
 use hyper::body::Bytes;
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
-use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
@@ -196,14 +197,6 @@ pub fn validate_uninstall_script_body(bytes: &[u8]) -> Result<String, String> {
         ));
     }
     Ok(text.to_string())
-}
-
-/// Computes lowercase hex SHA-256 digest of `bytes`.
-#[cfg_attr(not(unix), allow(dead_code))]
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 /// Builds the exact flag list forwarded to `uninstall.sh`.

@@ -7,10 +7,10 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use hyp_proto::jcs::sha256_hex;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
 
@@ -58,13 +58,6 @@ pub fn uuid_v4() -> String {
         bytes[14],
         bytes[15],
     )
-}
-
-/// Computes lowercase hex SHA-256 of arbitrary bytes.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 /// Formats epoch milliseconds as an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SS.sssZ`).
