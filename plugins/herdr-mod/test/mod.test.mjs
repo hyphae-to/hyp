@@ -700,3 +700,42 @@ test("static Herdr mod quality gates & file parity", () => {
 
   assert.equal(findLayoutNode({ id: "root", children: [{ id: "hyphae" }] }, "hyphae")?.id, "hyphae");
 });
+
+test("KV snapshots and cursor navigation keep values behind an explicit preview", async () => {
+  const { KvBrowser, buildKvCommandArgs, parseKvInspection } = await import("../mods/hyphae-panel/kv-view.js");
+  const key = "-draft/alpha\u202e";
+  const entry = { key, version: 2, updatedBy: "alice", updatedAt: 2, expiresAt: null, sizeBytes: 24, value: "NOT_METADATA" };
+  const raw = { namespaces: [{ name: "shared", originNode: "laptop", entryCount: 1, entries: [entry] }] };
+  const snapshot = parseSnapshotJson(JSON.stringify({ kv: raw }));
+  assert.equal(snapshot.kv.namespaces[0].entries[0].key, key);
+  assert.ok(!JSON.stringify(snapshot).includes("NOT_METADATA"));
+  assert.match(formatPillMetrics({ enrolled: true, unreadBreakdown: { kv: 2 } }).wideLabel, /2 KV/);
+  assert.equal(buildKvCommandArgs("preview", { originNode: "laptop", namespace: "shared", key: "bad\nkey" }), null);
+  const previewArgs = (key) => buildKvCommandArgs("preview", { originNode: "laptop", namespace: "shared", key });
+  assert.equal(previewArgs("nested/./key"), null);
+  assert.equal(previewArgs("é".repeat(129)), null);
+  assert.equal(previewArgs("folder\\key").at(-1), "--key=folder\\key");
+  assert.equal(previewArgs("é".repeat(128)).at(-1), "--key=" + "é".repeat(128));
+
+  const browser = new KvBrowser();
+  const calls = [];
+  const run = async (args) => {
+    calls.push(args);
+    if (args[1] === "keys") return { entries: [entry], nextAfter: key };
+    return { text: "\u001b[31mvisible\u202e\n" + "x".repeat(5000), version: 2 };
+  };
+  await browser.open(parseKvInspection(raw).namespaces[0], run);
+  assert.equal(browser.preview, null);
+  assert.deepEqual(calls[0], ["kv", "keys", "--node=laptop", "--ns=shared", "--json"]);
+  await browser.turnPage(true, run);
+  assert.equal(calls[1].at(-1), "--after=" + key);
+  await browser.show(key, run, sanitizeUiText);
+  assert.deepEqual(calls[2], ["kv", "preview", "--node=laptop", "--ns=shared", "--json", "--key=" + key]);
+  assert.ok(browser.preview.text.startsWith("visible\n"));
+  assert.ok(browser.preview.text.length <= 4096);
+  assert.equal(browser.preview.truncated, true);
+  assert.ok(!browser.preview.text.includes("\u001b"));
+  assert.ok(!browser.preview.text.includes("\u202e"));
+  browser.reset();
+  assert.equal(browser.preview, null);
+});

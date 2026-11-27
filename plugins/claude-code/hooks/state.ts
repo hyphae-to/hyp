@@ -9,7 +9,9 @@
 //   - Builds strict argv arrays (never shell strings) for `hyp session` quick controls,
 //     inserting `--` before any positional argument starting with `-`.
 
-export type PanelTab = 'subs' | 'queue' | 'rules' | 'mesh';
+import { parseKvInspection, type KvInspection } from './kv-view.mjs';
+
+export type PanelTab = 'subs' | 'queue' | 'rules' | 'mesh' | 'kv';
 
 export interface DaemonSummary {
   online: boolean;
@@ -128,6 +130,7 @@ export interface HyphaeSnapshot {
   updatedAt: number;
   daemon: DaemonSummary | null;
   sessions: SessionSummary[];
+  kv: KvInspection | null;
 }
 
 export interface ResolvedSessionResult {
@@ -563,6 +566,7 @@ export function parseSnapshotJson(rawText: string): HyphaeSnapshot | null {
     updatedAt: asNum(root.updatedAt, 0),
     daemon,
     sessions,
+    kv: parseKvInspection(root.kv),
   };
 }
 
@@ -907,5 +911,6 @@ export function parsePanelCommandArgs(
   if (first === 'queue' || first === 'inbox') return { action: 'open', tab: 'queue' };
   if (first === 'rules' || first === 'mutes') return { action: 'open', tab: 'rules' };
   if (first === 'mesh' || first === 'channels') return { action: 'open', tab: 'mesh' };
+  if (first === 'kv') return { action: 'open', tab: 'kv' };
   return { action: 'open' };
 }

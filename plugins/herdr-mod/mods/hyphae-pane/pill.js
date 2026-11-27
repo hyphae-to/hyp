@@ -1,6 +1,6 @@
 // Standalone composable Hyphae status pill for Herdr pane headers.
 //
-// Custom pane header mods can copy `pill.js`, `shared-client.js`, and `hyphae.svg`
+// Custom pane header mods can copy `pill.js`, `shared-client.js`, `kv-view.js`, and `hyphae.svg`
 // into their own mod folder (Herdr sandboxes JS module imports per mod folder)
 // and render the pill side-by-side with other widgets:
 //

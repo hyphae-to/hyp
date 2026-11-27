@@ -1,4 +1,5 @@
 import type { Register } from 'claude-code';
+import { KvBrowser, combineKvInspection, readKvCommandData } from './kv-view.mjs';
 import {
   buildSessionControlArgs,
   formatPersistentStatusLine,
@@ -28,6 +29,9 @@ type StatusStripMode = 'auto' | 'on' | 'off';
 
 interface PanelUiState {
   tab: PanelTab;
+  kv: KvBrowser;
+  kvOffset: number;
+  kvRevision: number | null;
   selectedSessionId: string | null;
   statusMode: StatusStripMode;
   lastStripKey: string;
@@ -39,6 +43,9 @@ interface PanelUiState {
 function createInitialState(): PanelUiState {
   return {
     tab: 'subs',
+    kv: new KvBrowser(),
+    kvOffset: 0,
+    kvRevision: null,
     selectedSessionId: null,
     statusMode: 'auto',
     lastStripKey: '',
@@ -219,7 +226,7 @@ export const register: Register = (on) => {
       name: COMMAND_NAME,
       description:
         'Open the Hyphae side panel (metadata-only inspector, bridges & controls)',
-      argumentHint: '[subs|queue|rules|mesh|status on|off|close]',
+      argumentHint: '[subs|queue|rules|mesh|kv|status on|off|close]',
       immediate: true,
     });
 
@@ -236,6 +243,7 @@ export const register: Register = (on) => {
     const parsed = parsePanelCommandArgs(e.args);
 
     if (parsed.action === 'close') {
+      uiState.kv.reset();
       stopPaneRefreshTimer();
       await $.ui.close({ id: PANE_ID });
       return { text: 'Closed Hyphae side panel.', isTextDisplayOnly: true };
@@ -252,7 +260,9 @@ export const register: Register = (on) => {
       };
     }
 
-    if (parsed.tab) {
+    if (parsed.tab && parsed.tab !== uiState.tab) {
+      uiState.kv.reset();
+      uiState.kvOffset = 0;
       uiState.tab = parsed.tab;
     }
     uiState.notice = null;
@@ -271,15 +281,26 @@ export const register: Register = (on) => {
     });
     $.ui.invalidate('ui.render');
 
+    if (uiState.tab === 'kv') {
+      await uiState.kv.inspect(async (args) => {
+        const res = await $.process.run(['hyp', ...args], { timeoutMs: CONTROL_TIMEOUT_MS });
+        return readKvCommandData(res.stdout, res.exitCode);
+      });
+      $.ui.invalidate('ui.render');
+    }
+
     return { text: 'Opened Hyphae side panel.', isTextDisplayOnly: true };
   });
 
   on('ui.close', { id: PANE_ID }, async (_$, e, next) => {
+    uiState.kv.reset();
+    uiState.kvOffset = 0;
     stopPaneRefreshTimer();
     return next(e);
   });
 
   on('session.end', async ($, e, next) => {
+    uiState.kv.reset();
     stopPaneRefreshTimer();
     stopStatusRefreshTimer();
     clearHostStatusBanner($);
@@ -342,6 +363,18 @@ export const register: Register = (on) => {
       }
       $.ui.invalidate('ui.render');
     };
+
+    const runKv = async (args: string[]): Promise<unknown> => {
+      const res = await $.process.run(['hyp', ...args], { timeoutMs: CONTROL_TIMEOUT_MS });
+      return readKvCommandData(res.stdout, res.exitCode);
+    };
+    const kv = uiState.kv;
+    if (!snapshot || snapshot.daemon?.online === false) kv.reset();
+    if (snapshot) kv.reconcileSnapshot(snapshot.kv, snapshot.daemon?.nodeId ?? "local");
+    if (snapshot && uiState.tab === 'kv' && snapshot.rev !== uiState.kvRevision && !kv.busy) {
+      uiState.kvRevision = snapshot.rev;
+      await kv.refreshPage(runKv);
+    }
 
     // Offline / missing ui/state.json graceful degradation
     // (Claude Code's native Pane chrome already provides the top-right × close button.)
@@ -418,7 +451,82 @@ export const register: Register = (on) => {
       ? active.details.channelEntries.length || active.details.channels.length
       : snapshot.sessions.length;
 
+    const inspection = combineKvInspection(snapshot.kv, kv.inspection, nodeId);
+    const renderKv = () => {
+      if (kv.preview) {
+        const preview = kv.preview;
+        return (
+          <Box flexDirection="column" gap={1}>
+            <Button key="hyphae-kv-back" plain hotkey="b" onPress={() => {
+              kv.back();
+              $.ui.invalidate('ui.render');
+            }}><Text dimColor>← back</Text></Button>
+            <Text bold>{`${sanitizeUiText(preview.key, 80)} · v${preview.version}${preview.truncated ? ' · truncated' : ''}`}</Text>
+            <Text>{preview.text}</Text>
+          </Box>
+        );
+      }
+      const namespace = kv.namespace;
+      const namespaces = inspection?.namespaces ?? [];
+      const entries = kv.page?.entries ?? [];
+      const total = namespace ? entries.length : namespaces.length;
+      const offset = Math.min(uiState.kvOffset, Math.floor(Math.max(0, total - 1) / MAX_VISIBLE_ROWS) * MAX_VISIBLE_ROWS);
+      const previous = offset > 0 || (namespace && kv.cursorHistory.length > 1);
+      const hasNext = offset + MAX_VISIBLE_ROWS < total || (namespace && kv.page?.nextAfter);
+      const turn = async (forward: boolean): Promise<void> => {
+        if (forward && offset + MAX_VISIBLE_ROWS < total) {
+          uiState.kvOffset = offset + MAX_VISIBLE_ROWS;
+        } else if (!forward && offset > 0) {
+          uiState.kvOffset = Math.max(0, offset - MAX_VISIBLE_ROWS);
+        } else {
+          await kv.turnPage(forward, runKv);
+          uiState.kvOffset = forward ? 0 : Math.floor(Math.max(0, (kv.page?.entries.length ?? 0) - 1) / MAX_VISIBLE_ROWS) * MAX_VISIBLE_ROWS;
+        }
+        $.ui.invalidate('ui.render');
+      };
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text bold>{namespace ? `${namespace.originNode}/${namespace.name}` : 'KV namespaces'}</Text>
+          {kv.error ? <Text color="red">{kv.error}</Text> : null}
+          {!namespace && inspection?.namespacesTruncated ? <Text dimColor>Namespace list truncated.</Text> : null}
+          {total === 0 ? <Text dimColor>{namespace ? 'No visible keys.' : 'No visible KV namespaces.'}</Text> : null}
+          {namespace ? entries.slice(offset, offset + MAX_VISIBLE_ROWS).map((entry, index) => (
+            <Box key={`kv-key-${index}`} flexDirection="column">
+              <Button key={`hyphae-kv-key-${index}`} plain onPress={async () => {
+                await kv.show(entry.key, runKv, sanitizeUiText);
+                $.ui.invalidate('ui.render');
+              }}>
+                <Text color="cyan">{sanitizeUiText(entry.key, 80)}</Text>
+              </Button>
+              <Text dimColor>{`v${entry.version} · ${sanitizeUiText(entry.updatedBy, 32)} · ${formatRelativeAge(entry.updatedAt, nowMs)} ago · ${entry.expiresAt === null ? 'no expiry' : `TTL ${formatRelativeAge(nowMs, entry.expiresAt)}`} · ${entry.sizeBytes} B`}</Text>
+            </Box>
+          )) : namespaces.slice(offset, offset + MAX_VISIBLE_ROWS).map((ns, index) => (
+            <Box key={`kv-namespace-${index}`} flexDirection="column">
+              <Button key={`hyphae-kv-namespace-${index}`} plain onPress={async () => {
+                await kv.open(ns, runKv);
+                uiState.kvOffset = 0;
+                $.ui.invalidate('ui.render');
+              }}>
+                <Text color="cyan">{`${ns.originNode}/${ns.name}`}</Text>
+              </Button>
+              <Text dimColor>{`${ns.entryCount} keys · ${ns.watchCount} watches${ns.epoch === null ? '' : ` · E2EE e${ns.epoch} · ${ns.memberCount} members`}`}</Text>
+            </Box>
+          ))}
+          <Box flexDirection="row" gap={2}>
+            {namespace ? <Button key="hyphae-kv-back" plain hotkey="b" onPress={() => {
+              kv.back();
+              uiState.kvOffset = 0;
+              $.ui.invalidate('ui.render');
+            }}><Text dimColor>← back</Text></Button> : null}
+            {previous ? <Button key="hyphae-kv-prev" plain hotkey="p" onPress={() => turn(false)}><Text dimColor>previous</Text></Button> : null}
+            {hasNext ? <Button key="hyphae-kv-next" plain hotkey="n" onPress={() => turn(true)}><Text dimColor>next</Text></Button> : null}
+          </Box>
+        </Box>
+      );
+    };
+
     const renderTabBody = () => {
+      if (uiState.tab === 'kv') return renderKv();
       if (!active) {
         const visibleSessions = snapshot.sessions.slice(0, MAX_VISIBLE_ROWS);
         return (
@@ -716,6 +824,7 @@ export const register: Register = (on) => {
       { id: 'queue', hotkey: '2', label: `Queue ${queueCount}` },
       { id: 'rules', hotkey: '3', label: `Rules ${rulesCount}` },
       { id: 'mesh', hotkey: '4', label: `Mesh ${meshCount}` },
+      { id: 'kv', hotkey: '5', label: 'KV' },
     ];
 
     const headerBridgeText =
@@ -806,8 +915,12 @@ export const register: Register = (on) => {
               plain
               hotkey="r"
               hover={{ color: 'cyan' }}
-              onPress={() => {
-                uiState.notice = { ok: true, text: 'Refreshed metadata.' };
+              onPress={async () => {
+                if (uiState.tab === 'kv') {
+                  await kv.inspect(runKv);
+                  await kv.refreshPage(runKv);
+                }
+                uiState.notice = { ok: !kv.error, text: kv.error ?? 'Refreshed metadata.' };
                 $.ui.invalidate('ui.render');
               }}
             >
@@ -861,9 +974,9 @@ export const register: Register = (on) => {
         ) : null}
 
         {/* Underlined Tab Bar (zero [ ... ] brackets) */}
-        {active ? (
+        {(
           <Box flexDirection="row" gap={2} flexWrap="wrap">
-            {tabs.map((tab) => {
+            {tabs.filter((tab) => active || tab.id === 'kv').map((tab) => {
               const isActive = uiState.tab === tab.id;
               return (
                 <Box key={`hover-tab-${tab.id}`}>
@@ -872,8 +985,13 @@ export const register: Register = (on) => {
                     plain
                     hotkey={tab.hotkey}
                     hover={{ color: 'cyan' }}
-                    onPress={() => {
-                      uiState.tab = tab.id;
+                    onPress={async () => {
+                      if (uiState.tab !== tab.id) {
+                        kv.reset();
+                        uiState.kvOffset = 0;
+                        uiState.tab = tab.id;
+                      }
+                      if (tab.id === 'kv') await kv.inspect(runKv);
                       $.ui.invalidate('ui.render');
                     }}
                   >
@@ -890,7 +1008,7 @@ export const register: Register = (on) => {
               );
             })}
           </Box>
-        ) : null}
+        )}
 
         {/* Tab Content */}
         <Box
@@ -903,7 +1021,7 @@ export const register: Register = (on) => {
           {renderTabBody()}
         </Box>
 
-        <Text dimColor>metadata only · untrusted external data</Text>
+        <Text dimColor>{kv.preview ? 'explicit KV preview · untrusted external data' : 'metadata only · untrusted external data'}</Text>
       </Box>
     );
   });

@@ -83,13 +83,13 @@ fn build_rs_pinned_digests_and_tree_hashes_match_sha2_crate_and_crlf_invariance(
         ("google-calendar", PluginKind::Bridge, 2),
         ("vercel", PluginKind::Bridge, 2),
         ("notion", PluginKind::Bridge, 2),
-        ("claude-panel", PluginKind::Harness, 2),
-        ("claude-code", PluginKind::Harness, 12),
-        ("herdr-mod", PluginKind::Harness, 9),
+        ("claude-panel", PluginKind::Harness, 3),
+        ("claude-code", PluginKind::Harness, 13),
+        ("herdr-mod", PluginKind::Harness, 11),
     ];
 
     assert_eq!(PINNED_PLUGINS.len(), expected_plugins.len());
-    assert_eq!(PINNED_PLUGIN_FILES.len(), 42);
+    assert_eq!(PINNED_PLUGIN_FILES.len(), 45);
     let plugins_dir = repo_root().join("plugins");
 
     for (spec, (exp_id, exp_kind, exp_count)) in PINNED_PLUGINS.iter().zip(expected_plugins.iter())
