@@ -24,7 +24,7 @@ use crate::config_file::{
     resolve_config_path_for_write, resolve_effective_node_id, resolve_home_dir, resolve_state_dir,
 };
 use crate::node_identity::short_hostname;
-use crate::pair::{attempt_delegated_pair_enroll, credential_secret_name, try_reload_live_daemon};
+use crate::pair::{credential_secret_name, try_reload_live_daemon};
 use crate::setup::configure_detected_harnesses_for_join;
 use crate::ui::{
     CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
@@ -46,6 +46,7 @@ use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::engine::pairing_client::{AuthClaimHttpError, collect_auth_claim_reply};
 use hyp_node::engine::{AuthClaimReply, AuthClaimRequest};
 use hyp_node::node_file::NodeFile;
+use hyp_pairing_client::attempt_delegated_pair_enroll;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::NodeProfile;
 use hyp_proto::problem::ProblemDetails;

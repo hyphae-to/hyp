@@ -1,0 +1,16 @@
+[package]
+name = "hyp-pairing-client"
+description = "Outbound Hyphae pairing and enrollment over HTTP and SSH"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hyp-crypto.workspace = true
+hyp-node.workspace = true
+hyp-proto.workspace = true
+hyp-store.workspace = true
+http.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
