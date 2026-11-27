@@ -3705,6 +3705,14 @@ impl LocalDaemonInner {
             "nextCursor": result.next_cursor,
             "items": result.items,
         });
+        // The receipt is the only mailbox identifier agents can use with `ids`.
+        if let Value::Array(items) = &mut out["items"] {
+            for item in items {
+                if let Value::Object(fields) = item {
+                    fields.remove("itemId");
+                }
+            }
+        }
         if !quarantine_notices.is_empty() {
             out["quarantinedNotices"] = Value::Array(quarantine_notices);
         }

@@ -126,7 +126,7 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
         json!({
             "name": "hyp_inbox",
             "description": format!(
-                "Read <hyphae-inbox> (ack:false peeks). Never poll. Items: trustTier, untrusted: true. {warning}",
+                "Read <hyphae-inbox>. ack:false peeks. Never poll. ids: receipts. Items: trustTier, untrusted: true. {warning}",
                 warning = hyp_harness_ipc::protocol::UNTRUSTED_PROVENANCE,
             ),
             "inputSchema": {
