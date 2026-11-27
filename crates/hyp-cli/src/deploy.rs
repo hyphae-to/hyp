@@ -7,11 +7,12 @@ use crate::ui::{
     print_checks, print_json, print_next_steps, print_warnings,
 };
 use clap::{Subcommand, ValueEnum};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::Empty;
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::pairing::{validate_endpoint_origin, validate_http_endpoint_origin};
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
 use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
+use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::engine::{DropRelayConfig, normalize_drop_portal_url};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, SignedNodeManifest};
@@ -2663,19 +2664,18 @@ async fn probe_manifest_url(
 
     // Read bounded body
     let body_bytes = match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), async {
-        let mut body = resp.into_body();
+        let body = resp.into_body();
         let mut out = Vec::new();
-        while let Some(frame_res) = body.frame().await {
-            let frame = frame_res.map_err(|e| format!("body read error: {e}"))?;
-            if let Some(chunk) = frame.data_ref() {
-                if out.len() + chunk.len() > MAX_MANIFEST_RESPONSE_BYTES {
-                    return Err(format!(
-                        "manifest response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
-                    ));
-                }
-                out.extend_from_slice(chunk);
+        consume_bounded_body(body, MAX_MANIFEST_RESPONSE_BYTES, |chunk| {
+            out.extend_from_slice(chunk)
+        })
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(error) => format!("body read error: {error}"),
+            BoundedBodyError::TooLarge => {
+                format!("manifest response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap")
             }
-        }
+        })?;
         Ok::<Vec<u8>, String>(out)
     })
     .await
