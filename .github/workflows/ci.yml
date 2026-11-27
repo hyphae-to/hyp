@@ -216,6 +216,15 @@ jobs:
           shared-key: rust-ci-linux-sccache-control-v1
           save-if: ${{ github.ref == 'refs/heads/experiment/linux-sccache-gha' && github.event_name == 'workflow_dispatch' && inputs.compiler_cache == 'dependencies' }}
 
+      - name: Mask the GitHub Actions cache runtime token
+        if: github.ref == 'refs/heads/experiment/linux-sccache-gha' && runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.compiler_cache == 'sccache'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = process.env.ACTIONS_RUNTIME_TOKEN;
+            if (!token) throw new Error('GitHub Actions cache runtime token is missing');
+            core.setSecret(token);
+
       - name: Install pinned sccache
         if: github.ref == 'refs/heads/experiment/linux-sccache-gha' && runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.compiler_cache == 'sccache'
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
