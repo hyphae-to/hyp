@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
 use http::HeaderMap;
-use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_crypto::rfc3339::{format_rfc3339_seconds, now_unix_ms};
 use hyp_proto::cloudevent::{CloudEvent, MAX_ATTRIBUTE_CHARS, MAX_DATA_BYTES, check_cloudevent_v2};
 use hyp_proto::filter::{
     Filter, ObservedTopicStats, SubscriptionDiagnostic, TopicCatalogEntry, TopicMetadata,
@@ -85,12 +85,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 fn now_rfc3339_seconds() -> String {
-    let full = format_rfc3339_millis(now_unix_ms());
-    if let Some((prefix, _)) = full.rsplit_once('.') {
-        format!("{prefix}Z")
-    } else {
-        full
-    }
+    format_rfc3339_seconds(now_unix_ms())
 }
 
 /// Outcome of ingesting a webhook delivery into an adapter.
