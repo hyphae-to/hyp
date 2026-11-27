@@ -19,6 +19,9 @@ use crate::setup::{
     canonical_dedup_key, codex_mcp_config_path, default_node_id, detect_harness_statuses,
     read_openclaw_hyphae_preferences, resolve_claude_profiles,
 };
+use crate::term::AltScreenGuard;
+#[cfg(unix)]
+use crate::term::RawTtyGuard;
 use crate::ui::{
     CliError, EXIT_ERROR, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
@@ -29,9 +32,9 @@ use std::collections::BTreeSet;
 use std::f64::consts::PI;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
 #[cfg(unix)]
-use std::io::{BufReader, Read};
+use std::io::BufReader;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
@@ -1174,163 +1177,6 @@ pub fn parse_key_bytes(bytes: &[u8]) -> KeyEvent {
         [b'q'] | [b'Q'] => KeyEvent::Cancel,
         [b] if b.is_ascii_graphic() || *b == b' ' => KeyEvent::Char(*b as char),
         _ => KeyEvent::Other,
-    }
-}
-
-/// RAII alternate-screen + hidden-cursor guard.
-///
-/// Enters `\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l` on creation and unconditionally restores
-/// `\x1b[?25h\x1b[0m\x1b[?1049l` on `leave()` or `Drop` (including early returns / panic unwinds).
-struct AltScreenGuard {
-    active: bool,
-}
-
-impl AltScreenGuard {
-    fn enter_if(enabled: bool) -> Self {
-        if enabled {
-            let mut out = io::stdout().lock();
-            let _ = out.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
-            let _ = out.flush();
-        }
-        Self { active: enabled }
-    }
-
-    fn leave(&mut self) {
-        if self.active {
-            self.active = false;
-            let mut out = io::stdout().lock();
-            let _ = out.write_all(b"\x1b[?25h\x1b[0m\x1b[?1049l");
-            let _ = out.flush();
-        }
-    }
-}
-
-impl Drop for AltScreenGuard {
-    fn drop(&mut self) {
-        self.leave();
-    }
-}
-
-/// Pure-Rust Unix `/dev/tty` raw-mode guard backed by `stty -g` / `stty raw -echo`.
-/// Unconditionally restores the exact saved `stty` state in `Drop`.
-#[cfg(unix)]
-struct RawTtyGuard {
-    saved_state: String,
-    tty: fs::File,
-    active: bool,
-}
-
-#[cfg(unix)]
-impl RawTtyGuard {
-    fn run_stty(tty: &fs::File, args: &[&str]) -> io::Result<std::process::Output> {
-        let stdin_file = tty.try_clone()?;
-        Command::new("stty")
-            .args(args)
-            .stdin(Stdio::from(stdin_file))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-    }
-
-    fn enter(nonblocking: bool) -> io::Result<Self> {
-        let tty = fs::File::open("/dev/tty")?;
-        let saved_out = Self::run_stty(&tty, &["-g"])?;
-        if !saved_out.status.success() {
-            return Err(io::Error::other("stty -g failed on /dev/tty"));
-        }
-        let saved_state = String::from_utf8_lossy(&saved_out.stdout)
-            .trim()
-            .to_string();
-        if saved_state.is_empty() {
-            return Err(io::Error::other("stty -g returned empty state"));
-        }
-
-        let mut guard = Self {
-            saved_state,
-            tty,
-            active: true,
-        };
-        if let Err(e) = guard.set_mode(nonblocking) {
-            guard.restore();
-            return Err(e);
-        }
-        Ok(guard)
-    }
-
-    fn set_mode(&self, nonblocking: bool) -> io::Result<()> {
-        let args: &[&str] = if nonblocking {
-            &["raw", "-echo", "min", "0", "time", "0"]
-        } else {
-            &["raw", "-echo", "min", "0", "time", "1"]
-        };
-        let out = Self::run_stty(&self.tty, args)?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other("stty raw -echo failed on /dev/tty"))
-        }
-    }
-
-    fn poll_any_key(&mut self) -> Option<KeyEvent> {
-        let mut buf = [0u8; 8];
-        match self.tty.read(&mut buf) {
-            Ok(n) if n > 0 => Some(parse_key_bytes(&buf[..n])),
-            _ => None,
-        }
-    }
-
-    fn drain_pending(&mut self) {
-        let mut buf = [0u8; 32];
-        for _ in 0..4 {
-            match self.tty.read(&mut buf) {
-                Ok(n) if n > 0 => continue,
-                _ => break,
-            }
-        }
-    }
-
-    /// Reads one key event with a ~100ms POSIX `stty raw -echo min 0 time 1` timeout.
-    /// Returns `Ok(None)` on idle tick so the live banner can advance pulses with zero `unsafe`.
-    fn read_key_timeout(&mut self) -> io::Result<Option<KeyEvent>> {
-        let mut buf = [0u8; 8];
-        match self.tty.read(&mut buf) {
-            Ok(0) => Ok(None),
-            Ok(n) => {
-                let mut total = n;
-                // If a lone ESC arrived, give the terminal one VTIME=1 (100ms) window
-                // to deliver the remainder of an arrow-key escape sequence (`[A`/`OA`).
-                if total == 1 && buf[0] == 0x1b {
-                    if let Ok(extra) = self.tty.read(&mut buf[1..]) {
-                        total += extra;
-                    }
-                }
-                Ok(Some(parse_key_bytes(&buf[..total])))
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn read_key(&mut self) -> io::Result<KeyEvent> {
-        loop {
-            if let Some(key) = self.read_key_timeout()? {
-                return Ok(key);
-            }
-        }
-    }
-
-    fn restore(&mut self) {
-        if self.active {
-            self.active = false;
-            let _ = Self::run_stty(&self.tty, &[self.saved_state.as_str()]);
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawTtyGuard {
-    fn drop(&mut self) {
-        self.restore();
     }
 }
 
@@ -3188,7 +3034,7 @@ fn play_fullscreen_intro_on_alt_screen(
         if wait_ms > 0 {
             let deadline = Instant::now() + Duration::from_millis(wait_ms);
             while Instant::now() < deadline {
-                if let Some(key) = raw_tty.poll_any_key() {
+                if let Some(key) = raw_tty.poll_any_key(parse_key_bytes) {
                     raw_tty.drain_pending();
                     return if key == KeyEvent::Cancel {
                         AnimOutcome::Cancelled
@@ -3211,7 +3057,7 @@ pub fn play_mycelium_animation(no_anim: bool) {
     }
     let (term_rows, term_cols) = detect_terminal_size();
     let color_mode = detect_color_mode();
-    let mut alt = AltScreenGuard::enter_if(true);
+    let mut alt = AltScreenGuard::wizard(true);
 
     #[cfg(unix)]
     if let Ok(mut raw) = RawTtyGuard::enter(true) {
@@ -3267,7 +3113,7 @@ pub fn run_preview_animation(no_anim: bool) -> ExitCode {
 
     // Live interactive TTY: play the full-screen alternate-screen animation.
     let (term_rows, term_cols) = detect_terminal_size();
-    let mut alt = AltScreenGuard::enter_if(true);
+    let mut alt = AltScreenGuard::wizard(true);
 
     #[cfg(unix)]
     if let Ok(mut raw) = RawTtyGuard::enter(true) {
@@ -7594,7 +7440,7 @@ pub fn run_setup_toggle_interactive(
     {
         if io::stdout().is_terminal() {
             let color_mode = detect_color_mode();
-            let mut alt = AltScreenGuard::enter_if(true);
+            let mut alt = AltScreenGuard::wizard(true);
             if let Ok(mut raw) = RawTtyGuard::enter(false) {
                 let live_anim = !wizard_anim_disabled(false) && color_mode != ColorMode::Plain;
                 let mut anim_tick: usize = 0;
@@ -7609,7 +7455,7 @@ pub fn run_setup_toggle_interactive(
                         render_openclaw_config_fullscreen(
                             &oc_state, home, None, true, term_rows, term_cols, color_mode,
                         );
-                        let key = match raw.read_key() {
+                        let key = match raw.read_key(parse_key_bytes) {
                             Ok(k) => k,
                             Err(e) => break Err(format!("Failed reading TTY input: {e}")),
                         };
@@ -7638,7 +7484,7 @@ pub fn run_setup_toggle_interactive(
                         &state, home, false, false, term_rows, term_cols, color_mode, anim_tick,
                     );
                     let key = if live_anim && has_live_banner {
-                        match raw.read_key_timeout() {
+                        match raw.read_key_timeout(parse_key_bytes) {
                             Ok(Some(k)) => k,
                             Ok(None) => {
                                 anim_tick = anim_tick.wrapping_add(1);
@@ -7647,7 +7493,7 @@ pub fn run_setup_toggle_interactive(
                             Err(e) => break Err(format!("Failed reading TTY input: {e}")),
                         }
                     } else {
-                        match raw.read_key() {
+                        match raw.read_key(parse_key_bytes) {
                             Ok(k) => k,
                             Err(e) => break Err(format!("Failed reading TTY input: {e}")),
                         }
@@ -7804,7 +7650,7 @@ fn run_fullscreen_tui_loop(
     let color_mode = detect_color_mode();
     let (mut term_rows, mut term_cols) = detect_terminal_size();
 
-    let mut alt = AltScreenGuard::enter_if(true);
+    let mut alt = AltScreenGuard::wizard(true);
     let Ok(mut raw) = RawTtyGuard::enter(play_intro) else {
         alt.leave();
         return None;
@@ -7949,7 +7795,7 @@ fn run_fullscreen_tui_loop(
         };
 
         let key = if live_anim && has_live_banner {
-            match raw.read_key_timeout() {
+            match raw.read_key_timeout(parse_key_bytes) {
                 Ok(Some(k)) => k,
                 Ok(None) => {
                     anim_tick = anim_tick.wrapping_add(1);
@@ -7958,7 +7804,7 @@ fn run_fullscreen_tui_loop(
                 Err(e) => break WizardAction::Error(format!("Failed reading TTY input: {e}")),
             }
         } else {
-            match raw.read_key() {
+            match raw.read_key(parse_key_bytes) {
                 Ok(k) => k,
                 Err(e) => break WizardAction::Error(format!("Failed reading TTY input: {e}")),
             }
