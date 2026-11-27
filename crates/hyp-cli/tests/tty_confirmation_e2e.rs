@@ -176,7 +176,7 @@ fn non_tty_security_sensitive_commands_fail_closed_with_zero_mutations() {
     // Legacy unsigned config is a fixture; no current CLI can create it without approval.
     fs::write(
         &config_path,
-        serde_json::to_vec(&json!({"nodeId": NodeDb::open(state_dir.join("node.sqlite")).unwrap().local().get_metadata("node_id").unwrap().unwrap_or_else(|| "bogdan@local-host".into()), "gate": SecurityGateConfig::default()}))
+        serde_json::to_vec(&json!({"nodeId": NodeDb::open(state_dir.join("node.sqlite")).unwrap().local().get_metadata("node_id").unwrap().unwrap_or_else(|| "riley@local-host".into()), "gate": SecurityGateConfig::default()}))
             .unwrap(),
     )
     .unwrap();

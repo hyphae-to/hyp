@@ -538,7 +538,7 @@ fn build_transports() -> Vec<TransportGuide> {
             title: "Optional SSH (`ssh://`, Zero Open Ports)",
             best_for: "Personal servers, bastions, air-gapped VPCs, and hosts already reachable via `~/.ssh/config`.",
             endpoint_format: "ssh://[user@]host[:port][?stateDir=/path&bin=/path/to/hyp]",
-            example: "hyp pair ssh ops@solace   # or: hyp pair invite --mode p2p --node-id solace --endpoint ssh://ops@solace",
+            example: "hyp pair ssh ops@maple-relay   # or: hyp pair invite --mode p2p --node-id maple-relay --endpoint ssh://ops@maple-relay",
             notes: "Tunnels Hyphae v2 HTTP/1.1 + SSE over `ssh -o BatchMode=yes -T -- <target> \"... hyp connect\"` to `<state_dir>/peer.sock` (0600). Full Hyphae E2EE, Ed25519 auth, and manifest verification remain 100% enforced.",
         },
     ]
@@ -569,7 +569,7 @@ fn run_guide(mode: Option<GuideMode>, as_json: bool) -> Result<ExitCode, CliErro
     });
     let next = vec![
         "hyp pair invite --mode p2p --node-id alice@macbook --endpoint https://alice.tailnet.ts.net --preset member".to_string(),
-        "hyp pair ssh ops@solace --preset member".to_string(),
+        "hyp pair ssh ops@maple-relay --preset member".to_string(),
         "hyp pair inspect <<< '<token>'".to_string(),
         "hyp deploy providers".to_string(),
     ];
@@ -4926,12 +4926,12 @@ fn run_pair_ssh(
     if raw_target.is_empty() {
         return Err(CliError::usage(
             "INVALID_ENDPOINT",
-            "Missing SSH target (e.g. `ops@solace` or `great-northern`)",
+            "Missing SSH target (e.g. `ops@maple-relay` or `cedar-desk`)",
         )
-        .with_fix("Example: hyp pair ssh ops@solace --preset member".to_string()));
+        .with_fix("Example: hyp pair ssh ops@maple-relay --preset member".to_string()));
     }
     if raw_target.contains("://") && !raw_target.starts_with("ssh://") {
-        return Err(CliError::usage("INVALID_ENDPOINT", format!("`hyp pair ssh` expects an SSH target or ssh:// URL (got '{raw_target}')")).with_fix("Example: hyp pair ssh ops@solace  (or use `hyp pair join` / `hyp pair accept` for https://)".to_string()));
+        return Err(CliError::usage("INVALID_ENDPOINT", format!("`hyp pair ssh` expects an SSH target or ssh:// URL (got '{raw_target}')")).with_fix("Example: hyp pair ssh ops@maple-relay  (or use `hyp pair join` / `hyp pair accept` for https://)".to_string()));
     }
 
     let raw_ssh_url = if raw_target.starts_with("ssh://") {

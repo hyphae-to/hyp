@@ -3521,7 +3521,7 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
         .human()
         .upsert_authority(
             &HumanAuthorityInput {
-                human_id: "bogdan".to_string(),
+                human_id: "riley".to_string(),
                 kid: passkey_kid.clone(),
                 label: "macbook-touchid".to_string(),
                 role: HumanAuthorityRole::Admin,
@@ -3624,7 +3624,7 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
         cascade: None,
         parameters: None,
     };
-    let lock_signed_json = sign_seal(&passkey_ed, "bogdan", &lock_action, past_issued, past_exp);
+    let lock_signed_json = sign_seal(&passkey_ed, "riley", &lock_action, past_issued, past_exp);
 
     db.lock()
         .unwrap()
@@ -3783,7 +3783,7 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
     rogue_unlock.action = HumanApprovalActionKind::GateUnlock;
     rogue_unlock.locked = false;
     rogue_unlock.exp = format_rfc3339_millis(t0 + 600_000);
-    let rogue_json = sign_seal(&rogue, "bogdan", &rogue_unlock, t0, t0 + 600_000);
+    let rogue_json = sign_seal(&rogue, "riley", &rogue_unlock, t0, t0 + 600_000);
     db.lock()
         .unwrap()
         .connection()
@@ -3818,7 +3818,7 @@ async fn issue10_passkey_gate_lock_seal_tamper_detection_and_unlock_lifecycle() 
         cascade: None,
         parameters: None,
     };
-    let unlock_signed_json = sign_seal(&passkey_ed, "bogdan", &unlock_action, t0, t0 + 600_000);
+    let unlock_signed_json = sign_seal(&passkey_ed, "riley", &unlock_action, t0, t0 + 600_000);
     db.lock()
         .unwrap()
         .human()

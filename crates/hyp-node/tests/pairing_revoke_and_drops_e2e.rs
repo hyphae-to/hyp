@@ -1014,20 +1014,8 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     // Enroll human Admin (epoch 3) and Signer (epoch 1) on `worker@box`.
     let human_admin = Ed25519KeyPair::generate().unwrap();
     let lost_phone = Ed25519KeyPair::generate().unwrap();
-    enroll_human(
-        &worker,
-        "bogdan",
-        &human_admin,
-        HumanAuthorityRole::Admin,
-        3,
-    );
-    enroll_human(
-        &worker,
-        "bogdan",
-        &lost_phone,
-        HumanAuthorityRole::Signer,
-        1,
-    );
+    enroll_human(&worker, "riley", &human_admin, HumanAuthorityRole::Admin, 3);
+    enroll_human(&worker, "riley", &lost_phone, HumanAuthorityRole::Signer, 1);
     assert_eq!(worker.db().human().min_auth_epoch().unwrap(), 1);
 
     // This subscriber has a real Passkey-managed policy, not only a legacy HMAC policy.
@@ -1036,7 +1024,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         .human()
         .upsert_authority(
             &HumanAuthorityInput {
-                human_id: "bogdan".into(),
+                human_id: "riley".into(),
                 kid: human_admin.kid(),
                 label: "Passkey Admin".into(),
                 role: HumanAuthorityRole::Admin,
@@ -1074,7 +1062,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         parameters: None,
     };
     let mut approval_claim = build_directive_claim(
-        "bogdan",
+        "riley",
         &human_admin,
         3,
         worker.node_id().as_str(),
@@ -1104,7 +1092,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
 
     // Prove the directive path is valid before the remote reduction, with this managed gate.
     let before_claim = build_directive_claim(
-        "bogdan",
+        "riley",
         &lost_phone,
         1,
         worker.node_id().as_str(),
@@ -1144,7 +1132,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     let forged_rev = sign_human_revocation(
         &HumanRevocationPayloadV1 {
             v: 1,
-            human_id: "bogdan".to_string(),
+            human_id: "riley".to_string(),
             revoked_kid: human_admin.kid(),
             new_min_auth_epoch: 9,
             revoked_at: format_rfc3339_millis(now_ms()),
@@ -1211,7 +1199,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         worker
             .db()
             .human()
-            .get_authority("bogdan", &human_admin.kid())
+            .get_authority("riley", &human_admin.kid())
             .unwrap()
             .unwrap()
             .status,
@@ -1256,7 +1244,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     let valid_rev = sign_human_revocation(
         &HumanRevocationPayloadV1 {
             v: 1,
-            human_id: "bogdan".to_string(),
+            human_id: "riley".to_string(),
             revoked_kid: lost_phone.kid(),
             new_min_auth_epoch: 3,
             revoked_at: format_rfc3339_millis(now_ms()),
@@ -1268,7 +1256,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     .unwrap();
     let rev_ce = ProtoCloudEvent::new(
         format!("rev-{}", uuid_v4()),
-        "human:bogdan",
+        "human:riley",
         TYPE_HUMAN_REVOCATION_V1,
         serde_json::to_value(&valid_rev).unwrap(),
     );
@@ -1288,7 +1276,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
         let rec = worker
             .db()
             .human()
-            .get_authority("bogdan", &lost_phone.kid())
+            .get_authority("riley", &lost_phone.kid())
             .unwrap()
             .unwrap();
         if min_ep == 3 && rec.status == HumanAuthorityStatus::Revoked {
@@ -1314,7 +1302,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     // Simultaneously, any claim signed by the revoked `lost_phone` key MUST immediately fail closed!
     let now = now_ms();
     let revoked_claim = build_directive_claim(
-        "bogdan",
+        "riley",
         &lost_phone,
         1,
         worker.node_id().as_str(),
@@ -1375,7 +1363,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
             "local.security",
             ProtoCloudEvent::new(
                 format!("local-replay-{}", uuid_v4()),
-                "human:bogdan",
+                "human:riley",
                 TYPE_HUMAN_REVOCATION_V1,
                 serde_json::to_value(&valid_rev).unwrap(),
             ),
@@ -1389,7 +1377,7 @@ async fn h4_inbound_revocation_event_revokes_key_and_bumps_min_epoch_automatical
     let admin_reduction = sign_human_revocation(
         &HumanRevocationPayloadV1 {
             v: 1,
-            human_id: "bogdan".into(),
+            human_id: "riley".into(),
             revoked_kid: human_admin.kid(),
             new_min_auth_epoch: 3,
             revoked_at: format_rfc3339_millis(now_ms()),
@@ -1469,14 +1457,14 @@ async fn h5_old_epoch_key_spoofing_higher_claim_epoch_is_rejected() {
 
     let admin_ep1 = Ed25519KeyPair::generate().unwrap();
     let signer_ep1 = Ed25519KeyPair::generate().unwrap();
-    enroll_human(&node, "bogdan", &admin_ep1, HumanAuthorityRole::Admin, 1);
-    enroll_human(&node, "bogdan", &signer_ep1, HumanAuthorityRole::Signer, 1);
+    enroll_human(&node, "riley", &admin_ep1, HumanAuthorityRole::Admin, 1);
+    enroll_human(&node, "riley", &signer_ep1, HumanAuthorityRole::Signer, 1);
 
     // Bump `min_auth_epoch` to 2 by revoking `signer_ep1`.
     let rev = sign_human_revocation(
         &HumanRevocationPayloadV1 {
             v: 1,
-            human_id: "bogdan".to_string(),
+            human_id: "riley".to_string(),
             revoked_kid: signer_ep1.kid(),
             new_min_auth_epoch: 2,
             revoked_at: format_rfc3339_millis(now_ms()),
@@ -1492,7 +1480,7 @@ async fn h5_old_epoch_key_spoofing_higher_claim_epoch_is_rejected() {
     // ATTACK: Old epoch-1 key (`rec.auth_epoch == 1`) lies and sets `claim.auth_epoch = 2`!
     let now = now_ms();
     let spoofed_claim = build_directive_claim(
-        "bogdan",
+        "riley",
         &admin_ep1,
         2,
         node.node_id().as_str(),
@@ -1519,10 +1507,10 @@ async fn h5_old_epoch_key_spoofing_higher_claim_epoch_is_rejected() {
 
     // Enroll genuine epoch-2 key: claiming mismatched epoch 3 STILL fails closed!
     let admin_ep2 = Ed25519KeyPair::generate().unwrap();
-    enroll_human(&node, "bogdan", &admin_ep2, HumanAuthorityRole::Admin, 2);
+    enroll_human(&node, "riley", &admin_ep2, HumanAuthorityRole::Admin, 2);
 
     let mismatched_claim = build_directive_claim(
-        "bogdan",
+        "riley",
         &admin_ep2,
         3,
         node.node_id().as_str(),
@@ -1545,7 +1533,7 @@ async fn h5_old_epoch_key_spoofing_higher_claim_epoch_is_rejected() {
 
     // Genuine epoch-2 key with exact `claim.auth_epoch == 2` succeeds!
     let valid_claim = build_directive_claim(
-        "bogdan",
+        "riley",
         &admin_ep2,
         2,
         node.node_id().as_str(),
@@ -1814,12 +1802,12 @@ async fn h11_and_h15_rejected_drops_audit_without_secret_leak_and_signed_overwri
 
     let human_kp = Ed25519KeyPair::generate().unwrap();
     let rogue_kp = Ed25519KeyPair::generate().unwrap();
-    enroll_human(&node, "bogdan", &human_kp, HumanAuthorityRole::Admin, 1);
+    enroll_human(&node, "riley", &human_kp, HumanAuthorityRole::Admin, 1);
 
     // 1. Store initial secret `api-secret`.
     let initial_secret = "CANARY_INITIAL_SECRET_999111";
     let c1 = build_secret_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         node.node_id().as_str(),
@@ -1838,7 +1826,7 @@ async fn h11_and_h15_rejected_drops_audit_without_secret_leak_and_signed_overwri
     //    when caller passes `overwrite_secret = true`!
     let blocked_secret = "CANARY_NEVER_WRITTEN_888222";
     let c2 = build_secret_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         node.node_id().as_str(),
@@ -1862,7 +1850,7 @@ async fn h11_and_h15_rejected_drops_audit_without_secret_leak_and_signed_overwri
     // 3. H15: Secret claim with human-signed `overwrite: true` succeeds even with `overwrite_secret = false`.
     let rotated_secret = "CANARY_ROTATED_SECRET_777333";
     let c3 = build_secret_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         node.node_id().as_str(),
@@ -1913,7 +1901,7 @@ async fn h11_and_h15_rejected_drops_audit_without_secret_leak_and_signed_overwri
     ));
     // (c) Expired claim
     let c_expired = build_directive_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         node.node_id().as_str(),
@@ -1996,7 +1984,7 @@ async fn h16_reserved_secret_names_rejected_in_crypto_and_engine() {
     let node = UnifiedNode::open(make_p2p_config("h16@test", &dir)).unwrap();
     node.register_handle("sess-ops", "ops").await.unwrap();
     let human_kp = Ed25519KeyPair::generate().unwrap();
-    enroll_human(&node, "bogdan", &human_kp, HumanAuthorityRole::Admin, 1);
+    enroll_human(&node, "riley", &human_kp, HumanAuthorityRole::Admin, 1);
 
     for reserved in [
         "t3-auth-token",
@@ -2005,7 +1993,7 @@ async fn h16_reserved_secret_names_rejected_in_crypto_and_engine() {
         "staged-join-token-team",
     ] {
         let claim = build_secret_claim(
-            "bogdan",
+            "riley",
             &human_kp,
             1,
             node.node_id().as_str(),

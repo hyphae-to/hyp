@@ -861,7 +861,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
     let node = open_local_node("h6-drop@box", tmp.path());
 
     let human_kp = Ed25519KeyPair::generate().unwrap();
-    enroll_human_authority(&node, "bogdan", &human_kp, HumanAuthorityRole::Admin);
+    enroll_human_authority(&node, "riley", &human_kp, HumanAuthorityRole::Admin);
 
     // Build a genuine sealed verified directive drop envelope for `h6-drop@box/dev`.
     let now = now_ms();
@@ -869,7 +869,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         v: 1,
         claim_id: format!("claim-h6-{}", uuid_v4()),
         kind: HumanDropKind::Directive,
-        human_id: "bogdan".into(),
+        human_id: "riley".into(),
         human_kid: human_kp.kid(),
         auth_epoch: 1,
         issued_at: format_rfc3339_millis(now),
@@ -1038,7 +1038,7 @@ async fn h6_drop_watcher_reconnects_with_last_event_id_and_surfaces_unrecoverabl
         .await;
     assert!(
         delivered[0].starts_with("<hyphae-inbox handle=\"dev\" unread=\"1\" urgency=\"queue\">")
-            && delivered[0].contains("human:bogdan:")
+            && delivered[0].contains("human:riley:")
             && delivered[0].contains("verified=\"true\""),
         "H9/RFC 0004: reconnected human directive must deliver verified XML digest: {:?}",
         delivered
@@ -1750,7 +1750,7 @@ async fn g14_locked_policy_sig_caches_secret_store_and_invalidates_on_digest_cha
         db.human()
             .upsert_authority(
                 &HumanAuthorityInput {
-                    human_id: "bogdan".into(),
+                    human_id: "riley".into(),
                     kid: admin_kp.kid(),
                     label: "Admin".into(),
                     role: HumanAuthorityRole::Admin,
@@ -2120,7 +2120,7 @@ async fn h18_drop_watcher_ignores_junk_envelope_and_delivers_subsequent_valid_dr
     let node = open_local_node("h18-drop@box", tmp.path());
 
     let human_kp = Ed25519KeyPair::generate().unwrap();
-    enroll_human_authority(&node, "bogdan", &human_kp, HumanAuthorityRole::Admin);
+    enroll_human_authority(&node, "riley", &human_kp, HumanAuthorityRole::Admin);
 
     let wrong_kp = Ed25519KeyPair::generate().unwrap();
     let now = now_ms();
@@ -2129,7 +2129,7 @@ async fn h18_drop_watcher_ignores_junk_envelope_and_delivers_subsequent_valid_dr
             v: 1,
             claim_id: format!("claim-h18-{}", uuid_v4()),
             kind: HumanDropKind::Directive,
-            human_id: "bogdan".into(),
+            human_id: "riley".into(),
             human_kid: kp.kid(),
             auth_epoch: 1,
             issued_at: format_rfc3339_millis(now),
@@ -2252,7 +2252,7 @@ async fn h18_drop_watcher_ignores_junk_envelope_and_delivers_subsequent_valid_dr
         .await;
     assert!(
         delivered[0].starts_with("<hyphae-inbox handle=\"dev\" unread=\"1\" urgency=\"queue\">")
-            && delivered[0].contains("human:bogdan:")
+            && delivered[0].contains("human:riley:")
             && delivered[0].contains("verified=\"true\""),
         "H18: drop watcher must survive junk envelope and deliver valid verified XML digest: {delivered:?}"
     );

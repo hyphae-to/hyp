@@ -1182,7 +1182,7 @@ mod tests {
             normalize_repo_token_pattern("Bayfold/*").unwrap(),
             "bayfold/*"
         );
-        assert_eq!(normalize_repo_token_pattern("Bowd").unwrap(), "bowd/*");
+        assert_eq!(normalize_repo_token_pattern("Riley").unwrap(), "riley/*");
         assert_eq!(
             normalize_repo_token_pattern("acme/.github").unwrap(),
             "acme/.github"
@@ -1225,7 +1225,7 @@ mod tests {
             Zeroizing::new("hyphae_gh_tok_exact_c".to_string()),
         );
         cfg.repo_tokens.insert(
-            "bowd/*".to_string(),
+            "riley/*".to_string(),
             Zeroizing::new("hyphae_gh_tok_personal_a".to_string()),
         );
 
@@ -1238,7 +1238,7 @@ mod tests {
             Some("hyphae_gh_tok_org_b")
         );
         assert_eq!(
-            cfg.token_for_repo("bowd/my-app"),
+            cfg.token_for_repo("riley/my-app"),
             Some("hyphae_gh_tok_personal_a")
         );
         assert_eq!(cfg.token_for_repo("oss/public-repo"), None);
@@ -1249,7 +1249,7 @@ mod tests {
             vec![
                 "bayfold/*".to_string(),
                 "bayfold/special".to_string(),
-                "bowd/*".to_string(),
+                "riley/*".to_string(),
             ]
         );
 
@@ -1273,7 +1273,7 @@ mod tests {
                 "*".to_string(),
                 "bayfold/*".to_string(),
                 "bayfold/special".to_string(),
-                "bowd/*".to_string(),
+                "riley/*".to_string(),
             ]
         );
     }

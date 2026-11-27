@@ -29,10 +29,10 @@ A digest sent while a turn is active is the same digest the wake nudge would hav
 
 ```xml
 <hyphae-inbox handle="plugins-dev" unread="4" urgency="queue">
-  <dm from="bogdan@macbook/concierge" count="1"/>
+  <dm from="riley@demo-laptop/assistant" count="1"/>
   <channel name="#incidents" count="1"/>
-  <bridge target="telegram:moneypenny0bot" count="1"/>
-  <stream subscription="gmail:bowd" topic="local.gmail" count="2"/>
+  <bridge target="telegram:examplehelper0bot" count="1"/>
+  <stream subscription="gmail:riley" topic="local.gmail" count="2"/>
   <muted count="3"/>
 </hyphae-inbox>
 ```

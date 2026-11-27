@@ -341,9 +341,9 @@ await test("differential native WebCrypto vs pure-JS fallback (Ed25519 + X25519)
 // 7. WebAuthn PRF -> HKDF-SHA256 -> Ed25519 Seed Derivation
 // ----------------------------------------------------------------------------
 await test("prfEvalInput & derivePrfEd25519Seed determinism and domain separation", async () => {
-  const input1 = await prfEvalInput("bogdan", "salt-alpha-123456");
-  const input2 = await prfEvalInput("bogdan", "salt-alpha-123456");
-  const inputOtherSalt = await prfEvalInput("bogdan", "salt-beta-123456");
+  const input1 = await prfEvalInput("riley", "salt-alpha-123456");
+  const input2 = await prfEvalInput("riley", "salt-alpha-123456");
+  const inputOtherSalt = await prfEvalInput("riley", "salt-beta-123456");
   const inputOtherHuman = await prfEvalInput("alice", "salt-alpha-123456");
   assert.equal(input1.length, 32);
   assert.deepEqual(input1, input2);
@@ -351,11 +351,11 @@ await test("prfEvalInput & derivePrfEd25519Seed determinism and domain separatio
   assert.notDeepEqual(input1, inputOtherHuman);
 
   const prfOut = hexDecode("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
-  const seedE1 = await derivePrfEd25519Seed(prfOut, "bogdan", 1);
-  const seedE1Again = await derivePrfEd25519Seed(prfOut, "bogdan", 1);
-  const seedE2 = await derivePrfEd25519Seed(prfOut, "bogdan", 2);
+  const seedE1 = await derivePrfEd25519Seed(prfOut, "riley", 1);
+  const seedE1Again = await derivePrfEd25519Seed(prfOut, "riley", 1);
+  const seedE2 = await derivePrfEd25519Seed(prfOut, "riley", 2);
   const seedOtherHuman = await derivePrfEd25519Seed(prfOut, "alice", 1);
-  const seedHighEpoch = await derivePrfEd25519Seed(prfOut, "bogdan", 0x100000007n);
+  const seedHighEpoch = await derivePrfEd25519Seed(prfOut, "riley", 0x100000007n);
 
   assert.equal(seedE1.length, 32);
   assert.deepEqual(seedE1, seedE1Again);
@@ -365,7 +365,7 @@ await test("prfEvalInput & derivePrfEd25519Seed determinism and domain separatio
 
   const mutatedPrf = new Uint8Array(prfOut);
   mutatedPrf[31] ^= 0x01;
-  const seedMutated = await derivePrfEd25519Seed(mutatedPrf, "bogdan", 1);
+  const seedMutated = await derivePrfEd25519Seed(mutatedPrf, "riley", 1);
   assert.notDeepEqual(seedE1, seedMutated);
 });
 
@@ -390,7 +390,7 @@ await test("NodeCertV1 hcert1_ verification & fail-closed tamper/phishing reject
 
   const { signed, hcert1 } = await signNodeCert(
     {
-      humanId: "bogdan",
+      humanId: "riley",
       authEpoch: 1,
       nodeId: "prod@eu-1",
       encryptionJwk: nodeEncJwk,
@@ -485,7 +485,7 @@ await test("sealHumanDrop -> openHumanDrop (directive & secret) + hdrop1_ + bit-
     claim: {
       v: 1,
       kind: "directive",
-      humanId: "bogdan",
+      humanId: "riley",
       authEpoch: 1,
       issuedAt: "2026-11-24T21:00:00Z",
       expiresAt: "2026-11-24T21:10:00Z",
@@ -522,7 +522,7 @@ await test("sealHumanDrop -> openHumanDrop (directive & secret) + hdrop1_ + bit-
     claim: {
       v: 1,
       kind: "secret",
-      humanId: "bogdan",
+      humanId: "riley",
       authEpoch: 2,
       issuedAt: "2026-11-24T21:00:00Z",
       expiresAt: "2026-11-24T21:05:00Z",
@@ -636,7 +636,7 @@ await test("reserved secret-name denylist, SAS fingerprint & fragment parser sec
           claim: {
             v: 1,
             kind: "secret",
-            humanId: "bogdan",
+            humanId: "riley",
             authEpoch: 1,
             issuedAt: "2026-11-24T21:00:00Z",
             expiresAt: "2026-11-24T21:05:00Z",
@@ -706,7 +706,7 @@ await test("reserved secret-name denylist, SAS fingerprint & fragment parser sec
 // ----------------------------------------------------------------------------
 await test("derivePrfX25519Keypair determinism, domain separation & golden vector parity", async () => {
   const goldenPrf = new Uint8Array(32).fill(0x42);
-  const humanId = "bogdan@laptop";
+  const humanId = "riley@laptop";
 
   const xSeedDefault = await derivePrfX25519Seed(goldenPrf, humanId);
   const xSeedEpoch1 = await derivePrfX25519Seed(goldenPrf, humanId, 1);
@@ -803,8 +803,8 @@ await test("validateDraftText rejects BiDi overrides, zero-width, CR & >512 char
 // ----------------------------------------------------------------------------
 await test("sealHumanDraft -> openHumanDraft roundtrip & fail-closed bit-flip/tamper mutations", async () => {
   const humanPrf = new Uint8Array(32).fill(0x42);
-  const humanEnc = await derivePrfX25519Keypair(humanPrf, "bogdan@laptop", 1);
-  const otherEnc = await derivePrfX25519Keypair(new Uint8Array(32).fill(0x99), "bogdan@laptop", 1);
+  const humanEnc = await derivePrfX25519Keypair(humanPrf, "riley@laptop", 1);
+  const otherEnc = await derivePrfX25519Keypair(new Uint8Array(32).fill(0x99), "riley@laptop", 1);
 
   const payload = {
     v: 1,
@@ -958,7 +958,7 @@ await test("parseFragmentString accepts valid encDraft ONLY on directive & ignor
   const targetEncPub = await x25519PublicFromPrivate(randomBytes(32));
   const targetEncJwk = { kty: "OKP", crv: "X25519", x: base64urlEncode(targetEncPub) };
 
-  const humanEnc = await derivePrfX25519Keypair(new Uint8Array(32).fill(0x42), "bogdan@laptop", 1);
+  const humanEnc = await derivePrfX25519Keypair(new Uint8Array(32).fill(0x42), "riley@laptop", 1);
   const validEncDraft = await sealHumanDraft({
     payload: {
       v: 1,

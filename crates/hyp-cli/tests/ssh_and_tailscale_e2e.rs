@@ -158,29 +158,30 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = TempDir::new().unwrap();
-    let solace_dir = tmp.path().join("solace");
+    let maple_relay_dir = tmp.path().join("maple-relay");
     let alice_dir = tmp.path().join("alice");
-    fs::create_dir_all(&solace_dir).unwrap();
+    fs::create_dir_all(&maple_relay_dir).unwrap();
     fs::create_dir_all(&alice_dir).unwrap();
 
-    // 1. Boot `solace` P2P node serving ONLY on `peer.sock` (ZERO TCP listener!)
-    let mut solace_cfg = NodeConfig::p2p(NodeId::new("solace").unwrap(), &solace_dir);
-    solace_cfg.secret_backend = Some(SecretBackend::File);
-    solace_cfg.public_endpoint = Some("ssh://ops@mock-box".to_string());
-    solace_cfg.kv_namespaces.push(KvNamespaceConfig {
+    // 1. Boot `maple-relay` P2P node serving ONLY on `peer.sock` (ZERO TCP listener!)
+    let mut maple_relay_cfg =
+        NodeConfig::p2p(NodeId::new("maple-relay").unwrap(), &maple_relay_dir);
+    maple_relay_cfg.secret_backend = Some(SecretBackend::File);
+    maple_relay_cfg.public_endpoint = Some("ssh://ops@mock-box".to_string());
+    maple_relay_cfg.kv_namespaces.push(KvNamespaceConfig {
         name: "shared".to_string(),
         mode: KvMode::E2ee,
         write_model: KvWriteModel::Shared,
     });
-    let solace = UnifiedNode::open(solace_cfg).unwrap();
-    let peer_sock = solace_dir.join("peer.sock");
-    let (bound_sock, _unix_srv) = Arc::clone(&solace)
+    let maple_relay = UnifiedNode::open(maple_relay_cfg).unwrap();
+    let peer_sock = maple_relay_dir.join("peer.sock");
+    let (bound_sock, _unix_srv) = Arc::clone(&maple_relay)
         .serve_unix(peer_sock.clone())
         .await
         .unwrap();
     assert_eq!(bound_sock, peer_sock);
     assert_eq!(
-        solace.peer_socket_path().as_deref(),
+        maple_relay.peer_socket_path().as_deref(),
         Some(peer_sock.as_path())
     );
 
@@ -204,13 +205,13 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
     write_executable_script(&mock_ssh, &script);
     let _env_guard = EnvRestoreGuard::set("HYPHAE_SSH_BIN", &mock_ssh);
 
-    // 3. Boot `alice@macbook` local node and pair with `solace` via `hp2p1_` carrying `ssh://ops@mock-box`.
+    // 3. Boot `alice@macbook` local node and pair with `maple-relay` via `hp2p1_` carrying `ssh://ops@mock-box`.
     let mut alice_cfg = NodeConfig::local(NodeId::new("alice@macbook").unwrap(), &alice_dir);
     alice_cfg.secret_backend = Some(SecretBackend::File);
     let alice = UnifiedNode::open(alice_cfg).unwrap();
 
     let scopes = ScopePreset::Member.expand();
-    let (hp2p1_token, offer) = solace
+    let (hp2p1_token, offer) = maple_relay
         .create_p2p_invite(scopes.clone(), scopes.clone(), 300_000)
         .unwrap();
     assert_eq!(offer.endpoint, "ssh://ops@mock-box");
@@ -220,7 +221,7 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
         .accept_p2p_invite(&hp2p1_token, scopes.clone())
         .await
         .expect("accept_p2p_invite over ssh:// must succeed");
-    assert_eq!(link_info.peer_id, "solace");
+    assert_eq!(link_info.peer_id, "maple-relay");
     assert_eq!(link_info.endpoint, "ssh://ops@mock-box");
 
     // Verify ssh wrapper received hardened anti-injection argv (`-o BatchMode=yes ... -T -- ops@mock-box ...`)
@@ -231,30 +232,35 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
     );
 
     // 4. Register sessions/handles on both nodes and verify bidirectional E2EE DM + live SSE over `ssh://`!
-    solace.register_session("solace:s1", "{}").unwrap();
-    solace.register_handle("solace:s1", "ops").await.unwrap();
+    maple_relay
+        .register_session("maple-relay:s1", "{}")
+        .unwrap();
+    maple_relay
+        .register_handle("maple-relay:s1", "ops")
+        .await
+        .unwrap();
     alice.register_session("alice:s1", "{}").unwrap();
     alice.register_handle("alice:s1", "dev").await.unwrap();
 
-    let dm_to_solace_secret = "SSH-E2EE-SECRET-ALICE-TO-SOLACE-99182";
+    let dm_to_maple_relay_secret = "SSH-E2EE-SECRET-ALICE-TO-MAPLE-RELAY-99182";
     let sent1 = alice
-        .send_dm("dev", "solace/ops", dm_to_solace_secret)
+        .send_dm("dev", "maple-relay/ops", dm_to_maple_relay_secret)
         .await
-        .expect("E2EE DM alice -> solace over ssh://");
+        .expect("E2EE DM alice -> maple-relay over ssh://");
     assert!(sent1.encrypted, "DM over ssh:// MUST remain E2EE encrypted");
 
-    let recv_on_solace = wait_for_mailbox_item(&solace, "solace:s1", |e| {
-        e.kind == MailboxKind::Message && e.text.contains(dm_to_solace_secret)
+    let recv_on_maple_relay = wait_for_mailbox_item(&maple_relay, "maple-relay:s1", |e| {
+        e.kind == MailboxKind::Message && e.text.contains(dm_to_maple_relay_secret)
     })
     .await;
-    assert_eq!(recv_on_solace.text, dm_to_solace_secret);
+    assert_eq!(recv_on_maple_relay.text, dm_to_maple_relay_secret);
 
-    // Reverse direction: solace -> alice delivered over Alice's persistent SSE `/v1/inbox` SSH stream!
-    let dm_to_alice_secret = "SSH-SSE-PUSH-SOLACE-TO-ALICE-77412";
-    let sent2 = solace
+    // Reverse direction: maple-relay -> alice delivered over Alice's persistent SSE `/v1/inbox` SSH stream!
+    let dm_to_alice_secret = "SSH-SSE-PUSH-MAPLE-RELAY-TO-ALICE-77412";
+    let sent2 = maple_relay
         .send_dm("ops", "alice@macbook/dev", dm_to_alice_secret)
         .await
-        .expect("E2EE DM solace -> alice queued for SSE");
+        .expect("E2EE DM maple-relay -> alice queued for SSE");
     assert!(
         sent2.encrypted,
         "reverse DM over ssh:// MUST remain E2EE encrypted"
@@ -270,7 +276,7 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
     let kv_secret = "SSH-KV-E2EE-VALUE-33491";
     let kv_written = alice
         .kv_set(KvWriteRequest {
-            host_node: "solace".to_string(),
+            host_node: "maple-relay".to_string(),
             namespace: "shared".to_string(),
             key: "deploy/status".to_string(),
             value: json!({ "state": "green", "token": kv_secret }),
@@ -281,28 +287,28 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
             ttl_ms: None,
             clear_ttl: false,
             encrypt: true,
-            e2ee_members: Some(vec!["alice@macbook".to_string(), "solace".to_string()]),
+            e2ee_members: Some(vec!["alice@macbook".to_string(), "maple-relay".to_string()]),
         })
         .await
         .expect("E2EE KV set over ssh://");
     assert_eq!(kv_written.version, 1);
 
-    // Zero plaintext KV value in solace's SQLite database!
-    assert_zero_plaintext_in_sqlite(&solace_dir, kv_secret);
+    // Zero plaintext KV value in maple-relay's SQLite database!
+    assert_zero_plaintext_in_sqlite(&maple_relay_dir, kv_secret);
 
     let kv_read_alice = alice
-        .kv_get("solace", "shared", "deploy/status")
+        .kv_get("maple-relay", "shared", "deploy/status")
         .await
         .expect("KV get over ssh://")
         .expect("KV entry exists");
     assert_eq!(kv_read_alice.value["token"], kv_secret);
 
-    let kv_read_solace = solace
+    let kv_read_maple_relay = maple_relay
         .kv_get("local", "shared", "deploy/status")
         .await
-        .expect("KV get locally on solace")
-        .expect("KV entry exists on solace");
-    assert_eq!(kv_read_solace.value["token"], kv_secret);
+        .expect("KV get locally on maple-relay")
+        .expect("KV entry exists on maple-relay");
+    assert_eq!(kv_read_maple_relay.value["token"], kv_secret);
 
     // 6. Streaming E2EE file transfer (`transfer.stream.v2`) over `ssh://`!
     let file_secret = "SSH-TRANSFER-SECRET-BYTES-55201\nLine 2.\n";
@@ -311,7 +317,7 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
 
     let transfer_res = alice
         .send_files(
-            "solace",
+            "maple-relay",
             Some("ops"),
             &[TarInputEntry {
                 archive_path: "notes/ssh-report.txt".to_string(),
@@ -323,9 +329,9 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
         .expect("streaming E2EE file transfer over ssh://");
     assert!(transfer_res.ciphertext_bytes > 0);
     assert!(transfer_res.plaintext_digest.starts_with("sha256:"));
-    assert_eq!(transfer_res.to_node, "solace");
+    assert_eq!(transfer_res.to_node, "maple-relay");
 
-    let recv_transfer = wait_for_mailbox_item(&solace, "solace:s1", |e| {
+    let recv_transfer = wait_for_mailbox_item(&maple_relay, "maple-relay:s1", |e| {
         e.kind == MailboxKind::Transfer && e.text.contains(&transfer_res.id)
     })
     .await;
@@ -339,11 +345,11 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
         .as_str()
         .expect("extracted file diskPath");
     assert_eq!(fs::read_to_string(extracted_path).unwrap(), file_secret);
-    assert_zero_plaintext_in_sqlite(&solace_dir, "SSH-TRANSFER-SECRET-BYTES");
+    assert_zero_plaintext_in_sqlite(&maple_relay_dir, "SSH-TRANSFER-SECRET-BYTES");
 
     // 7. Deterministic child-process teardown on `shutdown()` (zero leaked mock ssh PIDs!)
     alice.shutdown();
-    solace.shutdown();
+    maple_relay.shutdown();
 
     let recorded_pids: Vec<i32> = fs::read_to_string(&pid_log)
         .expect("read pid log")
@@ -397,7 +403,7 @@ fn cli_hyp_pair_ssh_dry_run_live_handshake_status_and_injection_rejection() {
             "--profile",
             "p2p",
             "--node-id",
-            "solace",
+            "maple-relay",
             "--bind",
             "none",
             "--no-local-socket",
@@ -448,7 +454,7 @@ fn cli_hyp_pair_ssh_dry_run_live_handshake_status_and_injection_rejection() {
         .args([
             "pair",
             "ssh",
-            "ops@solace",
+            "ops@maple-relay",
             "--node-id",
             "alice@macbook",
             "--remote-state-dir",
@@ -466,13 +472,13 @@ fn cli_hyp_pair_ssh_dry_run_live_handshake_status_and_injection_rejection() {
     assert_eq!(dry_env["data"]["dryRun"], true);
     assert_eq!(dry_env["data"]["transport"], "ssh");
 
-    // 4. Live one-command `hyp pair ssh ops@solace` over mock SSH!
+    // 4. Live one-command `hyp pair ssh ops@maple-relay` over mock SSH!
     let live_out = isolated_cmd(tmp.path())
         .env("HYPHAE_SSH_BIN", &mock_ssh)
         .args([
             "pair",
             "ssh",
-            "ops@solace",
+            "ops@maple-relay",
             "--node-id",
             "alice@macbook",
             "--remote-state-dir",
@@ -495,10 +501,10 @@ fn cli_hyp_pair_ssh_dry_run_live_handshake_status_and_injection_rejection() {
     let live_env = parse_json_stdout(&live_out);
     assert_eq!(live_env["ok"], true);
     assert_eq!(live_env["data"]["transport"], "ssh");
-    assert_eq!(live_env["data"]["peerId"], "solace");
+    assert_eq!(live_env["data"]["peerId"], "maple-relay");
     assert_eq!(live_env["data"]["handshakeCompleted"], true);
     let endpoint_str = live_env["data"]["endpoint"].as_str().unwrap();
-    assert!(endpoint_str.starts_with("ssh://ops@solace?stateDir="));
+    assert!(endpoint_str.starts_with("ssh://ops@maple-relay?stateDir="));
     // Security invariant: stdout JSON must NOT echo raw hp2p1_ secret or authCredential
     let raw_stdout = String::from_utf8_lossy(&live_out.stdout);
     assert!(!raw_stdout.contains("hp2p1_"));
@@ -516,20 +522,20 @@ fn cli_hyp_pair_ssh_dry_run_live_handshake_status_and_injection_rejection() {
     assert_eq!(status_out.status.code(), Some(0));
     let status_env = parse_json_stdout(&status_out);
     let peers = status_env["data"]["peers"].as_array().unwrap();
-    let solace_row = peers
+    let maple_relay_row = peers
         .iter()
-        .find(|p| p["peer"] == "solace")
-        .expect("solace row in status");
-    assert_eq!(solace_row["status"], "ok");
-    assert_eq!(solace_row["transport"], "ssh");
-    assert_eq!(solace_row["e2ee"], "dm+chan");
-    assert_eq!(solace_row["kv"], "kv.e2ee.v1");
+        .find(|p| p["peer"] == "maple-relay")
+        .expect("maple-relay row in status");
+    assert_eq!(maple_relay_row["status"], "ok");
+    assert_eq!(maple_relay_row["transport"], "ssh");
+    assert_eq!(maple_relay_row["e2ee"], "dm+chan");
+    assert_eq!(maple_relay_row["kv"], "kv.e2ee.v1");
     assert!(
-        solace_row["notes"]
+        maple_relay_row["notes"]
             .as_str()
             .unwrap_or("")
             .contains("transport=ssh"),
-        "expected transport=ssh in notes: {solace_row}"
+        "expected transport=ssh in notes: {maple_relay_row}"
     );
 
     // 6. `hyp pair guide --json` advertises all 3 transports (`tailscale`, `https`, `ssh`)

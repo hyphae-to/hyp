@@ -406,7 +406,7 @@ async fn relay_disabled_fails_closed_and_enabled_enforces_auth_scopes_and_manife
     let human_admin = Ed25519KeyPair::generate().unwrap();
     enroll_human_authority(
         &hub,
-        "bogdan",
+        "riley",
         &human_admin,
         HumanAuthorityRole::Admin,
         "Admin YubiKey",
@@ -814,7 +814,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
     let human_kp = Ed25519KeyPair::generate().unwrap();
     enroll_human_authority(
         &target,
-        "bogdan",
+        "riley",
         &human_kp,
         HumanAuthorityRole::Admin,
         "MacBook Passkey",
@@ -935,7 +935,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
     // 2. Browser posts Item 1 (Secret) BEFORE target subscribes (tests late-subscriber catch-up!)
     let secret_canary = "hyphae_zk_canary_987654321_do_not_store_in_sqlite";
     let secret_claim = build_secret_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         &created.drop_id,
@@ -994,7 +994,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
     // 4. Browser posts Item 2 (Directive) AFTER SSE connected -> pushed live!
     let directive_body = "DEPLOY_NOW_OVERRIDE rotate eu-1 canary and confirm rollout";
     let directive_claim = build_directive_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         &created.drop_id,
@@ -1040,7 +1040,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         .await
         .unwrap();
     assert_eq!(ingested_secret.kind, "secret");
-    assert_eq!(ingested_secret.human_id, "bogdan");
+    assert_eq!(ingested_secret.human_id, "riley");
     assert_eq!(ingested_secret.kid, human_kp.kid());
     assert_eq!(
         ingested_secret.secret_name.as_deref(),
@@ -1072,7 +1072,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
 
     // Overwrite guard: second secret drop with overwrite = false -> 409 Conflict
     let secret_claim_v2 = build_secret_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         "",
@@ -1124,7 +1124,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
 
     // Overwrite succeeds ONLY when the human explicitly signs `overwrite: true`!
     let secret_claim_v3 = build_secret_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         "",
@@ -1161,7 +1161,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
     let original_gate_hmac_key = target.secret_store().get("gate-policy-hmac-key").unwrap();
     for reserved_name in ["node-ed25519-key", "gate-policy-hmac-key"] {
         let reserved_claim = build_secret_claim(
-            "bogdan",
+            "riley",
             &human_kp,
             1,
             "",
@@ -1203,7 +1203,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         .await
         .unwrap();
     assert_eq!(ingested_dir.kind, "directive");
-    assert_eq!(ingested_dir.human_id, "bogdan");
+    assert_eq!(ingested_dir.human_id, "riley");
     assert_eq!(ingested_dir.kid, human_kp.kid());
     assert_eq!(ingested_dir.target_session.as_deref(), Some("claude:ops"));
     assert!(!ingested_dir.downgraded_to_notify);
@@ -1220,7 +1220,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         .unwrap()
         .expect("mailbox.human_auth_json must be populated");
     let parsed_auth: VerifiedHumanClaim = serde_json::from_str(&auth_json_raw).unwrap();
-    assert_eq!(parsed_auth.human_id, "bogdan");
+    assert_eq!(parsed_auth.human_id, "riley");
     assert_eq!(parsed_auth.kid, human_kp.kid());
     assert_eq!(parsed_auth.claim_id, directive_claim.claim_id);
     assert_eq!(parsed_auth.kind, "directive");
@@ -1233,7 +1233,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
         })
         .unwrap();
     let kid8: String = human_kp.kid().chars().take(8).collect();
-    let expected_reviewer = format!("human:bogdan:{kid8}");
+    let expected_reviewer = format!("human:riley:{kid8}");
     let dir_audit = audit_rows
         .iter()
         .find(|r| {
@@ -1277,7 +1277,7 @@ async fn full_http_sse_drop_roundtrip_secret_sink_directive_gate_replay_and_burn
 
     // Offline `hdrop1_` token roundtrip via `ingest_human_drop_token`
     let offline_claim = build_directive_claim(
-        "bogdan",
+        "riley",
         &human_kp,
         1,
         "",
@@ -1365,7 +1365,7 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
     let admin_kp = Ed25519KeyPair::generate().unwrap();
     enroll_human_authority(
         &node,
-        "bogdan",
+        "riley",
         &admin_kp,
         HumanAuthorityRole::Admin,
         "Admin Key",
@@ -1381,7 +1381,7 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
     assert_eq!(decoded, signed_cert);
     let cert_payload = verify_node_cert(&decoded, &admin_kp.public_key(), now_ms(), 1).unwrap();
     assert_eq!(cert_payload.node_id, "tamper@test");
-    assert_eq!(cert_payload.human_id, "bogdan");
+    assert_eq!(cert_payload.human_id, "riley");
     assert_eq!(cert_payload.signing_jwk, node.identity().signing_jwk());
     assert_eq!(
         cert_payload.encryption_jwk,
@@ -1410,7 +1410,7 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
 
     // Valid drop succeeds before tampering
     let claim_ok = build_directive_claim(
-        "bogdan",
+        "riley",
         &admin_kp,
         1,
         "",
@@ -1470,7 +1470,7 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
     let ctx_after_tamper = InboundContext {
         session_id: "claude:main".to_string(),
         origin_node: node.node_id().to_string(),
-        sender: "human:bogdan:test".to_string(),
+        sender: "human:riley:test".to_string(),
         trust_tier: GateTrustTier::HumanVerified,
         e2ee_verified: true,
         identity_verified: true,
@@ -1480,14 +1480,14 @@ async fn gate_policy_sig_detects_direct_sqlite_human_authorities_tamper_and_issu
         bridge: None,
         event: CloudEvent::new(
             "human-tamper-check",
-            "human:bogdan:test",
+            "human:riley:test",
             TYPE_HUMAN_DROP_V1,
             json!({ "text": "Should be quarantined on policy tamper" }),
         ),
         transfer_paths: Vec::new(),
         rendered_text: Some("Should be quarantined on policy tamper".to_string()),
         human_auth: Some(VerifiedHumanClaim {
-            human_id: "bogdan".to_string(),
+            human_id: "riley".to_string(),
             kid: admin_kp.kid(),
             role: "admin".to_string(),
             claim_id: "clm-tamper-check".to_string(),
@@ -1528,7 +1528,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
     let signer_kp = Ed25519KeyPair::generate().unwrap();
     enroll_human_authority(
         &node,
-        "bogdan",
+        "riley",
         &admin_kp,
         HumanAuthorityRole::Admin,
         "Admin Root",
@@ -1536,7 +1536,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
     );
     enroll_human_authority(
         &node,
-        "bogdan",
+        "riley",
         &signer_kp,
         HumanAuthorityRole::Signer,
         "Lost Phone Passkey",
@@ -1551,7 +1551,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
 
     // Before revocation, signer drop at epoch 1 succeeds
     let c1 = build_directive_claim(
-        "bogdan",
+        "riley",
         &signer_kp,
         1,
         "",
@@ -1566,7 +1566,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
     // Non-admin revocation MUST fail closed!
     let bad_rev_payload = HumanRevocationPayloadV1 {
         v: 1,
-        human_id: "bogdan".to_string(),
+        human_id: "riley".to_string(),
         revoked_kid: admin_kp.kid(),
         new_min_auth_epoch: 2,
         revoked_at: format_rfc3339_millis(now_ms()),
@@ -1583,7 +1583,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
     // Admin revocation succeeds and bumps min_auth_epoch monotonically to 2
     let admin_rev_payload = HumanRevocationPayloadV1 {
         v: 1,
-        human_id: "bogdan".to_string(),
+        human_id: "riley".to_string(),
         revoked_kid: signer_kp.kid(),
         new_min_auth_epoch: 2,
         revoked_at: format_rfc3339_millis(now_ms()),
@@ -1597,7 +1597,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
     let revoked_rec = node
         .db()
         .human()
-        .get_authority("bogdan", &signer_kp.kid())
+        .get_authority("riley", &signer_kp.kid())
         .unwrap()
         .unwrap();
     assert_eq!(revoked_rec.status, HumanAuthorityStatus::Revoked);
@@ -1627,7 +1627,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
 
     // Subsequent drop from revoked signer fails closed (even at epoch 2)
     let c_revoked = build_directive_claim(
-        "bogdan",
+        "riley",
         &signer_kp,
         2,
         "",
@@ -1649,7 +1649,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
 
     // Drop from active admin with stale epoch 1 (< min_auth_epoch 2) fails closed
     let c_stale = build_directive_claim(
-        "bogdan",
+        "riley",
         &admin_kp,
         1,
         "",
@@ -1671,7 +1671,7 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
 
     // H5: Old epoch-1 key claiming a spoofed higher `claim.auth_epoch = 2` MUST fail closed!
     let c_spoofed = build_directive_claim(
-        "bogdan",
+        "riley",
         &admin_kp,
         2,
         "",
@@ -1695,14 +1695,14 @@ async fn ingest_human_revocation_enforces_admin_role_and_monotonic_epoch() {
     let admin_ep2_kp = Ed25519KeyPair::generate().unwrap();
     enroll_human_authority(
         &node,
-        "bogdan",
+        "riley",
         &admin_ep2_kp,
         HumanAuthorityRole::Admin,
         "Admin Root Epoch 2",
         2,
     );
     let c_fresh = build_directive_claim(
-        "bogdan",
+        "riley",
         &admin_ep2_kp,
         2,
         "",

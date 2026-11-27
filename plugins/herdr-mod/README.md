@@ -15,7 +15,7 @@ Press `5` in the inspector to browse KV namespaces and keys. Select a key to req
 ## Zero-Polling Architecture
 
 - **Local panes:** Watches `~/.config/hyphae/ui/` (or `<stateDir>/ui` from `node.json`, with `~/.config/hyphae/state/ui` fallback) using Herdr's native `watchFolder` + `readTextFile("state.json")` — zero polling and zero subprocess spawns.
-- **Remote SSH spaces (`solace/t4g`):** Deduplicates in-flight and cached fetches across all panes on the same remote host through `shared("hyphae.remoteInFlight")` + `shared("hyphae.remoteCache")` and runs `exec("hyp", ["inspect", "--all", "--json"], { on: machine })` with exponential backoff.
+- **Remote SSH spaces (`maple-relay/t4g`):** Deduplicates in-flight and cached fetches across all panes on the same remote host through `shared("hyphae.remoteInFlight")` + `shared("hyphae.remoteCache")` and runs `exec("hyp", ["inspect", "--all", "--json"], { on: machine })` with exponential backoff.
 - **Strict metadata boundary:** Neither `ui/state.json` nor the Herdr mods ever read or render message bodies, CloudEvent `data`, wakeup `note`s, quarantined payloads, or secrets. Quarantined alerts direct you to `hyp gate review` in your terminal.
 
 ## Install

@@ -172,10 +172,10 @@ For personal servers, bastions, or private VPC machines already reachable over S
 
 ```sh
 # On the remote server (binds only user-only 0600 <state_dir>/peer.sock):
-hyp node start --profile p2p --node-id solace --bind none
+hyp node start --profile p2p --node-id maple-relay --bind none
 
-# From your laptop (one-command mutual P2P pairing over ssh://ops@solace):
-hyp pair ssh ops@solace --preset member
+# From your laptop (one-command mutual P2P pairing over ssh://ops@maple-relay):
+hyp pair ssh ops@maple-relay --preset member
 ```
 
 - `router` and `p2p` nodes automatically bind `<state_dir>/peer.sock` (`0600`) on Unix (opt-in on `local` nodes via `--peer-socket <path>` or `listen.peerSocket: true`).

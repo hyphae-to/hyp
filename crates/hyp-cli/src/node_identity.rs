@@ -136,8 +136,8 @@ pub(crate) fn short_hostname() -> String {
 #[test]
 fn format_default_node_id_sanitizes_macos_local_host_name() {
     assert_eq!(
-        format_default_node_id("Bogdan", "MacBook-Pro-8", "local-host"),
-        "bogdan@macbook-pro-8"
+        format_default_node_id("Riley", "Studio-MacBook-Pro", "local-host"),
+        "riley@studio-macbook-pro"
     );
     assert_eq!(
         format_default_node_id("Alice", "Alice's MacBook Pro.local", "local-host"),
@@ -152,6 +152,6 @@ fn generic_localhost_detection_catches_macos_fallbacks() {
     assert!(is_generic_localhost("localhost"));
     assert!(is_generic_localhost("localhost.localdomain"));
     assert!(is_generic_localhost("LOCAL-HOST"));
-    assert!(!is_generic_localhost("MacBook-Pro-8"));
+    assert!(!is_generic_localhost("Studio-MacBook-Pro"));
     assert!(!is_generic_localhost("workstation.local"));
 }

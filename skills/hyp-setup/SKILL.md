@@ -228,9 +228,9 @@ Check which orchestrators and native push transports are present on this machine
 
   # Option 2 — Zero-port SSH (`ssh://`, personal servers/bastions/VPCs via ~/.ssh/config + peer.sock):
   # One-command mutual P2P pairing (remote node runs `hyp node start --profile p2p` or `--peer-socket`):
-  hyp pair ssh ops@solace --preset member --json
+  hyp pair ssh ops@maple-relay --preset member --json
   # Or manual/asymmetric workflow:
-  hyp pair invite --mode p2p --node-id solace --endpoint ssh://ops@solace --preset member
+  hyp pair invite --mode p2p --node-id maple-relay --endpoint ssh://ops@maple-relay --preset member
   ```
   *(SSH is strictly a transport pipe via `hyp connect` -> `<state_dir>/peer.sock` `0600`; full Hyphae v2 E2EE, Ed25519 auth, and manifest verification remain 100% enforced.)*
 - **Team Hub (`am2_`)**:
@@ -324,8 +324,8 @@ Identify what the user wants to change and execute only the targeted workflow:
 - Inspect the built-in pairing & transport guide (Tailscale Serve HTTPS, Public HTTPS, and Optional `ssh://`): `hyp pair guide --json` (or `--mode p2p|team|public`).
 - One-command zero-port SSH mutual P2P pairing (tunnels over `ssh -o BatchMode=yes` -> remote `hyp connect` -> `peer.sock` `0600`):
   ```sh
-  hyp pair ssh ops@solace --preset member --json
-  hyp pair ssh great-northern --dry-run --json
+  hyp pair ssh ops@maple-relay --preset member --json
+  hyp pair ssh cedar-desk --dry-run --json
   ```
 - Mint invites (`https://` or `ssh://[user@]host[:port]`): `hyp pair invite --mode p2p|team --node-id <id> --endpoint <url> ...`
 - Inspect & accept invites safely via stdin or `--token-file` (triggers live `peers.reload` on the running daemon):

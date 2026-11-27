@@ -311,12 +311,12 @@ mod tests {
     #[test]
     fn normalize_telegram_target_name_validates_and_normalizes() {
         assert_eq!(
-            normalize_telegram_target_name("Moneypenny0_Bot").as_deref(),
-            Some("moneypenny0_bot")
+            normalize_telegram_target_name("ExampleHelper0_Bot").as_deref(),
+            Some("examplehelper0_bot")
         );
         assert_eq!(
-            normalize_telegram_target_name("@Moneypenny0_Bot").as_deref(),
-            Some("moneypenny0_bot")
+            normalize_telegram_target_name("@ExampleHelper0_Bot").as_deref(),
+            Some("examplehelper0_bot")
         );
         assert_eq!(
             normalize_telegram_target_name("  @My.Bot-1_2  ").as_deref(),
@@ -436,7 +436,7 @@ mod tests {
                             .unwrap_or("");
 
                         if path == format!("/bot{secret_ok}/getMe") {
-                            let body = r#"{"ok":true,"result":{"id":42,"is_bot":true,"username":"Moneypenny0_Bot"}}"#;
+                            let body = r#"{"ok":true,"result":{"id":42,"is_bot":true,"username":"ExampleHelper0_Bot"}}"#;
                             let resp = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 body.len(),
@@ -504,14 +504,14 @@ mod tests {
         assert!(missing.warning.is_none());
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
-        // 2. Valid getMe username "Moneypenny0_Bot" -> normalized "moneypenny0_bot"!
+        // 2. Valid getMe username "ExampleHelper0_Bot" -> normalized "examplehelper0_bot"!
         store.set(DEFAULT_TELEGRAM_SECRET_NAME, secret_ok).unwrap();
         let ok = resolve_telegram_default_target_from_store(
             &store,
             DEFAULT_TELEGRAM_SECRET_NAME,
             Some(&base),
         );
-        assert_eq!(ok.target, "moneypenny0_bot");
+        assert_eq!(ok.target, "examplehelper0_bot");
         assert_eq!(ok.source, "getMe");
         assert!(ok.warning.is_none());
 

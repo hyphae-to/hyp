@@ -38,15 +38,15 @@ test("parseTerminalAddress handles local, remote SSH, and empty inputs", () => {
     rawTid: "t4g",
     address: "t4g",
   });
-  assert.deepEqual(parseTerminalAddress("solace/t4g"), {
-    machine: "solace",
+  assert.deepEqual(parseTerminalAddress("maple-relay/t4g"), {
+    machine: "maple-relay",
     rawTid: "t4g",
-    address: "solace/t4g",
+    address: "maple-relay/t4g",
   });
-  assert.deepEqual(parseTerminalAddress("  great-northern/t12  "), {
-    machine: "great-northern",
+  assert.deepEqual(parseTerminalAddress("  cedar-desk/t12  "), {
+    machine: "cedar-desk",
     rawTid: "t12",
-    address: "great-northern/t12",
+    address: "cedar-desk/t12",
   });
   assert.deepEqual(parseTerminalAddress(""), {
     machine: null,
@@ -379,7 +379,7 @@ test("createHyphaeClient cancels watchFolder cleanly on dispose and deduplicates
     watchFolder: () => watchPromise,
     exec: async (_cmd, _args, opts) => {
       execCalls += 1;
-      assert.equal(opts.on, "solace");
+      assert.equal(opts.on, "maple-relay");
       return {
         code: 0,
         stdout: JSON.stringify({
@@ -416,11 +416,11 @@ test("createHyphaeClient cancels watchFolder cleanly on dispose and deduplicates
   assert.equal(client.resolveTerminal("t4g").entry?.handle, "alice");
 
   // Trigger two concurrent remote refreshes -> must dedup to 1 exec call!
-  client.ensureRemoteFresh("solace", fakeCx, false);
-  client.ensureRemoteFresh("solace", fakeCx, false);
+  client.ensureRemoteFresh("maple-relay", fakeCx, false);
+  client.ensureRemoteFresh("maple-relay", fakeCx, false);
   await new Promise((r) => setTimeout(r, 15));
   assert.equal(execCalls, 1);
-  assert.equal(client.resolveTerminal("solace/t2").entry?.handle, "remote-bob");
+  assert.equal(client.resolveTerminal("maple-relay/t2").entry?.handle, "remote-bob");
 
   localPresent = false;
   await client.refreshNow(null, fakeCx);
@@ -450,7 +450,7 @@ test("U5: multiple pane clients sharing shared() deduplicate in-flight remote SS
     },
     exec: async (_cmd, _args, opts) => {
       execCalls += 1;
-      assert.equal(opts.on, "solace");
+      assert.equal(opts.on, "maple-relay");
       return execPromise;
     },
     shared: (k) => sharedStore[k],
@@ -468,17 +468,17 @@ test("U5: multiple pane clients sharing shared() deduplicate in-flight remote SS
     },
   };
 
-  // Simulate 3 separate panes on SSH host `solace` starting up simultaneously!
+  // Simulate 3 separate panes on SSH host `maple-relay` starting up simultaneously!
   const paneA = createHyphaeClient(makeHost());
   const paneB = createHyphaeClient(makeHost());
   const paneC = createHyphaeClient(makeHost());
 
-  paneA.ensureRemoteFresh("solace", fakeCx, false);
+  paneA.ensureRemoteFresh("maple-relay", fakeCx, false);
   // Lock MUST be written synchronously BEFORE exec completes so panes B & C dedup immediately!
-  assert.equal(typeof sharedStore["hyphae.remoteInFlight"]?.solace, "number");
+  assert.equal(typeof sharedStore["hyphae.remoteInFlight"]?.["maple-relay"], "number");
 
-  paneB.ensureRemoteFresh("solace", fakeCx, false);
-  paneC.ensureRemoteFresh("solace", fakeCx, false);
+  paneB.ensureRemoteFresh("maple-relay", fakeCx, false);
+  paneC.ensureRemoteFresh("maple-relay", fakeCx, false);
   assert.equal(execCalls, 1, "3 panes on the same SSH host must share ONE in-flight exec");
 
   resolveExec({
@@ -488,7 +488,7 @@ test("U5: multiple pane clients sharing shared() deduplicate in-flight remote SS
       data: {
         schemaVersion: 1,
         rev: 15,
-        daemon: { online: true, nodeId: "solace", quarantinedGlobal: 0 },
+        daemon: { online: true, nodeId: "maple-relay", quarantinedGlobal: 0 },
         sessions: [{ sessionId: "claude:r1", enrolled: true, handle: "remote-alice", herdrTerminalId: "t2" }],
         byHerdrTerminal: { t2: "claude:r1" },
       },
@@ -498,15 +498,15 @@ test("U5: multiple pane clients sharing shared() deduplicate in-flight remote SS
   await Promise.allSettled(pendingTasks);
 
   // Lock must be released after completion, and all panes resolve the shared cached snapshot.
-  assert.equal(sharedStore["hyphae.remoteInFlight"]?.solace, undefined);
-  assert.equal(paneA.resolveTerminal("solace/t2").entry?.handle, "remote-alice");
-  assert.equal(paneB.resolveTerminal("solace/t2").entry?.handle, "remote-alice");
-  assert.equal(paneC.resolveTerminal("solace/t2").entry?.handle, "remote-alice");
+  assert.equal(sharedStore["hyphae.remoteInFlight"]?.["maple-relay"], undefined);
+  assert.equal(paneA.resolveTerminal("maple-relay/t2").entry?.handle, "remote-alice");
+  assert.equal(paneB.resolveTerminal("maple-relay/t2").entry?.handle, "remote-alice");
+  assert.equal(paneC.resolveTerminal("maple-relay/t2").entry?.handle, "remote-alice");
 
   // Stale in-flight lock older than TTL must automatically recover instead of deadlocking!
   sharedStore["hyphae.remoteCache"] = {};
-  sharedStore["hyphae.remoteInFlight"] = { solace: Date.now() - 30_000 };
-  paneB.ensureRemoteFresh("solace", fakeCx, false);
+  sharedStore["hyphae.remoteInFlight"] = { "maple-relay": Date.now() - 30_000 };
+  paneB.ensureRemoteFresh("maple-relay", fakeCx, false);
   assert.equal(execCalls, 2, "expired stale in-flight lock must allow a fresh remote fetch");
 
   paneA.dispose();
@@ -624,7 +624,7 @@ test("pill.js renderHyphaePill integrates cleanly and dispatches dock vs overlay
     const el = pillMod.renderHyphaePill({
       theme,
       paneId: "p1",
-      terminal: "solace/t4g",
+      terminal: "maple-relay/t4g",
       entry: {
         sessionId: "claude:1",
         enrolled: true,
@@ -639,7 +639,7 @@ test("pill.js renderHyphaePill integrates cleanly and dispatches dock vs overlay
     el.handlers.click({}, { stop_propagation: () => { stopped = true; } });
     assert.equal(stopped, true);
     assert.equal(calls.setShared[0].k, "hyphae.selected");
-    assert.equal(calls.setShared[0].v.machine, "solace");
+    assert.equal(calls.setShared[0].v.machine, "maple-relay");
     assert.equal(calls.setShared[0].v.rawTid, "t4g");
     assert.equal(calls.openOverlay.length, 1);
     assert.equal(calls.openOverlay[0].mod, "hyphae-panel");

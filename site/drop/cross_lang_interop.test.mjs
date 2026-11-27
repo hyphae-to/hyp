@@ -848,7 +848,7 @@ describe("Cross-language Verified Human Drops interop (JS <-> Rust hyp CLI)", ()
     const pkNodeId = "passkey-interop@box";
     writeFileSync(pkCfgPath, JSON.stringify({ v: 2, nodeId: pkNodeId }, null, 2) + "\n", "utf8");
 
-    const pkHumanId = "bogdan@passkey";
+    const pkHumanId = "riley@passkey";
     const pkPrfOut = randomBytes(32);
     const pkEdSeed = await derivePrfEd25519Seed(pkPrfOut, pkHumanId, 1);
     const pkEdKp = await ed25519KeypairFromSeed(pkEdSeed);

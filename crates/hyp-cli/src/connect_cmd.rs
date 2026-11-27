@@ -309,7 +309,7 @@ mod tests {
             &cfg_path,
             serde_json::to_vec_pretty(&json!({
                 "v": 2,
-                "nodeId": "solace",
+                "nodeId": "maple-relay",
                 "profile": "p2p",
                 "listen": { "bind": "127.0.0.1:8799" }
             }))

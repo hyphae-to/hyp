@@ -243,7 +243,7 @@ fn cli_emit_to_live_node_local_ingest_socket_unsigned_and_signed() {
             "auth",
             "init",
             "--human-id",
-            "bogdan",
+            "riley",
             "--label",
             "laptop-admin",
             "--state-dir",
@@ -306,7 +306,7 @@ fn cli_emit_to_live_node_local_ingest_socket_unsigned_and_signed() {
         assert_eq!(signed_json["data"]["topic"], "local.schedule");
         assert_eq!(signed_json["data"]["decision"], "allow");
         assert_eq!(signed_json["data"]["trustTier"], "human-verified");
-        assert_eq!(signed_json["data"]["verifiedHumanId"], "bogdan");
+        assert_eq!(signed_json["data"]["verifiedHumanId"], "riley");
     }
 
     // 6. Verify `hyp status --json` reports `data.localIngest.enabled == true` & `socketExists == true`.
@@ -345,7 +345,7 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
             "auth",
             "init",
             "--human-id",
-            "bogdan",
+            "riley",
             "--label",
             "laptop-admin",
             "--state-dir",
@@ -389,7 +389,7 @@ fn cli_drop_create_encrypted_draft_and_cross_language_rust_to_js_open() {
     for (idx, slot) in prf_out.iter_mut().enumerate() {
         *slot = ((idx * 11 + 5) & 0xff) as u8;
     }
-    let human_id = "bogdan";
+    let human_id = "riley";
     let auth_epoch = 1u64;
     let prf_salt = "salt-draft-interop-v050";
     let passkey_ed = derive_prf_ed25519_keypair(&prf_out, human_id, auth_epoch).unwrap();
@@ -623,13 +623,13 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
     let state_dir = home.join("state");
     let state_str = state_dir.to_str().unwrap();
 
-    // 1. `hyp auth init --human-id bogdan --label laptop-admin --json`
+    // 1. `hyp auth init --human-id riley --label laptop-admin --json`
     let init_out = isolated_cmd(home)
         .args([
             "auth",
             "init",
             "--human-id",
-            "bogdan",
+            "riley",
             "--label",
             "laptop-admin",
             "--state-dir",
@@ -646,7 +646,7 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
     );
     let init_json = parse_json_stdout(&init_out);
     assert_eq!(init_json["ok"], true);
-    assert_eq!(init_json["data"]["humanId"], "bogdan");
+    assert_eq!(init_json["data"]["humanId"], "riley");
     assert_eq!(init_json["data"]["role"], "admin");
     assert!(
         init_json["data"]["nodeCert"]
@@ -743,7 +743,7 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
     let hdrop1 = seal_hdrop1_via_stored_admin(
         &state_dir,
         init_json["data"]["nodeId"].as_str().unwrap(),
-        "bogdan",
+        "riley",
         init_json["data"]["kid"].as_str().unwrap(),
         hyp_crypto::human::HumanDropKind::Secret,
         Some("demo-api-key"),
@@ -774,7 +774,7 @@ fn cli_auth_init_certify_sign_and_drop_ingest_secret_zero_leak() {
     assert_eq!(ingest_json["ok"], true);
     assert_eq!(ingest_json["data"]["kind"], "secret");
     assert_eq!(ingest_json["data"]["secretName"], "demo-api-key");
-    assert_eq!(ingest_json["data"]["humanId"], "bogdan");
+    assert_eq!(ingest_json["data"]["humanId"], "riley");
 
     // 6. Verify SecretStore::get("demo-api-key") == secret_plaintext
     let store = SecretStore::new(&state_dir, SecretBackend::File);
@@ -1326,7 +1326,7 @@ fn cli_drop_create_offline_and_cross_language_browser_js_to_rust_ingest() {
             "auth",
             "init",
             "--human-id",
-            "bogdan",
+            "riley",
             "--label",
             "laptop-admin",
             "--state-dir",
@@ -1966,7 +1966,7 @@ fn cli_drop_portal_url_override_and_fail_closed_validation() {
             "auth",
             "init",
             "--human-id",
-            "bogdan",
+            "riley",
             "--label",
             "laptop-admin",
             "--state-dir",

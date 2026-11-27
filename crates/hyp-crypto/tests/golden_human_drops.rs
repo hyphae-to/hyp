@@ -54,7 +54,7 @@ fn sample_directive_claim(
         v: 1,
         kind: HumanDropKind::Directive,
         claim_id: "9f2aB7xQ_kL3mNpRsTuVwX".to_string(),
-        human_id: "bogdan".to_string(),
+        human_id: "riley".to_string(),
         human_kid: signer.kid(),
         auth_epoch: 1,
         issued_at: format_rfc3339_millis(T0),
@@ -80,7 +80,7 @@ fn sample_secret_claim(
         v: 1,
         kind: HumanDropKind::Secret,
         claim_id: "7c1dE4fG_hI2jKlMnOpQrS".to_string(),
-        human_id: "bogdan".to_string(),
+        human_id: "riley".to_string(),
         human_kid: signer.kid(),
         auth_epoch: 1,
         issued_at: format_rfc3339_millis(T0),
@@ -144,7 +144,7 @@ fn golden_prf_hkdf_derivation_and_hpke_context_vectors() {
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
         0x1f, 0x20,
     ];
-    let human_id = "bogdan";
+    let human_id = "riley";
     let prf_salt = "prf_salt_golden_v1";
     let auth_epoch = 1u64;
 
@@ -155,13 +155,13 @@ fn golden_prf_hkdf_derivation_and_hpke_context_vectors() {
     // Independent SHA-256 check
     use sha2::{Digest, Sha256};
     let expected_prf_in = hex::encode(Sha256::digest(
-        b"hyphae/v2/human-prf-input\nbogdan\nprf_salt_golden_v1",
+        b"hyphae/v2/human-prf-input\nriley\nprf_salt_golden_v1",
     ));
     assert_eq!(prf_in_hex, expected_prf_in);
 
     // 2. Differential RFC 5869 HKDF-SHA256 check for Ed25519 seed derivation
     let mut expected_info = Vec::new();
-    expected_info.extend_from_slice(b"bogdan\n");
+    expected_info.extend_from_slice(b"riley\n");
     expected_info.extend_from_slice(&1u64.to_be_bytes());
     let expected_seed = reference_hkdf_sha256_32(HUMAN_PRF_HKDF_SALT, &prf_output, &expected_info);
 
@@ -207,17 +207,17 @@ fn golden_prf_hkdf_derivation_and_hpke_context_vectors() {
     // Frozen golden vector assertions for bit-exact cross-language parity with site/drop/crypto.js
     assert_eq!(
         prf_in_hex,
-        "7e500e31932ab6c81d57d84949f41bae4327fe499ab7e0211cfab425d6ce5e72"
+        "3e33d281eb415de893fb84014f62c4f73089c6a0a246af486ef7a1b20ef62835"
     );
     assert_eq!(
         hex::encode(kp.seed_bytes()),
-        "d443b3ac0935528b5813b3a27d3d4cf4a7266c48c0de1c3a36d519913a2ce32e"
+        "bf4ac0b286c37619dee23126a228416cfbba5c9c647a7087c8940b88c2e71400"
     );
     assert_eq!(
         kp.public_key_b64(),
-        "eMuBWJusgijh1-2_nof6NSlSDyQdzsE4FKbocPWB3XY"
+        "K9V8yrpadyse_IxKHl1U3ZF3C1foO3X71UAInHriGx8"
     );
-    assert_eq!(kp.kid(), "P03lzSdySUrFPBDsc7vkJ0hwfPr_clwMYFkFn8KeG54");
+    assert_eq!(kp.kid(), "lGP0xwXhgK3CMB4qC8aWhJflZ-de5JGALgoM-5A19l8");
 }
 
 // ============================================================================
@@ -238,7 +238,7 @@ fn roundtrip_directive_and_secret_hdrop1_hides_all_metadata() {
 
     // Outer wire JSON MUST NOT leak humanId, humanKid, nodeId, kind, secretSpec, or body!
     let wire_json = to_canonical_json(&env).unwrap();
-    assert!(!wire_json.contains("bogdan"));
+    assert!(!wire_json.contains("riley"));
     assert!(!wire_json.contains(&human.kid()));
     assert!(!wire_json.contains("prod@eu-1"));
     assert!(!wire_json.contains(&node_enc.kid()));
@@ -261,7 +261,7 @@ fn roundtrip_directive_and_secret_hdrop1_hides_all_metadata() {
         "prod@eu-1",
         T0 + 1_000,
         |hid, kid| {
-            assert_eq!(hid, "bogdan");
+            assert_eq!(hid, "riley");
             assert_eq!(kid, human.kid());
             Some((human.public_key(), 1))
         },
@@ -297,7 +297,7 @@ fn roundtrip_node_cert_hcert1_and_mutations_fail_closed() {
         node_id: "prod@eu-1".to_string(),
         signing_jwk: node_sign.to_jwk(),
         encryption_jwk: node_enc.to_jwk(),
-        human_id: "bogdan".to_string(),
+        human_id: "riley".to_string(),
         human_kid: admin.kid(),
         auth_epoch: 2,
         issued_at: format_rfc3339_millis(T0),
@@ -360,7 +360,7 @@ fn roundtrip_human_revocation_and_cross_domain_rejection() {
 
     let rev = HumanRevocationPayloadV1 {
         v: 1,
-        human_id: "bogdan".to_string(),
+        human_id: "riley".to_string(),
         revoked_kid: lost_phone.kid(),
         new_min_auth_epoch: 3,
         revoked_at: format_rfc3339_millis(T0),
@@ -710,20 +710,20 @@ fn reserved_secret_names_fail_closed_case_insensitively_on_seal_and_open() {
 
 #[test]
 fn golden_prf_x25519_derivation_differential_and_parity_vectors() {
-    // 1. Existing golden PRF seed (`0x01..=0x20`, `human_id = "bogdan"`, `auth_epoch = 1`)
+    // 1. Existing golden PRF seed (`0x01..=0x20`, `human_id = "riley"`, `auth_epoch = 1`)
     let prf_output: [u8; 32] = [
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
         0x1f, 0x20,
     ];
-    let mut info_bogdan = Vec::new();
-    info_bogdan.extend_from_slice(b"bogdan\n");
-    info_bogdan.extend_from_slice(&1u64.to_be_bytes());
+    let mut info_riley = Vec::new();
+    info_riley.extend_from_slice(b"riley\n");
+    info_riley.extend_from_slice(&1u64.to_be_bytes());
     let expected_x25519_seed =
-        reference_hkdf_sha256_32(HUMAN_PRF_X25519_SALT, &prf_output, &info_bogdan);
+        reference_hkdf_sha256_32(HUMAN_PRF_X25519_SALT, &prf_output, &info_riley);
 
-    let xkp = derive_prf_x25519_keypair(&prf_output, "bogdan", 1).unwrap();
-    let edkp = derive_prf_ed25519_keypair(&prf_output, "bogdan", 1).unwrap();
+    let xkp = derive_prf_x25519_keypair(&prf_output, "riley", 1).unwrap();
+    let edkp = derive_prf_ed25519_keypair(&prf_output, "riley", 1).unwrap();
     assert_eq!(xkp.secret_bytes(), &expected_x25519_seed);
     assert_ne!(
         xkp.secret_bytes(),
@@ -734,11 +734,11 @@ fn golden_prf_x25519_derivation_differential_and_parity_vectors() {
     assert_eq!(xkp.to_jwk().crv, "X25519");
 
     // Deterministic, epoch-rotated, and humanId-separated
-    let xkp_again = derive_prf_x25519_keypair(&prf_output, "bogdan", 1).unwrap();
+    let xkp_again = derive_prf_x25519_keypair(&prf_output, "riley", 1).unwrap();
     assert_eq!(xkp.public_key_bytes(), xkp_again.public_key_bytes());
     assert_eq!(xkp.kid(), xkp_again.kid());
 
-    let xkp_epoch2 = derive_prf_x25519_keypair(&prf_output, "bogdan", 2).unwrap();
+    let xkp_epoch2 = derive_prf_x25519_keypair(&prf_output, "riley", 2).unwrap();
     assert_ne!(xkp.public_key_bytes(), xkp_epoch2.public_key_bytes());
     assert_ne!(xkp.kid(), xkp_epoch2.kid());
 
@@ -746,47 +746,47 @@ fn golden_prf_x25519_derivation_differential_and_parity_vectors() {
     assert_ne!(xkp.public_key_bytes(), xkp_other.public_key_bytes());
 
     // Fail closed on invalid inputs (exact same guards as Ed25519 derivation)
-    assert!(derive_prf_x25519_keypair(&prf_output, "bogdan", 0).is_err());
+    assert!(derive_prf_x25519_keypair(&prf_output, "riley", 0).is_err());
     assert!(derive_prf_x25519_keypair(&prf_output, "", 1).is_err());
     assert!(derive_prf_x25519_keypair(&prf_output, "bad\nhuman", 1).is_err());
     assert!(derive_prf_x25519_keypair(&prf_output, "UPPER", 1).is_err());
 
-    // 2. Cross-language parity vector (`[0x42; 32]`, `"bogdan@laptop"`, `auth_epoch = 1`)
+    // 2. Cross-language parity vector (`[0x42; 32]`, `"riley@laptop"`, `auth_epoch = 1`)
     let prf_42 = [0x42u8; 32];
     let mut info_laptop = Vec::new();
-    info_laptop.extend_from_slice(b"bogdan@laptop\n");
+    info_laptop.extend_from_slice(b"riley@laptop\n");
     info_laptop.extend_from_slice(&1u64.to_be_bytes());
     let expected_seed_42 = reference_hkdf_sha256_32(HUMAN_PRF_X25519_SALT, &prf_42, &info_laptop);
-    let xkp_42 = derive_prf_x25519_keypair(&prf_42, "bogdan@laptop", 1).unwrap();
+    let xkp_42 = derive_prf_x25519_keypair(&prf_42, "riley@laptop", 1).unwrap();
     assert_eq!(xkp_42.secret_bytes(), &expected_seed_42);
 
     // Frozen golden vectors for bit-exact cross-language parity with site/drop/crypto.js
     assert_eq!(
         hex::encode(xkp.secret_bytes()),
-        "099d665826cff6a44e236c8fe3e081d4428b4ee28cf1a3898b8ef4c269b3417b"
+        "6a11f21c76839118dd7b1a3398bf55e161f0e17ee55f4255a34e1739fde2c10a"
     );
     assert_eq!(
         xkp.public_key_b64(),
-        "v90neJzK8qwdSLUnQKSLzaaU6Psjp4-YXBYsYL-ZOyg"
+        "-r-JbVKpJ8b7Il0KEDoENapjf4573RBx91N-stbiyko"
     );
-    assert_eq!(xkp.kid(), "Exkxfg7cKbR9aacvUy5mFbxVkoQhIimxzkqwFZUBoZc");
+    assert_eq!(xkp.kid(), "X-Nb11_B-mkg8EhgSVDFqZGErzIGUtA5B9hw8ermw0Y");
 
     assert_eq!(
         hex::encode(xkp_42.secret_bytes()),
-        "e5695da5aa539c847fc6bd6948102582935dae6810b1ca8d035028dad1bb77c9"
+        "cff92086a9a86d5a5899dd7c954653507df69eccf32be25aefeaedffc95d9b78"
     );
     assert_eq!(
         xkp_42.public_key_b64(),
-        "4_7PQWSFgghH68INaJ0SKEI3CO1GyTaE6xCu9OsLZHQ"
+        "sCgHjkeXSeIo_WraHUREnLiKvaxGyUlNXC7g-_2Id1U"
     );
-    assert_eq!(xkp_42.kid(), "HyMwO2TH1gWVhnrHJu00SczRe_mSYojkebEvLp5X2hw");
+    assert_eq!(xkp_42.kid(), "UtmzLYU60s2Jj123YDj9-lyyavWFwXCEcWZ6nVFcTd4");
 }
 
 #[test]
 fn encrypted_human_draft_roundtrip_and_mutated_inputs_fail_closed() {
     let prf_42 = [0x42u8; 32];
-    let human_enc = derive_prf_x25519_keypair(&prf_42, "bogdan@laptop", 1).unwrap();
-    let other_enc = derive_prf_x25519_keypair(&prf_42, "bogdan@laptop", 2).unwrap();
+    let human_enc = derive_prf_x25519_keypair(&prf_42, "riley@laptop", 1).unwrap();
+    let other_enc = derive_prf_x25519_keypair(&prf_42, "riley@laptop", 2).unwrap();
 
     // Exact HPKE info and AAD byte formatting
     let info = human_draft_hpke_info("prod@eu-1", &human_enc.kid());

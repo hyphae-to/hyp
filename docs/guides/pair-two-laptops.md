@@ -62,10 +62,10 @@ If Machine A is a personal workstation, bastion, or private VPC host you can alr
 
 ```sh
 # One-command mutual P2P pairing over SSH (supports ~/.ssh/config aliases, user@host, or user@host:port)
-hyp pair ssh ops@solace --preset member
+hyp pair ssh ops@maple-relay --preset member
 
 # Preview without connecting:
-hyp pair ssh great-northern --dry-run
+hyp pair ssh cedar-desk --dry-run
 ```
 
 For manual or asymmetric workflows, mint an `hp2p1_` (or `am2_`) invite directly with an `ssh://` endpoint:
@@ -73,8 +73,8 @@ For manual or asymmetric workflows, mint an `hp2p1_` (or `am2_`) invite directly
 ```sh
 hyp pair invite \
   --mode p2p \
-  --node-id solace \
-  --endpoint ssh://ops@solace \
+  --node-id maple-relay \
+  --endpoint ssh://ops@maple-relay \
   --grant dm:send dm:receive files:send=25mb \
   --request dm:send dm:receive
 ```

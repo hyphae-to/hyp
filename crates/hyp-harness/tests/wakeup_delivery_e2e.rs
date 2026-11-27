@@ -846,7 +846,7 @@ async fn test4_mesh_drop_link_encrypted_draft_roundtrip_and_fail_closed_guards()
     let node = open_local_node("draft-e2e@box", dir.path());
 
     // Derive Passkey-PRF Ed25519 + companion X25519 keypair and enroll WITH `enc_jwk_json`.
-    let human_id = "bogdan@phone";
+    let human_id = "riley@phone";
     let prf_out = [0x42u8; 32];
     let human_sign_kp = derive_prf_ed25519_keypair(&prf_out, human_id, 1).unwrap();
     let human_enc_kp = derive_prf_x25519_keypair(&prf_out, human_id, 1).unwrap();
@@ -1238,7 +1238,7 @@ async fn test_mesh_drop_link_secret_zero_leak_and_burn() {
 
     // Enroll an active human admin authority + sign & persist a NodeCertV1 (`hcert1_`).
     let human_admin = Ed25519KeyPair::generate().unwrap();
-    let human_id = "bogdan@phone";
+    let human_id = "riley@phone";
     {
         let db = node.db();
         db.human()
@@ -2305,7 +2305,7 @@ async fn test_drop_secret_exists_hint_and_conflict_notice_local_and_external_wat
     // Enroll an active human admin authority + issue NodeCertV1 (`hcert1_`).
     let human_admin = Ed25519KeyPair::generate().unwrap();
     let attacker_kp = Ed25519KeyPair::generate().unwrap();
-    let human_id = "bogdan@phone";
+    let human_id = "riley@phone";
     {
         let db = node.db();
         db.human()

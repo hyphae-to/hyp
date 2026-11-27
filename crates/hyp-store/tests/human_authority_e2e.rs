@@ -183,7 +183,7 @@ fn seed_db_at_version(path: &Path, version: i64) {
         conn.execute(
             "INSERT INTO human_authorities
                 (human_id, kid, label, role, jwk_json, prf_salt, auth_epoch, status, created_at)
-             VALUES ('bogdan', 'kid_v4_legacy', 'v4-passkey', 'signer', ?1, 'salt_v4', 1, 'active', ?2)",
+             VALUES ('riley', 'kid_v4_legacy', 'v4-passkey', 'signer', ?1, 'salt_v4', 1, 'active', ?2)",
             params![sample_jwk("v4_legacy_key"), T0 + 3],
         )
         .unwrap();
@@ -258,7 +258,7 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
     // Enroll laptop admin + two phone signer keys
     let admin = human
         .upsert_authority(
-            &sample_authority("bogdan", "kid_admin_1", HumanAuthorityRole::Admin, 1),
+            &sample_authority("riley", "kid_admin_1", HumanAuthorityRole::Admin, 1),
             T0,
         )
         .unwrap();
@@ -267,13 +267,13 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
 
     human
         .upsert_authority(
-            &sample_authority("bogdan", "kid_phone_1", HumanAuthorityRole::Signer, 1),
+            &sample_authority("riley", "kid_phone_1", HumanAuthorityRole::Signer, 1),
             T0 + 1,
         )
         .unwrap();
     human
         .upsert_authority(
-            &sample_authority("bogdan", "kid_phone_2", HumanAuthorityRole::Signer, 2),
+            &sample_authority("riley", "kid_phone_2", HumanAuthorityRole::Signer, 2),
             T0 + 2,
         )
         .unwrap();
@@ -299,7 +299,7 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
     // Revoke phone_1 and advance min_auth_epoch -> 4
     let rev1_json = r#"{"payload":"{}","sig":"sig1"}"#;
     let new_min = human
-        .revoke_authority_monotonic("bogdan", "kid_phone_1", 4, rev1_json, T0 + 100)
+        .revoke_authority_monotonic("riley", "kid_phone_1", 4, rev1_json, T0 + 100)
         .unwrap();
     assert_eq!(new_min, 4);
     assert_eq!(human.min_auth_epoch().unwrap(), 4);
@@ -311,7 +311,7 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
     assert_eq!(human.list_authorities(true).unwrap().len(), 3);
 
     let revoked_rec = human
-        .get_authority("bogdan", "kid_phone_1")
+        .get_authority("riley", "kid_phone_1")
         .unwrap()
         .unwrap();
     assert_eq!(revoked_rec.status, HumanAuthorityStatus::Revoked);
@@ -321,7 +321,7 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
     // Attempting to resurrect a revoked key via upsert MUST fail closed!
     assert!(matches!(
         human.upsert_authority(
-            &sample_authority("bogdan", "kid_phone_1", HumanAuthorityRole::Signer, 5),
+            &sample_authority("riley", "kid_phone_1", HumanAuthorityRole::Signer, 5),
             T0 + 200,
         ),
         Err(StoreError::InvalidState(_))
@@ -330,7 +330,7 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
     // Revoking phone_2 with stale lower epoch (2 < 4) STILL revokes phone_2 AND NEVER rolls back min_auth_epoch!
     let rev2_json = r#"{"payload":"{}","sig":"sig2"}"#;
     let stayed_min = human
-        .revoke_authority_monotonic("bogdan", "kid_phone_2", 2, rev2_json, T0 + 300)
+        .revoke_authority_monotonic("riley", "kid_phone_2", 2, rev2_json, T0 + 300)
         .unwrap();
     assert_eq!(stayed_min, 4, "min_auth_epoch must NEVER roll back below 4");
     assert_eq!(human.min_auth_epoch().unwrap(), 4);
@@ -341,7 +341,7 @@ fn monotonic_min_auth_epoch_anti_rollback_and_revoked_key_non_resurrection() {
 
     // Unknown key revocation fails with NotFound
     assert!(matches!(
-        human.revoke_authority_monotonic("bogdan", "kid_nonexistent", 10, rev2_json, T0 + 400),
+        human.revoke_authority_monotonic("riley", "kid_nonexistent", 10, rev2_json, T0 + 400),
         Err(StoreError::NotFound(_))
     ));
     assert_eq!(human.min_auth_epoch().unwrap(), 4);
@@ -354,7 +354,7 @@ fn authorities_digest_is_order_independent_and_detects_every_mutation() {
     let db_b = NodeDb::open_in_memory().unwrap();
 
     let k1 = sample_authority("alice", "kid_z", HumanAuthorityRole::Admin, 1);
-    let k2 = sample_authority("bogdan", "kid_a", HumanAuthorityRole::Signer, 2);
+    let k2 = sample_authority("riley", "kid_a", HumanAuthorityRole::Signer, 2);
 
     let d_empty = db_a.human().authorities_digest().unwrap();
     assert_eq!(d_empty.len(), 64);
@@ -380,7 +380,7 @@ fn authorities_digest_is_order_independent_and_detects_every_mutation() {
     // 1. Mutate role via raw SQLite tampering
     db_a.connection()
         .execute(
-            "UPDATE human_authorities SET role = 'admin' WHERE human_id = 'bogdan' AND kid = 'kid_a'",
+            "UPDATE human_authorities SET role = 'admin' WHERE human_id = 'riley' AND kid = 'kid_a'",
             [],
         )
         .unwrap();
@@ -436,7 +436,7 @@ fn authorities_digest_is_order_independent_and_detects_every_mutation() {
     //    and refusing resurrection!
     let new_min = db_a
         .human()
-        .revoke_authority_monotonic("bogdan", "kid_a", 3, r#"{"r":1}"#, T0 + 10)
+        .revoke_authority_monotonic("riley", "kid_a", 3, r#"{"r":1}"#, T0 + 10)
         .unwrap();
     assert_eq!(new_min, 3);
     assert_eq!(db_a.human().min_auth_epoch().unwrap(), 3);
@@ -453,7 +453,7 @@ fn authorities_digest_is_order_independent_and_detects_every_mutation() {
     // Attempting to resurrect the revoked key fails closed!
     assert!(matches!(
         db_a.human().upsert_authority(
-            &sample_authority("bogdan", "kid_a", HumanAuthorityRole::Admin, 100),
+            &sample_authority("riley", "kid_a", HumanAuthorityRole::Admin, 100),
             T0 + 15,
         ),
         Err(StoreError::InvalidState(_))
@@ -608,7 +608,7 @@ fn node_certs_anti_rollback_and_mailbox_human_auth_json_attachment() {
                 item_id: "drop-item-1".to_string(),
                 text: "Verified directive body".to_string(),
                 kind: MailboxKind::Message,
-                source: "human:bogdan".to_string(),
+                source: "human:riley".to_string(),
                 gate_state: GateState::Pending,
                 gate_reason: None,
                 traceparent: None,
@@ -623,7 +623,7 @@ fn node_certs_anti_rollback_and_mailbox_human_auth_json_attachment() {
 
     assert_eq!(db.human().get_mailbox_human_auth(&receipt).unwrap(), None);
     let auth_meta =
-        r#"{"claimId":"c1","humanId":"bogdan","humanKid":"kid_phone_1","verified":true}"#;
+        r#"{"claimId":"c1","humanId":"riley","humanKid":"kid_phone_1","verified":true}"#;
     assert!(
         db.human()
             .set_mailbox_human_auth(&receipt, auth_meta)
@@ -657,12 +657,12 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
     // Empty store -> None
     assert_eq!(human.get_preferred_human_enc_jwk(None).unwrap(), None);
     assert_eq!(
-        human.get_preferred_human_enc_jwk(Some("bogdan")).unwrap(),
+        human.get_preferred_human_enc_jwk(Some("riley")).unwrap(),
         None
     );
 
     // Enroll authority without enc_jwk_json -> preferred lookup still None
-    let a1 = sample_authority("bogdan", "kid_no_enc", HumanAuthorityRole::Admin, 1);
+    let a1 = sample_authority("riley", "kid_no_enc", HumanAuthorityRole::Admin, 1);
     let r1 = human.upsert_authority(&a1, T0).unwrap();
     assert_eq!(r1.enc_jwk_json, None);
     assert_eq!(human.get_preferred_human_enc_jwk(None).unwrap(), None);
@@ -693,20 +693,20 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
         "kid_alice_enc"
     );
     assert_eq!(
-        human.get_preferred_human_enc_jwk(Some("bogdan")).unwrap(),
+        human.get_preferred_human_enc_jwk(Some("riley")).unwrap(),
         None
     );
 
-    // Upgrade bogdan's existing active authority (created_at = T0) with enc_jwk_json
+    // Upgrade riley's existing active authority (created_at = T0) with enc_jwk_json
     assert!(
         human
-            .update_authority_enc_jwk("kid_no_enc", &sample_enc_jwk("bogdan_x25519_old"), T0 + 20)
+            .update_authority_enc_jwk("kid_no_enc", &sample_enc_jwk("riley_x25519_old"), T0 + 20)
             .unwrap()
     );
-    // For bogdan specifically, returns kid_no_enc; globally alice (created_at = T0 + 10 > T0) is newer!
+    // For riley specifically, returns kid_no_enc; globally alice (created_at = T0 + 10 > T0) is newer!
     assert_eq!(
         human
-            .get_preferred_human_enc_jwk(Some("bogdan"))
+            .get_preferred_human_enc_jwk(Some("riley"))
             .unwrap()
             .unwrap()
             .kid,
@@ -721,9 +721,9 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
         "kid_alice_enc"
     );
 
-    // Enroll newer bogdan authority WITH enc_jwk_json at T0 + 50 -> becomes newest globally & for bogdan
-    let mut a3 = sample_authority("bogdan", "kid_bogdan_new", HumanAuthorityRole::Signer, 2);
-    a3.enc_jwk_json = Some(sample_enc_jwk("bogdan_x25519_new"));
+    // Enroll newer riley authority WITH enc_jwk_json at T0 + 50 -> becomes newest globally & for riley
+    let mut a3 = sample_authority("riley", "kid_riley_new", HumanAuthorityRole::Signer, 2);
+    a3.enc_jwk_json = Some(sample_enc_jwk("riley_x25519_new"));
     human.upsert_authority(&a3, T0 + 50).unwrap();
     assert_eq!(
         human
@@ -731,43 +731,38 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
             .unwrap()
             .unwrap()
             .kid,
-        "kid_bogdan_new"
+        "kid_riley_new"
     );
     assert_eq!(
         human
-            .get_preferred_human_enc_jwk(Some("bogdan"))
+            .get_preferred_human_enc_jwk(Some("riley"))
             .unwrap()
             .unwrap()
             .kid,
-        "kid_bogdan_new"
+        "kid_riley_new"
     );
 
-    // Even newer bogdan authority WITHOUT enc_jwk_json is ignored by preferred_enc_jwk lookup
-    let a4 = sample_authority(
-        "bogdan",
-        "kid_bogdan_no_enc2",
-        HumanAuthorityRole::Signer,
-        3,
-    );
+    // Even newer riley authority WITHOUT enc_jwk_json is ignored by preferred_enc_jwk lookup
+    let a4 = sample_authority("riley", "kid_riley_no_enc2", HumanAuthorityRole::Signer, 3);
     human.upsert_authority(&a4, T0 + 100).unwrap();
     assert_eq!(
         human
-            .get_preferred_human_enc_jwk(Some("bogdan"))
+            .get_preferred_human_enc_jwk(Some("riley"))
             .unwrap()
             .unwrap()
             .kid,
-        "kid_bogdan_new"
+        "kid_riley_new"
     );
 
-    // Revoking kid_bogdan_new falls back cleanly to kid_no_enc (for bogdan) and kid_alice_enc (globally),
+    // Revoking kid_riley_new falls back cleanly to kid_no_enc (for riley) and kid_alice_enc (globally),
     // AND refuses to update enc_jwk_json on the revoked key!
     human
-        .revoke_authority_monotonic("bogdan", "kid_bogdan_new", 2, r#"{"r":1}"#, T0 + 150)
+        .revoke_authority_monotonic("riley", "kid_riley_new", 2, r#"{"r":1}"#, T0 + 150)
         .unwrap();
     assert!(
         !human
             .update_authority_enc_jwk(
-                "kid_bogdan_new",
+                "kid_riley_new",
                 &sample_enc_jwk("revoked_attempt"),
                 T0 + 160
             )
@@ -785,7 +780,7 @@ fn enc_jwk_lifecycle_preferred_lookup_and_revocation_guard() {
     );
     assert_eq!(
         human
-            .get_preferred_human_enc_jwk(Some("bogdan"))
+            .get_preferred_human_enc_jwk(Some("riley"))
             .unwrap()
             .unwrap()
             .kid,
@@ -875,8 +870,7 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
         );
 
         // Post-migration v5 operations work immediately (including enc_jwk_json!)
-        let mut post_auth =
-            sample_authority("bogdan", "kid_post_mig", HumanAuthorityRole::Admin, 1);
+        let mut post_auth = sample_authority("riley", "kid_post_mig", HumanAuthorityRole::Admin, 1);
         post_auth.enc_jwk_json = Some(sample_enc_jwk("post_mig_x25519"));
         let stored = db.human().upsert_authority(&post_auth, T0 + 100).unwrap();
         assert_eq!(
@@ -902,7 +896,7 @@ fn full_v1_v2_v3_v4_to_v5_migration_parity_backups_and_zero_data_loss() {
         .get_active_authority_by_kid("kid_v4_legacy")
         .unwrap()
         .expect("v4 human authority must survive v4->v5 migration");
-    assert_eq!(legacy_v4.human_id, "bogdan");
+    assert_eq!(legacy_v4.human_id, "riley");
     assert_eq!(legacy_v4.enc_jwk_json, None);
     assert!(
         db_v4
