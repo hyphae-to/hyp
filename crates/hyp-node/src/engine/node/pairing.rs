@@ -1,5 +1,9 @@
 use crate::engine::config::NodeError;
 use crate::engine::http_util::{HttpClient, compute_etag, full_body};
+use crate::engine::pairing_client::{
+    AdminPairReplyError, AdminPairRequestError, AuthClaimHttpError, build_admin_pair_request,
+    build_delegated_pair_request, collect_auth_claim_reply, p2p_counter_grant,
+};
 use crate::engine::peer_link::{
     AuthClaimReply, AuthClaimRequest, DelegatedPairReply, DelegatedPairRequest, GuestPairReply,
     GuestPairRequest, MAX_JSON_RESPONSE_BYTES, P2pPairServerReply, PairBindingV2, PairRequestV2,
@@ -11,15 +15,13 @@ use hyp_crypto::compat_v1::{
 };
 use hyp_crypto::human::{
     DelegatedPairProofV1, NodeCertPayloadV1, decode_hcert1, decode_hjoin1, node_cert_sha256,
-    sign_delegated_pair_proof, verify_delegated_pair_proof, verify_human_invite,
-    verify_human_invite_claim, verify_node_cert,
+    verify_delegated_pair_proof, verify_human_invite, verify_human_invite_claim, verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::pairing::{
-    AdminInviteV2, GrantV2, P2pOfferToken, P2pPairConfirmation, P2pPairResponse,
-    create_p2p_confirmation, create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1,
-    encode_am2_with_signed_grant, encode_hp2p1, extract_am2_signed_grant, sign_grant_v2,
-    verify_grant_v2, verify_p2p_confirmation, verify_p2p_response,
+    AdminInviteV2, GrantV2, P2pOfferToken, P2pPairResponse, create_p2p_confirmation,
+    create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1, encode_am2_with_signed_grant,
+    encode_hp2p1, extract_am2_signed_grant, sign_grant_v2, verify_grant_v2, verify_p2p_response,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, parse_rfc3339_millis};
 use hyp_crypto::{Ed25519KeyPair, OkpJwk as CryptoOkpJwk, SignedPayload};
@@ -1063,8 +1065,16 @@ impl UnifiedNode {
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(full_body(serde_json::to_vec(req)?))
             .map_err(|e| NodeError::Http(e.to_string()))?;
-        let resp = self.http_client.request(http_req).await?;
-        let (status, _headers, body) = HttpClient::collect(resp, MAX_JSON_RESPONSE_BYTES).await?;
+        let (status, body) = collect_auth_claim_reply(
+            self.http_client.request(http_req),
+            None,
+            MAX_JSON_RESPONSE_BYTES,
+        )
+        .await
+        .map_err(|error| match error {
+            AuthClaimHttpError::Request(error) | AuthClaimHttpError::Body(error) => error,
+            AuthClaimHttpError::Timeout => NodeError::Http("claim request timed out".into()),
+        })?;
         if !status.is_success() {
             return Err(HttpClient::decode_error_response(status, &body));
         }
@@ -1081,26 +1091,13 @@ impl UnifiedNode {
         hcert1: &str,
         expected_hub_fingerprint: Option<&str>,
     ) -> Result<(DelegatedPairReply, PeerLinkInfo), NodeError> {
-        let ts = format_rfc3339_millis(now_ms());
-        let ed_jwk = self.identity.signing_jwk();
-        let x_jwk = self.identity.encryption_jwk();
-        let proof = DelegatedPairProofV1 {
-            hub_node_id: hub_node_id.to_string(),
-            node_id: self.config.node_id.to_string(),
-            ed25519_jwk: ed_jwk.clone(),
-            x25519_jwk: x_jwk.clone(),
-            node_cert_sha256: node_cert_sha256(hcert1),
-            timestamp: ts.clone(),
-        };
-        let proof_sig = sign_delegated_pair_proof(&proof, &self.identity.signing)?;
-        let req = DelegatedPairRequest {
-            node_id: self.config.node_id.to_string(),
-            ed25519_jwk: ed_jwk,
-            x25519_jwk: x_jwk,
-            node_cert: hcert1.trim().to_string(),
-            timestamp: ts,
-            proof_sig,
-        };
+        let req = build_delegated_pair_request(
+            hub_node_id,
+            self.config.node_id.as_str(),
+            &self.identity,
+            hcert1,
+            || format_rfc3339_millis(now_ms()),
+        )?;
 
         let base = hub_endpoint.trim_end_matches('/');
         let url = format!("{base}/v1/pair/delegated");
@@ -1193,40 +1190,23 @@ impl UnifiedNode {
         let invite = decode_am2(am2_token)?;
         let inline_signed_grant = extract_am2_signed_grant(am2_token)?;
         let parsed_code = parse_pairing_code_v1(&invite.pairing_code)?;
-        let pair_kp = derive_pairing_key_v1(&parsed_code.secret, &parsed_code.grant_id)?;
-
-        let binding = PairBindingV2 {
-            v: 2,
-            grant_id: parsed_code.grant_id.clone(),
-            node_id: self.config.node_id.to_string(),
-            signing_jwk: self.identity.signing_jwk(),
-            encryption_jwk: self.identity.encryption_jwk(),
-            bound_at: format_rfc3339_millis(now_ms()),
-        };
-        let payload = to_canonical_json(&binding)?;
-        let pairing_sig = pair_kp.sign_domain_b64("binding", payload.as_bytes());
-        let self_sig = self
-            .identity
-            .signing
-            .sign_domain_b64("binding-self", payload.as_bytes());
-
-        let pair_req = PairRequestV2 {
-            grant_id: parsed_code.grant_id,
-            payload,
-            pairing_sig,
-            self_sig,
-        };
-        let mut req_val = serde_json::to_value(&pair_req)?;
-        if let Some(ref sg) = inline_signed_grant {
-            if let Some(obj) = req_val.as_object_mut() {
-                obj.insert("signedGrant".to_string(), serde_json::to_value(sg)?);
-            }
-        }
+        let request_bytes = build_admin_pair_request(
+            &parsed_code,
+            self.config.node_id.as_str(),
+            &self.identity,
+            inline_signed_grant.as_ref(),
+            || format_rfc3339_millis(now_ms()),
+        )
+        .map_err(|error| match error {
+            AdminPairRequestError::PairingKey(error)
+            | AdminPairRequestError::Canonicalization(error) => NodeError::Crypto(error),
+            AdminPairRequestError::Serialization(error) => NodeError::from(error),
+        })?;
         let http_req = Request::builder()
             .method(Method::POST)
             .uri("/v1/pair")
             .header(http::header::CONTENT_TYPE, "application/json")
-            .body(full_body(serde_json::to_vec(&req_val)?))
+            .body(full_body(request_bytes))
             .map_err(|e| NodeError::Http(e.to_string()))?;
         let resp = self
             .http_client
@@ -1240,12 +1220,14 @@ impl UnifiedNode {
 
         // Verify the returned grant against the out-of-band pinned adminJwk from `am2_`.
         let admin_pk = invite.admin_jwk.to_ed25519()?;
-        let verified_grant = verify_grant_v2(&reply.grant, &admin_pk)?;
-        if verified_grant.node_id != self.config.node_id.as_str() {
-            return Err(NodeError::Unauthorized(
-                "hub returned grant for wrong nodeId".into(),
-            ));
-        }
+        let verified_grant = reply
+            .verify_grant(&admin_pk, self.config.node_id.as_str())
+            .map_err(|error| match error {
+                AdminPairReplyError::Signature(error) => NodeError::Crypto(error),
+                AdminPairReplyError::WrongNode(_) => {
+                    NodeError::Unauthorized("hub returned grant for wrong nodeId".into())
+                }
+            })?;
 
         // Persist authCredential in SecretStore (never plaintext in SQLite!).
         let cred_ref = self.save_peer_auth_credential(&reply.node_id, &reply.auth_credential)?;
@@ -1690,19 +1672,14 @@ impl UnifiedNode {
 
         let now = now_ms();
         let bob_grant_id = uuid_v4();
-        let bob_grant = GrantV2 {
-            v: 2,
-            id: bob_grant_id.clone(),
-            node_id: offer.node_id.clone(),
-            scopes: expanded_to_alice.clone(),
-            trust_tier: Some("peer".to_string()),
-            pairing_key: None,
-            subject_signing_jwk: Some(offer.signing_jwk.clone()),
-            subject_encryption_jwk: Some(offer.encryption_jwk.clone()),
-            issued_at: format_rfc3339_millis(now),
-            pair_by: None,
-            expires_at: None,
-        };
+        let bob_grant = p2p_counter_grant(
+            &offer,
+            bob_grant_id,
+            expanded_to_alice.clone(),
+            "peer",
+            format_rfc3339_millis(now),
+            None,
+        );
 
         let my_endpoint = self
             .bound_addr
@@ -1740,12 +1717,8 @@ impl UnifiedNode {
         let server_reply: P2pPairServerReply = serde_json::from_slice(&body)?;
 
         // Verify Alice's confirmation against Alice's zero-TOFU JWK embedded in `hp2p1_`!
-        let confirmation = P2pPairConfirmation {
-            offer_id: server_reply.offer_id.clone(),
-            alice_grant_to_bob: server_reply.alice_grant_to_bob.clone(),
-        };
         let verified_alice_grant =
-            verify_p2p_confirmation(&offer, &confirmation, self.config.node_id.as_str())?;
+            server_reply.verify_grant(&offer, self.config.node_id.as_str())?;
 
         // Pin Alice's JWKs from the OOB `hp2p1_` offer BEFORE verifying Alice's manifest!
         let alice_sign_pk = offer.signing_jwk.to_ed25519()?;

@@ -66,13 +66,13 @@ use crate::engine::http_util::{
 };
 use crate::engine::node::{AuthenticatedPeer, UnifiedNode};
 use crate::engine::peer_link::{
-    AuthClaimRequest, ChannelEpochResponse, ChannelJoinRequest, ChannelJoinResponse,
-    ChannelLeaveRequest, ChannelPostRequest, ChannelsResponse, DelegatedPairRequest,
-    GuestPairRequest, HandlesResponse, InboxAckRequest, InboxAckResponse, KvDeleteBody,
-    KvEpochResponse, KvListResponse, KvSetBody, PairRequestV2, PeerKeysResponse,
-    PostMessageRequest, PostMessageResponse, PublishEventRequest, PutChannelEpochRequest,
-    PutHandlesRequest, PutKeyRequest, PutKvEpochRequest, PutSubscriptionsRequest,
-    PutSubscriptionsResponse, SubscriptionsResponse, TransferUploadResponse,
+    AdminPairRequestEnvelope, AuthClaimRequest, ChannelEpochResponse, ChannelJoinRequest,
+    ChannelJoinResponse, ChannelLeaveRequest, ChannelPostRequest, ChannelsResponse,
+    DelegatedPairRequest, GuestPairRequest, HandlesResponse, InboxAckRequest, InboxAckResponse,
+    KvDeleteBody, KvEpochResponse, KvListResponse, KvSetBody, PeerKeysResponse, PostMessageRequest,
+    PostMessageResponse, PublishEventRequest, PutChannelEpochRequest, PutHandlesRequest,
+    PutKeyRequest, PutKvEpochRequest, PutSubscriptionsRequest, PutSubscriptionsResponse,
+    SubscriptionsResponse, TransferUploadResponse,
 };
 
 const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -208,17 +208,6 @@ struct AckDropBody {
     seq: u64,
     #[serde(default = "default_true")]
     burn: bool,
-}
-
-/// Wire envelope for `POST /v1/pair` supporting both Hub-local grants and inline
-/// offline Admin-CA-signed `GrantV2` (`signedGrant` / `signedGrantV2`).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AdminPairRequestEnvelope {
-    #[serde(flatten)]
-    base: PairRequestV2,
-    #[serde(default, alias = "signedGrantV2")]
-    signed_grant: Option<SignedPayload>,
 }
 
 /// Wire envelope for `PUT /v1/keys` supporting both single-proof rotation (signed by the

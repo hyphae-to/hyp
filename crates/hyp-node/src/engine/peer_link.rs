@@ -73,6 +73,20 @@ pub struct PairRequestV2 {
     pub self_sig: String,
 }
 
+/// Supports both Hub-local grants and inline offline Admin-CA grants.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminPairRequestEnvelope {
+    #[serde(flatten)]
+    pub(crate) base: PairRequestV2,
+    #[serde(
+        default,
+        alias = "signedGrantV2",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) signed_grant: Option<SignedPayload>,
+}
+
 /// Server reply to `POST /v1/pair`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
