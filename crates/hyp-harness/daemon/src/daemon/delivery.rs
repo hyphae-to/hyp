@@ -990,30 +990,26 @@ impl LocalDaemonInner {
         session_id: &str,
         bypass_activity_grace: bool,
     ) -> (Option<String>, bool) {
-        {
-            let mut sessions = self.session_runtime();
-            let runtime = sessions.entry(session_id.to_owned()).or_default();
-            if runtime.flushing {
-                return (None, false);
-            }
-            runtime.flushing = true;
-        }
-
-        struct FlushGuard<'a> {
-            daemon: &'a LocalDaemonInner,
-            session_id: &'a str,
-        }
-        impl Drop for FlushGuard<'_> {
-            fn drop(&mut self) {
-                self.daemon
-                    .clear_runtime_field(self.session_id, |runtime| runtime.flushing = false);
-            }
-        }
-        let _guard = FlushGuard {
-            daemon: self,
-            session_id,
+        let lock = self.flush_lock_for(session_id);
+        let Ok(guard) = lock.try_lock() else {
+            // An arrival can race the final snapshot of the in-flight flush.
+            self.defer_interrupt_wake(session_id);
+            return (None, false);
         };
+        let result = self
+            .flush_session_locked(session_id, bypass_activity_grace)
+            .await;
+        drop(guard);
+        drop(lock);
+        self.update_runtime(session_id, |_| ());
+        result
+    }
 
+    pub(super) async fn flush_session_locked(
+        self: &Arc<Self>,
+        session_id: &str,
+        bypass_activity_grace: bool,
+    ) -> (Option<String>, bool) {
         let mut terminal_error: Option<String> = None;
         let mut delivered_any = false;
 
@@ -1181,6 +1177,17 @@ impl LocalDaemonInner {
                 // They remain cleanly unread for TurnStart (`pre_turn`) digests and passive UIs,
                 // while L3 streams (`--claude-channel`, `watch`, `wait`) still receive them below.
                 if !batch.notify_only {
+                    let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt
+                        && transport.supports_interrupt()
+                    {
+                        PushMode::Interrupt
+                    } else {
+                        PushMode::Queue
+                    };
+                    if push_mode == PushMode::Interrupt && self.defer_interrupt_wake(session_id) {
+                        break;
+                    }
+
                     // Unified Active-Turn Hook Grace / Activity Lease Deferral:
                     // When a hook-capable session is actively running a turn (`Active`), let
                     // in-turn hooks drain first instead of nudging the input box immediately:
@@ -1210,17 +1217,26 @@ impl LocalDaemonInner {
                         }
                     }
 
-                    let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt
-                        && transport.supports_interrupt()
-                    {
-                        PushMode::Interrupt
-                    } else {
-                        PushMode::Queue
-                    };
                     let batch_id = compute_batch_idempotency_id(session_id, &batch);
                     let outcome = transport
                         .deliver_digest(&batch.rendered, &batch_id, push_mode)
                         .await;
+                    if push_mode == PushMode::Interrupt
+                        && matches!(
+                            outcome,
+                            PushOutcome::Delivered
+                                | PushOutcome::Hold {
+                                    interrupted: true,
+                                    ..
+                                }
+                                | PushOutcome::Reject {
+                                    interrupted: true,
+                                    ..
+                                }
+                        )
+                    {
+                        self.start_interrupt_wake_cooldown(session_id);
+                    }
                     match outcome {
                         PushOutcome::Delivered => {
                             self.commit_delivered_batch(session_id, &batch);

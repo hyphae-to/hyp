@@ -135,6 +135,7 @@ pub const DEFAULT_PEERS_RELOAD_TIMEOUT: Duration = Duration::from_millis(1_200);
 /// Default grace window waiting for a mid-turn tool hook (`PostToolUse`) to drain an `Interrupt`
 /// on an `Active` hooked session before falling back to an external L2 `PushTransport`.
 pub const DEFAULT_INTERRUPT_HOOK_GRACE: Duration = Duration::from_secs(2);
+const DEFAULT_INTERRUPT_WAKE_COOLDOWN: Duration = Duration::from_secs(5);
 /// Default sliding activity lease duration after the last hook call before a hooked session
 /// without a TurnEnd (`Stop` / `agent_end`) event decays to `Idle` and flushes held `Queue` batches.
 pub const DEFAULT_QUEUE_ACTIVITY_LEASE: Duration = Duration::from_secs(15);
@@ -252,6 +253,8 @@ pub struct LocalDaemonConfig {
     /// Grace window waiting for a mid-turn tool hook (`PostToolUse`) to drain an `Interrupt`
     /// while a hooked session is `Active` before falling back to L2 `PushTransport`.
     pub interrupt_hook_grace: Duration,
+    /// Minimum time between disruptive external push wakes for the same session.
+    pub interrupt_wake_cooldown: Duration,
     /// Sliding activity lease duration after the last hook call before an active hooked session
     /// without TurnEnd (`Stop` / `agent_end`) decays to `Idle` and flushes held `Queue` batches to L2.
     pub queue_activity_lease: Duration,
@@ -284,6 +287,7 @@ impl Default for LocalDaemonConfig {
             session_prune_interval: DEFAULT_SESSION_PRUNE_INTERVAL,
             drop_watcher_backoff_ms: vec![500, 1_000, 2_000, 5_000],
             interrupt_hook_grace: DEFAULT_INTERRUPT_HOOK_GRACE,
+            interrupt_wake_cooldown: DEFAULT_INTERRUPT_WAKE_COOLDOWN,
             queue_activity_lease: DEFAULT_QUEUE_ACTIVITY_LEASE,
             wake_recovery: WakeRecoveryConfig::default(),
             wake_check_interval: Duration::from_secs(DEFAULT_WAKE_CHECK_INTERVAL_SECS),
@@ -580,7 +584,7 @@ struct SessionRuntime {
     openclaw_target: Option<(String, String)>,
     /// A verified SessionStart exported the daemon wait token.
     env_file_exported: bool,
-    flushing: bool,
+    flush_lock: Option<Arc<AsyncMutex<()>>>,
 }
 
 trait DaemonStateLock<T> {
