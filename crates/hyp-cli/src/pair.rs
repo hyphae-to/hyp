@@ -3218,6 +3218,317 @@ fn run_accept(
     }
 }
 
+struct ValidatedP2pOffer {
+    offer: P2pOfferToken,
+    signing_pk: Ed25519PublicKey,
+    encryption_pk: X25519PublicKey,
+    expires_ms: i64,
+    raw_map: Option<Map<String, Value>>,
+}
+
+type PairTokenError = (&'static str, String, Option<String>);
+
+fn validate_p2p_invite_for_accept(
+    token: &str,
+    onboarding: bool,
+) -> Result<ValidatedP2pOffer, PairTokenError> {
+    let offer = decode_hp2p1(token).map_err(|error| {
+        let message = if onboarding {
+            format!("Invalid hp2p1_ join token: {error}")
+        } else {
+            format!("Invalid or tampered hp2p1_ pairing token: {error}")
+        };
+        (
+            "INVALID_TOKEN",
+            message,
+            Some(
+                "Ask the inviter to generate a fresh token with `hyp pair invite --mode p2p`."
+                    .into(),
+            ),
+        )
+    })?;
+    if offer.node_id == LOCAL_NODE_ID || !is_valid_node_id(&offer.node_id) {
+        return Err((
+            "INVALID_TOKEN",
+            format!("Invalid peer nodeId '{}' in hp2p1_ token", offer.node_id),
+            None,
+        ));
+    }
+    validate_endpoint_origin(&offer.endpoint).map_err(|error| (
+        "INVALID_ENDPOINT",
+        format!("Untrusted endpoint '{}' in hp2p1_ token: {error}", offer.endpoint),
+        Some("Peer endpoints must use https:// (or loopback http://127.0.0.1 for local testing).".into()),
+    ))?;
+    let signing_pk = offer.signing_jwk.to_ed25519().map_err(|error| {
+        (
+            "INVALID_KEY",
+            format!("Invalid signingJwk in hp2p1_ token: {error}"),
+            None,
+        )
+    })?;
+    let encryption_pk = offer.encryption_jwk.to_x25519().map_err(|error| {
+        (
+            "INVALID_KEY",
+            format!("Invalid encryptionJwk in hp2p1_ token: {error}"),
+            None,
+        )
+    })?;
+    let raw_map = extract_raw_json_object(HP2P1_PREFIX, token);
+    verify_optional_hp2p1_sig(&offer, &signing_pk, raw_map.as_ref()).map_err(
+        |(code, message)| {
+            (
+                code,
+                message,
+                Some("Request a fresh unmodified hp2p1_ offer from the peer.".into()),
+            )
+        },
+    )?;
+    let expires_ms = parse_rfc3339_millis(&offer.expires_at).map_err(|error| {
+        (
+            "INVALID_TOKEN",
+            format!("Invalid expiresAt timestamp: {error}"),
+            None,
+        )
+    })?;
+    if now_unix_ms() > expires_ms {
+        return Err((
+            "TOKEN_EXPIRED",
+            format!(
+                "P2P pairing offer '{}' from '{}' expired at {}",
+                offer.offer_id, offer.node_id, offer.expires_at
+            ),
+            Some(format!(
+                "Ask '{}' to generate a fresh hp2p1_ invite.",
+                offer.node_id
+            )),
+        ));
+    }
+    Ok(ValidatedP2pOffer {
+        offer,
+        signing_pk,
+        encryption_pk,
+        expires_ms,
+        raw_map,
+    })
+}
+
+struct P2pOfferScopes {
+    granted: Vec<String>,
+    offered: Vec<String>,
+    requested: Vec<String>,
+    trust_tier: StoreTrustTier,
+}
+
+fn p2p_offer_scopes(
+    offer: &P2pOfferToken,
+    explicit_grant_scopes: Option<Vec<String>>,
+    warnings: &mut Vec<String>,
+) -> Result<P2pOfferScopes, (&'static str, String)> {
+    let expand = |raw: &[String], field: &str| {
+        if raw.is_empty() {
+            Ok(Vec::new())
+        } else {
+            expand_v2_scopes(raw).map_err(|error| {
+                (
+                    "INVALID_TOKEN",
+                    format!("Invalid {field} in hp2p1_ token: {error}"),
+                )
+            })
+        }
+    };
+    let offered = expand(&offer.offered_scopes, "offeredScopes")?;
+    let requested = expand(&offer.requested_scopes, "requestedScopes")?;
+    let granted_scopes = match explicit_grant_scopes {
+        Some(scopes) => scopes,
+        None if !requested.is_empty() => {
+            strip_privileged_default_scopes(requested.clone(), warnings)
+        }
+        None if !offered.is_empty() => strip_privileged_default_scopes(offered.clone(), warnings),
+        None => ScopePreset::Member.expand(),
+    };
+    // Unsigned trustTier metadata cannot select an authorization tier.
+    let trust_tier = parse_store_trust_tier(
+        infer_trust_tier(InviteMode::P2p, None, &offered),
+        StoreTrustTier::Peer,
+    );
+    Ok(P2pOfferScopes {
+        granted: granted_scopes,
+        offered,
+        requested,
+        trust_tier,
+    })
+}
+
+struct P2pPeerRecords<'a> {
+    db: &'a NodeDb,
+    offer: &'a P2pOfferToken,
+    granted_scopes: &'a [String],
+    trust_tier: StoreTrustTier,
+    now_ms: i64,
+}
+
+impl P2pPeerRecords<'_> {
+    fn upsert(
+        &self,
+        signing_kid: &str,
+        encryption_kid: &str,
+        credential_ref: &str,
+        via_ssh: bool,
+    ) -> Result<(), (&'static str, String)> {
+        let peer_id = &self.offer.node_id;
+        self.db
+            .peers()
+            .upsert_peer(
+                &PeerInput {
+                    peer_id: peer_id.clone(),
+                    endpoint: Some(self.offer.endpoint.clone()),
+                    profile: PeerProfile::P2p,
+                    trust_tier: self.trust_tier,
+                    status: PeerStatus::Active,
+                    scopes: self.granted_scopes.to_vec(),
+                    auth_credential_ref: Some(credential_ref.to_owned()),
+                },
+                self.now_ms,
+            )
+            .map_err(|error| {
+                (
+                    "DB_ERROR",
+                    if via_ssh {
+                        format!("Failed to persist SSH peer '{peer_id}': {error}")
+                    } else {
+                        format!("Failed to upsert peer '{peer_id}': {error}")
+                    },
+                )
+            })?;
+
+        let signing_jwk = serde_json::to_string(&self.offer.signing_jwk)
+            .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+        let encryption_jwk = serde_json::to_string(&self.offer.encryption_jwk)
+            .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+        let key_owner = if via_ssh { "remote" } else { "peer" };
+        for (kid, key_use, jwk_json, purpose) in [
+            (signing_kid, KeyUse::Signing, signing_jwk, "signing"),
+            (
+                encryption_kid,
+                KeyUse::Encryption,
+                encryption_jwk,
+                "encryption",
+            ),
+        ] {
+            self.db
+                .peers()
+                .upsert_peer_key(
+                    &PeerKeyInput {
+                        peer_id: peer_id.clone(),
+                        kid: kid.to_owned(),
+                        key_use,
+                        jwk_json,
+                        status: KeyStatus::Active,
+                        expires_at: None,
+                    },
+                    self.now_ms,
+                )
+                .map_err(|error| {
+                    (
+                        "DB_ERROR",
+                        format!("Failed to pin {key_owner} {purpose} JWK: {error}"),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn save_live(
+        &self,
+        live: &LiveP2pHandshakeResult,
+        identify_peer_in_cache_error: bool,
+    ) -> Result<Vec<String>, (&'static str, String)> {
+        let peer_id = &self.offer.node_id;
+        for (id, direction, signed, scopes) in [
+            (
+                &live.alice_grant_verified.id,
+                GrantDirection::Outbound,
+                &live.alice_grant_signed,
+                live.alice_grant_verified.scopes.as_slice(),
+            ),
+            (
+                &live.bob_grant_id,
+                GrantDirection::Inbound,
+                &live.bob_grant_signed,
+                self.granted_scopes,
+            ),
+        ] {
+            let signed_json = serde_json::to_string(signed)
+                .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+            save_grant_idempotent(
+                self.db,
+                &GrantInput {
+                    id: id.clone(),
+                    peer_id: peer_id.clone(),
+                    direction,
+                    signed_json,
+                    scopes: scopes.to_vec(),
+                    trust_tier: self.trust_tier,
+                    issued_at: self.now_ms,
+                    // The short invite pairing window does not bound an accepted live grant.
+                    pair_by: None,
+                    expires_at: None,
+                },
+                self.now_ms,
+            )
+            .map_err(|error| ("DB_ERROR", error))?;
+        }
+
+        let manifest_json = serde_json::to_string(&live.signed_manifest)
+            .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+        let capabilities: Vec<String> = live
+            .manifest_payload
+            .capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_owned())
+            .collect();
+        self.db
+            .peers()
+            .cache_manifest(
+                peer_id,
+                &ManifestCacheUpdate {
+                    manifest_version: live.manifest_payload.manifest_version as i64,
+                    manifest_json,
+                    etag: Some(live.manifest_etag.clone()),
+                    capabilities: capabilities.clone(),
+                    accept_downgrade: false,
+                },
+                self.now_ms,
+            )
+            .map_err(|error| {
+                (
+                    "MANIFEST_CACHE_ERROR",
+                    if identify_peer_in_cache_error {
+                        format!("Failed to cache verified manifest for '{peer_id}': {error}")
+                    } else {
+                        format!("Failed to cache verified manifest: {error}")
+                    },
+                )
+            })?;
+        Ok(capabilities)
+    }
+}
+
+fn save_live_p2p_credential(
+    secrets: &SecretStore,
+    peer_id: &str,
+    auth_credential: &str,
+) -> Result<String, (&'static str, String)> {
+    let name = credential_secret_name("peer-auth", peer_id);
+    secrets.set(&name, auth_credential).map_err(|error| {
+        (
+            "KEYSTORE_ERROR",
+            format!("Failed to store peer authCredential in SecretStore: {error}"),
+        )
+    })?;
+    Ok(name)
+}
+
 fn accept_hp2p1(
     token: &str,
     state_dir_arg: Option<PathBuf>,
@@ -3228,132 +3539,26 @@ fn accept_hp2p1(
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
     let cmd = "pair accept";
-    let offer = match decode_hp2p1(token) {
-        Ok(o) => o,
-        Err(e) => {
-            return Err(CliError::error(
-                "INVALID_TOKEN",
-                format!("Invalid or tampered hp2p1_ pairing token: {e}"),
-            )
-            .with_fix(
-                "Ask the inviter to generate a fresh token with `hyp pair invite --mode p2p`."
-                    .to_string(),
-            ));
+    let ValidatedP2pOffer {
+        offer,
+        signing_pk,
+        encryption_pk,
+        expires_ms: exp_ms,
+        raw_map,
+    } = validate_p2p_invite_for_accept(token, false).map_err(|(code, message, fix)| {
+        let error = CliError::error(code, message);
+        match fix {
+            Some(fix) => error.with_fix(fix),
+            None => error,
         }
-    };
-
-    if offer.node_id == LOCAL_NODE_ID || !is_valid_node_id(&offer.node_id) {
-        return Err(CliError::error(
-            "INVALID_TOKEN",
-            format!("Invalid peer nodeId '{}' in hp2p1_ token", offer.node_id),
-        ));
-    }
-
-    validate_endpoint_origin(&offer.endpoint).map_err(|e| {
-        CliError::error(
-            "INVALID_ENDPOINT",
-            format!(
-                "Untrusted endpoint '{}' in hp2p1_ token: {e}",
-                offer.endpoint
-            ),
-        )
-        .with_fix(
-            "Peer endpoints must use https:// (or loopback http://127.0.0.1 for local testing)."
-                .to_string(),
-        )
     })?;
-
-    let signing_pk = match offer.signing_jwk.to_ed25519() {
-        Ok(pk) => pk,
-        Err(e) => {
-            return Err(CliError::error(
-                "INVALID_KEY",
-                format!("Invalid signingJwk in hp2p1_ token: {e}"),
-            ));
-        }
-    };
-    let encryption_pk = match offer.encryption_jwk.to_x25519() {
-        Ok(pk) => pk,
-        Err(e) => {
-            return Err(CliError::error(
-                "INVALID_KEY",
-                format!("Invalid encryptionJwk in hp2p1_ token: {e}"),
-            ));
-        }
-    };
-
-    let raw_map = extract_raw_json_object(HP2P1_PREFIX, token);
-    if let Err((code, msg)) = verify_optional_hp2p1_sig(&offer, &signing_pk, raw_map.as_ref()) {
-        return Err(CliError::error(code, msg)
-            .with_fix("Request a fresh unmodified hp2p1_ offer from the peer.".to_string()));
-    }
-
-    let exp_ms = match parse_rfc3339_millis(&offer.expires_at) {
-        Ok(ms) => ms,
-        Err(e) => {
-            return Err(CliError::error(
-                "INVALID_TOKEN",
-                format!("Invalid expiresAt timestamp: {e}"),
-            ));
-        }
-    };
-    let now = now_unix_ms();
-    if now > exp_ms {
-        return Err(CliError::error(
-            "TOKEN_EXPIRED",
-            format!(
-                "P2P pairing offer '{}' from '{}' expired at {}",
-                offer.offer_id, offer.node_id, offer.expires_at
-            ),
-        )
-        .with_fix(format!(
-            "Ask '{}' to generate a fresh hp2p1_ invite.",
-            offer.node_id
-        )));
-    }
-
-    let expanded_offered = if offer.offered_scopes.is_empty() {
-        Vec::new()
-    } else {
-        match expand_v2_scopes(&offer.offered_scopes) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error(
-                    "INVALID_TOKEN",
-                    format!("Invalid offeredScopes in hp2p1_ token: {e}"),
-                ));
-            }
-        }
-    };
-
-    let expanded_requested = if offer.requested_scopes.is_empty() {
-        Vec::new()
-    } else {
-        match expand_v2_scopes(&offer.requested_scopes) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error(
-                    "INVALID_TOKEN",
-                    format!("Invalid requestedScopes in hp2p1_ token: {e}"),
-                ));
-            }
-        }
-    };
-
-    let granted_scopes = if let Some(explicit) = explicit_grant_scopes {
-        explicit
-    } else if !expanded_requested.is_empty() {
-        // P1-8: Never auto-grant `bridge:post` or `forward:via` without explicit `--grant`.
-        strip_privileged_default_scopes(expanded_requested.clone(), &mut warnings)
-    } else if !expanded_offered.is_empty() {
-        strip_privileged_default_scopes(expanded_offered.clone(), &mut warnings)
-    } else {
-        ScopePreset::Member.expand()
-    };
-
-    // P1-9: Never trust unsigned `trustTier` metadata in P2P offers; infer strictly as Peer/Guest.
-    let trust_tier_raw = infer_trust_tier(InviteMode::P2p, None, &expanded_offered);
-    let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Peer);
+    let P2pOfferScopes {
+        granted: granted_scopes,
+        offered: expanded_offered,
+        requested: expanded_requested,
+        trust_tier,
+    } = p2p_offer_scopes(&offer, explicit_grant_scopes, &mut warnings)
+        .map_err(|(code, message)| CliError::error(code, message))?;
     let untrusted_note = extract_untrusted_escalation(raw_map.as_ref(), &offer.node_id);
 
     let explicit_state = state_dir_arg.is_some();
@@ -3458,14 +3663,8 @@ fn accept_hp2p1(
     };
 
     let cred_ref = if let Some(ref live) = live_res {
-        let name = credential_secret_name("peer-auth", &offer.node_id);
-        secrets.set(&name, &live.auth_credential).map_err(|e| {
-            CliError::error(
-                "KEYSTORE_ERROR",
-                format!("Failed to store peer authCredential in SecretStore: {e}"),
-            )
-        })?;
-        name
+        save_live_p2p_credential(&secrets, &offer.node_id, &live.auth_credential)
+            .map_err(|(code, message)| CliError::error(code, message))?
     } else {
         let name = credential_secret_name("pair-p2p", &offer.node_id);
         secrets.set(&name, token).map_err(|e| {
@@ -3480,152 +3679,20 @@ fn accept_hp2p1(
     let now_db = now_ms();
     let _ = db.local().ensure_metadata("node_id", &local_node_id);
 
-    if let Err(e) = db.peers().upsert_peer(
-        &PeerInput {
-            peer_id: offer.node_id.clone(),
-            endpoint: Some(offer.endpoint.clone()),
-            profile: PeerProfile::P2p,
-            trust_tier,
-            status: PeerStatus::Active,
-            scopes: granted_scopes.clone(),
-            auth_credential_ref: Some(cred_ref.clone()),
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "DB_ERROR",
-            format!("Failed to upsert peer '{}': {e}", offer.node_id),
-        ));
-    }
-
-    let sign_jwk_json = match serde_json::to_string(&offer.signing_jwk) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-        }
+    let records = P2pPeerRecords {
+        db: &db,
+        offer: &offer,
+        granted_scopes: &granted_scopes,
+        trust_tier,
+        now_ms: now_db,
     };
-    let enc_jwk_json = match serde_json::to_string(&offer.encryption_jwk) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-        }
-    };
-
-    if let Err(e) = db.peers().upsert_peer_key(
-        &PeerKeyInput {
-            peer_id: offer.node_id.clone(),
-            kid: kid.clone(),
-            key_use: KeyUse::Signing,
-            jwk_json: sign_jwk_json,
-            status: KeyStatus::Active,
-            expires_at: None,
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "DB_ERROR",
-            format!("Failed to pin peer signing JWK: {e}"),
-        ));
-    }
-    if let Err(e) = db.peers().upsert_peer_key(
-        &PeerKeyInput {
-            peer_id: offer.node_id.clone(),
-            kid: enc_kid.clone(),
-            key_use: KeyUse::Encryption,
-            jwk_json: enc_jwk_json,
-            status: KeyStatus::Active,
-            expires_at: None,
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "DB_ERROR",
-            format!("Failed to pin peer encryption JWK: {e}"),
-        ));
-    }
-
+    records
+        .upsert(&kid, &enc_kid, &cred_ref, false)
+        .map_err(|(code, message)| CliError::error(code, message))?;
     if let Some(ref live) = live_res {
-        // Persist Alice's verified outbound grant, Bob's inbound counter-grant, and Alice's verified manifest!
-        let alice_grant_json = match serde_json::to_string(&live.alice_grant_signed) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-        if let Err(e) = save_grant_idempotent(
-            &db,
-            &GrantInput {
-                id: live.alice_grant_verified.id.clone(),
-                peer_id: offer.node_id.clone(),
-                direction: GrantDirection::Outbound,
-                signed_json: alice_grant_json,
-                scopes: live.alice_grant_verified.scopes.clone(),
-                trust_tier,
-                issued_at: now_db,
-                pair_by: None,
-                expires_at: None,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error("DB_ERROR", e));
-        }
-
-        let bob_grant_json = match serde_json::to_string(&live.bob_grant_signed) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-        if let Err(e) = save_grant_idempotent(
-            &db,
-            &GrantInput {
-                id: live.bob_grant_id.clone(),
-                peer_id: offer.node_id.clone(),
-                direction: GrantDirection::Inbound,
-                signed_json: bob_grant_json,
-                scopes: granted_scopes.clone(),
-                trust_tier,
-                issued_at: now_db,
-                // P1-18: Do NOT stamp the short invite pairing window onto an accepted long-lived peer grant.
-                pair_by: None,
-                expires_at: None,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error("DB_ERROR", e));
-        }
-
-        let manifest_json = match serde_json::to_string(&live.signed_manifest) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-        let caps: Vec<String> = live
-            .manifest_payload
-            .capabilities
-            .iter()
-            .map(|c| c.as_str().to_string())
-            .collect();
-        if let Err(e) = db.peers().cache_manifest(
-            &offer.node_id,
-            &ManifestCacheUpdate {
-                manifest_version: live.manifest_payload.manifest_version as i64,
-                manifest_json,
-                etag: Some(live.manifest_etag.clone()),
-                capabilities: caps,
-                accept_downgrade: false,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error(
-                "MANIFEST_CACHE_ERROR",
-                format!(
-                    "Failed to cache verified manifest for '{}': {e}",
-                    offer.node_id
-                ),
-            ));
-        }
+        records
+            .save_live(live, true)
+            .map_err(|(code, message)| CliError::error(code, message))?;
     } else {
         // Offline local staging: sign and persist local counter-grant (`GrantV2`).
         let counter_grant_id = format!("p2p-{}", offer.offer_id);
@@ -3762,6 +3829,236 @@ fn accept_hp2p1(
     Ok(ExitCode::from(EXIT_OK))
 }
 
+struct ValidatedAm2Invite {
+    invite: AdminInviteV2,
+    admin_pk: Ed25519PublicKey,
+    parsed_v1: Option<PairingCodeV1>,
+    raw_map: Option<Map<String, Value>>,
+    signed_grant: Option<(SignedPayload, GrantV2)>,
+}
+
+fn validate_am2_invite_for_accept(
+    token: &str,
+    onboarding: bool,
+) -> Result<ValidatedAm2Invite, PairTokenError> {
+    let invite = decode_am2(token).map_err(|error| {
+        (
+            "INVALID_TOKEN",
+            if onboarding {
+                format!("Invalid am2_ join token: {error}")
+            } else {
+                format!("Invalid or tampered am2_ invite bundle: {error}")
+            },
+            Some("Verify the am2_ bundle was not truncated or modified.".into()),
+        )
+    })?;
+    validate_endpoint_origin(&invite.router).map_err(|error| {
+        (
+            "INVALID_ENDPOINT",
+            format!(
+                "Untrusted router endpoint '{}' in am2_ bundle: {error}",
+                invite.router
+            ),
+            None,
+        )
+    })?;
+    let admin_pk = invite.admin_jwk.to_ed25519().map_err(|error| {
+        (
+            "INVALID_KEY",
+            format!("Invalid adminJwk in am2_ bundle: {error}"),
+            None,
+        )
+    })?;
+
+    let parsed_v1 = if onboarding || invite.pairing_code.starts_with("t3mp1_") {
+        Some(
+            parse_pairing_code_v1(&invite.pairing_code).map_err(|error| {
+                (
+                    "INVALID_TOKEN",
+                    format!("Malformed pairingCode in am2_ bundle: {error}"),
+                    None,
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    let raw_map = extract_raw_json_object(AM2_PREFIX, token);
+    let signed_grant = verify_optional_am2_signed_grant(
+        &admin_pk,
+        parsed_v1.as_ref().map(|code| code.grant_id.as_str()),
+        raw_map.as_ref(),
+    )
+    .map_err(|(code, message)| {
+        (
+            code,
+            message,
+            Some(
+                "Request a fresh unmodified am2_ bundle from your organization administrator."
+                    .into(),
+            ),
+        )
+    })?;
+    Ok(ValidatedAm2Invite {
+        invite,
+        admin_pk,
+        parsed_v1,
+        raw_map,
+        signed_grant,
+    })
+}
+
+struct Am2PeerRecords<'a> {
+    db: &'a NodeDb,
+    peer_id: &'a str,
+    invite: &'a AdminInviteV2,
+    now_ms: i64,
+}
+
+impl Am2PeerRecords<'_> {
+    fn upsert(
+        &self,
+        trust_tier: StoreTrustTier,
+        scopes: &[String],
+        credential_ref: &str,
+        for_onboarding: bool,
+    ) -> Result<(), (&'static str, String)> {
+        self.db
+            .peers()
+            .upsert_peer(
+                &PeerInput {
+                    peer_id: self.peer_id.to_owned(),
+                    endpoint: Some(self.invite.router.clone()),
+                    profile: PeerProfile::Router,
+                    trust_tier,
+                    status: PeerStatus::Active,
+                    scopes: scopes.to_vec(),
+                    auth_credential_ref: Some(credential_ref.to_owned()),
+                },
+                self.now_ms,
+            )
+            .map_err(|error| {
+                let role = if for_onboarding { "hub" } else { "team hub" };
+                (
+                    "DB_ERROR",
+                    format!("Failed to upsert {role} peer '{}': {error}", self.peer_id),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn pin_keys(
+        &self,
+        admin_kid: &str,
+        live: Option<&LiveAm2HandshakeResult>,
+        for_onboarding: bool,
+    ) -> Result<(), (&'static str, String)> {
+        let admin_json = serde_json::to_string(&self.invite.admin_jwk)
+            .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+        let pin_admin =
+            || self.pin_key(admin_kid.to_owned(), KeyUse::Admin, admin_json, "Admin-CA");
+        if let Some(live) = live {
+            let pin_hub_keys = || {
+                let sign_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.signing_jwk);
+                let enc_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.encryption_jwk);
+                let sign_json = serde_json::to_string(&sign_jwk)
+                    .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+                let enc_json = serde_json::to_string(&enc_jwk)
+                    .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+                Ok((sign_json, enc_json))
+            };
+            let (sign_json, enc_json) = if for_onboarding {
+                let keys = pin_hub_keys()?;
+                pin_admin()?;
+                keys
+            } else {
+                pin_admin()?;
+                pin_hub_keys()?
+            };
+            self.pin_key(
+                live.hub_signing_pk.kid(),
+                KeyUse::Signing,
+                sign_json,
+                "hub signing",
+            )?;
+            self.pin_key(
+                live.hub_encryption_pk.kid(),
+                KeyUse::Encryption,
+                enc_json,
+                "hub encryption",
+            )?;
+        } else {
+            pin_admin()?;
+        }
+        Ok(())
+    }
+
+    fn pin_key(
+        &self,
+        kid: String,
+        key_use: KeyUse,
+        jwk_json: String,
+        label: &str,
+    ) -> Result<(), (&'static str, String)> {
+        self.db
+            .peers()
+            .upsert_peer_key(
+                &PeerKeyInput {
+                    peer_id: self.peer_id.to_owned(),
+                    kid,
+                    key_use,
+                    jwk_json,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                self.now_ms,
+            )
+            .map_err(|error| ("DB_ERROR", format!("Failed to pin {label} JWK: {error}")))?;
+        Ok(())
+    }
+
+    fn cache_hub_manifest(
+        &self,
+        live: &LiveAm2HandshakeResult,
+    ) -> Result<(), (&'static str, String)> {
+        let manifest_json = serde_json::to_string(&live.signed_manifest)
+            .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+        let capabilities = live
+            .manifest_payload
+            .capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_owned())
+            .collect();
+        self.db
+            .peers()
+            .cache_manifest(
+                self.peer_id,
+                &ManifestCacheUpdate {
+                    manifest_version: live.manifest_payload.manifest_version as i64,
+                    manifest_json,
+                    etag: Some(live.manifest_etag.clone()),
+                    capabilities,
+                    accept_downgrade: false,
+                },
+                self.now_ms,
+            )
+            .map_err(|error| {
+                (
+                    "MANIFEST_CACHE_ERROR",
+                    format!("Failed to cache verified hub manifest: {error}"),
+                )
+            })?;
+        Ok(())
+    }
+}
+
+fn signed_am2_trust_tier(grant: Option<&GrantV2>) -> StoreTrustTier {
+    grant
+        .and_then(|grant| grant.trust_tier.as_deref())
+        .map(|tier| parse_store_trust_tier(tier, StoreTrustTier::Org))
+        .unwrap_or(StoreTrustTier::Org)
+}
+
 fn accept_am2(
     token: &str,
     state_dir_arg: Option<PathBuf>,
@@ -3772,67 +4069,21 @@ fn accept_am2(
     as_json: bool,
 ) -> Result<ExitCode, CliError> {
     let cmd = "pair accept";
-    let invite = match decode_am2(token) {
-        Ok(i) => i,
-        Err(e) => {
-            return Err(CliError::error(
-                "INVALID_TOKEN",
-                format!("Invalid or tampered am2_ invite bundle: {e}"),
-            )
-            .with_fix("Verify the am2_ bundle was not truncated or modified.".to_string()));
+    let ValidatedAm2Invite {
+        invite,
+        admin_pk,
+        parsed_v1,
+        raw_map,
+        signed_grant: verified_grant_pair,
+    } = validate_am2_invite_for_accept(token, false).map_err(|(code, message, fix)| {
+        let error = CliError::error(code, message);
+        match fix {
+            Some(fix) => error.with_fix(fix),
+            None => error,
         }
-    };
-
-    validate_endpoint_origin(&invite.router).map_err(|e| {
-        CliError::error(
-            "INVALID_ENDPOINT",
-            format!(
-                "Untrusted router endpoint '{}' in am2_ bundle: {e}",
-                invite.router
-            ),
-        )
     })?;
-
-    let admin_pk = match invite.admin_jwk.to_ed25519() {
-        Ok(pk) => pk,
-        Err(e) => {
-            return Err(CliError::error(
-                "INVALID_KEY",
-                format!("Invalid adminJwk in am2_ bundle: {e}"),
-            ));
-        }
-    };
     let kid = admin_pk.kid();
     let admin_fingerprint = admin_pk.fingerprint();
-
-    let parsed_v1 = if invite.pairing_code.starts_with("t3mp1_") {
-        match parse_pairing_code_v1(&invite.pairing_code) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                return Err(CliError::error(
-                    "INVALID_TOKEN",
-                    format!("Malformed pairingCode in am2_ bundle: {e}"),
-                ));
-            }
-        }
-    } else {
-        None
-    };
-
-    let raw_map = extract_raw_json_object(AM2_PREFIX, token);
-    let verified_grant_pair = match verify_optional_am2_signed_grant(
-        &admin_pk,
-        parsed_v1.as_ref().map(|p| p.grant_id.as_str()),
-        raw_map.as_ref(),
-    ) {
-        Ok(v) => v,
-        Err((code, msg)) => {
-            return Err(CliError::error(code, msg).with_fix(
-                "Request a fresh unmodified am2_ bundle from your organization administrator."
-                    .to_string(),
-            ));
-        }
-    };
 
     let now = now_unix_ms();
     let mut expires_at_str = raw_map
@@ -3958,11 +4209,8 @@ fn accept_am2(
 
     // P1-9: NEVER fall back to unsigned `raw_map["trustTier"]` and NEVER map remote input
     // `"self"` to `StoreTrustTier::SelfNode`. Always derive strictly from the Admin-CA-signed grant.
-    let mut trust_tier = verified_grant_pair
-        .as_ref()
-        .and_then(|(_, g)| g.trust_tier.as_deref())
-        .map(|t| parse_store_trust_tier(t, StoreTrustTier::Org))
-        .unwrap_or(StoreTrustTier::Org);
+    let mut trust_tier =
+        signed_am2_trust_tier(verified_grant_pair.as_ref().map(|(_, grant)| grant));
 
     let explicit_state = state_dir_arg.is_some();
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), None, None);
@@ -4078,12 +4326,7 @@ fn accept_am2(
 
     if let Some(ref live) = live_res {
         scopes = live.verified_grant.scopes.clone();
-        trust_tier = live
-            .verified_grant
-            .trust_tier
-            .as_deref()
-            .map(|t| parse_store_trust_tier(t, StoreTrustTier::Org))
-            .unwrap_or(StoreTrustTier::Org);
+        trust_tier = signed_am2_trust_tier(Some(&live.verified_grant));
         if let Some(ref db) = existing_db {
             if let Err((code, msg)) =
                 check_existing_signing_pin(db, &peer_id, &live.hub_signing_pk.kid())
@@ -4139,122 +4382,22 @@ fn accept_am2(
         strip_privileged_default_scopes(scopes.clone(), &mut warnings)
     };
 
-    if let Err(e) = db.peers().upsert_peer(
-        &PeerInput {
-            peer_id: peer_id.clone(),
-            endpoint: Some(invite.router.clone()),
-            profile: PeerProfile::Router,
-            trust_tier,
-            status: PeerStatus::Active,
-            scopes: effective_peer_scopes.clone(),
-            auth_credential_ref: Some(cred_ref.clone()),
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "DB_ERROR",
-            format!("Failed to upsert team hub peer '{peer_id}': {e}"),
-        ));
-    }
-
-    let admin_jwk_json = match serde_json::to_string(&invite.admin_jwk) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-        }
+    let records = Am2PeerRecords {
+        db: &db,
+        peer_id: &peer_id,
+        invite: &invite,
+        now_ms: now_db,
     };
-    if let Err(e) = db.peers().upsert_peer_key(
-        &PeerKeyInput {
-            peer_id: peer_id.clone(),
-            kid: kid.clone(),
-            key_use: KeyUse::Admin,
-            jwk_json: admin_jwk_json,
-            status: KeyStatus::Active,
-            expires_at: None,
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "DB_ERROR",
-            format!("Failed to pin Admin-CA JWK: {e}"),
-        ));
-    }
-
+    records
+        .upsert(trust_tier, &effective_peer_scopes, &cred_ref, false)
+        .map_err(|(code, message)| CliError::error(code, message))?;
+    records
+        .pin_keys(&kid, live_res.as_ref(), false)
+        .map_err(|(code, message)| CliError::error(code, message))?;
     if let Some(ref live) = live_res {
-        let hub_sign_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.signing_jwk);
-        let hub_enc_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.encryption_jwk);
-        let hub_sign_json = match serde_json::to_string(&hub_sign_jwk) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-        let hub_enc_json = match serde_json::to_string(&hub_enc_jwk) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-        if let Err(e) = db.peers().upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: peer_id.clone(),
-                kid: live.hub_signing_pk.kid(),
-                key_use: KeyUse::Signing,
-                jwk_json: hub_sign_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error(
-                "DB_ERROR",
-                format!("Failed to pin hub signing JWK: {e}"),
-            ));
-        }
-        if let Err(e) = db.peers().upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: peer_id.clone(),
-                kid: live.hub_encryption_pk.kid(),
-                key_use: KeyUse::Encryption,
-                jwk_json: hub_enc_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error(
-                "DB_ERROR",
-                format!("Failed to pin hub encryption JWK: {e}"),
-            ));
-        }
-        let manifest_json = match serde_json::to_string(&live.signed_manifest) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-        let caps: Vec<String> = live
-            .manifest_payload
-            .capabilities
-            .iter()
-            .map(|c| c.as_str().to_string())
-            .collect();
-        if let Err(e) = db.peers().cache_manifest(
-            &peer_id,
-            &ManifestCacheUpdate {
-                manifest_version: live.manifest_payload.manifest_version as i64,
-                manifest_json,
-                etag: Some(live.manifest_etag.clone()),
-                capabilities: caps,
-                accept_downgrade: false,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error(
-                "MANIFEST_CACHE_ERROR",
-                format!("Failed to cache verified hub manifest: {e}"),
-            ));
-        }
+        records
+            .cache_hub_manifest(live)
+            .map_err(|(code, message)| CliError::error(code, message))?;
     }
 
     let grant_id = live_res
@@ -4409,55 +4552,13 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
     db: &NodeDb,
     secrets: &SecretStore,
 ) -> Result<OnboardJoinResult, LiveHandshakeError> {
-    let offer = decode_hp2p1(token).map_err(|e| LiveHandshakeError::Rejected {
-        code: "INVALID_TOKEN",
-        message: format!("Invalid hp2p1_ join token: {e}"),
-    })?;
-    if offer.node_id == LOCAL_NODE_ID || !is_valid_node_id(&offer.node_id) {
-        return Err(LiveHandshakeError::Rejected {
-            code: "INVALID_TOKEN",
-            message: format!("Invalid peer nodeId '{}' in hp2p1_ token", offer.node_id),
-        });
-    }
-    validate_endpoint_origin(&offer.endpoint).map_err(|e| LiveHandshakeError::Rejected {
-        code: "INVALID_ENDPOINT",
-        message: format!(
-            "Untrusted endpoint '{}' in hp2p1_ token: {e}",
-            offer.endpoint
-        ),
-    })?;
-    let signing_pk = offer
-        .signing_jwk
-        .to_ed25519()
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "INVALID_KEY",
-            message: format!("Invalid signingJwk in hp2p1_ token: {e}"),
-        })?;
-    let encryption_pk =
-        offer
-            .encryption_jwk
-            .to_x25519()
-            .map_err(|e| LiveHandshakeError::Rejected {
-                code: "INVALID_KEY",
-                message: format!("Invalid encryptionJwk in hp2p1_ token: {e}"),
-            })?;
-    let raw_map = extract_raw_json_object(HP2P1_PREFIX, token);
-    verify_optional_hp2p1_sig(&offer, &signing_pk, raw_map.as_ref())
-        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
-    let exp_ms =
-        parse_rfc3339_millis(&offer.expires_at).map_err(|e| LiveHandshakeError::Rejected {
-            code: "INVALID_TOKEN",
-            message: format!("Invalid expiresAt timestamp: {e}"),
-        })?;
-    if now_unix_ms() > exp_ms {
-        return Err(LiveHandshakeError::Rejected {
-            code: "TOKEN_EXPIRED",
-            message: format!(
-                "P2P pairing offer '{}' from '{}' expired at {}",
-                offer.offer_id, offer.node_id, offer.expires_at
-            ),
-        });
-    }
+    let ValidatedP2pOffer {
+        offer,
+        signing_pk,
+        encryption_pk,
+        ..
+    } = validate_p2p_invite_for_accept(token, true)
+        .map_err(|(code, message, _)| LiveHandshakeError::Rejected { code, message })?;
     let kid = signing_pk.kid();
     let enc_kid = encryption_pk.kid();
     check_existing_signing_pin(db, &offer.node_id, &kid)
@@ -4465,35 +4566,12 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
     check_existing_peer_pin(db, &offer.node_id, PeerProfile::P2p, &offer.endpoint)
         .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
 
-    let expanded_offered = if offer.offered_scopes.is_empty() {
-        Vec::new()
-    } else {
-        expand_v2_scopes(&offer.offered_scopes).map_err(|e| LiveHandshakeError::Rejected {
-            code: "INVALID_TOKEN",
-            message: format!("Invalid offeredScopes in hp2p1_ token: {e}"),
-        })?
-    };
-    let expanded_requested = if offer.requested_scopes.is_empty() {
-        Vec::new()
-    } else {
-        expand_v2_scopes(&offer.requested_scopes).map_err(|e| LiveHandshakeError::Rejected {
-            code: "INVALID_TOKEN",
-            message: format!("Invalid requestedScopes in hp2p1_ token: {e}"),
-        })?
-    };
-    let raw_default_scopes = if !expanded_requested.is_empty() {
-        expanded_requested
-    } else if !expanded_offered.is_empty() {
-        expanded_offered.clone()
-    } else {
-        ScopePreset::Member.expand()
-    };
-    // P1-8: Never auto-grant `bridge:post` or `forward:via` during `onboard --join`.
-    let mut _strip_warnings = Vec::new();
-    let granted_scopes = strip_privileged_default_scopes(raw_default_scopes, &mut _strip_warnings);
-    // P1-9: Never trust unsigned `trustTier` metadata in P2P offers; infer strictly as Peer/Guest.
-    let trust_tier_raw = infer_trust_tier(InviteMode::P2p, None, &expanded_offered);
-    let trust_tier = parse_store_trust_tier(trust_tier_raw, StoreTrustTier::Peer);
+    let P2pOfferScopes {
+        granted: granted_scopes,
+        trust_tier,
+        ..
+    } = p2p_offer_scopes(&offer, None, &mut Vec::new())
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
     let local_endpoint = load_local_public_endpoint(state_dir);
 
     let live = execute_live_p2p_handshake(
@@ -4506,151 +4584,21 @@ pub(crate) fn live_pair_hp2p1_for_onboard(
         trust_tier,
     )?;
 
-    let cred_ref = credential_secret_name("peer-auth", &offer.node_id);
-    secrets
-        .set(&cred_ref, &live.auth_credential)
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "KEYSTORE_ERROR",
-            message: format!("Failed to store peer authCredential in SecretStore: {e}"),
-        })?;
-    let now_db = now_ms();
-    db.peers()
-        .upsert_peer(
-            &PeerInput {
-                peer_id: offer.node_id.clone(),
-                endpoint: Some(offer.endpoint.clone()),
-                profile: PeerProfile::P2p,
-                trust_tier,
-                status: PeerStatus::Active,
-                scopes: granted_scopes.clone(),
-                auth_credential_ref: Some(cred_ref),
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to upsert peer '{}': {e}", offer.node_id),
-        })?;
-    let sign_jwk_json =
-        serde_json::to_string(&offer.signing_jwk).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    let enc_jwk_json =
-        serde_json::to_string(&offer.encryption_jwk).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    db.peers()
-        .upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: offer.node_id.clone(),
-                kid: kid.clone(),
-                key_use: KeyUse::Signing,
-                jwk_json: sign_jwk_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to pin peer signing JWK: {e}"),
-        })?;
-    db.peers()
-        .upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: offer.node_id.clone(),
-                kid: enc_kid,
-                key_use: KeyUse::Encryption,
-                jwk_json: enc_jwk_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to pin peer encryption JWK: {e}"),
-        })?;
-    let alice_grant_json = serde_json::to_string(&live.alice_grant_signed).map_err(|e| {
-        LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        }
-    })?;
-    save_grant_idempotent(
+    let cred_ref = save_live_p2p_credential(secrets, &offer.node_id, &live.auth_credential)
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    let records = P2pPeerRecords {
         db,
-        &GrantInput {
-            id: live.alice_grant_verified.id.clone(),
-            peer_id: offer.node_id.clone(),
-            direction: GrantDirection::Outbound,
-            signed_json: alice_grant_json,
-            scopes: live.alice_grant_verified.scopes.clone(),
-            trust_tier,
-            issued_at: now_db,
-            pair_by: None,
-            expires_at: None,
-        },
-        now_db,
-    )
-    .map_err(|message| LiveHandshakeError::Rejected {
-        code: "DB_ERROR",
-        message,
-    })?;
-    let bob_grant_json = serde_json::to_string(&live.bob_grant_signed).map_err(|e| {
-        LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        }
-    })?;
-    save_grant_idempotent(
-        db,
-        &GrantInput {
-            id: live.bob_grant_id,
-            peer_id: offer.node_id.clone(),
-            direction: GrantDirection::Inbound,
-            signed_json: bob_grant_json,
-            scopes: granted_scopes.clone(),
-            trust_tier,
-            issued_at: now_db,
-            // P1-18: Do NOT stamp the short invite pairing window onto an accepted long-lived peer grant.
-            pair_by: None,
-            expires_at: None,
-        },
-        now_db,
-    )
-    .map_err(|message| LiveHandshakeError::Rejected {
-        code: "DB_ERROR",
-        message,
-    })?;
-    let manifest_json =
-        serde_json::to_string(&live.signed_manifest).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    let caps: Vec<String> = live
-        .manifest_payload
-        .capabilities
-        .iter()
-        .map(|c| c.as_str().to_string())
-        .collect();
-    db.peers()
-        .cache_manifest(
-            &offer.node_id,
-            &ManifestCacheUpdate {
-                manifest_version: live.manifest_payload.manifest_version as i64,
-                manifest_json,
-                etag: Some(live.manifest_etag),
-                capabilities: caps,
-                accept_downgrade: false,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "MANIFEST_CACHE_ERROR",
-            message: format!("Failed to cache verified manifest: {e}"),
-        })?;
+        offer: &offer,
+        granted_scopes: &granted_scopes,
+        trust_tier,
+        now_ms: now_ms(),
+    };
+    records
+        .upsert(&kid, &enc_kid, &cred_ref, false)
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    records
+        .save_live(&live, false)
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
 
     Ok(OnboardJoinResult {
         format: "hp2p1",
@@ -4670,33 +4618,18 @@ pub(crate) fn live_pair_am2_for_onboard(
     db: &NodeDb,
     secrets: &SecretStore,
 ) -> Result<OnboardJoinResult, LiveHandshakeError> {
-    let invite = decode_am2(token).map_err(|e| LiveHandshakeError::Rejected {
+    let ValidatedAm2Invite {
+        invite,
+        admin_pk,
+        parsed_v1,
+        raw_map,
+        signed_grant: verified_grant_pair,
+    } = validate_am2_invite_for_accept(token, true)
+        .map_err(|(code, message, _)| LiveHandshakeError::Rejected { code, message })?;
+    let parsed_v1 = parsed_v1.ok_or_else(|| LiveHandshakeError::Rejected {
         code: "INVALID_TOKEN",
-        message: format!("Invalid am2_ join token: {e}"),
+        message: "Missing t3mp1_ pairingCode in am2_ bundle".into(),
     })?;
-    validate_endpoint_origin(&invite.router).map_err(|e| LiveHandshakeError::Rejected {
-        code: "INVALID_ENDPOINT",
-        message: format!(
-            "Untrusted router endpoint '{}' in am2_ bundle: {e}",
-            invite.router
-        ),
-    })?;
-    let admin_pk = invite
-        .admin_jwk
-        .to_ed25519()
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "INVALID_KEY",
-            message: format!("Invalid adminJwk in am2_ bundle: {e}"),
-        })?;
-    let parsed_v1 =
-        parse_pairing_code_v1(&invite.pairing_code).map_err(|e| LiveHandshakeError::Rejected {
-            code: "INVALID_TOKEN",
-            message: format!("Malformed pairingCode in am2_ bundle: {e}"),
-        })?;
-    let raw_map = extract_raw_json_object(AM2_PREFIX, token);
-    let verified_grant_pair =
-        verify_optional_am2_signed_grant(&admin_pk, Some(&parsed_v1.grant_id), raw_map.as_ref())
-            .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
     let raw_hub_node_id = raw_map
         .as_ref()
         .and_then(|m| m.get("nodeId"))
@@ -4725,99 +4658,24 @@ pub(crate) fn live_pair_am2_for_onboard(
             message: format!("Failed to store hub authCredential in SecretStore: {e}"),
         })?;
 
-    let trust_tier = live
-        .verified_grant
-        .trust_tier
-        .as_deref()
-        .map(|t| parse_store_trust_tier(t, StoreTrustTier::Org))
-        .unwrap_or(StoreTrustTier::Org);
+    let trust_tier = signed_am2_trust_tier(Some(&live.verified_grant));
     let now_db = now_ms();
     // P1-8: Never auto-grant `bridge:post` or `forward:via` during `onboard --join`.
     let mut _strip_warnings = Vec::new();
     let effective_scopes =
         strip_privileged_default_scopes(live.verified_grant.scopes.clone(), &mut _strip_warnings);
-    db.peers()
-        .upsert_peer(
-            &PeerInput {
-                peer_id: live.hub_node_id.clone(),
-                endpoint: Some(invite.router.clone()),
-                profile: PeerProfile::Router,
-                trust_tier,
-                status: PeerStatus::Active,
-                scopes: effective_scopes.clone(),
-                auth_credential_ref: Some(cred_ref),
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to upsert hub peer '{}': {e}", live.hub_node_id),
-        })?;
-    let admin_jwk_json =
-        serde_json::to_string(&invite.admin_jwk).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    let hub_sign_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.signing_jwk);
-    let hub_enc_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.encryption_jwk);
-    let hub_sign_json =
-        serde_json::to_string(&hub_sign_jwk).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    let hub_enc_json =
-        serde_json::to_string(&hub_enc_jwk).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    db.peers()
-        .upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: live.hub_node_id.clone(),
-                kid: admin_pk.kid(),
-                key_use: KeyUse::Admin,
-                jwk_json: admin_jwk_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to pin Admin-CA JWK: {e}"),
-        })?;
-    db.peers()
-        .upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: live.hub_node_id.clone(),
-                kid: live.hub_signing_pk.kid(),
-                key_use: KeyUse::Signing,
-                jwk_json: hub_sign_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to pin hub signing JWK: {e}"),
-        })?;
-    db.peers()
-        .upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: live.hub_node_id.clone(),
-                kid: live.hub_encryption_pk.kid(),
-                key_use: KeyUse::Encryption,
-                jwk_json: hub_enc_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to pin hub encryption JWK: {e}"),
-        })?;
+    let records = Am2PeerRecords {
+        db,
+        peer_id: &live.hub_node_id,
+        invite: &invite,
+        now_ms: now_db,
+    };
+    records
+        .upsert(trust_tier, &effective_scopes, &cred_ref, true)
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
+    records
+        .pin_keys(&admin_pk.kid(), Some(&live), true)
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
     let signed_grant_json =
         serde_json::to_string(&live.signed_grant).map_err(|e| LiveHandshakeError::Rejected {
             code: "ENCODE_ERROR",
@@ -4842,33 +4700,9 @@ pub(crate) fn live_pair_am2_for_onboard(
         code: "DB_ERROR",
         message,
     })?;
-    let manifest_json =
-        serde_json::to_string(&live.signed_manifest).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    let caps: Vec<String> = live
-        .manifest_payload
-        .capabilities
-        .iter()
-        .map(|c| c.as_str().to_string())
-        .collect();
-    db.peers()
-        .cache_manifest(
-            &live.hub_node_id,
-            &ManifestCacheUpdate {
-                manifest_version: live.manifest_payload.manifest_version as i64,
-                manifest_json,
-                etag: Some(live.manifest_etag),
-                capabilities: caps,
-                accept_downgrade: false,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "MANIFEST_CACHE_ERROR",
-            message: format!("Failed to cache verified hub manifest: {e}"),
-        })?;
+    records
+        .cache_hub_manifest(&live)
+        .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
 
     Ok(OnboardJoinResult {
         format: "am2",
@@ -4880,6 +4714,103 @@ pub(crate) fn live_pair_am2_for_onboard(
     })
 }
 
+#[derive(Debug)]
+enum JoinEndpointError {
+    Origin(hyp_crypto::CryptoError),
+    Ssh(hyp_crypto::CryptoError),
+}
+
+fn normalize_join_endpoint(raw_url: &str) -> Result<String, JoinEndpointError> {
+    validate_endpoint_origin(raw_url).map_err(JoinEndpointError::Origin)?;
+    let trimmed = raw_url.trim();
+    if trimmed.starts_with("ssh://") {
+        return parse_ssh_endpoint(trimmed)
+            .map(|endpoint| endpoint.canonical_url())
+            .map_err(JoinEndpointError::Ssh);
+    }
+    let no_slash = trimmed.trim_end_matches('/');
+    Ok(no_slash
+        .strip_suffix("/v1/manifest")
+        .unwrap_or(no_slash)
+        .to_owned())
+}
+
+fn persist_url_join_manifest(
+    db: &NodeDb,
+    peer_id: &str,
+    verified: &VerifiedLiveManifest,
+    signed_to_cache: &SignedNodeManifest,
+    payload_to_cache: &NodeManifestPayload,
+    now_ms: i64,
+) -> Result<Vec<String>, (&'static str, String)> {
+    let signing_jwk = CryptoOkpJwk::from(&verified.payload.identity.signing_jwk);
+    let encryption_jwk = CryptoOkpJwk::from(&verified.payload.identity.encryption_jwk);
+    let sign_json =
+        serde_json::to_string(&signing_jwk).map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+    let enc_json = serde_json::to_string(&encryption_jwk)
+        .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+    for (kid, key_use, jwk_json, purpose) in [
+        (
+            verified.signing_pk.kid(),
+            KeyUse::Signing,
+            sign_json,
+            "signing",
+        ),
+        (
+            verified.encryption_pk.kid(),
+            KeyUse::Encryption,
+            enc_json,
+            "encryption",
+        ),
+    ] {
+        db.peers()
+            .upsert_peer_key(
+                &PeerKeyInput {
+                    peer_id: peer_id.to_owned(),
+                    kid,
+                    key_use,
+                    jwk_json,
+                    status: KeyStatus::Active,
+                    expires_at: None,
+                },
+                now_ms,
+            )
+            .map_err(|error| {
+                (
+                    "DB_ERROR",
+                    format!("Failed to pin {purpose} JWK for '{peer_id}': {error}"),
+                )
+            })?;
+    }
+
+    let capabilities: Vec<String> = payload_to_cache
+        .capabilities
+        .iter()
+        .map(|capability| capability.as_str().to_owned())
+        .collect();
+    let manifest_json = serde_json::to_string(signed_to_cache)
+        .map_err(|error| ("ENCODE_ERROR", error.to_string()))?;
+    db.peers()
+        .cache_manifest(
+            peer_id,
+            &ManifestCacheUpdate {
+                manifest_version: payload_to_cache.manifest_version as i64,
+                manifest_json,
+                etag: verified.etag.clone(),
+                capabilities: capabilities.clone(),
+                accept_downgrade: false,
+            },
+            now_ms,
+        )
+        .map_err(|error| {
+            (
+                "MANIFEST_CACHE_ERROR",
+                format!("Failed to cache verified manifest for '{peer_id}': {error}"),
+            )
+        })?;
+    Ok(capabilities)
+}
+
 /// Executes a live public/team node URL join (`/v1/manifest` + optional `/v1/guest/pair`) during `hyp onboard --join`.
 pub(crate) fn live_join_url_for_onboard(
     raw_url: &str,
@@ -4888,25 +4819,16 @@ pub(crate) fn live_join_url_for_onboard(
     db: &NodeDb,
     warnings: &mut Vec<String>,
 ) -> Result<OnboardJoinResult, LiveHandshakeError> {
-    validate_endpoint_origin(raw_url).map_err(|e| LiveHandshakeError::Rejected {
-        code: "INVALID_ENDPOINT",
-        message: format!("Invalid target URL '{raw_url}': {e}"),
+    let base_url = normalize_join_endpoint(raw_url).map_err(|error| {
+        let message = match error {
+            JoinEndpointError::Origin(error) => format!("Invalid target URL '{raw_url}': {error}"),
+            JoinEndpointError::Ssh(error) => format!("Invalid target SSH URL '{raw_url}': {error}"),
+        };
+        LiveHandshakeError::Rejected {
+            code: "INVALID_ENDPOINT",
+            message,
+        }
     })?;
-    let trimmed = raw_url.trim();
-    let base_url = if trimmed.starts_with("ssh://") {
-        parse_ssh_endpoint(trimmed)
-            .map_err(|e| LiveHandshakeError::Rejected {
-                code: "INVALID_ENDPOINT",
-                message: format!("Invalid target SSH URL '{raw_url}': {e}"),
-            })?
-            .canonical_url()
-    } else {
-        let no_slash = trimmed.trim_end_matches('/');
-        no_slash
-            .strip_suffix("/v1/manifest")
-            .unwrap_or(no_slash)
-            .to_string()
-    };
 
     let v = match fetch_and_verify_manifest(&base_url) {
         Ok(v) => v,
@@ -4978,74 +4900,15 @@ pub(crate) fn live_join_url_for_onboard(
             message: format!("Failed to register peer '{peer_id}': {e}"),
         })?;
 
-    let sign_jwk = CryptoOkpJwk::from(&v.payload.identity.signing_jwk);
-    let enc_jwk = CryptoOkpJwk::from(&v.payload.identity.encryption_jwk);
-    let sign_json = serde_json::to_string(&sign_jwk).map_err(|e| LiveHandshakeError::Rejected {
-        code: "ENCODE_ERROR",
-        message: e.to_string(),
-    })?;
-    let enc_json = serde_json::to_string(&enc_jwk).map_err(|e| LiveHandshakeError::Rejected {
-        code: "ENCODE_ERROR",
-        message: e.to_string(),
-    })?;
-    db.peers()
-        .upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: peer_id.clone(),
-                kid: v.signing_pk.kid(),
-                key_use: KeyUse::Signing,
-                jwk_json: sign_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to pin signing JWK for '{peer_id}': {e}"),
-        })?;
-    db.peers()
-        .upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: peer_id.clone(),
-                kid: v.encryption_pk.kid(),
-                key_use: KeyUse::Encryption,
-                jwk_json: enc_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "DB_ERROR",
-            message: format!("Failed to pin encryption JWK for '{peer_id}': {e}"),
-        })?;
-    let manifest_json =
-        serde_json::to_string(&effective_signed).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: e.to_string(),
-        })?;
-    let caps: Vec<String> = effective_payload
-        .capabilities
-        .iter()
-        .map(|c| c.as_str().to_string())
-        .collect();
-    db.peers()
-        .cache_manifest(
-            &peer_id,
-            &ManifestCacheUpdate {
-                manifest_version: effective_payload.manifest_version as i64,
-                manifest_json,
-                etag: v.etag,
-                capabilities: caps,
-                accept_downgrade: false,
-            },
-            now_db,
-        )
-        .map_err(|e| LiveHandshakeError::Rejected {
-            code: "MANIFEST_CACHE_ERROR",
-            message: format!("Failed to cache verified manifest for '{peer_id}': {e}"),
-        })?;
+    persist_url_join_manifest(
+        db,
+        &peer_id,
+        &v,
+        &effective_signed,
+        &effective_payload,
+        now_db,
+    )
+    .map_err(|(code, message)| LiveHandshakeError::Rejected { code, message })?;
 
     Ok(OnboardJoinResult {
         format: "url",
@@ -5902,33 +5765,18 @@ fn run_join(
 ) -> Result<ExitCode, CliError> {
     let cmd = "pair join";
 
-    validate_endpoint_origin(&url).map_err(|e| {
-        CliError::usage(
+    let base_url = normalize_join_endpoint(&url).map_err(|error| match error {
+        JoinEndpointError::Origin(error) => CliError::usage(
             "INVALID_ENDPOINT",
-            format!("Invalid target URL '{url}': {e}"),
+            format!("Invalid target URL '{url}': {error}"),
         )
-        .with_fix("Use https:// (or loopback http://127.0.0.1 for local testing).".to_string())
+        .with_fix("Use https:// (or loopback http://127.0.0.1 for local testing).".to_owned()),
+        JoinEndpointError::Ssh(error) => CliError::usage(
+            "INVALID_ENDPOINT",
+            format!("Invalid SSH target URL '{url}': {error}"),
+        )
+        .with_fix("Use ssh://[user@]host[:port][?stateDir=/path]".to_owned()),
     })?;
-
-    let trimmed = url.trim();
-    let base_url = if trimmed.starts_with("ssh://") {
-        match parse_ssh_endpoint(trimmed) {
-            Ok(ep) => ep.canonical_url(),
-            Err(e) => {
-                return Err(CliError::usage(
-                    "INVALID_ENDPOINT",
-                    format!("Invalid SSH target URL '{url}': {e}"),
-                )
-                .with_fix("Use ssh://[user@]host[:port][?stateDir=/path]".to_string()));
-            }
-        }
-    } else {
-        let no_slash = trimmed.trim_end_matches('/');
-        no_slash
-            .strip_suffix("/v1/manifest")
-            .unwrap_or(no_slash)
-            .to_string()
-    };
 
     if let Some(ref raw) = node_id_arg {
         if raw == LOCAL_NODE_ID || !is_valid_node_id(raw) {
@@ -6175,89 +6023,12 @@ fn run_join(
         let signed_to_cache = effective_signed_manifest.as_ref().unwrap_or(&v.signed);
         let payload_to_cache = effective_manifest_payload.as_ref().unwrap_or(&v.payload);
 
-        let sign_jwk = CryptoOkpJwk::from(&v.payload.identity.signing_jwk);
-        let enc_jwk = CryptoOkpJwk::from(&v.payload.identity.encryption_jwk);
-        let k = v.signing_pk.kid();
-        let ek = v.encryption_pk.kid();
-        let fp = v.signing_pk.fingerprint();
-
-        let sign_json = match serde_json::to_string(&sign_jwk) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-        let enc_json = match serde_json::to_string(&enc_jwk) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-
-        if let Err(e) = db.peers().upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: peer_id.clone(),
-                kid: k.clone(),
-                key_use: KeyUse::Signing,
-                jwk_json: sign_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error(
-                "DB_ERROR",
-                format!("Failed to pin signing JWK for '{peer_id}': {e}"),
-            ));
-        }
-        if let Err(e) = db.peers().upsert_peer_key(
-            &PeerKeyInput {
-                peer_id: peer_id.clone(),
-                kid: ek.clone(),
-                key_use: KeyUse::Encryption,
-                jwk_json: enc_json,
-                status: KeyStatus::Active,
-                expires_at: None,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error(
-                "DB_ERROR",
-                format!("Failed to pin encryption JWK for '{peer_id}': {e}"),
-            ));
-        }
-
-        capabilities = payload_to_cache
-            .capabilities
-            .iter()
-            .map(|c| c.as_str().to_string())
-            .collect();
-        let manifest_json = match serde_json::to_string(signed_to_cache) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-            }
-        };
-        if let Err(e) = db.peers().cache_manifest(
-            &peer_id,
-            &ManifestCacheUpdate {
-                manifest_version: payload_to_cache.manifest_version as i64,
-                manifest_json,
-                etag: v.etag.clone(),
-                capabilities: capabilities.clone(),
-                accept_downgrade: false,
-            },
-            now_db,
-        ) {
-            return Err(CliError::error(
-                "MANIFEST_CACHE_ERROR",
-                format!("Failed to cache verified manifest for '{peer_id}': {e}"),
-            ));
-        }
-
-        kid = Some(k);
-        enc_kid = Some(ek);
-        fingerprint = Some(fp);
+        capabilities =
+            persist_url_join_manifest(&db, &peer_id, v, signed_to_cache, payload_to_cache, now_db)
+                .map_err(|(code, message)| CliError::error(code, message))?;
+        kid = Some(v.signing_pk.kid());
+        enc_kid = Some(v.encryption_pk.kid());
+        fingerprint = Some(v.signing_pk.fingerprint());
         hyphae_version = Some(payload_to_cache.hyphae_version.clone());
     }
 
@@ -7003,160 +6774,26 @@ fn run_pair_ssh(
         },
     };
 
-    let cred_ref = credential_secret_name("peer-auth", &remote_node_id);
-    secrets.set(&cred_ref, &live.auth_credential).map_err(|e| {
-        CliError::error(
-            "KEYSTORE_ERROR",
-            format!("Failed to store peer authCredential in SecretStore: {e}"),
-        )
-    })?;
-
+    let cred_ref = save_live_p2p_credential(&secrets, &remote_node_id, &live.auth_credential)
+        .map_err(|(code, message)| CliError::error(code, message))?;
     let now_db = now_ms();
     let _ = db.local().ensure_metadata("node_id", &local_node_id);
-
-    if let Err(e) = db.peers().upsert_peer(
-        &PeerInput {
-            peer_id: remote_node_id.clone(),
-            endpoint: Some(canonical_endpoint.clone()),
-            profile: PeerProfile::P2p,
-            trust_tier,
-            status: PeerStatus::Active,
-            scopes: local_granted_scopes.clone(),
-            auth_credential_ref: Some(cred_ref.clone()),
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "DB_ERROR",
-            format!("Failed to persist SSH peer '{remote_node_id}': {e}"),
-        ));
-    }
-
     let kid = offer_sign_pk.kid();
     let enc_kid = offer_enc_pk.kid();
     let fingerprint = offer_sign_pk.fingerprint();
-    let sign_jwk_json = match serde_json::to_string(&offer.signing_jwk) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-        }
+    let records = P2pPeerRecords {
+        db: &db,
+        offer: &offer,
+        granted_scopes: &local_granted_scopes,
+        trust_tier,
+        now_ms: now_db,
     };
-    let enc_jwk_json = match serde_json::to_string(&offer.encryption_jwk) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-        }
-    };
-
-    if let Err(e) = db.peers().upsert_peer_key(
-        &PeerKeyInput {
-            peer_id: remote_node_id.clone(),
-            kid: kid.clone(),
-            key_use: KeyUse::Signing,
-            jwk_json: sign_jwk_json,
-            status: KeyStatus::Active,
-            expires_at: None,
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "DB_ERROR",
-            format!("Failed to pin remote signing JWK: {e}"),
-        ));
-    }
-    if let Err(e) = db.peers().upsert_peer_key(
-        &PeerKeyInput {
-            peer_id: remote_node_id.clone(),
-            kid: enc_kid.clone(),
-            key_use: KeyUse::Encryption,
-            jwk_json: enc_jwk_json,
-            status: KeyStatus::Active,
-            expires_at: None,
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "DB_ERROR",
-            format!("Failed to pin remote encryption JWK: {e}"),
-        ));
-    }
-
-    let alice_grant_json = match serde_json::to_string(&live.alice_grant_signed) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-        }
-    };
-    if let Err(e) = save_grant_idempotent(
-        &db,
-        &GrantInput {
-            id: live.alice_grant_verified.id.clone(),
-            peer_id: remote_node_id.clone(),
-            direction: GrantDirection::Outbound,
-            signed_json: alice_grant_json,
-            scopes: live.alice_grant_verified.scopes.clone(),
-            trust_tier,
-            issued_at: now_db,
-            pair_by: None,
-            expires_at: None,
-        },
-        now_db,
-    ) {
-        return Err(CliError::error("DB_ERROR", e));
-    }
-
-    let bob_grant_json = match serde_json::to_string(&live.bob_grant_signed) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-        }
-    };
-    if let Err(e) = save_grant_idempotent(
-        &db,
-        &GrantInput {
-            id: live.bob_grant_id.clone(),
-            peer_id: remote_node_id.clone(),
-            direction: GrantDirection::Inbound,
-            signed_json: bob_grant_json,
-            scopes: local_granted_scopes.clone(),
-            trust_tier,
-            issued_at: now_db,
-            pair_by: None,
-            expires_at: None,
-        },
-        now_db,
-    ) {
-        return Err(CliError::error("DB_ERROR", e));
-    }
-
-    let manifest_json = match serde_json::to_string(&live.signed_manifest) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-        }
-    };
-    let caps: Vec<String> = live
-        .manifest_payload
-        .capabilities
-        .iter()
-        .map(|c| c.as_str().to_string())
-        .collect();
-    if let Err(e) = db.peers().cache_manifest(
-        &remote_node_id,
-        &ManifestCacheUpdate {
-            manifest_version: live.manifest_payload.manifest_version as i64,
-            manifest_json,
-            etag: Some(live.manifest_etag.clone()),
-            capabilities: caps.clone(),
-            accept_downgrade: false,
-        },
-        now_db,
-    ) {
-        return Err(CliError::error(
-            "MANIFEST_CACHE_ERROR",
-            format!("Failed to cache verified manifest: {e}"),
-        ));
-    }
+    records
+        .upsert(&kid, &enc_kid, &cred_ref, true)
+        .map_err(|(code, message)| CliError::error(code, message))?;
+    let caps = records
+        .save_live(&live, false)
+        .map_err(|(code, message)| CliError::error(code, message))?;
 
     drop(db);
     let reload = try_reload_live_daemon(&state_dir, explicit_state);
