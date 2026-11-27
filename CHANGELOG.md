@@ -2,7 +2,7 @@
 
 All notable changes to Hyphae (`hyp`) are documented in this file.
 
-## [Unreleased]
+## [0.8.0] - 2026-11-27
 
 ### Changed
 - **Timestamp parsing**: Invalid non-ASCII seconds fields now fail cleanly instead of panicking. Wire timestamps keep strict uppercase separators; compatibility timestamps retain their existing lowercase and space forms.
@@ -19,6 +19,8 @@ All notable changes to Hyphae (`hyp`) are documented in this file.
 - **Rollback note**: saved per-session delivery policies no longer contain `maxBatchTokens`, `maxInlineItems` or `maxSingleItemShare`. Releases up to 0.7.0 require those fields, so after a downgrade a session whose policy was saved by this version fails to load its delivery policy.
 
 ### Added
+- **Scoped Shared KV**. Browse peer namespaces and entries in the terminal inspector, Herdr, and Claude Code panels. Agent access to Shared KV is an onboarding choice.
+- **SSH peer transport**. Connect and pair over SSH, with Tailscale checks in `hyp doctor`. The `/join` portal supports delegated human-certificate admission.
 - **Six event-source plugins (Beta)**: `agentmail`, `sentry`, `gmail`, `google-calendar`, `vercel` and `notion`, installed with `hyp plugin install <name>` and wired as `kind: "source"` so each thread subscribes with its own `hyp_stream` filter. All are outbound-only by default (WebSocket or polling) and run on a laptop or a hub; Sentry, Vercel and Notion also accept signed webhooks (`*_MODE=webhook`). Events carry routing metadata and short previews only, never message or page bodies.
 - **Tailscale Funnel for plugin webhooks (`<PREFIX>_WEBHOOK_FUNNEL`)**: Sentry, Vercel and Notion webhook modes can publish their own loopback path through Funnel and log the public URL, with no reverse proxy to configure; their onboarding trees offer it as the recommended route on a tailnet.
 - **AgentMail catch-up**: mail received while the WebSocket was down (reconnects, restarts, sleep) is listed over REST on connect and delivered, deduplicated by message ID.
@@ -29,6 +31,13 @@ All notable changes to Hyphae (`hyp`) are documented in this file.
 ### Security & Hardening
 - **Private directories**: Reject symlink directories before tightening permissions, leaving their targets unchanged. Node staging directories now use the same owner and permission checks as the keystore.
 - **Plugins that crash after connecting now stop**: `plugins/sdk/client.mjs` logs one line (message only) and hard-stops the process on an uncaught error or unhandled rejection. Previously the open channel kept a crashed Node bridge (Telegram, Slack, WhatsApp, webhook, Prometheus or a custom plugin) alive, so the node reported it as running and the restart backoff and `CrashLoopBackOff` breaker never engaged.
+
+### Fixed
+- **Verified Human Drop enrollment**. Restored browser Passkey enrollment on the Drop portal. [#208](https://github.com/hyphae-to/hyp/pull/208)
+- **Node and harness reliability**. Register shutdown signal handlers before signaling readiness and wait for committed Codex Queue fallbacks in integration tests. [#206](https://github.com/hyphae-to/hyp/pull/206) · [#203](https://github.com/hyphae-to/hyp/pull/203)
+
+### Release verification
+- Rehearse updates on a configured, paired installation before publishing. Stable and nightly releases share the archive build workflow. [#211](https://github.com/hyphae-to/hyp/pull/211) · [#214](https://github.com/hyphae-to/hyp/pull/214)
 
 ## [0.7.0] - 2026-11-25
 

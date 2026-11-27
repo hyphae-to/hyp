@@ -70,7 +70,7 @@ Hyphae requires a fresh live Passkey Admin approval for gate-policy and human-au
 
 Read the [Threat Model](docs/security/threat-model.md) and [Hardening Guide](docs/security/hardening.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
-## Status (`v0.7.0`)
+## Status (`v0.8.0`)
 
 - **Solid:** Local multi-agent mesh (Claude Code, Antigravity, Herdr, Codex, OpenCode), `hyp emit` + OS cron triggers, public GitHub poller, Direct P2P pairing, Verified Human Drops + `hyp exec --env`, signed local `hyp update`
 - **Beta:** Team Hubs (`am2_` Admin-CA), external chat bridges (Telegram, Slack, WhatsApp), signed hub webhooks

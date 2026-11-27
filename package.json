@@ -1,6 +1,6 @@
 {
   "name": "hyphae-workspace-tools",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "Dev-only JS/TS lint and test entry points for Hyphae (core hyp binary remains pure static Rust with zero runtime Node.js dependency).",
