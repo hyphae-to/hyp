@@ -55,6 +55,51 @@ pub struct InboundEvaluation {
     pub categories: Vec<String>,
 }
 
+fn inbound_evaluation(
+    decision: GateDecision,
+    stage: impl Into<String>,
+    payload_sha256: String,
+    categories: Vec<String>,
+    audit_seq: Option<i64>,
+) -> InboundEvaluation {
+    InboundEvaluation {
+        decision,
+        stage: stage.into(),
+        receipt: None,
+        duplicate: false,
+        payload_sha256,
+        audit_seq,
+        confidence: Some(1.0),
+        categories,
+    }
+}
+
+fn inbound_audit(
+    ctx: &InboundContext,
+    stage: &str,
+    decision: StoreGateDecision,
+    payload_sha256: &str,
+    traceparent: Option<String>,
+) -> GateAuditInput {
+    GateAuditInput {
+        direction: GateDirection::Inbound,
+        stage: stage.to_owned(),
+        decision,
+        origin_node: Some(ctx.origin_node.clone()),
+        source: Some(ctx.sender.clone()),
+        session_id: Some(ctx.session_id.clone()),
+        receipt_id: None,
+        event_type: Some(ctx.event.event_type.clone()),
+        trust_tier: Some(ctx.trust_tier.as_str().to_owned()),
+        confidence: Some(1.0),
+        categories: Vec::new(),
+        reason: None,
+        traceparent,
+        payload_sha256: payload_sha256.to_owned(),
+        reviewer: None,
+    }
+}
+
 /// Complete result of evaluating an outbound pre-encrypt payload through Stage 1 DLP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundEvaluation {
@@ -312,6 +357,9 @@ impl SecurityGatePipeline {
         let payload_text = ctx.payload_text();
         let payload_sha256 = sha256_hex(payload_text.as_bytes());
         let traceparent = ctx.traceparent();
+        let audit = |stage, decision, traceparent| {
+            inbound_audit(ctx, stage, decision, &payload_sha256, traceparent)
+        };
 
         // Step 0: Anti-tamper guard policy integrity verification.
         // If human-approved policy signing is required and on-disk config was modified (e.g. by a
@@ -333,33 +381,27 @@ impl SecurityGatePipeline {
             )?;
             let audit_seq = self.record_audit(
                 &GateAuditInput {
-                    direction: GateDirection::Inbound,
-                    stage: "policy_integrity".to_string(),
-                    decision: StoreGateDecision::Quarantine,
-                    origin_node: Some(ctx.origin_node.clone()),
-                    source: Some(ctx.sender.clone()),
-                    session_id: Some(ctx.session_id.clone()),
                     receipt_id: receipt.clone(),
-                    event_type: Some(ctx.event.event_type.clone()),
-                    trust_tier: Some(ctx.trust_tier.as_str().to_string()),
-                    confidence: Some(1.0),
                     categories: cats.clone(),
                     reason: Some(reason.clone()),
-                    traceparent,
-                    payload_sha256: payload_sha256.clone(),
-                    reviewer: None,
+                    ..audit(
+                        "policy_integrity",
+                        StoreGateDecision::Quarantine,
+                        traceparent,
+                    )
                 },
                 now_ms,
             )?;
             return Ok(InboundEvaluation {
-                decision: GateDecision::Quarantine { reason, notice },
-                stage: "policy_integrity".to_string(),
                 receipt,
                 duplicate,
-                payload_sha256,
-                audit_seq: Some(audit_seq),
-                confidence: Some(1.0),
-                categories: cats,
+                ..inbound_evaluation(
+                    GateDecision::Quarantine { reason, notice },
+                    "policy_integrity",
+                    payload_sha256,
+                    cats,
+                    Some(audit_seq),
+                )
             });
         }
 
@@ -391,17 +433,18 @@ impl SecurityGatePipeline {
                     now_ms,
                 )?;
                 return Ok(InboundEvaluation {
-                    decision: GateDecision::Hold {
-                        reason,
-                        retry_after_ms,
-                    },
-                    stage: "stage1".to_string(),
                     receipt: existing_receipt.map(ToString::to_string),
-                    duplicate: false,
-                    payload_sha256,
-                    audit_seq: Some(audit_seq),
                     confidence: None,
-                    categories: cats,
+                    ..inbound_evaluation(
+                        GateDecision::Hold {
+                            reason,
+                            retry_after_ms,
+                        },
+                        "stage1",
+                        payload_sha256,
+                        cats,
+                        Some(audit_seq),
+                    )
                 });
             }
             GateDecision::Block { reason } => {
@@ -412,34 +455,20 @@ impl SecurityGatePipeline {
                 }
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
-                        direction: GateDirection::Inbound,
-                        stage: "stage1".to_string(),
-                        decision: StoreGateDecision::Block,
-                        origin_node: Some(ctx.origin_node.clone()),
-                        source: Some(ctx.sender.clone()),
-                        session_id: Some(ctx.session_id.clone()),
                         receipt_id: existing_receipt.map(ToString::to_string),
-                        event_type: Some(ctx.event.event_type.clone()),
-                        trust_tier: Some(ctx.trust_tier.as_str().to_string()),
-                        confidence: Some(1.0),
                         categories: cats.clone(),
                         reason: Some(reason.clone()),
-                        traceparent,
-                        payload_sha256: payload_sha256.clone(),
-                        reviewer: None,
+                        ..audit("stage1", StoreGateDecision::Block, traceparent)
                     },
                     now_ms,
                 )?;
-                return Ok(InboundEvaluation {
-                    decision: GateDecision::Block { reason },
-                    stage: "stage1".to_string(),
-                    receipt: None,
-                    duplicate: false,
+                return Ok(inbound_evaluation(
+                    GateDecision::Block { reason },
+                    "stage1",
                     payload_sha256,
-                    audit_seq: Some(audit_seq),
-                    confidence: Some(1.0),
-                    categories: cats,
-                });
+                    cats,
+                    Some(audit_seq),
+                ));
             }
             GateDecision::Quarantine { reason, notice } => {
                 let mut cats = vec!["gate.quarantined".to_string()];
@@ -454,33 +483,23 @@ impl SecurityGatePipeline {
                 )?;
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
-                        direction: GateDirection::Inbound,
-                        stage: "stage1".to_string(),
-                        decision: StoreGateDecision::Quarantine,
-                        origin_node: Some(ctx.origin_node.clone()),
-                        source: Some(ctx.sender.clone()),
-                        session_id: Some(ctx.session_id.clone()),
                         receipt_id: receipt.clone(),
-                        event_type: Some(ctx.event.event_type.clone()),
-                        trust_tier: Some(ctx.trust_tier.as_str().to_string()),
-                        confidence: Some(1.0),
                         categories: cats.clone(),
                         reason: Some(reason.clone()),
-                        traceparent,
-                        payload_sha256: payload_sha256.clone(),
-                        reviewer: None,
+                        ..audit("stage1", StoreGateDecision::Quarantine, traceparent)
                     },
                     now_ms,
                 )?;
                 return Ok(InboundEvaluation {
-                    decision: GateDecision::Quarantine { reason, notice },
-                    stage: "stage1".to_string(),
                     receipt,
                     duplicate,
-                    payload_sha256,
-                    audit_seq: Some(audit_seq),
-                    confidence: Some(1.0),
-                    categories: cats,
+                    ..inbound_evaluation(
+                        GateDecision::Quarantine { reason, notice },
+                        "stage1",
+                        payload_sha256,
+                        cats,
+                        Some(audit_seq),
+                    )
                 });
             }
         };
@@ -494,21 +513,18 @@ impl SecurityGatePipeline {
                     let _ =
                         self.reject_existing_in_mailbox(r, ctx, "human_auth_unverified", now_ms)?;
                 }
-                return Ok(InboundEvaluation {
-                    decision: GateDecision::Block {
+                return Ok(inbound_evaluation(
+                    GateDecision::Block {
                         reason: "human_auth_unverified".to_string(),
                     },
-                    stage: "human_authority".to_string(),
-                    receipt: None,
-                    duplicate: false,
+                    "human_authority",
                     payload_sha256,
-                    audit_seq: None,
-                    confidence: Some(1.0),
-                    categories: vec![
+                    vec![
                         "gate.blocked".to_string(),
                         "human_auth_unverified".to_string(),
                     ],
-                });
+                    None,
+                ));
             };
             let (receipt, duplicate) = self.approve_existing_or_store_pending(
                 existing_receipt,
@@ -531,19 +547,16 @@ impl SecurityGatePipeline {
                     &extra,
                     now_ms,
                 )?;
-                return Ok(InboundEvaluation {
-                    decision: GateDecision::Hold {
+                return Ok(inbound_evaluation(
+                    GateDecision::Hold {
                         reason: "local_inbox_full".to_string(),
                         retry_after_ms: 5_000,
                     },
-                    stage: "mailbox".to_string(),
-                    receipt: None,
-                    duplicate: false,
+                    "mailbox",
                     payload_sha256,
-                    audit_seq: Some(audit_seq),
-                    confidence: Some(1.0),
-                    categories: cats,
-                });
+                    cats,
+                    Some(audit_seq),
+                ));
             }
             if let Some(ref r) = receipt {
                 let auth_json = serde_json::to_string(auth).map_err(|e| {
@@ -562,35 +575,27 @@ impl SecurityGatePipeline {
             cats.extend(stage1_out.categories);
             let audit_seq = self.record_audit(
                 &GateAuditInput {
-                    direction: GateDirection::Inbound,
-                    stage: "human_authority".to_string(),
-                    decision: StoreGateDecision::Allow,
-                    origin_node: Some(ctx.origin_node.clone()),
-                    source: Some(ctx.sender.clone()),
-                    session_id: Some(ctx.session_id.clone()),
                     receipt_id: receipt.clone(),
-                    event_type: Some(ctx.event.event_type.clone()),
                     trust_tier: Some("human-verified".to_string()),
-                    confidence: Some(1.0),
                     categories: cats.clone(),
                     reason: urgency_cap_gate_reason(stage1_cap).map(str::to_string),
-                    traceparent,
-                    payload_sha256: payload_sha256.clone(),
                     reviewer: Some(format!("human:{}:{}", auth.human_id, kid8)),
+                    ..audit("human_authority", StoreGateDecision::Allow, traceparent)
                 },
                 now_ms,
             )?;
             return Ok(InboundEvaluation {
-                decision: GateDecision::Allow {
-                    max_urgency: stage1_cap,
-                },
-                stage: "human_authority".to_string(),
                 receipt,
                 duplicate,
-                payload_sha256,
-                audit_seq: Some(audit_seq),
-                confidence: Some(1.0),
-                categories: cats,
+                ..inbound_evaluation(
+                    GateDecision::Allow {
+                        max_urgency: stage1_cap,
+                    },
+                    "human_authority",
+                    payload_sha256,
+                    cats,
+                    Some(audit_seq),
+                )
             });
         }
 
@@ -660,6 +665,9 @@ impl SecurityGatePipeline {
         let payload_text = ctx.payload_text();
         let payload_sha256 = sha256_hex(payload_text.as_bytes());
         let traceparent = ctx.traceparent();
+        let audit = |stage, decision, traceparent| {
+            inbound_audit(ctx, stage, decision, &payload_sha256, traceparent)
+        };
 
         // Step 0: Anti-tamper guard policy integrity verification (fail-closed even for HumanVerified!).
         if self.is_policy_tampered() {
@@ -679,33 +687,27 @@ impl SecurityGatePipeline {
             )?;
             let audit_seq = self.record_audit(
                 &GateAuditInput {
-                    direction: GateDirection::Inbound,
-                    stage: "policy_integrity".to_string(),
-                    decision: StoreGateDecision::Quarantine,
-                    origin_node: Some(ctx.origin_node.clone()),
-                    source: Some(ctx.sender.clone()),
-                    session_id: Some(ctx.session_id.clone()),
                     receipt_id: receipt.clone(),
-                    event_type: Some(ctx.event.event_type.clone()),
-                    trust_tier: Some(ctx.trust_tier.as_str().to_string()),
-                    confidence: Some(1.0),
                     categories: cats.clone(),
                     reason: Some(reason.clone()),
-                    traceparent,
-                    payload_sha256: payload_sha256.clone(),
-                    reviewer: None,
+                    ..audit(
+                        "policy_integrity",
+                        StoreGateDecision::Quarantine,
+                        traceparent,
+                    )
                 },
                 now_ms,
             )?;
             return Ok(InboundEvaluation {
-                decision: GateDecision::Quarantine { reason, notice },
-                stage: "policy_integrity".to_string(),
                 receipt,
                 duplicate,
-                payload_sha256,
-                audit_seq: Some(audit_seq),
-                confidence: Some(1.0),
-                categories: cats,
+                ..inbound_evaluation(
+                    GateDecision::Quarantine { reason, notice },
+                    "policy_integrity",
+                    payload_sha256,
+                    cats,
+                    Some(audit_seq),
+                )
             });
         }
 
@@ -719,34 +721,20 @@ impl SecurityGatePipeline {
                 ];
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
-                        direction: GateDirection::Inbound,
-                        stage: "local_ingest".to_string(),
-                        decision: StoreGateDecision::Block,
-                        origin_node: Some(ctx.origin_node.clone()),
-                        source: Some(ctx.sender.clone()),
-                        session_id: Some(ctx.session_id.clone()),
-                        receipt_id: None,
-                        event_type: Some(ctx.event.event_type.clone()),
                         trust_tier: Some("human-verified".to_string()),
-                        confidence: Some(1.0),
                         categories: cats.clone(),
                         reason: Some(reason.clone()),
-                        traceparent,
-                        payload_sha256: payload_sha256.clone(),
-                        reviewer: None,
+                        ..audit("local_ingest", StoreGateDecision::Block, traceparent)
                     },
                     now_ms,
                 )?;
-                return Ok(InboundEvaluation {
-                    decision: GateDecision::Block { reason },
-                    stage: "local_ingest".to_string(),
-                    receipt: None,
-                    duplicate: false,
+                return Ok(inbound_evaluation(
+                    GateDecision::Block { reason },
+                    "local_ingest",
                     payload_sha256,
-                    audit_seq: Some(audit_seq),
-                    confidence: Some(1.0),
-                    categories: cats,
-                });
+                    cats,
+                    Some(audit_seq),
+                ));
             };
             let kid8: String = auth.kid.chars().take(8).collect();
             let cats = vec![
@@ -756,34 +744,20 @@ impl SecurityGatePipeline {
             ];
             let audit_seq = self.record_audit(
                 &GateAuditInput {
-                    direction: GateDirection::Inbound,
-                    stage: "local_ingest".to_string(),
-                    decision: StoreGateDecision::Allow,
-                    origin_node: Some(ctx.origin_node.clone()),
-                    source: Some(ctx.sender.clone()),
-                    session_id: Some(ctx.session_id.clone()),
-                    receipt_id: None,
-                    event_type: Some(ctx.event.event_type.clone()),
                     trust_tier: Some("human-verified".to_string()),
-                    confidence: Some(1.0),
                     categories: cats.clone(),
-                    reason: None,
-                    traceparent,
-                    payload_sha256: payload_sha256.clone(),
                     reviewer: Some(format!("human:{}:{}", auth.human_id, kid8)),
+                    ..audit("local_ingest", StoreGateDecision::Allow, traceparent)
                 },
                 now_ms,
             )?;
-            return Ok(InboundEvaluation {
-                decision: GateDecision::ALLOW,
-                stage: "local_ingest".to_string(),
-                receipt: None,
-                duplicate: false,
+            return Ok(inbound_evaluation(
+                GateDecision::ALLOW,
+                "local_ingest",
                 payload_sha256,
-                audit_seq: Some(audit_seq),
-                confidence: Some(1.0),
-                categories: cats,
-            });
+                cats,
+                Some(audit_seq),
+            ));
         }
 
         // Step 2: Deterministic Stage 1 screening (mutex dropped before any .await!).
@@ -813,17 +787,17 @@ impl SecurityGatePipeline {
                     now_ms,
                 )?;
                 return Ok(InboundEvaluation {
-                    decision: GateDecision::Hold {
-                        reason,
-                        retry_after_ms,
-                    },
-                    stage: "stage1".to_string(),
-                    receipt: None,
-                    duplicate: false,
-                    payload_sha256,
-                    audit_seq: Some(audit_seq),
                     confidence: None,
-                    categories: cats,
+                    ..inbound_evaluation(
+                        GateDecision::Hold {
+                            reason,
+                            retry_after_ms,
+                        },
+                        "stage1",
+                        payload_sha256,
+                        cats,
+                        Some(audit_seq),
+                    )
                 });
             }
             GateDecision::Block { reason } => {
@@ -831,34 +805,19 @@ impl SecurityGatePipeline {
                 cats.extend(stage1_out.categories);
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
-                        direction: GateDirection::Inbound,
-                        stage: "stage1".to_string(),
-                        decision: StoreGateDecision::Block,
-                        origin_node: Some(ctx.origin_node.clone()),
-                        source: Some(ctx.sender.clone()),
-                        session_id: Some(ctx.session_id.clone()),
-                        receipt_id: None,
-                        event_type: Some(ctx.event.event_type.clone()),
-                        trust_tier: Some(ctx.trust_tier.as_str().to_string()),
-                        confidence: Some(1.0),
                         categories: cats.clone(),
                         reason: Some(reason.clone()),
-                        traceparent,
-                        payload_sha256: payload_sha256.clone(),
-                        reviewer: None,
+                        ..audit("stage1", StoreGateDecision::Block, traceparent)
                     },
                     now_ms,
                 )?;
-                return Ok(InboundEvaluation {
-                    decision: GateDecision::Block { reason },
-                    stage: "stage1".to_string(),
-                    receipt: None,
-                    duplicate: false,
+                return Ok(inbound_evaluation(
+                    GateDecision::Block { reason },
+                    "stage1",
                     payload_sha256,
-                    audit_seq: Some(audit_seq),
-                    confidence: Some(1.0),
-                    categories: cats,
-                });
+                    cats,
+                    Some(audit_seq),
+                ));
             }
             GateDecision::Quarantine { reason, notice } => {
                 let mut cats = vec!["gate.quarantined".to_string()];
@@ -873,33 +832,23 @@ impl SecurityGatePipeline {
                 )?;
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
-                        direction: GateDirection::Inbound,
-                        stage: "stage1".to_string(),
-                        decision: StoreGateDecision::Quarantine,
-                        origin_node: Some(ctx.origin_node.clone()),
-                        source: Some(ctx.sender.clone()),
-                        session_id: Some(ctx.session_id.clone()),
                         receipt_id: receipt.clone(),
-                        event_type: Some(ctx.event.event_type.clone()),
-                        trust_tier: Some(ctx.trust_tier.as_str().to_string()),
-                        confidence: Some(1.0),
                         categories: cats.clone(),
                         reason: Some(reason.clone()),
-                        traceparent,
-                        payload_sha256: payload_sha256.clone(),
-                        reviewer: None,
+                        ..audit("stage1", StoreGateDecision::Quarantine, traceparent)
                     },
                     now_ms,
                 )?;
                 return Ok(InboundEvaluation {
-                    decision: GateDecision::Quarantine { reason, notice },
-                    stage: "stage1".to_string(),
                     receipt,
                     duplicate,
-                    payload_sha256,
-                    audit_seq: Some(audit_seq),
-                    confidence: Some(1.0),
-                    categories: cats,
+                    ..inbound_evaluation(
+                        GateDecision::Quarantine { reason, notice },
+                        "stage1",
+                        payload_sha256,
+                        cats,
+                        Some(audit_seq),
+                    )
                 });
             }
         };
@@ -938,36 +887,25 @@ impl SecurityGatePipeline {
         cats.extend(collected_categories);
         let audit_seq = self.record_audit(
             &GateAuditInput {
-                direction: GateDirection::Inbound,
-                stage: last_stage.clone(),
-                decision: StoreGateDecision::Allow,
-                origin_node: Some(ctx.origin_node.clone()),
-                source: Some(ctx.sender.clone()),
-                session_id: Some(ctx.session_id.clone()),
-                receipt_id: None,
-                event_type: Some(ctx.event.event_type.clone()),
-                trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                 confidence: last_confidence,
                 categories: cats.clone(),
                 reason: urgency_cap_gate_reason(stage1_cap).map(str::to_string),
-                traceparent,
-                payload_sha256: payload_sha256.clone(),
-                reviewer: None,
+                ..audit(&last_stage, StoreGateDecision::Allow, traceparent)
             },
             now_ms,
         )?;
 
         Ok(InboundEvaluation {
-            decision: GateDecision::Allow {
-                max_urgency: stage1_cap,
-            },
-            stage: last_stage,
-            receipt: None,
-            duplicate: false,
-            payload_sha256,
-            audit_seq: Some(audit_seq),
             confidence: last_confidence,
-            categories: cats,
+            ..inbound_evaluation(
+                GateDecision::Allow {
+                    max_urgency: stage1_cap,
+                },
+                last_stage,
+                payload_sha256,
+                cats,
+                Some(audit_seq),
+            )
         })
     }
 
@@ -986,6 +924,9 @@ impl SecurityGatePipeline {
         collected_categories: &mut Vec<String>,
         now_ms: i64,
     ) -> Result<Option<InboundEvaluation>, GateError> {
+        let audit = |stage, decision, traceparent| {
+            inbound_audit(ctx, stage, decision, payload_sha256, traceparent)
+        };
         match outcome.decision {
             GateDecision::Allow { .. } => {
                 *last_stage = stage_label.to_string();
@@ -1010,17 +951,18 @@ impl SecurityGatePipeline {
                     now_ms,
                 )?;
                 Ok(Some(InboundEvaluation {
-                    decision: GateDecision::Hold {
-                        reason,
-                        retry_after_ms,
-                    },
-                    stage: stage_label.to_string(),
                     receipt: existing_receipt.map(ToString::to_string),
-                    duplicate: false,
-                    payload_sha256: payload_sha256.to_string(),
-                    audit_seq: Some(audit_seq),
                     confidence: outcome.confidence,
-                    categories: cats,
+                    ..inbound_evaluation(
+                        GateDecision::Hold {
+                            reason,
+                            retry_after_ms,
+                        },
+                        stage_label,
+                        payload_sha256.to_string(),
+                        cats,
+                        Some(audit_seq),
+                    )
                 }))
             }
             GateDecision::Quarantine { reason, notice } => {
@@ -1041,33 +983,25 @@ impl SecurityGatePipeline {
                 )?;
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
-                        direction: GateDirection::Inbound,
-                        stage: stage_label.to_string(),
-                        decision: store_decision,
-                        origin_node: Some(ctx.origin_node.clone()),
-                        source: Some(ctx.sender.clone()),
-                        session_id: Some(ctx.session_id.clone()),
                         receipt_id: receipt.clone(),
-                        event_type: Some(ctx.event.event_type.clone()),
-                        trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                         confidence: outcome.confidence,
                         categories: cats.clone(),
                         reason: Some(reason.clone()),
-                        traceparent,
-                        payload_sha256: payload_sha256.to_string(),
-                        reviewer: None,
+                        ..audit(stage_label, store_decision, traceparent)
                     },
                     now_ms,
                 )?;
                 Ok(Some(InboundEvaluation {
-                    decision: GateDecision::Quarantine { reason, notice },
-                    stage: stage_label.to_string(),
                     receipt,
                     duplicate,
-                    payload_sha256: payload_sha256.to_string(),
-                    audit_seq: Some(audit_seq),
                     confidence: outcome.confidence,
-                    categories: cats,
+                    ..inbound_evaluation(
+                        GateDecision::Quarantine { reason, notice },
+                        stage_label,
+                        payload_sha256.to_string(),
+                        cats,
+                        Some(audit_seq),
+                    )
                 }))
             }
             GateDecision::Block { reason } => {
@@ -1083,33 +1017,23 @@ impl SecurityGatePipeline {
                 }
                 let audit_seq = self.record_audit(
                     &GateAuditInput {
-                        direction: GateDirection::Inbound,
-                        stage: stage_label.to_string(),
-                        decision: store_decision,
-                        origin_node: Some(ctx.origin_node.clone()),
-                        source: Some(ctx.sender.clone()),
-                        session_id: Some(ctx.session_id.clone()),
                         receipt_id: existing_receipt.map(ToString::to_string),
-                        event_type: Some(ctx.event.event_type.clone()),
-                        trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                         confidence: outcome.confidence,
                         categories: cats.clone(),
                         reason: Some(reason.clone()),
-                        traceparent,
-                        payload_sha256: payload_sha256.to_string(),
-                        reviewer: None,
+                        ..audit(stage_label, store_decision, traceparent)
                     },
                     now_ms,
                 )?;
                 Ok(Some(InboundEvaluation {
-                    decision: GateDecision::Block { reason },
-                    stage: stage_label.to_string(),
-                    receipt: None,
-                    duplicate: false,
-                    payload_sha256: payload_sha256.to_string(),
-                    audit_seq: Some(audit_seq),
                     confidence: outcome.confidence,
-                    categories: cats,
+                    ..inbound_evaluation(
+                        GateDecision::Block { reason },
+                        stage_label,
+                        payload_sha256.to_string(),
+                        cats,
+                        Some(audit_seq),
+                    )
                 }))
             }
         }
@@ -1298,50 +1222,48 @@ impl SecurityGatePipeline {
                 now_ms,
             )?;
             return Ok(InboundEvaluation {
-                decision: GateDecision::Hold {
-                    reason: "local_inbox_full".to_string(),
-                    retry_after_ms: 5_000,
-                },
-                stage: "mailbox".to_string(),
-                receipt: None,
-                duplicate: false,
-                payload_sha256: payload_sha256.to_string(),
-                audit_seq: Some(audit_seq),
                 confidence,
-                categories: cats,
+                ..inbound_evaluation(
+                    GateDecision::Hold {
+                        reason: "local_inbox_full".to_string(),
+                        retry_after_ms: 5_000,
+                    },
+                    "mailbox",
+                    payload_sha256.to_string(),
+                    cats,
+                    Some(audit_seq),
+                )
             });
         }
 
         let audit_seq = self.record_audit(
             &GateAuditInput {
-                direction: GateDirection::Inbound,
-                stage: stage.to_string(),
-                decision: StoreGateDecision::Allow,
-                origin_node: Some(ctx.origin_node.clone()),
-                source: Some(ctx.sender.clone()),
-                session_id: Some(ctx.session_id.clone()),
                 receipt_id: receipt.clone(),
-                event_type: Some(ctx.event.event_type.clone()),
-                trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                 confidence,
                 categories: categories.clone(),
                 reason: urgency_cap_gate_reason(max_urgency).map(str::to_string),
-                traceparent,
-                payload_sha256: payload_sha256.to_string(),
-                reviewer: None,
+                ..inbound_audit(
+                    ctx,
+                    stage,
+                    StoreGateDecision::Allow,
+                    payload_sha256,
+                    traceparent,
+                )
             },
             now_ms,
         )?;
 
         Ok(InboundEvaluation {
-            decision: GateDecision::Allow { max_urgency },
-            stage: stage.to_string(),
             receipt,
             duplicate,
-            payload_sha256: payload_sha256.to_string(),
-            audit_seq: Some(audit_seq),
             confidence,
-            categories,
+            ..inbound_evaluation(
+                GateDecision::Allow { max_urgency },
+                stage,
+                payload_sha256.to_string(),
+                categories,
+                Some(audit_seq),
+            )
         })
     }
 
@@ -1475,21 +1397,17 @@ impl SecurityGatePipeline {
         let audit_reason = format!("{reason} (retry_after_ms={retry_after_ms})");
         let seq = self.record_audit(
             &GateAuditInput {
-                direction: GateDirection::Inbound,
-                stage: stage.to_string(),
-                decision: StoreGateDecision::Error,
-                origin_node: Some(ctx.origin_node.clone()),
-                source: Some(ctx.sender.clone()),
-                session_id: Some(ctx.session_id.clone()),
                 receipt_id,
-                event_type: Some(ctx.event.event_type.clone()),
-                trust_tier: Some(ctx.trust_tier.as_str().to_string()),
                 confidence: None,
                 categories: cats.clone(),
                 reason: Some(audit_reason),
-                traceparent,
-                payload_sha256: payload_sha256.to_string(),
-                reviewer: None,
+                ..inbound_audit(
+                    ctx,
+                    stage,
+                    StoreGateDecision::Error,
+                    payload_sha256,
+                    traceparent,
+                )
             },
             now_ms,
         )?;
