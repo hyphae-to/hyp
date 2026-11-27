@@ -205,7 +205,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci-workspace
+          shared-key: rust-ci-workspace-v2
+          cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Formatting check (rustfmt)
