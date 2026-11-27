@@ -36,9 +36,9 @@ use hyp_crypto::rfc3339::format_rfc3339_millis;
 use hyp_node::delivery::{
     DEFAULT_MIDTURN_QUEUE_DIGEST_SECONDS, DeliveryEngine, DeliveryError, DeliveryRule,
     DeliveryUrgency, InboxFilter, InboxItemState, InboxItemView, InboxQuery, InboxQueryResult,
-    InboxStateFilter, PackableItem, PackedDeliveryBatch, archive_muted_entry,
-    gate_reason_urgency_cap, move_pending_to_muted, muted_count, pack_inbox_digest,
-    query_inbox_for_node, record_delivered_receipts, strictest_urgency_cap,
+    InboxStateFilter, PackableItem, PackedDeliveryBatch, SessionDeliveryPolicy,
+    archive_muted_entry, gate_reason_urgency_cap, move_pending_to_muted, muted_count,
+    pack_inbox_digest, query_inbox_for_node, record_delivered_receipts, strictest_urgency_cap,
     urgency_cap_gate_reason,
 };
 pub use hyp_node::engine::WakeRecoveryConfig;
@@ -640,6 +640,13 @@ struct ActivityGraceTimer {
     generation: u64,
     fire_at: Instant,
     bypass_grace: bool,
+}
+
+struct FocusChange {
+    policy: SessionDeliveryPolicy,
+    unread: usize,
+    muted: usize,
+    rev: u64,
 }
 
 struct LocalDaemonInner {
@@ -5868,6 +5875,63 @@ impl LocalDaemonInner {
         }))
     }
 
+    async fn set_session_focus(
+        self: &Arc<Self>,
+        session_id: &str,
+        focus_mode: bool,
+        allow_vips: Option<bool>,
+        extra_rules: &[DeliveryRule],
+    ) -> Result<FocusChange, (String, String)> {
+        let (default_urgency, store_mode) = if focus_mode {
+            (DeliveryUrgency::Notify, DeliveryMode::Notify)
+        } else {
+            (DeliveryUrgency::Queue, DeliveryMode::Full)
+        };
+        let now = self.current_time_ms();
+        let (policy, unread, muted) = {
+            let db = self.node.db();
+            let _ = db.local().set_delivery_mode(session_id, store_mode, now);
+            let policy = self
+                .delivery
+                .update_policy(&db, session_id, |p| {
+                    p.focus_mode = focus_mode;
+                    p.default_mode = default_urgency;
+                    if let Some(v) = allow_vips {
+                        p.focus_allow_interrupt_vips = v;
+                    }
+                    for rule in extra_rules {
+                        p.upsert_rule(rule.clone());
+                    }
+                })
+                .map_err(delivery_err_tuple)?;
+            for rule in extra_rules {
+                if rule.delivery == DeliveryUrgency::Mute {
+                    let _ = db
+                        .local()
+                        .add_mute(session_id, &rule.target, session_id, now);
+                }
+            }
+            let unread = self.effective_pending_count(&db, session_id);
+            let muted = muted_count(&db, session_id).unwrap_or(0);
+            (policy, unread, muted)
+        };
+
+        let rev = self.bump_ui_rev();
+        if !focus_mode {
+            let restored = self.restore_focus_buffered_items(session_id);
+            if unread > 0 || restored > 0 {
+                self.flush_session(session_id).await;
+            }
+        }
+
+        Ok(FocusChange {
+            policy,
+            unread,
+            muted,
+            rev,
+        })
+    }
+
     async fn tool_mode(
         self: &Arc<Self>,
         session_id: &str,
@@ -5882,54 +5946,25 @@ impl LocalDaemonInner {
         let allow_vips = args.get("focusAllowInterruptVips").and_then(Value::as_bool);
         let extra_rules = parse_rules_arg(args)?;
 
-        let (focus_mode, default_urgency, store_mode) =
-            match mode_raw.trim().to_ascii_lowercase().as_str() {
-                "notify" => (true, DeliveryUrgency::Notify, DeliveryMode::Notify),
-                "queue" | "full" => (false, DeliveryUrgency::Queue, DeliveryMode::Full),
-                other => {
-                    return Err((
-                        "invalid_request".into(),
-                        format!("Expected mode 'queue' | 'full' | 'notify', got '{other}'"),
-                    ));
-                }
-            };
-
-        let now = self.current_time_ms();
-        let (policy, unread, muted) = {
-            let db = self.node.db();
-            let _ = db.local().set_delivery_mode(session_id, store_mode, now);
-            let policy = self
-                .delivery
-                .update_policy(&db, session_id, |p| {
-                    p.focus_mode = focus_mode;
-                    p.default_mode = default_urgency;
-                    if let Some(v) = allow_vips {
-                        p.focus_allow_interrupt_vips = v;
-                    }
-                    for rule in &extra_rules {
-                        p.upsert_rule(rule.clone());
-                    }
-                })
-                .map_err(delivery_err_tuple)?;
-            for rule in &extra_rules {
-                if rule.delivery == DeliveryUrgency::Mute {
-                    let _ = db
-                        .local()
-                        .add_mute(session_id, &rule.target, session_id, now);
-                }
+        let focus_mode = match mode_raw.trim().to_ascii_lowercase().as_str() {
+            "notify" => true,
+            "queue" | "full" => false,
+            other => {
+                return Err((
+                    "invalid_request".into(),
+                    format!("Expected mode 'queue' | 'full' | 'notify', got '{other}'"),
+                ));
             }
-            let unread = self.effective_pending_count(&db, session_id);
-            let muted = muted_count(&db, session_id).unwrap_or(0);
-            (policy, unread, muted)
         };
 
-        self.bump_ui_rev();
-        if !focus_mode {
-            let restored = self.restore_focus_buffered_items(session_id);
-            if unread > 0 || restored > 0 {
-                self.flush_session(session_id).await;
-            }
-        }
+        let FocusChange {
+            policy,
+            unread,
+            muted,
+            ..
+        } = self
+            .set_session_focus(session_id, focus_mode, allow_vips, &extra_rules)
+            .await?;
 
         Ok(json!({
             "deliveryMode": policy.default_mode.as_str(),
@@ -6787,6 +6822,48 @@ impl LocalDaemonInner {
         }))
     }
 
+    fn subscription_id_for_key(&self, session_id: &str, key: &str) -> String {
+        let cached = {
+            let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            guard.get(session_id).and_then(|list| {
+                list.iter()
+                    .find(|meta| meta.key.as_deref() == Some(key) || meta.id == key)
+                    .map(|meta| meta.id.clone())
+            })
+        };
+        cached
+            .or_else(|| {
+                let db = self.node.db();
+                db.events()
+                    .find_subscription_by_key(session_id, key)
+                    .ok()
+                    .flatten()
+                    .map(|sub| sub.id)
+            })
+            .unwrap_or_else(|| key.to_string())
+    }
+
+    fn delete_session_subscription(
+        &self,
+        session_id: &str,
+        sub_id: &str,
+        clear_cache_if_missing: bool,
+    ) -> Result<bool, (String, String)> {
+        let removed = {
+            let db = self.node.db();
+            db.events()
+                .delete_subscription_for_subscriber(sub_id, session_id)
+                .map_err(store_err_tuple)?
+        };
+        if removed || clear_cache_if_missing {
+            let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            if let Some(list) = guard.get_mut(session_id) {
+                list.retain(|meta| meta.id != sub_id);
+            }
+        }
+        Ok(removed)
+    }
+
     async fn tool_unsubscribe(
         &self,
         session_id: &str,
@@ -6798,46 +6875,15 @@ impl LocalDaemonInner {
         } else {
             key_arg.filter(|key| !key.contains(':'))
         };
-        let target_id = if let Some(id) = id_arg {
-            Some(id.to_string())
+        let sub_id = if let Some(id) = id_arg {
+            id.to_string()
         } else if let Some(key) = key_arg {
-            let cached = {
-                let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
-                guard.get(session_id).and_then(|list| {
-                    list.iter()
-                        .find(|s| s.key.as_deref() == Some(key) || s.id == key)
-                        .map(|s| s.id.clone())
-                })
-            };
-            cached
-                .or_else(|| {
-                    let db = self.node.db();
-                    db.events()
-                        .find_subscription_by_key(session_id, key)
-                        .ok()
-                        .flatten()
-                        .map(|s| s.id)
-                })
-                .or_else(|| Some(key.to_string()))
+            self.subscription_id_for_key(session_id, key)
         } else {
             return Err(("invalid_request".into(), "Expected id or key".into()));
         };
 
-        let removed = if let Some(sub_id) = target_id {
-            let db_removed = {
-                let db = self.node.db();
-                db.events()
-                    .delete_subscription_for_subscriber(&sub_id, session_id)
-                    .map_err(store_err_tuple)?
-            };
-            let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
-            if let Some(list) = guard.get_mut(session_id) {
-                list.retain(|s| s.id != sub_id);
-            }
-            db_removed
-        } else {
-            false
-        };
+        let removed = self.delete_session_subscription(session_id, &sub_id, true)?;
         if removed {
             self.bump_ui_rev();
         }
@@ -12054,45 +12100,18 @@ async fn handle_session_focus(
         }
     };
 
-    let now = daemon.current_time_ms();
-    let store_mode = if enabled {
-        DeliveryMode::Notify
-    } else {
-        DeliveryMode::Full
+    let FocusChange {
+        policy,
+        unread,
+        muted,
+        rev,
+    } = match daemon
+        .set_session_focus(&sess.id, enabled, allow_vips, &[])
+        .await
+    {
+        Ok(change) => change,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
     };
-    let default_urgency = if enabled {
-        DeliveryUrgency::Notify
-    } else {
-        DeliveryUrgency::Queue
-    };
-
-    let (policy, unread, muted) = {
-        let db = daemon.node.db();
-        let _ = db.local().set_delivery_mode(&sess.id, store_mode, now);
-        let policy = match daemon.delivery.update_policy(&db, &sess.id, |p| {
-            p.focus_mode = enabled;
-            p.default_mode = default_urgency;
-            if let Some(v) = allow_vips {
-                p.focus_allow_interrupt_vips = v;
-            }
-        }) {
-            Ok(p) => p,
-            Err(e) => {
-                return json!({ "ok": false, "code": "delivery_error", "error": e.to_string() });
-            }
-        };
-        let unread = daemon.effective_pending_count(&db, &sess.id);
-        let muted = muted_count(&db, &sess.id).unwrap_or(0);
-        (policy, unread, muted)
-    };
-
-    let rev = daemon.bump_ui_rev();
-    if !enabled {
-        let restored = daemon.restore_focus_buffered_items(&sess.id);
-        if unread > 0 || restored > 0 {
-            daemon.flush_session(&sess.id).await;
-        }
-    }
 
     json!({
         "ok": true,
@@ -12466,24 +12485,7 @@ fn handle_session_unsubscribe(daemon: &LocalDaemonInner, packet: &Map<String, Va
     let sub_id = if let Some(id) = explicit_id {
         id.to_string()
     } else if let Some(key) = key_arg {
-        let cached = {
-            let guard = daemon.sub_meta.lock().expect("sub_meta lock poisoned");
-            guard.get(&sess.id).and_then(|list| {
-                list.iter()
-                    .find(|m| m.key.as_deref() == Some(key) || m.id == key)
-                    .map(|m| m.id.clone())
-            })
-        };
-        cached
-            .or_else(|| {
-                let db = daemon.node.db();
-                db.events()
-                    .find_subscription_by_key(&sess.id, key)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.id)
-            })
-            .unwrap_or_else(|| key.to_string())
+        daemon.subscription_id_for_key(&sess.id, key)
     } else {
         return json!({
             "ok": false,
@@ -12514,26 +12516,12 @@ fn handle_session_unsubscribe(daemon: &LocalDaemonInner, packet: &Map<String, Va
         });
     }
 
-    let removed = {
-        let db = daemon.node.db();
-        match db
-            .events()
-            .delete_subscription_for_subscriber(&sub_id, &sess.id)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return json!({ "ok": false, "code": "store_error", "error": e.to_string() });
-            }
-        }
+    let removed = match daemon.delete_session_subscription(&sess.id, &sub_id, false) {
+        Ok(removed) => removed,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
     };
 
     if removed {
-        {
-            let mut guard = daemon.sub_meta.lock().expect("sub_meta lock poisoned");
-            if let Some(list) = guard.get_mut(&sess.id) {
-                list.retain(|m| m.id != sub_id);
-            }
-        }
         // Clean up local upstream_pushdowns cache if no remaining local subscribers watch this remote topic.
         let my_node = daemon.node.node_id().as_str();
         if sub.origin_node != "local" && sub.origin_node != my_node {
