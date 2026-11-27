@@ -497,6 +497,7 @@ dependencies = [
  "flate2",
  "hex",
  "hyp-proto",
+ "libc",
  "ring",
  "serde",
  "serde_json",

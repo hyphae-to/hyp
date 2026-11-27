@@ -497,6 +497,35 @@ fn check_private_owner_and_mode(path: &Path, expect_dir: bool) -> Result<u64, Cr
     check_private_path(path, expect_dir, true)
 }
 
+#[cfg(unix)]
+fn open_private_directory(dir: &Path) -> Result<fs::File, CryptoError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    Ok(OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?)
+}
+
+#[cfg(unix)]
+fn tighten_private_directory(directory: &fs::File, path: &Path) -> Result<(), CryptoError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != current_euid() {
+        return Err(CryptoError::Keystore(format!(
+            "{} is not a directory owned by current user",
+            path.display()
+        )));
+    }
+    directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    if directory.metadata()?.mode() & 0o077 != 0 {
+        return Err(CryptoError::Keystore(format!(
+            "{} has overly broad permissions after chmod",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Creates or tightens a user-owned real directory to mode 0700, rejecting links before chmod.
 pub fn ensure_private_dir(dir: &Path) -> Result<(), CryptoError> {
     if !dir.exists() {
@@ -504,10 +533,8 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), CryptoError> {
     }
     let _ = check_private_path(dir, true, false)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
+    tighten_private_directory(&open_private_directory(dir)?, dir)?;
+    #[cfg(not(unix))]
     let _ = check_private_owner_and_mode(dir, true)?;
     Ok(())
 }
@@ -2620,6 +2647,33 @@ mod tests {
         ensure_private_dir(&target).unwrap();
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_permissions_stay_on_opened_inode_after_path_swap() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory");
+        let moved = temp.path().join("moved");
+        let target = temp.path().join("unrelated-target");
+        for directory in [&path, &target] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let opened = open_private_directory(&path).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(open_private_directory(&path).is_err());
+        tighten_private_directory(&opened, &path).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&moved).unwrap().permissions().mode() & 0o777,
             0o700
         );
     }
