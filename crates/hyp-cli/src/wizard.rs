@@ -541,11 +541,24 @@ pub fn apply_desktop_mcp_config(
     home: &Path,
     cli_bin: &str,
 ) -> Result<DesktopMcpApplyResult, String> {
+    let manager = match harness {
+        ManualGuideHarness::ClaudeDesktop => crate::skillshare::Skillshare::detect(home),
+        _ => None,
+    };
+    apply_desktop_mcp_config_with_manager(harness, home, cli_bin, manager)
+}
+
+fn apply_desktop_mcp_config_with_manager(
+    harness: ManualGuideHarness,
+    home: &Path,
+    cli_bin: &str,
+    manager: Option<crate::skillshare::Skillshare>,
+) -> Result<DesktopMcpApplyResult, String> {
     match harness {
         ManualGuideHarness::ClaudeDesktop => {
             let config_path = claude_desktop_config_path(home);
             let existed = config_path.exists();
-            if let Some(manager) = crate::skillshare::Skillshare::detect(home) {
+            if let Some(manager) = manager {
                 let already_configured = inspect_desktop_mcp_plan(harness, home, cli_bin)
                     .is_some_and(|plan| plan.already_configured);
                 manager.for_claude_desktop().configure_mcp(
@@ -8003,6 +8016,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path();
         let cli_bin = "/usr/local/bin/hyp";
+        // This fixture verifies the direct merger. Select its owner explicitly
+        // so an installed Skillshare cannot change the behavior under test.
+        let apply = || {
+            apply_desktop_mcp_config_with_manager(
+                ManualGuideHarness::ClaudeDesktop,
+                home,
+                cli_bin,
+                None,
+            )
+        };
 
         // 1. Missing file: plan reports not yet configured.
         let plan0 = inspect_desktop_mcp_plan(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
@@ -8033,8 +8056,7 @@ mod tests {
         )
         .unwrap();
 
-        let applied = apply_desktop_mcp_config(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
-            .expect("apply claude desktop mcp");
+        let applied = apply().expect("apply claude desktop mcp");
         assert!(!applied.created);
         assert!(!applied.already_configured);
         assert_eq!(applied.config_path, plan0.config_path);
@@ -8057,8 +8079,7 @@ mod tests {
         // 4. Malformed JSON MUST fail closed without clobbering user's file!
         let corrupt = "{ \"mcpServers\": BROKEN_JSON";
         fs::write(&plan0.config_path, corrupt).unwrap();
-        let err = apply_desktop_mcp_config(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
-            .expect_err("malformed JSON must fail closed");
+        let err = apply().expect_err("malformed JSON must fail closed");
         assert!(err.contains("malformed JSON"), "unexpected error: {err}");
         assert_eq!(
             fs::read_to_string(&plan0.config_path).unwrap(),
@@ -8069,8 +8090,7 @@ mod tests {
         // 5. Non-object `mcpServers` field also fails closed without clobbering.
         let bad_field = r#"{ "mcpServers": ["not-an-object"] }"#;
         fs::write(&plan0.config_path, bad_field).unwrap();
-        let err2 = apply_desktop_mcp_config(ManualGuideHarness::ClaudeDesktop, home, cli_bin)
-            .expect_err("non-object mcpServers must fail closed");
+        let err2 = apply().expect_err("non-object mcpServers must fail closed");
         assert!(err2.contains("mcpServers"), "unexpected error: {err2}");
         assert_eq!(fs::read_to_string(&plan0.config_path).unwrap(), bad_field);
     }
