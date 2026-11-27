@@ -3,6 +3,7 @@
 
 pub use hyp_proto::PROTOCOL_VERSION;
 
+mod armor;
 mod compare;
 pub mod compat_v1;
 pub mod e2ee;

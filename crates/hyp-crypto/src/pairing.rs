@@ -10,6 +10,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::armor::{armor, dearmor};
 use crate::compat_v1::parse_pairing_code_v1;
 use crate::error::CryptoError;
 use crate::hpke::hkdf_sha256;
@@ -683,23 +684,12 @@ fn validate_admin_invite(invite: &AdminInviteV2) -> Result<(), CryptoError> {
 /// Encodes a validated `AdminInviteV2` into an `am2_<base64url>` invite string.
 pub fn encode_am2(invite: &AdminInviteV2) -> Result<String, CryptoError> {
     validate_admin_invite(invite)?;
-    let canon = to_canonical_json(invite)?;
-    Ok(format!(
-        "{AM2_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(canon.as_bytes())
-    ))
+    armor(AM2_PREFIX, invite)
 }
 
 /// Decodes and strictly validates an `am2_<base64url>` invite string.
 pub fn decode_am2(token: &str) -> Result<AdminInviteV2, CryptoError> {
-    let trimmed = token.trim();
-    let encoded = trimmed
-        .strip_prefix(AM2_PREFIX)
-        .ok_or_else(|| CryptoError::InvalidPairing("expected 'am2_' prefix".into()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| CryptoError::InvalidPairing(format!("invalid am2_ base64url: {e}")))?;
-    let invite: AdminInviteV2 = serde_json::from_slice(&bytes)?;
+    let invite: AdminInviteV2 = dearmor(AM2_PREFIX, token, CryptoError::InvalidPairing)?;
     validate_admin_invite(&invite)?;
     Ok(invite)
 }
@@ -968,23 +958,12 @@ pub fn create_p2p_offer(
 /// Encodes a validated `P2pOfferToken` into an `hp2p1_<base64url>` string.
 pub fn encode_hp2p1(offer: &P2pOfferToken) -> Result<String, CryptoError> {
     validate_p2p_offer(offer)?;
-    let canon = to_canonical_json(offer)?;
-    Ok(format!(
-        "{HP2P1_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(canon.as_bytes())
-    ))
+    armor(HP2P1_PREFIX, offer)
 }
 
 /// Decodes and strictly validates an `hp2p1_<base64url>` pairing offer token.
 pub fn decode_hp2p1(token: &str) -> Result<P2pOfferToken, CryptoError> {
-    let trimmed = token.trim();
-    let encoded = trimmed
-        .strip_prefix(HP2P1_PREFIX)
-        .ok_or_else(|| CryptoError::InvalidPairing("expected 'hp2p1_' prefix".into()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| CryptoError::InvalidPairing(format!("invalid hp2p1_ base64url: {e}")))?;
-    let offer: P2pOfferToken = serde_json::from_slice(&bytes)?;
+    let offer: P2pOfferToken = dearmor(HP2P1_PREFIX, token, CryptoError::InvalidPairing)?;
     validate_p2p_offer(&offer)?;
     Ok(offer)
 }
