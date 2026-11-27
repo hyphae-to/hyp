@@ -23,16 +23,17 @@ import {
   isAllowedHubEndpoint,
   isValidNodeId,
   matchesNodePrefix,
-  prfEvalInput,
   randomBytes,
   sasFingerprint,
   signHumanInviteClaim,
   signNodeCert,
-  utf8Bytes,
   utf8String,
   verifyHumanInvite,
   zeroize,
-} from "../drop/crypto.js?v=2";
+} from "../drop/crypto.js?v=4";
+import { copyText as copyBrowserText, createPasskeyOperations, isEmbeddedInFrame } from "../passkey.js?v=1";
+
+export { isEmbeddedInFrame };
 
 const HINT_STORAGE_PREFIX = "hyphae.drop.hint.v1:";
 const DEFAULT_LOCAL_PORT = 47891;
@@ -42,15 +43,6 @@ const SAFARI_FALLBACK_FAILURE_THRESHOLD = 4;
 // ============================================================================
 // Pure Parsing, Formatting & Agent Prompt Helpers (Exported for Unit Testing)
 // ============================================================================
-
-export function isEmbeddedInFrame(win = typeof window !== "undefined" ? window : null) {
-  if (!win) return false;
-  try {
-    return win.top !== win.self;
-  } catch {
-    return true;
-  }
-}
 
 export function parseJoinFragment(rawInput) {
   let raw = typeof rawInput === "string" ? rawInput.trim() : "";
@@ -150,118 +142,11 @@ function loadPublicHint(humanId) {
 // WebAuthn Passkey + PRF Operations
 // ============================================================================
 
-function getRpId() {
-  const host = window.location.hostname;
-  if (!host || /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) {
-    return undefined;
-  }
-  return host;
-}
-
-function coerceBytes(val) {
-  if (!val) return null;
-  if (val instanceof Uint8Array) return new Uint8Array(val);
-  if (ArrayBuffer.isView(val)) {
-    return new Uint8Array(val.buffer.slice(val.byteOffset, val.byteOffset + val.byteLength));
-  }
-  const tag = Object.prototype.toString.call(val);
-  if (val instanceof ArrayBuffer || tag === "[object ArrayBuffer]" || tag === "[object SharedArrayBuffer]") {
-    return new Uint8Array(val).slice();
-  }
-  if (Array.isArray(val) && val.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
-    return Uint8Array.from(val);
-  }
-  if (typeof val === "string" && val.length > 0) {
-    try {
-      return base64urlDecode(val.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""));
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-function extractPrfFirst(cred) {
-  const ext = typeof cred?.getClientExtensionResults === "function" ? cred.getClientExtensionResults() : null;
-  const first = ext?.prf?.results?.first;
-  if (!first) return null;
-  const bytes = coerceBytes(first);
-  return bytes && bytes.length === 32 ? bytes : null;
-}
-
-async function evaluatePasskeyPrf(humanId, prfSalt, credentialIdB64 = "") {
-  if (!window.PublicKeyCredential || !navigator.credentials) {
-    throw new Error("WebAuthn Passkeys are not supported in this browser");
-  }
-  const evalInput = await prfEvalInput(humanId, prfSalt);
-  const publicKey = {
-    challenge: randomBytes(32),
-    userVerification: "required",
-    extensions: { prf: { eval: { first: evalInput } } },
-  };
-  const rpId = getRpId();
-  if (rpId) publicKey.rpId = rpId;
-  if (credentialIdB64) {
-    try {
-      publicKey.allowCredentials = [{ type: "public-key", id: base64urlDecode(credentialIdB64) }];
-    } catch {
-      // Fall back to discoverable Passkey prompt.
-    }
-  }
-  const assertion = await navigator.credentials.get({ publicKey });
-  if (!assertion) throw new Error("Passkey authentication was cancelled");
-  const prfOut = extractPrfFirst(assertion);
-  if (!prfOut) {
-    throw new Error(
-      "Your authenticator did not return a WebAuthn PRF secret. Use Safari 18+, Chrome, or Edge with a PRF-capable Passkey."
-    );
-  }
-  const rawId = coerceBytes(assertion.rawId);
-  const credentialId = rawId ? base64urlEncode(rawId) : (typeof assertion.id === "string" ? assertion.id : "");
-  return { prfOut, credentialId };
-}
-
-async function enrollPasskeyWithPrf(humanId, prfSalt) {
-  if (!window.PublicKeyCredential || !navigator.credentials) {
-    throw new Error("WebAuthn Passkeys are not supported in this browser");
-  }
-  const evalInput = await prfEvalInput(humanId, prfSalt);
-  const rpId = getRpId();
-  const rp = rpId ? { name: "Hyphae Authority", id: rpId } : { name: "Hyphae Authority" };
-  const created = await navigator.credentials.create({
-    publicKey: {
-      challenge: randomBytes(32),
-      rp,
-      user: { id: utf8Bytes(humanId), name: humanId, displayName: humanId },
-      pubKeyCredParams: [
-        { type: "public-key", alg: -7 },
-        { type: "public-key", alg: -8 },
-        { type: "public-key", alg: -257 },
-      ],
-      authenticatorSelection: {
-        residentKey: "required",
-        requireResidentKey: true,
-        userVerification: "required",
-      },
-      attestation: "none",
-      extensions: { prf: { eval: { first: evalInput } } },
-    },
-  });
-  if (!created) throw new Error("Passkey creation was cancelled");
-  const rawId = coerceBytes(created.rawId);
-  const credId = rawId ? base64urlEncode(rawId) : (typeof created.id === "string" ? created.id : "");
-  const ext = typeof created.getClientExtensionResults === "function" ? created.getClientExtensionResults() : null;
-
-  let prfOut = extractPrfFirst(created);
-  if (!prfOut) {
-    if (ext?.prf && ext.prf.enabled === false) {
-      throw new Error("This Passkey authenticator does not support the WebAuthn PRF extension.");
-    }
-    const res = await evaluatePasskeyPrf(humanId, prfSalt, credId);
-    prfOut = res.prfOut;
-  }
-  return { prfOut, credentialId: credId };
-}
+const { evaluatePasskeyPrf, enrollPasskeyWithPrf } = createPasskeyOperations({
+  rpName: "Hyphae Authority",
+  missingPrfMessage:
+    "Your authenticator did not return a WebAuthn PRF secret. Use Safari 18+, Chrome, or Edge with a PRF-capable Passkey.",
+});
 
 // ============================================================================
 // UI Controller
@@ -281,16 +166,8 @@ function clearBanner(el) {
   el.classList.add("hidden");
 }
 
-async function copyText(text, btn, idleLabel) {
-  try {
-    await navigator.clipboard.writeText(text);
-    btn.textContent = "Copied!";
-    setTimeout(() => {
-      btn.textContent = idleLabel;
-    }, 1800);
-  } catch {
-    btn.textContent = "Copy manually";
-  }
+function copyText(text, btn, idleLabel) {
+  return copyBrowserText(text, btn, idleLabel, { timeoutMs: 1800, fallbackLabel: "Copy manually" });
 }
 
 const appState = {

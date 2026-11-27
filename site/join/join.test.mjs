@@ -240,3 +240,62 @@ describe("site/join portal helpers & delegated admission crypto", () => {
     assert.equal(decodeHjoin1(token).adminJwk.x, adminKp.publicJwk.x);
   });
 });
+
+test("shared Passkey flow preserves relying-party labels, PRF fallback, and byte formats", async (t) => {
+  const { createPasskeyOperations } = await import("../passkey.js");
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  t.after(() => {
+    if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow);
+    else delete globalThis.window;
+    if (oldNavigator) Object.defineProperty(globalThis, "navigator", oldNavigator);
+  });
+  const attempts = [];
+  const prf = new Uint8Array(32).fill(27);
+  const rawId = Uint8Array.of(1, 2, 3);
+  let serialized = false;
+  const passkey = (first) => ({
+    rawId,
+    getClientExtensionResults: () => ({ prf: { enabled: true, results: { first } } }),
+  });
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { PublicKeyCredential: true, location: { hostname: "hyphae.to" } },
+  });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: {
+      credentials: {
+        async create({ publicKey }) {
+          attempts.push(publicKey);
+          return passkey(undefined);
+        },
+        async get({ publicKey }) {
+          attempts.push(publicKey);
+          return passkey(serialized ? Object.fromEntries(prf.entries()) : prf);
+        },
+      },
+    },
+  });
+  const join = createPasskeyOperations({ rpName: "Hyphae Authority", missingPrfMessage: "Join PRF missing" });
+  const drop = createPasskeyOperations({
+    rpName: "Hyphae Verified Drops",
+    missingPrfMessage: "Drop PRF missing",
+    allowSerializedBytes: true,
+  });
+  const salt = base64urlEncode(new Uint8Array(16));
+  const joined = await join.enrollPasskeyWithPrf("alice", salt);
+  assert.deepEqual(joined.prfOut, prf);
+  assert.equal(joined.credentialId, base64urlEncode(rawId));
+  assert.deepEqual(attempts[0].rp, { name: "Hyphae Authority", id: "hyphae.to" });
+  assert.deepEqual(attempts[1].allowCredentials[0].id, rawId);
+  assert.deepEqual(attempts[0].extensions, attempts[1].extensions);
+  assert.equal(attempts[1].userVerification, "required");
+
+  serialized = true;
+  await assert.rejects(join.evaluatePasskeyPrf("alice", salt), /Join PRF missing/);
+  const enrolled = await drop.enrollPasskeyWithPrf("alice", salt);
+  assert.deepEqual(enrolled.prfOut, prf);
+  assert.equal(enrolled.rpId, "hyphae.to");
+  assert.deepEqual(attempts[3].rp, { name: "Hyphae Verified Drops", id: "hyphae.to" });
+});
