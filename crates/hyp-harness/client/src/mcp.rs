@@ -7,8 +7,7 @@
 //! Also supports:
 //! - `_meta` callId extraction (`claudecode/toolUseId`, `callId`, `toolUseId`, `tool_use_id`,
 //!   `antigravity/toolCallId`, `toolCallId`) and `_meshCall` -> `callToken` stripping.
-//! - `--claude-channel` live push notifications (`notifications/claude/channel`) with
-//!   `channel.ready` / `channel.deliver` / `channel.ack` and automatic 1 s reconnect.
+//! - Best-effort Claude Code notifications (`notifications/claude/channel`) with automatic reconnect.
 
 use hyp_harness_ipc::protocol::{HarnessKind, TransportHintFields, normalize_mesh_tool_name};
 use hyp_harness_ipc::sock::{
@@ -306,7 +305,7 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
         pkt.insert("backend".into(), json!(backend.as_str()));
     }
     if options.channel {
-        pkt.insert("channel".into(), json!(true));
+        pkt.insert("channel".into(), json!("best-effort"));
     }
     if let Some(cid) = ephemeral_client_id {
         pkt.insert("clientId".into(), json!(cid));
@@ -440,7 +439,7 @@ pub fn build_initialize_instructions(
     }
     if options.channel {
         return format!(
-            "Join via hyp_mesh(action:'join', handle, include:['peers','topics']), hyp_send, hyp_stream (timers: local.schedule + OS cron -> hyp emit/ingest.sock). Push wakeups active via Claude channel (never run hyp wait or poll hyp_inbox). {H9_TRUST_NOTE}"
+            "Join via hyp_mesh(action:'join', handle). hyp_send, hyp_stream (local.schedule via hyp emit/ingest.sock). Claude channels are best effort when selected at launch. Use Monitor hyp watch or hyp wait when idle and hasLiveTransport=false. Never poll hyp_inbox. {H9_TRUST_NOTE}"
         );
     }
     if options.backend == Some(HarnessKind::Antigravity) {
@@ -720,27 +719,13 @@ where
                     && options.channel
                     && initialized
                 {
-                    if let (Some(delivery), Some(text)) = (
-                        resp.get("delivery").and_then(Value::as_u64),
-                        resp.get("text").and_then(Value::as_str),
-                    ) {
+                    if let Some(text) = resp.get("text").and_then(Value::as_str) {
                         let notif = json!({
                             "jsonrpc": "2.0",
                             "method": "notifications/claude/channel",
                             "params": { "content": text }
                         });
-                        let submitted = write_stdout_json(&mut stdout, &notif).await.is_ok();
-                        if let Some(c) = conn.as_mut() {
-                            let _ = write_ndjson_line_async(
-                                &mut c.writer,
-                                &json!({
-                                    "type": "channel.ack",
-                                    "delivery": delivery,
-                                    "submitted": submitted,
-                                }),
-                            )
-                            .await;
-                        }
+                        write_stdout_json(&mut stdout, &notif).await?;
                     }
                     continue;
                 }
@@ -798,7 +783,7 @@ where
                 let method = request.get("method").and_then(Value::as_str);
                 let id = request.get("id").cloned();
 
-                if method == Some("notifications/initialized") {
+                if method == Some("notifications/initialized") && initialize_seen {
                     initialized = true;
                     if options.channel {
                         if conn.is_none() {
@@ -866,8 +851,20 @@ where
                         };
                         if !initialize_seen {
                             initialize_seen = true;
-                            if options.backend.is_none() && conn.is_none() {
-                                options.backend = backend_hint_from_initialize(&params);
+                            let inferred = backend_hint_from_initialize(&params);
+                            if conn.is_none() {
+                                if options.backend.is_none() {
+                                    options.backend = inferred;
+                                }
+                                if inferred == Some(HarnessKind::Claude)
+                                    && options.backend == Some(HarnessKind::Claude)
+                                {
+                                    options.channel |= params
+                                        .get("clientInfo")
+                                        .and_then(|info| info.get("name"))
+                                        .and_then(Value::as_str)
+                                        == Some("claude-code");
+                                }
                             }
                         }
                         let res = initialize_result(&params, &options);
@@ -1055,24 +1052,34 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_hint_is_latched_and_never_overrides_explicit_backend() {
-        for (explicit, first, second, expected) in [
+        for (explicit, first, second, expected, expected_channel) in [
             (
                 None,
                 "openclaw-bundle-mcp",
                 "claude-code",
                 HarnessKind::Openclaw,
+                false,
             ),
             (
                 None,
                 "claude-code",
                 "openclaw-bundle-mcp",
                 HarnessKind::Claude,
+                true,
             ),
             (
                 Some(HarnessKind::Openclaw),
                 "codex-mcp-client",
                 "claude-code",
                 HarnessKind::Openclaw,
+                false,
+            ),
+            (
+                Some(HarnessKind::Codex),
+                "claude-code",
+                "claude-code",
+                HarnessKind::Codex,
+                false,
             ),
         ] {
             let options = McpOptions {
@@ -1090,6 +1097,7 @@ mod tests {
             let expected = build_initialize_instructions(
                 &McpOptions {
                     backend: Some(expected),
+                    channel: expected_channel,
                     ..McpOptions::new(PathBuf::from("nonexistent.sock"))
                 },
                 detect_env_herdr_active(),
@@ -1100,6 +1108,11 @@ mod tests {
             for line in output.lines() {
                 let response: Value = serde_json::from_str(line).unwrap();
                 assert_eq!(response["result"]["instructions"], expected);
+                assert_eq!(
+                    response["result"]["capabilities"]["experimental"]["claude/channel"]
+                        .is_object(),
+                    expected_channel,
+                );
             }
         }
         for info in [
@@ -1268,11 +1281,11 @@ mod tests {
     {
         let mut lines = BufReader::new(r).lines();
 
-        // 1. Expect mcp.hello with channel: true
+        // 1. Expect mcp.hello with best-effort channel support
         let hello: Value =
             serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(hello["type"], "mcp.hello");
-        assert_eq!(hello["channel"], true);
+        assert_eq!(hello["channel"], "best-effort");
 
         // 2. Expect channel.ready
         let ready: Value =
@@ -1287,13 +1300,7 @@ mod tests {
         .await
         .unwrap();
 
-        // 3. Expect channel.ack for delivery 7
-        let ack: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(ack["type"], "channel.ack");
-        assert_eq!(ack["delivery"], 7);
-        assert_eq!(ack["submitted"], true);
-
-        // 4. Handle mcp.caps -> hasPlugins: true
+        // 3. Handle mcp.caps -> hasPlugins: true
         let caps: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(caps["type"], "mcp.caps");
         write_ndjson_line_async(
@@ -1303,7 +1310,7 @@ mod tests {
         .await
         .unwrap();
 
-        // 5. Handle tool.call -> assert callId + callToken + canonical name
+        // 4. Handle tool.call -> assert callId + callToken + canonical name
         let call: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(call["type"], "tool.call");
         assert_eq!(call["name"], "hyp_mesh");
@@ -1352,8 +1359,7 @@ mod tests {
         let (server_w, client_r) = tokio::io::duplex(8192);
         let mut out_lines = BufReader::new(client_r).lines();
 
-        let mut opts = McpOptions::new(sock_path);
-        opts.channel = true;
+        let opts = McpOptions::new(sock_path);
 
         let mcp_task = tokio::spawn(async move {
             run_mcp_io(BufReader::new(server_r), server_w, opts)
@@ -1366,7 +1372,7 @@ mod tests {
             .write_all(
                 format!(
                     "{}\n",
-                    json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "claude-code", "version": "fixture"}}})
                 )
                 .as_bytes(),
             )
@@ -1517,9 +1523,9 @@ mod tests {
         let mut chan_opts = base.clone();
         chan_opts.channel = true;
         let chan = build_initialize_instructions(&chan_opts, false, false);
-        assert!(chan.contains("Push wakeups active via Claude channel"));
-        assert!(chan.contains("never run hyp wait or poll hyp_inbox"));
-        assert!(!chan.contains("Monitor"));
+        assert!(chan.contains("when selected at launch"));
+        assert!(chan.contains("hasLiveTransport"));
+        assert!(chan.contains("Monitor"));
 
         // 4. OpenClaw (X2: never suggests unusable `hyp wait`)
         let mut oc_opts = base.clone();

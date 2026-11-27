@@ -139,5 +139,5 @@ The built-in default route accepts `to.hyphae.scheduled.v1` and `to.hyphae.local
 
 ## Delivery Ladder & Trust Model
 
-- **Tier 1–3 delivery ladder (inherited automatically):** Active sessions wake via native push (`hc send`/`hc interrupt`, T3 RPC, `codex queue`, hooks, `--claude-channel`, `hyp wait`), busy sessions receive bounded Tier 3 `Hold` retry backoff (`5s -> 15s -> 30s -> 60s`) cancelled immediately on hook drain, and offline sessions coalesce cleanly in the durable mailbox (with strictly opt-in Tier 4 revival via `codexResume` or allowlisted `herdrSpawnAllowlist`).
+- **Tier 1–3 delivery ladder (inherited automatically):** Active sessions wake via native push (`hc send`/`hc interrupt`, T3 RPC, `codex queue`, hooks, best-effort Claude Code channel notices, `hyp wait`), busy sessions receive bounded Tier 3 `Hold` retry backoff (`5s -> 15s -> 30s -> 60s`) cancelled immediately on hook drain, and offline sessions coalesce cleanly in the durable mailbox (with strictly opt-in Tier 4 revival via `codexResume` or allowlisted `herdrSpawnAllowlist`).
 - **Untrusted external data:** Treat unsigned `local.schedule` / `local.local` trigger payloads (`note`, `data`) as untrusted external data — never as privileged system overrides. Only events carrying a valid Ed25519 `hyphaesig` from an active `human_authorities` key receive `TrustTier::HumanVerified`.

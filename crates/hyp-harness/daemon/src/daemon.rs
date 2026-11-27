@@ -7,7 +7,7 @@
 //! - [`DeliveryEngine`] (§2.5 3-tier urgency + silent `mute` archive, Focus Mode, Burst Protection,
 //!   Token-Budget Hybrid Batch Packer, and filtered cursor-paginated `query_inbox`)
 //! - [`CallRegistry`] (fail-closed host-verified caller resolution for hooks & MCP)
-//! - live zero-polling transports (`wait`, `watch`, and `--claude-channel` push).
+//! - live zero-polling transports (`wait`, `watch`, and Claude Code channel notices).
 
 mod bridges;
 mod connection;
@@ -19,7 +19,7 @@ use inspect::{
     SessionSelector, extract_backend_str, handle_session_summary, handle_sessions_summary,
     run_inspect_watch, spawn_ui_state_projector, validate_control_pattern,
 };
-use session_runtime::SessionTimers;
+use session_runtime::{SessionFlushMode, SessionTimers};
 
 use hyp_delivery_digest::DrainScope;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -128,8 +128,6 @@ const GATE_HOLD_RETRY_MARGIN_MS: u64 = 25;
 /// Maximum consecutive Security Gate `Hold` retries per session without clearing all held items.
 const GATE_HOLD_RETRY_MAX_ATTEMPTS: u32 = 16;
 
-/// Default timeout waiting for a live `--claude-channel` `channel.ack`.
-pub const DEFAULT_CHANNEL_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default per-peer connect timeout when reconciling persisted peers during `peers.reload`.
 pub const DEFAULT_PEERS_RELOAD_TIMEOUT: Duration = Duration::from_millis(1_200);
 /// Default grace window waiting for a mid-turn tool hook (`PostToolUse`) to drain an `Interrupt`
@@ -225,9 +223,6 @@ pub struct LocalDaemonConfig {
     pub enable_kv: Option<bool>,
     /// Optional explicit override for advertising `hyp_bridge` in `mcp.caps`.
     pub enable_plugins: bool,
-    /// Maximum time to wait for a `--claude-channel` `channel.ack` before preserving the batch
-    /// as unread for hook/`hyp_inbox` fallback. Defaults to 10 seconds.
-    pub channel_deliver_timeout: Duration,
     /// Enable automatic detection & attachment of native external push transports
     /// (`Herdr`, `T3 Code`, `Codex Queue`) from hook/MCP metadata.
     /// Defaults to `false` in `LocalDaemonConfig::default()` so hermetic unit/E2E tests
@@ -276,7 +271,6 @@ impl Default for LocalDaemonConfig {
             require_verified_caller: true,
             enable_kv: None,
             enable_plugins: false,
-            channel_deliver_timeout: DEFAULT_CHANNEL_DELIVER_TIMEOUT,
             auto_detect_transports: false,
             herdr_bin: None,
             codex_bin: None,
@@ -482,13 +476,12 @@ struct LiveWaiter {
 
 struct LiveChannel {
     conn_id: u64,
-    tx: mpsc::UnboundedSender<ChannelDeliverCommand>,
+    tx: mpsc::Sender<ChannelDeliverCommand>,
 }
 
 struct ChannelDeliverCommand {
-    delivery_id: u64,
+    session_id: String,
     text: String,
-    ack_tx: oneshot::Sender<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -512,6 +505,13 @@ struct LiveOpenClawService {
     tx: mpsc::UnboundedSender<OpenClawWakeCommand>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeChannelWake {
+    Fresh,
+    WaitingForIdle,
+    Attempted,
+}
+
 #[derive(Debug, Clone)]
 struct ClassifiedItemMeta {
     item_id: String,
@@ -522,6 +522,7 @@ struct ClassifiedItemMeta {
     channel: Option<String>,
     is_announcement: bool,
     notified: bool,
+    claude_channel_wake: ClaudeChannelWake,
     /// True only for trusted daemon-generated host sleep/wake notices.
     /// Counted in the digest and excluded from Tier 4 Herdr cold-spawn triggers.
     is_wake_notice: bool,
@@ -974,7 +975,7 @@ impl LocalDaemon {
     }
 
     /// Returns the active live wakeup transport kind for `session_id`, if any
-    /// (`"claude_channel"`, `"herdr"`, `"t3"`, `"openclaw"`, `"codex_queue"`, `"watch"`, `"wait"`, etc.).
+    /// (`"herdr"`, `"t3"`, `"openclaw"`, `"codex_queue"`, `"watch"`, `"wait"`, etc.).
     pub fn session_transport_kind(&self, session_id: &str) -> Option<&'static str> {
         self.inner.active_transport_kind(session_id)
     }
@@ -1382,6 +1383,7 @@ impl LocalDaemon {
                 channel: classification.parsed.channel,
                 is_announcement,
                 notified: false,
+                claude_channel_wake: ClaudeChannelWake::Fresh,
                 is_wake_notice: false,
             },
         );
@@ -2362,13 +2364,6 @@ impl LocalDaemonInner {
     }
 
     fn active_transport_kind(&self, session_id: &str) -> Option<&'static str> {
-        if self
-            .session_runtime()
-            .get(session_id)
-            .is_some_and(|runtime| runtime.channel.is_some())
-        {
-            return Some("claude_channel");
-        }
         if self.openclaw_plugin_wake_available_for(session_id) {
             return Some("openclaw_plugin");
         }
@@ -5107,12 +5102,14 @@ async fn handle_session_idle(daemon: &Arc<LocalDaemonInner>, packet: &Map<String
         return json!({ "ok": false, "error": err });
     }
     daemon.clear_openclaw_session_missing(&target_session_id);
-    daemon.mark_session_idle(&target_session_id);
-    // Any Queue batch deferred while the session was Active can now flush immediately to L2!
+    let flush_mode = daemon.mark_session_idle(&target_session_id);
+    // Flush pending wakeups at the newly observed idle boundary.
     let flush_daemon = Arc::clone(daemon);
     let flush_sid = target_session_id.clone();
     tokio::spawn(async move {
-        let _ = flush_daemon.flush_session(&flush_sid).await;
+        let _ = flush_daemon
+            .flush_session_inner(&flush_sid, flush_mode)
+            .await;
     });
     json!({ "ok": true, "result": { "sessionId": target_session_id, "idle": true } })
 }
@@ -5803,7 +5800,9 @@ async fn fanout_approved_local_ingest(
     for sub_sid in sessions_to_wake {
         // Explicit human approval (`hyp inbox approve` -> `inbox.wake`) bypasses active-turn
         // grace deferral so approved items wake subscribed sessions immediately.
-        let (_, delivered) = daemon.flush_session_inner(&sub_sid, true).await;
+        let (_, delivered) = daemon
+            .flush_session_inner(&sub_sid, SessionFlushMode::InterruptGraceExpired)
+            .await;
         if delivered {
             woken_any = true;
         }
@@ -5885,7 +5884,9 @@ async fn handle_inbox_wake_rpc(
                 db.local().pending_count(sid).unwrap_or(0) > 0
             };
             if has_pending {
-                let (_, delivered) = daemon.flush_session_inner(sid, true).await;
+                let (_, delivered) = daemon
+                    .flush_session_inner(sid, SessionFlushMode::InterruptGraceExpired)
+                    .await;
                 woken = delivered;
             }
         }

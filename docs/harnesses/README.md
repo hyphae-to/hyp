@@ -8,7 +8,7 @@ Run `hyp setup --harness auto` (or `--harness <comma-list>`) to wire MCP entries
 
 | Tier | Harness | Caller Binding | Push / Wakeup Path | Status UI | Guide |
 | --- | --- | --- | --- | --- | --- |
-| **Full** | **Claude Code** (CLI & Desktop) | `PreToolUse` hook (`session_id` + `_meta["claudecode/toolUseId"]`) | `PostToolUse`/`Stop` drain + opt-in `--claude-channel` / `hyp watch` / `hyp wait` | Native `hyphae-panel` + `/hyp` commands + optional `--statusline` | [claude-code.md](claude-code.md) |
+| **Full** | **Claude Code** (CLI & Desktop) | `PreToolUse` hook (`session_id` + `_meta["claudecode/toolUseId"]`) | `PostToolUse`/`Stop` drain + best-effort Claude Code channels / `hyp watch` / `hyp wait` | Native `hyphae-panel` + `/hyp` commands + optional `--statusline` | [claude-code.md](claude-code.md) |
 | **Full** | **Antigravity** (Desktop / IDE / CLI) | `PreToolUse` hook (`conversationId` + single-use `_meshCall`) | `PreInvocation` / `PostToolUse` / `Stop` drain + `hyp wait` | Stacked `--statusline` + `hyp ui` | [antigravity.md](antigravity.md) |
 | **Full** | **Herdr Core** | `--backend herdr` + `HC_TERMINAL_ID` verified via `hc get` (bare shells rejected) | Native `hc send` (`queue`) / `hc interrupt` (`interrupt`) | Native GPUI `hyphae-pane` pill + `hyphae-panel` dock (`--mod`) | [herdr.md](herdr.md) |
 | **Full** | **Codex** (CLI & Desktop) | Thread rollout presence (`$CODEX_HOME/sessions/`) + hooks (`~/.codex/hooks.json`) | Native `codex queue --thread <uuid>` + hook drain | `hyp inspect` / `hyp ui` (or Herdr pill when inside Herdr) | [codex.md](codex.md) |

@@ -88,18 +88,6 @@ pub async fn wait_for_live_transport(sock: &Path, session_id: &str) {
     panic!("timed out waiting for hasLiveTransport == true on {session_id}");
 }
 
-/// Polls `session.status` until `hasLiveTransport == false`.
-pub async fn wait_for_no_live_transport(sock: &Path, session_id: &str) {
-    for _ in 0..200 {
-        let st = session_status(sock, session_id).await;
-        if st["hasLiveTransport"].as_bool() == Some(false) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-    panic!("timed out waiting for hasLiveTransport == false on {session_id}");
-}
-
 /// Polls `session.status` until `pending >= min_pending`.
 pub async fn wait_for_pending_count(sock: &Path, session_id: &str, min_pending: u64) {
     for _ in 0..200 {

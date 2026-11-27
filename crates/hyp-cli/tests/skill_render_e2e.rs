@@ -489,7 +489,7 @@ fn static_repo_skill_is_cross_orchestrator_accurate() {
     assert!(text.starts_with("---\nname: hyp-mesh\n"));
     assert!(text.contains("Herdr"));
     assert!(text.contains("T3 Code"));
-    assert!(text.contains("--claude-channel"));
+    assert!(text.contains("Claude Code channel notices are best effort"));
     assert!(text.contains("codex queue"));
     assert!(text.contains("do **not** start a background waiter"));
     assert!(text.contains("WaitMsBeforeAsync: 500, IsDaemon: false"));
@@ -501,6 +501,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
         label: &'a str,
         args: Vec<&'a str>,
         envs: Vec<(&'a str, &'a str)>,
+        client_name: Option<&'a str>,
         expected_substr: &'a str,
         expect_monitor: bool,
     }
@@ -515,6 +516,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             label: "herdr-backend",
             args: vec!["mcp", sock_str, "--backend", "herdr"],
             envs: vec![],
+            client_name: None,
             expected_substr: "Herdr detected: check join hasLiveTransport",
             expect_monitor: false,
         },
@@ -522,6 +524,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             label: "herdr-env",
             args: vec!["mcp", sock_str],
             envs: vec![("HC_TERMINAL_ID", "t9a")],
+            client_name: None,
             expected_substr: "Herdr detected: check join hasLiveTransport",
             expect_monitor: false,
         },
@@ -529,6 +532,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             label: "t3-backend",
             args: vec!["mcp", sock_str, "--backend", "t3"],
             envs: vec![],
+            client_name: None,
             expected_substr: "T3 Code detected: check join hasLiveTransport",
             expect_monitor: false,
         },
@@ -536,20 +540,31 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             label: "t3-env",
             args: vec!["mcp", sock_str],
             envs: vec![("T3CODE_URL", "http://127.0.0.1:3773")],
+            client_name: None,
             expected_substr: "T3 Code detected: check join hasLiveTransport",
             expect_monitor: false,
+        },
+        McpInstrCase {
+            label: "claude-code-inferred",
+            args: vec!["mcp", sock_str],
+            envs: vec![],
+            client_name: Some("claude-code"),
+            expected_substr: "Claude channels are best effort when selected at launch",
+            expect_monitor: true,
         },
         McpInstrCase {
             label: "claude-channel",
             args: vec!["mcp", sock_str, "--claude-channel"],
             envs: vec![],
-            expected_substr: "Push wakeups active via Claude channel",
-            expect_monitor: false,
+            client_name: None,
+            expected_substr: "Claude channels are best effort when selected at launch",
+            expect_monitor: true,
         },
         McpInstrCase {
             label: "openclaw",
             args: vec!["mcp", sock_str, "--backend", "openclaw", "--ephemeral"],
             envs: vec![],
+            client_name: None,
             expected_substr: "OpenClaw cron/sessions_send",
             expect_monitor: false,
         },
@@ -557,6 +572,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             label: "antigravity",
             args: vec!["mcp", sock_str, "--backend", "antigravity"],
             envs: vec![],
+            client_name: None,
             expected_substr: "WaitMsBeforeAsync: 500",
             expect_monitor: false,
         },
@@ -564,6 +580,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             label: "claude-standalone",
             args: vec!["mcp", sock_str, "--backend", "claude"],
             envs: vec![],
+            client_name: None,
             expected_substr: "Monitor hyp watch",
             expect_monitor: true,
         },
@@ -571,6 +588,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             label: "default-standalone",
             args: vec!["mcp", sock_str],
             envs: vec![],
+            client_name: None,
             expected_substr: "Never poll hyp_inbox",
             expect_monitor: false,
         },
@@ -581,6 +599,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             label,
             args,
             envs,
+            client_name,
             expected_substr,
             expect_monitor,
         } = case;
@@ -598,11 +617,15 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
 
         let mut proc = ManagedProcess::spawn(format!("hyp mcp ({label})"), &mut cmd);
         let mut stdin = proc.take_stdin().unwrap();
+        let mut params = json!({"protocolVersion": "2025-06-18"});
+        if let Some(name) = client_name {
+            params["clientInfo"] = json!({"name": name, "version": "fixture"});
+        }
         let req = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": { "protocolVersion": "2025-06-18" }
+            "params": params
         });
         writeln!(stdin, "{req}").unwrap();
         stdin.flush().unwrap();
@@ -611,6 +634,11 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
         drop(stdin);
         let _ = proc.wait_timeout(Duration::from_secs(3));
 
+        assert_eq!(
+            resp["result"]["capabilities"]["experimental"]["claude/channel"].is_object(),
+            client_name == Some("claude-code") || args.contains(&"--claude-channel"),
+            "{label}: unexpected Claude channel capability",
+        );
         let instr = resp["result"]["instructions"]
             .as_str()
             .unwrap_or_else(|| panic!("case {label} missing instructions: {resp}"));

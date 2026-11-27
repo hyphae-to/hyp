@@ -11,7 +11,7 @@
 //!    cursor pagination + piggybacked `· N muted`), and `hyp_kv` (`set`/`get`/`list`/`delete`).
 //! 3. Zero-polling `wait` (`WaitMode::Once`) proving muted messages produce ZERO wakes while
 //!    non-muted messages wake immediately with piggybacked `· N muted`, plus streaming `watch`.
-//! 4. Live `--claude-channel` push (`notifications/claude/channel` + `channel.ack`).
+//! 4. Best-effort Claude Code channel notice (`notifications/claude/channel`).
 //! 5. Cross-platform loopback TCP (`LocalDaemon::start_tcp` -> `connector.addr`) + `daemon.status`.
 
 use std::net::SocketAddr;
@@ -826,7 +826,7 @@ async fn two_native_rust_daemons_over_rust_hub_hooks_mcp_delivery_wait_watch_kv_
         "MCP-E2EE-SHARED-SECRET-777"
     );
 
-    // 11. Live `--claude-channel` push end-to-end on Bob's native Rust daemon!
+    // 11. Claude channel notice end-to-end on Bob's native Rust daemon!
     let mut chan_opts = McpOptions::new(bob_sock.clone());
     chan_opts.channel = true;
     chan_opts.ephemeral = true;

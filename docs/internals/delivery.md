@@ -30,7 +30,7 @@ All four tiers emit the exact same compact `<hyphae-inbox>` XML count digest (ne
 
 ## 3. Unified Metadata-Only XML Digest Renderer (`packer.rs`)
 
-Both hooks (`PreInvocation`/`UserPromptSubmit`, `PostToolUse`, `Stop`, etc.) and push wake transports (`Herdr`, `Codex Queue`, `T3 Code`, `OpenClaw`, `--claude-channel`, `hyp wait`) render through `pack_inbox_digest`:
+Both hooks (`PreInvocation`/`UserPromptSubmit`, `PostToolUse`, `Stop`, etc.) and push wake transports (`Herdr`, `Codex Queue`, `T3 Code`, `OpenClaw`, Claude Code channels, `hyp wait`) render through `pack_inbox_digest`:
 
 ```xml
 <hyphae-inbox handle="plugins-dev" unread="5" urgency="queue">
@@ -45,13 +45,13 @@ Both hooks (`PreInvocation`/`UserPromptSubmit`, `PostToolUse`, `Stop`, etc.) and
 - **Zero Body Leak:** `pack_inbox_digest` never reads `item.text`. Every attribute value strips control/BiDi characters and strictly XML-escapes `&`, `<`, `>`, `"`, `'`.
 - **Unread-Only Listing:** Lists only sources/subscriptions with unread items; omits `<muted>` when 0; omits empty categories.
 - **Verified & Quarantine Isolation:** `human-verified` items carry `verified="true"` in a separate group key (unverified items can never merge into a verified count). Quarantined items are never counted in `unread="..."` and surface at most once as a single `<quarantined count="N"/>` element; details stay in `hyp gate review` (and `hyp_inbox`'s `quarantinedNotices`).
-- **At-Most-Once Watermark:** Delivering a digest via a hook or push wake stamps counted receipts `notified = 1` (keeping items `unread` in SQLite until `hyp_inbox` reads them) and cancels any pending duplicate wake nudge.
+- **At-Most-Once Watermark:** Delivering a digest via a hook, confirmed native push, or blocking waiter stamps counted receipts `notified = 1` (keeping items `unread` in SQLite until `hyp_inbox` reads them) and cancels any pending duplicate wake nudge.
 
 ---
 
 ## 4. Best-Effort Tier 1–3 Wakeup Ladder (+ Opt-In Tier 4)
 
-1. **Tier 1 / 2 (Native Push & Blocking Waiters):** Live push via Herdr (`hc send`/`hc interrupt`), `codex queue`, T3 WebSocket RPC, OpenClaw Gateway (`hyphae-wake` / `/hooks/wake`), OpenCode `session.idle` SDK prompt, `--claude-channel`, hooks (`PostToolUse`/`Stop`/`PreInvocation`), or blocking `hyp wait` / `hyp watch`.
+1. **Tier 1 / 2 (Native Push & Blocking Waiters):** Live push via Herdr (`hc send`/`hc interrupt`), `codex queue`, T3 WebSocket RPC, OpenClaw Gateway (`hyphae-wake` / `/hooks/wake`), OpenCode `session.idle` SDK prompt, Claude Code channels, hooks (`PostToolUse`/`Stop`/`PreInvocation`), or blocking `hyp wait` / `hyp watch`. When available, proven push and armed waiters take precedence over Claude Code channels. Channel submission leaves receipt and hook state untouched. When a hook has observed activity, the sliding activity lease gives Stop or an inbox read time to handle the receipt. A receipt still awaiting a wake at lease expiry gets one idle wake through an available route. Native transports use queue mode for this wake.
 2. **Tier 3 (Busy `Hold` Backoff & Durable Mailbox):** Busy turns enter bounded retry backoff (`5s -> 15s -> 30s -> 60s`), cancelled immediately when a hook drains first, and coalesce cleanly in SQLite with TTL.
 3. **Tier 4 (Strictly Opt-In Cold Revival):** Offline sessions are never spawned unless explicitly opted in via `node.json` (`codexResume` or allowlisted `herdrSpawnAllowlist`), passing only the `<hyphae-inbox>` digest.
 

@@ -2213,6 +2213,7 @@ fn shared_setup_skill_path(home: &Path) -> PathBuf {
 fn is_stock_legacy_setup_skill(text: &str) -> bool {
     // The stock setup skill predates the managed runtime marker.
     const LEGACY_DIGESTS: &[&str] = &[
+        "ed7a67f7478312e4b015ef58cb84fbe1ec77f1552d879070e2b88be1c3d76e7c",
         "6b2060da1c820016c22d3e6217dfe87d2866074c82b00a3c50f4552d57dd078e",
         "4a336e5b76253e513b4f57edae22cc9fbb2640080294c5cf0622912c1fb02186",
         "c86649c74bbca523f0cb5a2408fc5fd3080812f8aba1b28a921c0de8af16a547",
@@ -8643,7 +8644,7 @@ command = "other"
         assert!(HYPHAE_SETUP_SKILL_MD.contains("hyp gate apply"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("Herdr"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("Codex Queue"));
-        assert!(HYPHAE_SETUP_SKILL_MD.contains("--claude-channel"));
+        assert!(HYPHAE_SETUP_SKILL_MD.contains("Claude Code channels"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("T3 Code"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("OpenClaw"));
         assert!(HYPHAE_SETUP_SKILL_MD.contains("--no-skills"));

@@ -81,7 +81,7 @@ enum Commands {
     Mcp {
         /// Optional connector.sock path (defaults to HYPHAE_SOCKET / ~/.config/hyphae/state/connector.sock)
         socket: Option<PathBuf>,
-        /// Opt-in Claude CLI native push channel (`notifications/claude/channel`)
+        /// Legacy override for Claude Code channel support (normally inferred from MCP initialization)
         #[arg(long)]
         claude_channel: bool,
         /// Explicit backend override (normally inferred from MCP client initialization)

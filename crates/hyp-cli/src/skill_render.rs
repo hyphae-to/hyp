@@ -193,7 +193,6 @@ impl TransportHintMode {
             self,
             Self::Herdr
                 | Self::T3
-                | Self::ClaudeChannel
                 | Self::CodexQueue
                 | Self::OpenClawEphemeral
                 | Self::DesktopPassive
@@ -284,18 +283,14 @@ pub const fn sanitize_transport_for_target(
     // Pure push/ephemeral/passive targets never emit waiter commands.
     match target {
         SkillTargetHarness::Herdr => {
-            return if requested.is_no_waiter_mode()
-                && !matches!(requested, TransportHintMode::ClaudeChannel)
-            {
+            return if requested.is_no_waiter_mode() {
                 requested
             } else {
                 TransportHintMode::Herdr
             };
         }
         SkillTargetHarness::T3 => {
-            return if requested.is_no_waiter_mode()
-                && !matches!(requested, TransportHintMode::ClaudeChannel)
-            {
+            return if requested.is_no_waiter_mode() {
                 requested
             } else {
                 TransportHintMode::T3
@@ -517,13 +512,13 @@ fn render_transport_layer(target: SkillTargetHarness, transport: TransportHintMo
              - T3 Code RPC (`message.dispatch`) pushes and steers idle wakeups automatically. Do not start any background shell waiter or polling loop."
             .to_string(),
         TransportHintMode::ClaudeChannel => "## Wakeup Transport\n\
-             - Push wakeups are active via `--claude-channel` (`notifications/claude/channel`). Do not start any background shell waiter or polling loop."
+             - Claude channels are best effort. Idle without confirmed push: `Monitor` (`hyp watch`) or bg `hyp wait`."
             .to_string(),
         TransportHintMode::ClaudeMonitor => "## Wakeup Transport\n\
-             - Hooks drain active turns. Idle without push: stream via Claude `Monitor` (`hyp watch --session claude:<id>`) or background `hyp wait --session claude:<id>`."
+             - Hooks drain active turns. Idle without confirmed push: `Monitor` (`hyp watch --session claude:<id>`) or bg `hyp wait --session claude:<id>`."
             .to_string(),
         TransportHintMode::ClaudeDualWithPush => "## Wakeup Transport\n\
-             - Push is automatic in Herdr (`HC_TERMINAL_ID`), T3, or `--claude-channel` (no waiter). Standalone: `Monitor` (`hyp watch`) or bg `hyp wait`."
+             - Herdr (`HC_TERMINAL_ID`) and T3 push automatically. Claude channels are best effort. Idle without push: `Monitor` (`hyp watch`) or bg `hyp wait`."
             .to_string(),
         TransportHintMode::CodexQueue => "## Wakeup Transport\n\
              - Push wakeups are delivered automatically via `codex queue` while hooks drain active turns. Do not start a background shell waiter when push is active."
@@ -927,7 +922,7 @@ mod tests {
         let generic_transport = "\
 ## Wakeup Transport
 - Run `hyp setup --refresh-skills` to get guidance for your harness and its push transport.
-- Native push and managed turns handle idle wakeups in Herdr, T3 Code, `--claude-channel`, `codex queue`, and OpenClaw. When push is active, do **not** start a background waiter.
+- Native push and managed turns handle idle wakeups in Herdr, T3 Code, `codex queue`, and OpenClaw. When push is active, do **not** start a background waiter. Claude Code channel notices are best effort.
 - On a standalone hook harness, arm one background waiter when enrolled, idle, and expecting a reply. Use Claude `Monitor` with `hyp watch`, Antigravity `run_command` with `WaitMsBeforeAsync: 500, IsDaemon: false`, or background `hyp wait` on the other standalone CLIs. Passive Claude Desktop uses MCP only.";
         let claude_transport = render_transport_layer(
             SkillTargetHarness::Claude,
