@@ -25,7 +25,6 @@ import {
   isReservedSecretName,
   MAX_PADDED_PLAINTEXT,
   openHumanDraft,
-  prfEvalInput,
   randomBytes,
   sasFingerprint,
   sealHumanDrop,
@@ -38,6 +37,15 @@ import {
   verifyNodeCert,
   zeroize,
 } from "./crypto.js?v=4";
+import {
+  coerceBytes as readPasskeyBytes,
+  copyText as copyBrowserText,
+  createPasskeyOperations,
+  extractPrfFirst as readPasskeyPrfFirst,
+  isEmbeddedInFrame,
+} from "../passkey.js?v=1";
+
+export { isEmbeddedInFrame };
 
 const HINT_STORAGE_PREFIX = "hyphae.drop.hint.v1:";
 const MAX_DROP_TTL_MS = 10 * 60 * 1000;
@@ -262,168 +270,20 @@ function loadPublicHint(humanId) {
 // WebAuthn Passkey + PRF Operations
 // ============================================================================
 
-function getRpId() {
-  const host = window.location.hostname;
-  if (!host || /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) {
-    return undefined;
-  }
-  return host;
+export function coerceBytes(value) {
+  return readPasskeyBytes(value, true);
 }
 
-export function coerceBytes(val) {
-  if (!val) return null;
-  if (val instanceof Uint8Array) return new Uint8Array(val);
-  if (ArrayBuffer.isView(val)) {
-    return new Uint8Array(val.buffer.slice(val.byteOffset, val.byteOffset + val.byteLength));
-  }
-  const tag = Object.prototype.toString.call(val);
-  if (
-    val instanceof ArrayBuffer ||
-    tag === "[object ArrayBuffer]" ||
-    tag === "[object SharedArrayBuffer]"
-  ) {
-    return new Uint8Array(val).slice();
-  }
-  if (Array.isArray(val) && val.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
-    return Uint8Array.from(val);
-  }
-  if (typeof val === "string" && val.length > 0) {
-    try {
-      return base64urlDecode(val.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""));
-    } catch {
-      return null;
-    }
-  }
-  if (typeof val === "object") {
-    // Handle cross-realm buffers and extension-serialized byte maps (`{ "0": 12, "1": 34, ... }`).
-    if (typeof val.byteLength === "number" && val.byteLength > 0) {
-      try {
-        const view = new Uint8Array(val);
-        if (view.length === val.byteLength) return view.slice();
-      } catch {
-        // Fall through to indexed object check.
-      }
-    }
-    const keys = Object.keys(val);
-    if (
-      keys.length > 0 &&
-      keys.every((k, idx) => k === String(idx) && Number.isInteger(val[k]) && val[k] >= 0 && val[k] <= 255)
-    ) {
-      return Uint8Array.from(keys.map((k) => val[k]));
-    }
-  }
-  return null;
+export function extractPrfFirst(credential) {
+  return readPasskeyPrfFirst(credential, true);
 }
 
-export function extractPrfFirst(cred) {
-  const ext = typeof cred?.getClientExtensionResults === "function"
-    ? cred.getClientExtensionResults()
-    : null;
-  const first = ext?.prf?.results?.first;
-  if (!first) return null;
-  const bytes = coerceBytes(first);
-  return bytes && bytes.length === 32 ? bytes : null;
-}
-
-async function evaluatePasskeyPrf(humanId, prfSalt, credentialIdB64 = "") {
-  if (!window.PublicKeyCredential || !navigator.credentials) {
-    throw new Error("WebAuthn Passkeys are not supported in this browser");
-  }
-  const evalInput = await prfEvalInput(humanId, prfSalt);
-  const publicKey = {
-    challenge: randomBytes(32),
-    userVerification: "required",
-    extensions: {
-      prf: {
-        eval: { first: evalInput },
-      },
-    },
-  };
-  const rpId = getRpId();
-  if (rpId) publicKey.rpId = rpId;
-  if (credentialIdB64) {
-    try {
-      publicKey.allowCredentials = [
-        { type: "public-key", id: base64urlDecode(credentialIdB64) },
-      ];
-    } catch {
-      // Fall back to discoverable credential prompt.
-    }
-  }
-
-  const assertion = await navigator.credentials.get({ publicKey });
-  if (!assertion) {
-    throw new Error("Passkey authentication was cancelled");
-  }
-  const prfOut = extractPrfFirst(assertion);
-  if (!prfOut) {
-    throw new Error(
-      "Your authenticator did not return a WebAuthn PRF secret. Use Safari 18+, Chrome, or Edge with a PRF-capable Passkey (iCloud Keychain / Google Password Manager)."
-    );
-  }
-  const rawId = coerceBytes(assertion.rawId);
-  const credentialId = rawId ? base64urlEncode(rawId) : (typeof assertion.id === "string" ? assertion.id : "");
-  return { prfOut, credentialId };
-}
-
-async function enrollPasskeyWithPrf(humanId, prfSalt) {
-  if (!window.PublicKeyCredential || !navigator.credentials) {
-    throw new Error("WebAuthn Passkeys are not supported in this browser");
-  }
-  const evalInput = await prfEvalInput(humanId, prfSalt);
-  const rpId = getRpId();
-  const rp = rpId ? { name: "Hyphae Verified Drops", id: rpId } : { name: "Hyphae Verified Drops" };
-
-  const createOptions = {
-    challenge: randomBytes(32),
-    rp,
-    user: {
-      id: utf8Bytes(humanId),
-      name: humanId,
-      displayName: humanId,
-    },
-    pubKeyCredParams: [
-      { type: "public-key", alg: -7 },
-      { type: "public-key", alg: -8 },
-      { type: "public-key", alg: -257 },
-    ],
-    authenticatorSelection: {
-      residentKey: "required",
-      requireResidentKey: true,
-      userVerification: "required",
-    },
-    attestation: "none",
-    extensions: {
-      prf: {
-        eval: { first: evalInput },
-      },
-    },
-  };
-
-  const created = await navigator.credentials.create({ publicKey: createOptions });
-  if (!created) {
-    throw new Error("Passkey creation was cancelled");
-  }
-  const rawId = coerceBytes(created.rawId);
-  const credId = rawId ? base64urlEncode(rawId) : (typeof created.id === "string" ? created.id : "");
-  const ext = typeof created.getClientExtensionResults === "function"
-    ? created.getClientExtensionResults()
-    : null;
-
-  let prfOut = extractPrfFirst(created);
-  if (!prfOut) {
-    if (ext?.prf && ext.prf.enabled === false) {
-      throw new Error(
-        "This Passkey authenticator does not support the WebAuthn PRF extension."
-      );
-    }
-    // Many authenticators report `prf.enabled: true` on create() and evaluate on get().
-    const res = await evaluatePasskeyPrf(humanId, prfSalt, credId);
-    prfOut = res.prfOut;
-  }
-
-  return { prfOut, credentialId: credId, rpId: rpId || window.location.hostname };
-}
+const { evaluatePasskeyPrf, enrollPasskeyWithPrf } = createPasskeyOperations({
+  rpName: "Hyphae Verified Drops",
+  missingPrfMessage:
+    "Your authenticator did not return a WebAuthn PRF secret. Use Safari 18+, Chrome, or Edge with a PRF-capable Passkey (iCloud Keychain / Google Password Manager).",
+  allowSerializedBytes: true,
+});
 
 // ============================================================================
 // Browser UI Helpers
@@ -459,16 +319,8 @@ function formatLocalTime(date) {
   }
 }
 
-async function copyText(text, btn, idleLabel) {
-  try {
-    await navigator.clipboard.writeText(text);
-    btn.textContent = "Copied!";
-    setTimeout(() => {
-      btn.textContent = idleLabel;
-    }, 2000);
-  } catch {
-    btn.textContent = "Select & Copy Above";
-  }
+function copyText(text, btn, idleLabel) {
+  return copyBrowserText(text, btn, idleLabel, { timeoutMs: 2000, fallbackLabel: "Select & Copy Above" });
 }
 
 function autoSizeTextarea(el) {
@@ -487,16 +339,6 @@ function formatDirectiveStats(text) {
 // ============================================================================
 // App Entry Point
 // ============================================================================
-
-export function isEmbeddedInFrame(win = typeof window !== "undefined" ? window : null) {
-  if (!win) return false;
-  try {
-    return win.top !== win.self;
-  } catch {
-    // Cross-origin frame access throws SecurityError — fail closed.
-    return true;
-  }
-}
 
 function initBrowserApp() {
   // 0. Immediately capture and scrub URL #fragment before any other work!
