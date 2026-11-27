@@ -123,6 +123,18 @@ jobs:
       - name: Run JS/TS unit test suites
         run: npm run test:js
 
+      - name: Run native Claude Code panel tests
+        shell: bash
+        env:
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/hyphae-claude-config
+          DISABLE_TELEMETRY: "1"
+          DISABLE_ERROR_REPORTING: "1"
+        run: |
+          set -euo pipefail
+          runtime_dir="$RUNNER_TEMP/hyphae-claude-runtime"
+          npm install --prefix "$runtime_dir" --no-audit --no-fund --loglevel=error @anthropic-ai/claude-code@2.1.332
+          "$runtime_dir/node_modules/.bin/claude" plugin test "$GITHUB_WORKSPACE/plugins/claude-code"
+
       - name: Syntax-check JS, Python, shell, PowerShell, and verify installer mirror parity
         shell: bash
         run: |

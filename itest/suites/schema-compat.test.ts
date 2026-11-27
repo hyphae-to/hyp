@@ -3,16 +3,16 @@
  *
  * 100% deterministic with zero external network downloads in default runs (using Node 24's built-in
  * `node:sqlite` `DatabaseSync` and exact read-only migration SQL from `crates/hyp-store/migrations/`),
- * while also supporting optional real `HYP_PREV_BIN` (`N-1` binary) cross-checks when cached in CI!
+ * Ubuntu Tier 2 supplies the pinned prior release via `HYP_PREV_BIN`.
  *
  * Verifies:
- *  1. Forward migration (`schema v5 -> v7` AND `schema v6 -> v7`):
- *     - Automatic atomic pre-migration `backups/node.sqlite.v{5,6}-to-v7-*.bak` backup (`0600` perms!).
+ *  1. Forward migration (schema v5 and v6 to the current schema):
+ *     - Automatic atomic pre-migration `backups/node.sqlite.v{5,6}-to-vN-*.bak` backup (`0600` perms!).
  *     - Zero data loss across `sessions`, `peers`, `mailbox`, `human_authorities`, `human_claim_nonces`,
  *       and `muted_sources`.
- *     - `hyp status --json` and `hyp doctor --json` exit `0` with `ok: true` and report schema `v7`!
+ *     - `hyp status --json` and `hyp doctor --json` exit `0` with `ok: true` and report the current schema.
  *     - `hyp daemon` boots cleanly against the upgraded database!
- *  2. Future schema downgrade protection (`schema v99 -> v7`):
+ *  2. Future schema downgrade protection (schema v99 opened by this binary):
  *     - `hyp status --json` exits `1`, `ok: false`, `error.code === "SCHEMA_TOO_NEW"` with `hyp update` / `backups/` fix.
  *     - `hyp doctor --json` exits `1`, `ok: false`, `error.code === "SCHEMA_TOO_NEW"` and `store.sqlite` FAIL check.
  *     - `hyp daemon` refuses to boot (non-zero exit, fail-closed!).
@@ -302,7 +302,7 @@ for (const fromVersion of [5, 6] as const) {
         db.close();
       }
 
-      // Boot live `hyp daemon` against the upgraded v7 database and confirm it serves cleanly!
+      // Boot live `hyp daemon` against the upgraded database and confirm it serves cleanly!
       await hyp.startDaemon();
       const ins = await hyp.inspect({ all: true });
       assert.equal(ins.exitCode, 0);
