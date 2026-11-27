@@ -29,6 +29,11 @@ use hyp_crypto::keys::{
     X25519PublicKey,
 };
 use hyp_crypto::keystore::SecretStore;
+use hyp_crypto::manifest::{
+    ManifestPins, ManifestVerificationError, VerifiedManifest, decode_manifest_payload,
+    verify_manifest_canonical, verify_manifest_expiry, verify_manifest_signature,
+    verify_signed_manifest,
+};
 use hyp_crypto::pairing::{
     AM2_PREFIX, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES, P2pOfferToken,
     P2pPairConfirmation, P2pPairResponse, SshEndpoint, create_p2p_offer, create_p2p_response,
@@ -2578,106 +2583,102 @@ fn compute_manifest_etag(manifest_json: &str) -> String {
     format!("\"{}\"", &digest[..16])
 }
 
+#[derive(Clone, Copy)]
+enum ManifestSource {
+    PairingReply,
+    Fetch,
+}
+
+fn manifest_verification_error(
+    source: ManifestSource,
+    error: ManifestVerificationError,
+) -> (&'static str, String) {
+    use ManifestSource::*;
+    use ManifestVerificationError::*;
+    let from_reply = matches!(source, PairingReply);
+    let context = if from_reply {
+        "pairing manifest"
+    } else {
+        "manifest"
+    };
+    match error {
+        Payload(error) => (
+            "INVALID_MANIFEST",
+            match source {
+                PairingReply => format!("Invalid NodeManifestPayload in pairing reply: {error}"),
+                Fetch => format!("Invalid NodeManifestPayload in signed manifest: {error}"),
+            },
+        ),
+        NodeIdMismatch { actual, expected } => (
+            "NODE_ID_MISMATCH",
+            format!("Pairing reply manifest nodeId '{actual}' does not match expected '{expected}'"),
+        ),
+        Canonicalization(error) => (
+            "INVALID_MANIFEST",
+            format!("Failed to canonicalize {context} payload: {error}"),
+        ),
+        NonCanonical => (
+            "NON_CANONICAL_MANIFEST",
+            match source {
+                PairingReply => "Pairing reply manifest payload is not canonical RFC 8785 JCS (fail-closed)",
+                Fetch => "Signed manifest payload is not canonical RFC 8785 JCS (fail-closed)",
+            }.to_owned(),
+        ),
+        SigningKey(error) => ("INVALID_KEY", format!("Invalid signingJwk in {context}: {error}")),
+        EncryptionKey(error) => ("INVALID_KEY", format!("Invalid encryptionJwk in {context}: {error}")),
+        SigningPinMismatch => (
+            "KEY_PIN_MISMATCH",
+            "Pairing reply manifest signingJwk does not match out-of-band pinned key (fail-closed)".to_owned(),
+        ),
+        EncryptionPinMismatch => (
+            "KEY_PIN_MISMATCH",
+            "Pairing reply manifest encryptionJwk does not match out-of-band pinned key (fail-closed)".to_owned(),
+        ),
+        Signature(error) => (
+            "INVALID_SIGNATURE",
+            match source {
+                PairingReply => format!("Pairing reply manifest Ed25519 signature verification failed (fail-closed): {error}"),
+                Fetch => format!("Manifest Ed25519 signature verification failed (fail-closed): {error}"),
+            },
+        ),
+        InvalidExpiry { expires_at, source: error } => (
+            "INVALID_MANIFEST",
+            match source {
+                PairingReply => format!("Invalid expiresAt '{expires_at}' in pairing manifest: {error}"),
+                Fetch => format!("Invalid manifest expiresAt '{expires_at}': {error}"),
+            },
+        ),
+        Expired { node_id, expires_at } => (
+            "MANIFEST_EXPIRED",
+            match source {
+                PairingReply => format!("Peer '{node_id}' manifest in pairing reply expired at {expires_at}"),
+                Fetch => format!("Node '{node_id}' manifest expired at {expires_at}"),
+            },
+        ),
+    }
+}
+
 fn verify_signed_manifest_strict(
     signed: &SignedNodeManifest,
     expected_node_id: Option<&str>,
     expected_signing_pk: Option<&Ed25519PublicKey>,
     expected_enc_x: Option<&str>,
 ) -> Result<(NodeManifestPayload, Ed25519PublicKey, X25519PublicKey), (&'static str, String)> {
-    let payload = signed.decode_payload().map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!("Invalid NodeManifestPayload in pairing reply: {e}"),
-        )
-    })?;
-    if let Some(expected) = expected_node_id {
-        if payload.node_id.as_str() != expected {
-            return Err((
-                "NODE_ID_MISMATCH",
-                format!(
-                    "Pairing reply manifest nodeId '{}' does not match expected '{expected}'",
-                    payload.node_id
-                ),
-            ));
-        }
-    }
-    let canonical = payload.to_canonical_payload().map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!("Failed to canonicalize pairing manifest payload: {e}"),
-        )
-    })?;
-    if canonical != signed.payload {
-        return Err((
-            "NON_CANONICAL_MANIFEST",
-            "Pairing reply manifest payload is not canonical RFC 8785 JCS (fail-closed)"
-                .to_string(),
-        ));
-    }
-    let crypto_sign_jwk = CryptoOkpJwk::from(&payload.identity.signing_jwk);
-    let crypto_enc_jwk = CryptoOkpJwk::from(&payload.identity.encryption_jwk);
-    let signing_pk = crypto_sign_jwk.to_ed25519().map_err(|e| {
-        (
-            "INVALID_KEY",
-            format!("Invalid signingJwk in pairing manifest: {e}"),
-        )
-    })?;
-    let encryption_pk = crypto_enc_jwk.to_x25519().map_err(|e| {
-        (
-            "INVALID_KEY",
-            format!("Invalid encryptionJwk in pairing manifest: {e}"),
-        )
-    })?;
-
-    if let Some(expected_pk) = expected_signing_pk {
-        if &signing_pk != expected_pk {
-            return Err((
-                "KEY_PIN_MISMATCH",
-                "Pairing reply manifest signingJwk does not match out-of-band pinned key (fail-closed)"
-                    .to_string(),
-            ));
-        }
-    }
-    if let Some(expected_x) = expected_enc_x {
-        if payload.identity.encryption_jwk.x != expected_x {
-            return Err((
-                "KEY_PIN_MISMATCH",
-                "Pairing reply manifest encryptionJwk does not match out-of-band pinned key (fail-closed)"
-                    .to_string(),
-            ));
-        }
-    }
-
-    let verifier_pk = expected_signing_pk.unwrap_or(&signing_pk);
-    verifier_pk
-        .verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig)
-        .map_err(|e| {
-            (
-                "INVALID_SIGNATURE",
-                format!("Pairing reply manifest Ed25519 signature verification failed (fail-closed): {e}"),
-            )
-        })?;
-
-    let exp_ms = parse_rfc3339_millis(&payload.expires_at).map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!(
-                "Invalid expiresAt '{}' in pairing manifest: {e}",
-                payload.expires_at
-            ),
-        )
-    })?;
-    if now_unix_ms() > exp_ms {
-        return Err((
-            "MANIFEST_EXPIRED",
-            format!(
-                "Peer '{}' manifest in pairing reply expired at {}",
-                payload.node_id, payload.expires_at
-            ),
-        ));
-    }
-
-    Ok((payload, signing_pk, encryption_pk))
+    let verified = verify_signed_manifest(
+        signed,
+        ManifestPins {
+            node_id: expected_node_id,
+            signing_key: expected_signing_pk,
+            encryption_x: expected_enc_x,
+        },
+        now_unix_ms,
+    )
+    .map_err(|error| manifest_verification_error(ManifestSource::PairingReply, error))?;
+    Ok((
+        verified.payload,
+        verified.signing_key,
+        verified.encryption_key,
+    ))
 }
 
 fn post_json_handshake(
@@ -5174,65 +5175,12 @@ fn fetch_and_verify_manifest(
         )
     })?;
 
-    let payload = signed.decode_payload().map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!("Invalid NodeManifestPayload in signed manifest: {e}"),
-        )
-    })?;
-
-    let canonical = payload.to_canonical_payload().map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!("Failed to canonicalize manifest payload: {e}"),
-        )
-    })?;
-    if canonical != signed.payload {
-        return Err((
-            "NON_CANONICAL_MANIFEST",
-            "Signed manifest payload is not canonical RFC 8785 JCS (fail-closed)".to_string(),
-        ));
-    }
-
-    let crypto_sign_jwk = CryptoOkpJwk::from(&payload.identity.signing_jwk);
-    let crypto_enc_jwk = CryptoOkpJwk::from(&payload.identity.encryption_jwk);
-    let signing_pk = crypto_sign_jwk.to_ed25519().map_err(|e| {
-        (
-            "INVALID_KEY",
-            format!("Invalid signingJwk in manifest: {e}"),
-        )
-    })?;
-    let encryption_pk = crypto_enc_jwk.to_x25519().map_err(|e| {
-        (
-            "INVALID_KEY",
-            format!("Invalid encryptionJwk in manifest: {e}"),
-        )
-    })?;
-
-    signing_pk
-        .verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig)
-        .map_err(|e| {
-            (
-                "INVALID_SIGNATURE",
-                format!("Manifest Ed25519 signature verification failed (fail-closed): {e}"),
-            )
-        })?;
-
-    let exp_ms = parse_rfc3339_millis(&payload.expires_at).map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!("Invalid manifest expiresAt '{}': {e}", payload.expires_at),
-        )
-    })?;
-    if now_unix_ms() > exp_ms {
-        return Err((
-            "MANIFEST_EXPIRED",
-            format!(
-                "Node '{}' manifest expired at {}",
-                payload.node_id, payload.expires_at
-            ),
-        ));
-    }
+    let VerifiedManifest {
+        payload,
+        signing_key: signing_pk,
+        encryption_key: encryption_pk,
+    } = verify_signed_manifest(&signed, ManifestPins::default(), now_unix_ms)
+        .map_err(|error| manifest_verification_error(ManifestSource::Fetch, error))?;
 
     Ok(VerifiedLiveManifest {
         signed,
@@ -5240,6 +5188,55 @@ fn fetch_and_verify_manifest(
         signing_pk,
         encryption_pk,
         etag,
+    })
+}
+
+fn decode_enrollment_manifest(
+    signed: &SignedNodeManifest,
+    hub_node_id: &str,
+    path: &str,
+    label: &str,
+) -> Result<NodeManifestPayload, (&'static str, String)> {
+    let payload =
+        decode_manifest_payload(signed, Some(hub_node_id)).map_err(|error| match error {
+            ManifestVerificationError::Payload(error) => (
+                "INVALID_MANIFEST",
+                format!("Invalid NodeManifestPayload in {path} reply: {error}"),
+            ),
+            ManifestVerificationError::NodeIdMismatch { actual, expected } => (
+                "NODE_ID_MISMATCH",
+                format!("Manifest nodeId '{actual}' in {path} reply does not match '{expected}'"),
+            ),
+            error => ("INVALID_MANIFEST", error.to_string()),
+        })?;
+    verify_manifest_canonical(signed, &payload).map_err(|error| match error {
+        ManifestVerificationError::Canonicalization(error) => (
+            "INVALID_MANIFEST",
+            format!("Failed to canonicalize {label} manifest payload: {error}"),
+        ),
+        ManifestVerificationError::NonCanonical => (
+            "NON_CANONICAL_MANIFEST",
+            format!("Manifest in {path} reply is not canonical RFC 8785 JCS (fail-closed)"),
+        ),
+        error => ("INVALID_MANIFEST", error.to_string()),
+    })?;
+    Ok(payload)
+}
+
+fn verify_enrollment_manifest_expiry(
+    payload: &NodeManifestPayload,
+    path: &str,
+) -> Result<(), (&'static str, String)> {
+    verify_manifest_expiry(payload, now_unix_ms).map_err(|error| match error {
+        ManifestVerificationError::InvalidExpiry { source, .. } => (
+            "INVALID_MANIFEST",
+            format!("Invalid expiresAt in {path} manifest: {source}"),
+        ),
+        ManifestVerificationError::Expired { expires_at, .. } => (
+            "MANIFEST_EXPIRED",
+            format!("Hub manifest in {path} expired at {expires_at}"),
+        ),
+        error => ("INVALID_MANIFEST", error.to_string()),
     })
 }
 
@@ -5467,63 +5464,13 @@ fn attempt_guest_self_enroll(
     })?;
 
     // Verify the authenticated manifest returned by `/v1/guest/pair` against the pinned hub signing key!
-    let manifest_payload = reply.manifest.decode_payload().map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!("Invalid NodeManifestPayload in /v1/guest/pair reply: {e}"),
-        )
-    })?;
-    if manifest_payload.node_id.as_str() != hub_node_id {
-        return Err((
-            "NODE_ID_MISMATCH",
-            format!(
-                "Manifest nodeId '{}' in /v1/guest/pair reply does not match '{hub_node_id}'",
-                manifest_payload.node_id
-            ),
-        ));
-    }
-    let canonical_manifest = manifest_payload.to_canonical_payload().map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!("Failed to canonicalize guest-pair manifest payload: {e}"),
-        )
-    })?;
-    if canonical_manifest != reply.manifest.payload {
-        return Err((
-            "NON_CANONICAL_MANIFEST",
-            "Manifest in /v1/guest/pair reply is not canonical RFC 8785 JCS (fail-closed)"
-                .to_string(),
-        ));
-    }
-    hub_signing_pk
-        .verify_domain_b64(
-            "manifest",
-            reply.manifest.payload.as_bytes(),
-            &reply.manifest.sig,
-        )
-        .map_err(|e| {
-            (
-                "INVALID_SIGNATURE",
-                format!(
-                    "Manifest signature in /v1/guest/pair reply failed pinned hub key verification: {e}"
-                ),
-            )
-        })?;
-    let exp_ms = parse_rfc3339_millis(&manifest_payload.expires_at).map_err(|e| {
-        (
-            "INVALID_MANIFEST",
-            format!("Invalid expiresAt in /v1/guest/pair manifest: {e}"),
-        )
-    })?;
-    if now_unix_ms() > exp_ms {
-        return Err((
-            "MANIFEST_EXPIRED",
-            format!(
-                "Hub manifest in /v1/guest/pair expired at {}",
-                manifest_payload.expires_at
-            ),
-        ));
-    }
+    let manifest_payload =
+        decode_enrollment_manifest(&reply.manifest, hub_node_id, "/v1/guest/pair", "guest-pair")?;
+    verify_manifest_signature(&reply.manifest, hub_signing_pk).map_err(|error| (
+        "INVALID_SIGNATURE",
+        format!("Manifest signature in /v1/guest/pair reply failed pinned hub key verification: {error}"),
+    ))?;
+    verify_enrollment_manifest_expiry(&manifest_payload, "/v1/guest/pair")?;
 
     Ok(GuestEnrollOutcome::Enrolled {
         preset: reply.preset,
@@ -5783,38 +5730,13 @@ pub(crate) fn attempt_delegated_pair_enroll(
         )
     })?;
 
-    let manifest_payload = reply.signed_manifest.decode_payload().map_err(|e| {
-        (
-            200,
-            "INVALID_MANIFEST",
-            format!("Invalid NodeManifestPayload in /v1/pair/delegated reply: {e}"),
-        )
-    })?;
-    if manifest_payload.node_id.as_str() != hub_node_id {
-        return Err((
-            200,
-            "NODE_ID_MISMATCH",
-            format!(
-                "Manifest nodeId '{}' in /v1/pair/delegated reply does not match '{hub_node_id}'",
-                manifest_payload.node_id
-            ),
-        ));
-    }
-    let canonical_manifest = manifest_payload.to_canonical_payload().map_err(|e| {
-        (
-            200,
-            "INVALID_MANIFEST",
-            format!("Failed to canonicalize delegated-pair manifest payload: {e}"),
-        )
-    })?;
-    if canonical_manifest != reply.signed_manifest.payload {
-        return Err((
-            200,
-            "NON_CANONICAL_MANIFEST",
-            "Manifest in /v1/pair/delegated reply is not canonical RFC 8785 JCS (fail-closed)"
-                .to_string(),
-        ));
-    }
+    let manifest_payload = decode_enrollment_manifest(
+        &reply.signed_manifest,
+        hub_node_id,
+        "/v1/pair/delegated",
+        "delegated-pair",
+    )
+    .map_err(|(code, message)| (200, code, message))?;
     let manifest_sign_pk = CryptoOkpJwk::from(&manifest_payload.identity.signing_jwk)
         .to_ed25519()
         .map_err(|e| {
@@ -5849,36 +5771,15 @@ pub(crate) fn attempt_delegated_pair_enroll(
             ));
         }
     }
-    verify_pk
-        .verify_domain_b64(
-            "manifest",
-            reply.signed_manifest.payload.as_bytes(),
-            &reply.signed_manifest.sig,
-        )
-        .map_err(|e| {
-            (
-                200,
-                "INVALID_SIGNATURE",
-                format!("Manifest signature in /v1/pair/delegated reply failed verification: {e}"),
-            )
-        })?;
-    let exp_ms = parse_rfc3339_millis(&manifest_payload.expires_at).map_err(|e| {
+    verify_manifest_signature(&reply.signed_manifest, verify_pk).map_err(|error| {
         (
             200,
-            "INVALID_MANIFEST",
-            format!("Invalid expiresAt in /v1/pair/delegated manifest: {e}"),
+            "INVALID_SIGNATURE",
+            format!("Manifest signature in /v1/pair/delegated reply failed verification: {error}"),
         )
     })?;
-    if now_unix_ms() > exp_ms {
-        return Err((
-            200,
-            "MANIFEST_EXPIRED",
-            format!(
-                "Hub manifest in /v1/pair/delegated expired at {}",
-                manifest_payload.expires_at
-            ),
-        ));
-    }
+    verify_enrollment_manifest_expiry(&manifest_payload, "/v1/pair/delegated")
+        .map_err(|(code, message)| (200, code, message))?;
 
     Ok(DelegatedEnrollSuccess {
         hub_node_id: reply.node_id,
