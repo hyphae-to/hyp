@@ -69,7 +69,7 @@ export function openHyphaeInspector({ terminal, entry }) {
  * @param {object} opts
  * @param {Record<string, string>} opts.theme - Current Herdr `theme()` colors.
  * @param {string} opts.paneId - Pane identifier for stable element IDs.
- * @param {string | null} opts.terminal - Terminal address (`"t4g"` or `"solace/t4g"`).
+ * @param {string | null} opts.terminal - Terminal address (`"t4g"` or `"maple-relay/t4g"`).
  * @param {object | null} opts.entry - Session summary object from `ui/state.json`.
  * @param {boolean | "compact" | "medium" | "wide"} [opts.compact=false] - Width density mode.
  * @param {string} [opts.iconPath="mods/hyphae-pane/hyphae.svg"] - SVG logo path under Herdr home.

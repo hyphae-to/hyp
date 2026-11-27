@@ -11,7 +11,7 @@ Live per-pane Hyphae mesh status pills in every Herdr terminal header paired wit
   - Focus Mode or Mute All (`*`): compact `focus` / `muted` chip.
   - Security Gate quarantine pending: warm alert badge `⚠ N`.
 - **Thread Inspector (`hyphae-panel`, 380×560 floating window or 368 px right dock panel):**
-  - **Header bar (40 px):** Mycelium glyph, `@handle` (or `Unenrolled`), terminal address badge (`t4g` / `solace/t4g`), transport badge (`herdr` / `claude_channel`), Refresh (`↻`), and Close (`×`).
+  - **Header bar (40 px):** Mycelium glyph, `@handle` (or `Unenrolled`), terminal address badge (`t4g` / `maple-relay/t4g`), transport badge (`herdr` / `claude_channel`), Refresh (`↻`), and Close (`×`).
   - **Contextual focus tracking:** Automatically follows the currently focused Herdr pane (`focused()?.terminal`) with zero multi-agent switcher clutter.
   - **Quick-control strip:** `Focus ON/OFF` toggle, `Mute All` (`*`) toggle, and a metadata-only Quarantine banner (`⚠ N quarantined · Run hyp gate review in terminal`) when quarantined items exist.
   - **4 segmented tabs (`Subs`, `Queue`, `Rules`, `Mesh`):**
@@ -23,7 +23,7 @@ Live per-pane Hyphae mesh status pills in every Herdr terminal header paired wit
 ## How it behaves
 
 - **Local panes:** Watches `~/.config/hyphae/ui` (or `<stateDir>/ui` from `node.json`, with `~/.config/hyphae/state/ui` fallback) via `watchFolder` + `readTextFile("state.json")` — zero subprocess spawns and zero polling.
-- **Remote SSH spaces (`solace/t4g`):** Deduplicates fetches across all panes on the same machine via `shared("hyphae.remoteCache")` and refreshes via `exec("hyp", ["inspect", "--all", "--json"], { on: machine })` every 10 s with exponential backoff up to 60 s on error.
+- **Remote SSH spaces (`maple-relay/t4g`):** Deduplicates fetches across all panes on the same machine via `shared("hyphae.remoteCache")` and refreshes via `exec("hyp", ["inspect", "--all", "--json"], { on: machine })` every 10 s with exponential backoff up to 60 s on error.
 - **Clicking the header pill:** Publishes `shared("hyphae.selected")`. If the active layout has a `"hyphae"` child inside `"panel-body"`, selects and opens the right dock panel (`layout.select` + `layout.show`); otherwise opens `hyphae-panel` as a floating window overlay (`key: "hyphae-inspector"`).
 - **Keyboard in `hyphae-panel`:** `1`–`4` switch tabs, `r` refreshes, `Esc` blurs the mute input or closes the overlay. `cmd-shift-h` toggles `hyphae-panel` globally from `keys.json`.
 - **Space switching:** When mounted in `panel-body`, `hyphae-panel` appends `"hyphae"` to `shared("workspace.panels")` once so shipped `mods/tabs` remembers it per space.

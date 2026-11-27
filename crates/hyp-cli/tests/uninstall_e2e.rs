@@ -1357,7 +1357,7 @@ fast_mode = true
         write_json(&chain_path, &orig_sl);
         write_json(
             &config_hyphae.join("node.json"),
-            &json!({ "v": 2, "nodeId": "bogdan@macbook" }),
+            &json!({ "v": 2, "nodeId": "riley@demo-laptop" }),
         );
 
         let default_settings = h.join(".claude/settings.json");

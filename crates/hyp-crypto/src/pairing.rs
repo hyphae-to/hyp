@@ -1428,35 +1428,35 @@ mod tests {
 
     #[test]
     fn parse_ssh_endpoint_valid_and_security_mutations() {
-        let ep1 = parse_ssh_endpoint("ssh://great-northern").unwrap();
+        let ep1 = parse_ssh_endpoint("ssh://cedar-desk").unwrap();
         assert_eq!(ep1.user, None);
-        assert_eq!(ep1.host, "great-northern");
+        assert_eq!(ep1.host, "cedar-desk");
         assert_eq!(ep1.port, None);
         assert_eq!(ep1.state_dir, None);
         assert_eq!(ep1.bin, None);
-        assert_eq!(ep1.target(), "great-northern");
-        assert_eq!(ep1.canonical_url(), "ssh://great-northern");
+        assert_eq!(ep1.target(), "cedar-desk");
+        assert_eq!(ep1.canonical_url(), "ssh://cedar-desk");
         let args1 = ep1.build_ssh_args();
         assert!(args1.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
         assert!(args1.contains(&"-T".to_string()));
         let sep_idx = args1.iter().position(|a| a == "--").unwrap();
-        assert_eq!(args1[sep_idx + 1], "great-northern");
+        assert_eq!(args1[sep_idx + 1], "cedar-desk");
 
-        let ep2 = parse_ssh_endpoint("ssh://ops@bayfold-co-ops").unwrap();
+        let ep2 = parse_ssh_endpoint("ssh://ops@workshop-node").unwrap();
         assert_eq!(ep2.user.as_deref(), Some("ops"));
-        assert_eq!(ep2.host, "bayfold-co-ops");
+        assert_eq!(ep2.host, "workshop-node");
         assert_eq!(ep2.port, None);
-        assert_eq!(ep2.target(), "ops@bayfold-co-ops");
+        assert_eq!(ep2.target(), "ops@workshop-node");
 
-        let ep3 = parse_ssh_endpoint("ssh://ops@solace:2222").unwrap();
+        let ep3 = parse_ssh_endpoint("ssh://ops@maple-relay:2222").unwrap();
         assert_eq!(ep3.user.as_deref(), Some("ops"));
-        assert_eq!(ep3.host, "solace");
+        assert_eq!(ep3.host, "maple-relay");
         assert_eq!(ep3.port, Some(2222));
         let args3 = ep3.build_ssh_args();
         assert!(args3.windows(2).any(|w| w == ["-p", "2222"]));
 
         let ep4 = parse_ssh_endpoint(
-            "ssh://ops@solace:2222?stateDir=/var/lib/hyphae&bin=/usr/local/bin/hyp",
+            "ssh://ops@maple-relay:2222?stateDir=/var/lib/hyphae&bin=/usr/local/bin/hyp",
         )
         .unwrap();
         assert_eq!(ep4.state_dir.as_deref(), Some("/var/lib/hyphae"));
@@ -1473,13 +1473,13 @@ mod tests {
         assert_eq!(ep_v6.http_host_header(), "[::1]:2222");
 
         // validate_endpoint_origin accepts ssh://, https://, loopback http://
-        assert!(validate_endpoint_origin("ssh://ops@solace:2222").is_ok());
+        assert!(validate_endpoint_origin("ssh://ops@maple-relay:2222").is_ok());
         assert!(validate_endpoint_origin("https://alice.tailnet.ts.net").is_ok());
         assert!(validate_endpoint_origin("http://127.0.0.1:8790").is_ok());
         // Still rejects remote plaintext http://
         assert!(validate_endpoint_origin("http://mesh.acme.internal").is_err());
         // validate_http_endpoint_origin strictly rejects ssh://
-        assert!(validate_http_endpoint_origin("ssh://ops@solace").is_err());
+        assert!(validate_http_endpoint_origin("ssh://ops@maple-relay").is_err());
 
         // Security mutation vectors: option injection, shell metacharacters, bad ports, traversal
         let bad_cases = [

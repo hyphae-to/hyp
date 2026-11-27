@@ -73,7 +73,7 @@ Because MVP uses **Ed25519 only**, `crates/hyp-crypto/src/keys.rs`, `hpke.rs`, `
   "v": 1,
   "kind": "secret",
   "claimId": "<22-char base64url 128-bit single-use nonce>",
-  "humanId": "bogdan",
+  "humanId": "riley",
   "humanKid": "<RFC 7638 Ed25519 JWK thumbprint>",
   "authEpoch": 1,
   "issuedAt": "2026-11-24T21:00:00Z",
@@ -103,7 +103,7 @@ Because MVP uses **Ed25519 only**, `crates/hyp-crypto/src/keys.rs`, `hpke.rs`, `
 
 ```json
 {
-  "payload": "{\"authEpoch\":1,\"encryptionJwk\":{\"crv\":\"X25519\",\"kty\":\"OKP\",\"x\":\"...\"},\"expiresAt\":\"2027-11-24T00:00:00Z\",\"humanId\":\"bogdan\",\"humanKid\":\"...\",\"issuedAt\":\"2026-11-24T21:00:00Z\",\"nodeId\":\"prod@eu-1\",\"signingJwk\":{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"...\"},\"v\":1}",
+  "payload": "{\"authEpoch\":1,\"encryptionJwk\":{\"crv\":\"X25519\",\"kty\":\"OKP\",\"x\":\"...\"},\"expiresAt\":\"2027-11-24T00:00:00Z\",\"humanId\":\"riley\",\"humanKid\":\"...\",\"issuedAt\":\"2026-11-24T21:00:00Z\",\"nodeId\":\"prod@eu-1\",\"signingJwk\":{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"...\"},\"v\":1}",
   "sig": "<Ed25519 sig under hyphae/v2/human-node-cert\n>"
 }
 ```

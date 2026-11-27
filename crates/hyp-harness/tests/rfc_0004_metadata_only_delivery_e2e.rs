@@ -263,7 +263,7 @@ async fn rfc0004_decision1_and_2_zero_body_leak_across_all_nine_harnesses_all_ti
     let tmp = TempDir::new().unwrap();
     let node = open_local_node("rfc0004@box", tmp.path());
     let human_kp = Ed25519KeyPair::generate().unwrap();
-    enroll_human_authority(&node, "bogdan", &human_kp, HumanAuthorityRole::Admin);
+    enroll_human_authority(&node, "riley", &human_kp, HumanAuthorityRole::Admin);
 
     let gate_db = Arc::new(Mutex::new(
         NodeDb::open(tmp.path().join("node.sqlite")).unwrap(),
@@ -471,7 +471,7 @@ async fn rfc0004_decision1_and_2_zero_body_leak_across_all_nine_harnesses_all_ti
             json!({
                 "action": "subscribe",
                 "topic": "local.gmail",
-                "key": "gmail:bowd",
+                "key": "gmail:riley",
                 "coalesceSeconds": 0
             }),
         )
@@ -485,7 +485,7 @@ async fn rfc0004_decision1_and_2_zero_body_leak_across_all_nine_harnesses_all_ti
         v: 1,
         claim_id: "claim-rfc0004-1".into(),
         kind: HumanDropKind::Directive,
-        human_id: "bogdan".into(),
+        human_id: "riley".into(),
         human_kid: human_kp.kid(),
         auth_epoch: 1,
         issued_at: format_rfc3339_millis(now),
@@ -517,7 +517,7 @@ async fn rfc0004_decision1_and_2_zero_body_leak_across_all_nine_harnesses_all_ti
             rich_sid,
             "bridge:telegram",
             "br-1",
-            "telegram:moneypenny0bot",
+            "telegram:examplehelper0bot",
             "SECRET_TELEGRAM_BRIDGE_TEXT",
             MailboxKind::Plugin,
             GateTrustTier::Bridge,
@@ -584,10 +584,10 @@ async fn rfc0004_decision1_and_2_zero_body_leak_across_all_nine_harnesses_all_ti
         "missing verified flag: {rich_xml}"
     );
     assert!(rich_xml.contains("<channel name=\"#incidents\" count=\"1\"/>"));
-    assert!(rich_xml.contains("<bridge target=\"telegram:moneypenny0bot\" count=\"1\"/>"));
+    assert!(rich_xml.contains("<bridge target=\"telegram:examplehelper0bot\" count=\"1\"/>"));
     assert!(
         rich_xml
-            .contains("<stream subscription=\"gmail:bowd\" topic=\"local.gmail\" count=\"2\"/>")
+            .contains("<stream subscription=\"gmail:riley\" topic=\"local.gmail\" count=\"2\"/>")
     );
     assert!(rich_xml.contains("<stream topic=\"local.cron\" count=\"1\"/>"));
     assert!(
@@ -634,7 +634,7 @@ async fn rfc0004_decision3_hyp_inbox_acks_by_default_peek_provenance_and_focus_v
     let tmp = TempDir::new().unwrap();
     let node = open_local_node("inbox-d3@box", tmp.path());
     let human_kp = Ed25519KeyPair::generate().unwrap();
-    enroll_human_authority(&node, "bogdan", &human_kp, HumanAuthorityRole::Admin);
+    enroll_human_authority(&node, "riley", &human_kp, HumanAuthorityRole::Admin);
 
     let daemon = LocalDaemon::start(
         Arc::clone(&node),
@@ -666,7 +666,7 @@ async fn rfc0004_decision3_hyp_inbox_acks_by_default_peek_provenance_and_focus_v
         v: 1,
         claim_id: "claim-d3-1".into(),
         kind: HumanDropKind::Directive,
-        human_id: "bogdan".into(),
+        human_id: "riley".into(),
         human_kid: human_kp.kid(),
         auth_epoch: 1,
         issued_at: format_rfc3339_millis(now),

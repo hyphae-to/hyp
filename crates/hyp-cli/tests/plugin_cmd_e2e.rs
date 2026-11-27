@@ -1072,8 +1072,7 @@ fn compiled_hyp_plugin_install_telegram_resolves_bot_username_via_getme_and_fall
                 .and_then(|l| l.split_whitespace().nth(1))
                 .unwrap_or("");
             if path == format!("/bot{ok_tok}/getMe") {
-                let body =
-                    r#"{"ok":true,"result":{"id":7,"is_bot":true,"username":"Moneypenny0_Bot"}}"#;
+                let body = r#"{"ok":true,"result":{"id":7,"is_bot":true,"username":"ExampleHelper0_Bot"}}"#;
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -1094,7 +1093,7 @@ fn compiled_hyp_plugin_install_telegram_resolves_bot_username_via_getme_and_fall
 
     let api_base = format!("http://{addr}");
 
-    // 1. Happy path: stored telegram-bot-token + mock getMe -> defaultTarget == "moneypenny0_bot"
+    // 1. Happy path: stored telegram-bot-token + mock getMe -> defaultTarget == "examplehelper0_bot"
     let tmp_ok = TempDir::new().expect("tempdir ok");
     let home_ok = tmp_ok.path().join("home");
     let state_ok = tmp_ok.path().join("state");
@@ -1135,7 +1134,7 @@ fn compiled_hyp_plugin_install_telegram_resolves_bot_username_via_getme_and_fall
     assert_eq!(json_ok["ok"], true);
     assert_eq!(
         json_ok["data"]["plugins"][0]["defaultTarget"],
-        "moneypenny0_bot"
+        "examplehelper0_bot"
     );
     assert_eq!(
         json_ok["data"]["plugins"][0]["defaultTargetSource"],
@@ -1146,7 +1145,7 @@ fn compiled_hyp_plugin_install_telegram_resolves_bot_username_via_getme_and_fall
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v.as_str().is_some_and(|s| s.contains("moneypenny0_bot"))),
+            .any(|v| v.as_str().is_some_and(|s| s.contains("examplehelper0_bot"))),
         "next hints should suggest resolved target: {}",
         json_ok["next"]
     );

@@ -160,7 +160,7 @@ fn issue10_external_sqlite_lock_seal_survives_node_json_flip_delete_and_gate_ini
     assert_eq!(startup["ok"], true, "daemon startup failed: {startup}");
     let sock_path = PathBuf::from(startup["data"]["socketPath"].as_str().unwrap());
 
-    let passkey = TestPasskeyAdmin::generate("bogdan", "macbook-touchid");
+    let passkey = TestPasskeyAdmin::generate("riley", "macbook-touchid");
     let enroll_json = passkey.enroll_via_web(home, &state_dir, Some(&config_path));
     assert_eq!(enroll_json["data"]["webEnrolled"]["role"], "admin");
     assert!(enroll_json["data"]["secretName"].is_null());
@@ -402,7 +402,7 @@ fn issue10_mutated_wrong_signer_replayed_and_wrong_entrypoint_approvals_fail_clo
 
     // 1. Enroll primary Passkey Admin via `--web`, then enroll a non-admin (`Signer`) AND a
     //    revoked Passkey Admin via Passkey-approved `auth add` / `auth revoke`!
-    let admin = TestPasskeyAdmin::generate("bogdan", "admin-touchid");
+    let admin = TestPasskeyAdmin::generate("riley", "admin-touchid");
     admin.enroll_via_web(home, &state_dir, Some(&config_path));
 
     let signer_only = TestPasskeyAdmin::generate("helper", "signer-only-passkey");
@@ -674,7 +674,7 @@ fn issue10_mutated_wrong_signer_replayed_and_wrong_entrypoint_approvals_fail_clo
     // Attack 7: Unenrolled unknown key -> HTTP 403!
     let rogue_kp = Ed25519KeyPair::generate().unwrap();
     let (rogue_tok, _) =
-        admin.seal_approval_with_signer(&fragment, &action, &rogue_kp, "bogdan", 1, None);
+        admin.seal_approval_with_signer(&fragment, &action, &rogue_kp, "riley", 1, None);
     let (st_rogue, resp_rogue) =
         TestPasskeyAdmin::post_approval_to_fragment(&fragment, &rogue_tok, "https://hyphae.to");
     assert_eq!(st_rogue, 403, "unknown key must be rejected: {resp_rogue}");
@@ -781,7 +781,7 @@ fn issue81_auth_add_and_revoke_refuse_to_reseal_tampered_gate() {
     )
     .unwrap();
 
-    let admin = TestPasskeyAdmin::generate("bogdan", "macbook-touchid");
+    let admin = TestPasskeyAdmin::generate("riley", "macbook-touchid");
     let enroll_json = admin.enroll_via_web(home, &state_dir, Some(&config_path));
     assert_eq!(enroll_json["data"]["webEnrolled"]["role"], "admin");
 

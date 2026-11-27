@@ -2294,7 +2294,7 @@ client._dead.wait(timeout=15)
                                             "message_id": 51,
                                             "date": 1710000100,
                                             "chat": { "id": 77777, "type": "private" },
-                                            "from": { "id": 42, "username": "bogdan", "first_name": "Bogdan" },
+                                            "from": { "id": 42, "username": "riley", "first_name": "Riley" },
                                             "text": "Hello bot username target!"
                                         }
                                     }
@@ -2327,13 +2327,13 @@ client._dead.wait(timeout=15)
         let plugin_script = repo_root().join("plugins/telegram/index.mjs");
 
         // Configure a bot-username target via hello.targets[0] with whitespace-only TELEGRAM_TARGET.
-        // index.mjs MUST pick hello.targets[0] ("moneypenny0bot") with zero hardcoded "personal"!
+        // index.mjs MUST pick hello.targets[0] ("examplehelper0bot") with zero hardcoded "personal"!
         let mut cfg = SubprocessConfig::new(
             "telegram",
             AdapterKind::Bridge,
             node_bin,
             vec![plugin_script.to_string_lossy().into_owned()],
-            vec!["moneypenny0bot".to_string()],
+            vec!["examplehelper0bot".to_string()],
         );
 
         cfg.env.insert(
@@ -2353,13 +2353,16 @@ client._dead.wait(timeout=15)
         let _ = host.wait_for_event_count(1, Duration::from_secs(10)).await;
         let all_events = host.published_events().await;
         assert_eq!(all_events.len(), 1);
-        assert_eq!(all_events[0].0, "moneypenny0bot");
-        assert_eq!(all_events[0].1.source, "telegram/moneypenny0bot");
+        assert_eq!(all_events[0].0, "examplehelper0bot");
+        assert_eq!(all_events[0].1.source, "telegram/examplehelper0bot");
 
         let post_ok = supervisor
             .post(
-                "moneypenny0bot",
-                BTreeMap::from([("text".to_string(), json!("Hello back from moneypenny0bot"))]),
+                "examplehelper0bot",
+                BTreeMap::from([(
+                    "text".to_string(),
+                    json!("Hello back from examplehelper0bot"),
+                )]),
                 Duration::from_secs(5),
             )
             .await

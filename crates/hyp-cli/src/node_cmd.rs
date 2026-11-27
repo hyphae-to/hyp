@@ -1606,7 +1606,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let secrets = SecretStore::new(tmp.path(), SecretBackend::File);
         secrets
-            .set("github-bowd-token", "hyphae_gh_tok_bowd_1")
+            .set("github-riley-token", "hyphae_gh_tok_riley_1")
             .unwrap();
         secrets
             .set("github-bayfold-special", "hyphae_gh_tok_special_2")
@@ -1622,7 +1622,7 @@ mod tests {
                 "allowPrivateWithToken": true,
                 "maxActivePollers": 42,
                 "repoTokens": {
-                    "Bowd": { "secret": "github-bowd-token" },
+                    "Riley": { "secret": "github-riley-token" },
                     "bayfold/Special": { "secret": "github-bayfold-special" },
                     "missing-org/*": { "secret": "github-missing-org-token" }
                 }
@@ -1632,7 +1632,7 @@ mod tests {
                 "kind": "github-public",
                 "topic": "github",
                 "enabled": true,
-                "githubToken": { "secret": "github-bowd-token" }
+                "githubToken": { "secret": "github-riley-token" }
             }
         ]);
 
@@ -1643,7 +1643,10 @@ mod tests {
 
         assert!(cfg.allow_private_with_token);
         assert_eq!(cfg.max_active_pollers, 42);
-        assert_eq!(cfg.token_for_repo("bowd/app"), Some("hyphae_gh_tok_bowd_1"));
+        assert_eq!(
+            cfg.token_for_repo("riley/app"),
+            Some("hyphae_gh_tok_riley_1")
+        );
         assert_eq!(
             cfg.token_for_repo("bayfold/special"),
             Some("hyphae_gh_tok_special_2")
@@ -1652,7 +1655,7 @@ mod tests {
         assert_eq!(cfg.token_for_repo("oss/public"), None);
         assert_eq!(
             cfg.configured_token_scopes(),
-            vec!["bayfold/special".to_string(), "bowd/*".to_string()]
+            vec!["bayfold/special".to_string(), "riley/*".to_string()]
         );
 
         assert!(
@@ -1704,7 +1707,7 @@ mod tests {
                     "kind": "github-public",
                     "enabled": true,
                     "repoTokens": {
-                        bad_pat: { "secret": "github-bowd-token" }
+                        bad_pat: { "secret": "github-riley-token" }
                     }
                 }
             ]);
@@ -1986,7 +1989,7 @@ mod tests {
                     .and_then(|l| l.split_whitespace().nth(1))
                     .unwrap_or("");
                 if path == format!("/bot{ok_tok}/getMe") {
-                    let body = r#"{"ok":true,"result":{"username":"Moneypenny0_Bot"}}"#;
+                    let body = r#"{"ok":true,"result":{"username":"ExampleHelper0_Bot"}}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
@@ -2035,7 +2038,7 @@ mod tests {
         );
         assert!(skipped_ok.is_empty(), "skipped: {skipped_ok:?}");
         assert_eq!(parsed_ok.len(), 1);
-        assert_eq!(parsed_ok[0].config.targets, vec!["moneypenny0_bot"]);
+        assert_eq!(parsed_ok[0].config.targets, vec!["examplehelper0_bot"]);
         assert!(warnings_ok.is_empty(), "warnings: {warnings_ok:?}");
 
         // 2. HTTP 500 from getMe falls back to ["personal"] without blocking startup or leaking token!

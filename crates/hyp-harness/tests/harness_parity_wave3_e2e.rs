@@ -898,7 +898,7 @@ async fn x8_codex_uuid_session_auto_attaches_queue_transport_when_rollout_exists
             origin_node: "peer@box".into(),
             item_id: "cx-dm-1".into(),
             source: "peer@box/dev".into(),
-            text: "[hyphae · human-verified · bogdan] AUTO_WIRED_CODEX_QUEUE_WAKEUP".into(),
+            text: "[hyphae · human-verified · riley] AUTO_WIRED_CODEX_QUEUE_WAKEUP".into(),
             kind: MailboxKind::Message,
             trust_tier: GateTrustTier::Peer,
         })

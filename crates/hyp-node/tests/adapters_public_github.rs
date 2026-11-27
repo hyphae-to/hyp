@@ -1535,7 +1535,7 @@ async fn handle_multi_token_github(
 
     let required_auth_for = |repo: &str| -> Option<&'static str> {
         match repo {
-            "bowd/personal-priv" => Some("Bearer hyphae_gh_tok_bowd_a"),
+            "riley/personal-priv" => Some("Bearer hyphae_gh_tok_riley_a"),
             "bayfold/org-priv" => Some("Bearer hyphae_gh_tok_bayfold_b"),
             "bayfold/special" => Some("Bearer hyphae_gh_tok_bayfold_special_c"),
             _ => None,
@@ -1615,7 +1615,7 @@ async fn handle_multi_token_github(
         // Repo visibility metadata: GET /repos/{owner}/{repo}
         let repo = rest.to_ascii_lowercase();
         let (status, body) = match repo.as_str() {
-            "bowd/personal-priv" | "bayfold/org-priv" | "bayfold/special" => {
+            "riley/personal-priv" | "bayfold/org-priv" | "bayfold/special" => {
                 let expected = required_auth_for(&repo).unwrap();
                 if auth.as_deref() == Some(expected) {
                     (
@@ -1709,7 +1709,7 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
     // Store 3 distinct owner/repo tokens in an isolated file SecretStore (ZERO default `github_token`!).
     let tmp = tempfile::tempdir().unwrap();
     let store = SecretStore::new(tmp.path(), SecretBackend::File);
-    store.set("gh-bowd", "hyphae_gh_tok_bowd_a").unwrap();
+    store.set("gh-riley", "hyphae_gh_tok_riley_a").unwrap();
     store.set("gh-bayfold", "hyphae_gh_tok_bayfold_b").unwrap();
     store
         .set("gh-bayfold-special", "hyphae_gh_tok_bayfold_special_c")
@@ -1725,7 +1725,7 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
         max_active_pollers: 10,
         ..GitHubPublicConfig::default()
     };
-    cfg.with_repo_token_from_store("Bowd", &store, "gh-bowd")
+    cfg.with_repo_token_from_store("Riley", &store, "gh-riley")
         .unwrap()
         .with_repo_token_from_store("Bayfold/*", &store, "gh-bayfold")
         .unwrap()
@@ -1737,7 +1737,7 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
         vec![
             "bayfold/*".to_string(),
             "bayfold/special".to_string(),
-            "bowd/*".to_string(),
+            "riley/*".to_string(),
         ]
     );
 
@@ -1746,10 +1746,10 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
     adapter.start(host.clone()).await.unwrap();
 
     // 2. Visibility validation:
-    //    - bowd/personal-priv, bayfold/org-priv, bayfold/special, oss/public-repo -> ALL pass!
+    //    - riley/personal-priv, bayfold/org-priv, bayfold/special, oss/public-repo -> ALL pass!
     //    - other-org/priv -> FAILS CLOSED (no matching token -> even with allow_private_with_token: true)!
     for ok_repo in [
-        "bowd/personal-priv",
+        "riley/personal-priv",
         "bayfold/org-priv",
         "bayfold/special",
         "oss/public-repo",
@@ -1781,7 +1781,7 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
 
     // 3. Coalesce all 4 accessible repos (3 private across 2 owners + 1 public) into ONE adapter!
     let subs: Vec<CompiledSubscription> = [
-        "bowd/personal-priv",
+        "riley/personal-priv",
         "bayfold/org-priv",
         "bayfold/special",
         "oss/public-repo",
@@ -1805,7 +1805,7 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
     loop {
         let evs = host.events().await;
         let ids: Vec<&str> = evs.iter().map(|(_, e)| e.id.as_str()).collect();
-        if ids.contains(&"evt-bowd-personal-priv")
+        if ids.contains(&"evt-riley-personal-priv")
             && ids.contains(&"evt-bayfold-org-priv")
             && ids.contains(&"evt-bayfold-special")
             && ids.contains(&"evt-oss-public-repo")
@@ -1823,11 +1823,11 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
     let recorded = state.requests.lock().await.clone();
     assert!(!recorded.is_empty());
     for (path, auth_hdr) in &recorded {
-        if path.starts_with("/repos/bowd/personal-priv") {
+        if path.starts_with("/repos/riley/personal-priv") {
             assert_eq!(
                 auth_hdr.as_deref(),
-                Some("Bearer hyphae_gh_tok_bowd_a"),
-                "bowd/personal-priv got wrong auth header on {path}: {auth_hdr:?}"
+                Some("Bearer hyphae_gh_tok_riley_a"),
+                "riley/personal-priv got wrong auth header on {path}: {auth_hdr:?}"
             );
         } else if path.starts_with("/repos/bayfold/org-priv") {
             assert_eq!(
@@ -1867,7 +1867,7 @@ async fn multi_owner_repo_tokens_strict_isolation_coalescing_pattern_validation_
         ..GitHubPublicConfig::default()
     };
     cap_cfg
-        .with_repo_token_from_store("bowd/*", &store, "gh-bowd")
+        .with_repo_token_from_store("riley/*", &store, "gh-riley")
         .unwrap()
         .with_repo_token_from_store("bayfold/*", &store, "gh-bayfold")
         .unwrap()

@@ -2475,7 +2475,7 @@ fn subscription_meta_persists_across_reopen_and_cleans_up_atomically() {
             .set_subscription_meta(
                 "sub-1",
                 &hyp_store::SubscriptionMeta {
-                    key: Some("gmail:bowd".into()),
+                    key: Some("gmail:riley".into()),
                     urgency: Some("interrupt".into()),
                 },
             )
@@ -2515,18 +2515,18 @@ fn subscription_meta_persists_across_reopen_and_cleans_up_atomically() {
         .get_subscription_meta("sub-1")
         .unwrap()
         .expect("persisted meta for sub-1");
-    assert_eq!(meta1.key.as_deref(), Some("gmail:bowd"));
+    assert_eq!(meta1.key.as_deref(), Some("gmail:riley"));
     assert_eq!(meta1.urgency.as_deref(), Some("interrupt"));
 
     let found = db
         .events()
-        .find_subscription_by_key("claude:s1", "gmail:bowd")
+        .find_subscription_by_key("claude:s1", "gmail:riley")
         .unwrap()
         .expect("find_subscription_by_key must locate persisted key");
     assert_eq!(found.id, "sub-1");
     assert!(
         db.events()
-            .find_subscription_by_key("claude:s2", "gmail:bowd")
+            .find_subscription_by_key("claude:s2", "gmail:riley")
             .unwrap()
             .is_none(),
         "key lookup must be scoped per subscriber"

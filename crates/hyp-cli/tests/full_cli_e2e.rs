@@ -1250,7 +1250,7 @@ fn status_and_doctor_classify_inbound_local_v2_peers_and_fail_closed_without_enc
     db.peers()
         .upsert_peer(
             &PeerInput {
-                peer_id: "bowd@great-northern".to_string(),
+                peer_id: "riley@cedar-desk".to_string(),
                 endpoint: None,
                 profile: PeerProfile::Local,
                 trust_tier: TrustTier::Org,
@@ -1264,7 +1264,7 @@ fn status_and_doctor_classify_inbound_local_v2_peers_and_fail_closed_without_enc
     db.peers()
         .upsert_peer_key(
             &PeerKeyInput {
-                peer_id: "bowd@great-northern".to_string(),
+                peer_id: "riley@cedar-desk".to_string(),
                 kid: client_keys.encryption.public_key().kid(),
                 key_use: KeyUse::Encryption,
                 jwk_json: serde_json::to_string(&client_keys.encryption_jwk()).unwrap(),
@@ -1341,14 +1341,14 @@ fn status_and_doctor_classify_inbound_local_v2_peers_and_fail_closed_without_enc
     let status_json = parse_json_stdout(&status_out);
     let peers = status_json["data"]["peers"].as_array().unwrap();
     let find_peer = |id: &str| peers.iter().find(|p| p["peer"] == id);
-    let gn = find_peer("bowd@great-northern").expect("inbound local v2 peer present");
-    assert_eq!(gn["status"], "ok");
-    assert_eq!(gn["proto"], "v2");
-    assert_eq!(gn["version"], "v2-client");
-    assert_eq!(gn["e2ee"], "dm+chan");
-    assert_eq!(gn["kv"], "kv.e2ee.v1");
+    let desktop_peer = find_peer("riley@cedar-desk").expect("inbound local v2 peer present");
+    assert_eq!(desktop_peer["status"], "ok");
+    assert_eq!(desktop_peer["proto"], "v2");
+    assert_eq!(desktop_peer["version"], "v2-client");
+    assert_eq!(desktop_peer["e2ee"], "dm+chan");
+    assert_eq!(desktop_peer["kv"], "kv.e2ee.v1");
     assert!(
-        gn["notes"]
+        desktop_peer["notes"]
             .as_str()
             .unwrap()
             .contains("inbound v2 local client")

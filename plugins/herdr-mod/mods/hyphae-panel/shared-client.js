@@ -64,7 +64,7 @@ export function withAlpha(color, hexAlpha) {
 /**
  * Parses a Herdr terminal address into `{ machine, rawTid, address }`.
  * - `"t4g"` -> `{ machine: null, rawTid: "t4g", address: "t4g" }`
- * - `"solace/t4g"` -> `{ machine: "solace", rawTid: "t4g", address: "solace/t4g" }`
+ * - `"maple-relay/t4g"` -> `{ machine: "maple-relay", rawTid: "t4g", address: "maple-relay/t4g" }`
  */
 export function parseTerminalAddress(terminal) {
   if (typeof terminal !== "string") {

@@ -1273,10 +1273,10 @@ async fn node_start_repo_tokens_warnings_plaintext_fail_closed_and_gate_auth_hea
     let state_dir = tmp.path().join("state");
     fs::create_dir_all(&state_dir).unwrap();
 
-    // Populate ONLY `github-bowd-token`; omit `github-bayfold-token` to verify warning isolation.
+    // Populate ONLY `github-riley-token`; omit `github-bayfold-token` to verify warning isolation.
     let store = SecretStore::new(&state_dir, SecretBackend::File);
     store
-        .set("github-bowd-token", "hyphae_gh_tok_cli_bowd_999")
+        .set("github-riley-token", "hyphae_gh_tok_cli_riley_999")
         .unwrap();
 
     // 1. Valid `repoTokens` + missing secondary secret + duplicate enabled `github-public` source.
@@ -1294,7 +1294,7 @@ async fn node_start_repo_tokens_warnings_plaintext_fail_closed_and_gate_auth_hea
                 "allowPrivateWithToken": true,
                 "maxActivePollers": 25,
                 "repoTokens": {
-                    "bowd/*": { "secret": "github-bowd-token" },
+                    "riley/*": { "secret": "github-riley-token" },
                     "bayfold/*": { "secret": "github-bayfold-token" }
                 }
             },
@@ -1303,7 +1303,7 @@ async fn node_start_repo_tokens_warnings_plaintext_fail_closed_and_gate_auth_hea
                 "kind": "github-public",
                 "topic": "github",
                 "enabled": true,
-                "githubToken": { "secret": "github-bowd-token" }
+                "githubToken": { "secret": "github-riley-token" }
             }
         ]
     });
@@ -1341,10 +1341,10 @@ async fn node_start_repo_tokens_warnings_plaintext_fail_closed_and_gate_auth_hea
     assert_eq!(startup_env["data"]["githubPublicEnabled"], true);
     assert_eq!(
         startup_env["data"]["githubPublicTokenScopes"],
-        json!(["bowd/*"])
+        json!(["riley/*"])
     );
     assert!(
-        !startup_line.contains("hyphae_gh_tok_cli_bowd_999"),
+        !startup_line.contains("hyphae_gh_tok_cli_riley_999"),
         "raw GitHub token must NEVER appear in startup JSON!"
     );
 

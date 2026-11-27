@@ -180,7 +180,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
     let dir = TempDir::new().unwrap();
     let state_dir = dir.path().join("state");
 
-    // ---- Boot #1: join & subscribe with `key: "gmail:bowd"` and `mode: "interrupt"` ----
+    // ---- Boot #1: join & subscribe with `key: "gmail:riley"` and `mode: "interrupt"` ----
     let sub_id_1 = {
         let node = UnifiedNode::open(make_local_node_config(&state_dir, &["agentmail"])).unwrap();
         let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
@@ -209,7 +209,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
                 json!({
                     "action": "subscribe",
                     "topic": "local.agentmail",
-                    "key": "gmail:bowd",
+                    "key": "gmail:riley",
                     "filters": [{ "exact": { "type": "email.received" } }],
                     "mode": "interrupt",
                 }),
@@ -231,7 +231,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
         let subs = list_res["subscriptions"].as_array().unwrap();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0]["id"], sub_id);
-        assert_eq!(subs[0]["key"], "gmail:bowd");
+        assert_eq!(subs[0]["key"], "gmail:riley");
         assert_eq!(subs[0]["mode"], "interrupt");
 
         mcp.close().await;
@@ -251,7 +251,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
         let mut mcp = TestMcpClient::spawn(&sock_path);
         mcp.initialize().await;
 
-        // `list` after restart MUST still return `key == "gmail:bowd"` and `mode == "interrupt"`!
+        // `list` after restart MUST still return `key == "gmail:riley"` and `mode == "interrupt"`!
         let (list_after_restart, list_err) = mcp
             .call_verified_claude(
                 &sock_path,
@@ -265,7 +265,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0]["id"], sub_id_1);
         assert_eq!(
-            subs[0]["key"], "gmail:bowd",
+            subs[0]["key"], "gmail:riley",
             "subscription key must survive restart: {list_after_restart}"
         );
         assert_eq!(
@@ -273,7 +273,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
             "subscription urgency mode must survive restart: {list_after_restart}"
         );
 
-        // Re-subscribing with the same `key: "gmail:bowd"` MUST update in place with ZERO duplicates!
+        // Re-subscribing with the same `key: "gmail:riley"` MUST update in place with ZERO duplicates!
         let (resub_res, resub_err) = mcp
             .call_verified_claude(
                 &sock_path,
@@ -282,7 +282,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
                 json!({
                     "action": "subscribe",
                     "topic": "local.agentmail",
-                    "key": "gmail:bowd",
+                    "key": "gmail:riley",
                     "filters": [{ "exact": { "type": "email.urgent" } }],
                     "mode": "notify",
                 }),
@@ -314,7 +314,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
             "re-subscribing after restart MUST NOT create duplicate subscriptions: {list_after_update}"
         );
         assert_eq!(subs2[0]["id"], sub_id_1);
-        assert_eq!(subs2[0]["key"], "gmail:bowd");
+        assert_eq!(subs2[0]["key"], "gmail:riley");
         assert_eq!(subs2[0]["mode"], "notify");
         assert_eq!(
             subs2[0]["filters"],
@@ -342,7 +342,7 @@ async fn stream_subscription_key_and_urgency_survive_daemon_restart_without_dupl
                 &sock_path,
                 "sess-restart-1",
                 "hyp_stream",
-                json!({ "action": "unsubscribe", "key": "gmail:bowd" }),
+                json!({ "action": "unsubscribe", "key": "gmail:riley" }),
             )
             .await;
         assert!(!unsub_err, "unsubscribe by key failed: {unsub_res}");
@@ -393,7 +393,7 @@ async fn stream_subscribe_reports_accurate_stored_event_count_for_bare_and_local
     for i in 1..=2 {
         let ev = CloudEvent::new(
             format!("mail-{i}"),
-            "agentmail://inbox/bowd",
+            "agentmail://inbox/riley",
             "com.agentmail.message.received",
             json!({ "subject": format!("hello {i}") }),
         );
@@ -448,7 +448,7 @@ async fn stream_subscribe_reports_accurate_stored_event_count_for_bare_and_local
             .observed
             .sources
             .iter()
-            .any(|s| s == "agentmail://inbox/bowd")
+            .any(|s| s == "agentmail://inbox/riley")
     );
 
     let alerts_entry = catalog
