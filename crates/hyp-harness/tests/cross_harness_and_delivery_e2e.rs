@@ -3544,6 +3544,7 @@ case "$1" in
     exit 0
     ;;
   send)
+    printf '%s\n' 'send log complete' >> "{log}"
     printf '%s\n' '{{"ok":true}}'
     exit 0
     ;;
@@ -3638,13 +3639,20 @@ esac
     assert!(!dm_err);
 
     let mut log_contents = String::new();
+    let mut send_logged = false;
     for _ in 0..100 {
         log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if log_contents.contains("send --json --if idle t9h") {
+        // The multiline payload can be partially visible while fake-hc is writing it.
+        send_logged = log_contents.lines().any(|line| line == "send log complete");
+        if send_logged {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        send_logged,
+        "timed out waiting for fake-hc to finish logging send:\n{log_contents}"
+    );
     assert!(
         log_contents.contains("send --json --if idle t9h")
             && log_contents.contains(
