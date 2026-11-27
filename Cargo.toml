@@ -6,6 +6,7 @@ members = [
   "crates/hyp-crypto",
   "crates/hyp-store",
   "crates/hyp-node",
+  "crates/hyp-pairing-client",
   "crates/hyp-harness",
   "crates/hyp-harness/daemon",
   "crates/hyp-harness/client",
@@ -29,6 +30,7 @@ hyp-proto = { path = "crates/hyp-proto" }
 hyp-crypto = { path = "crates/hyp-crypto" }
 hyp-store = { path = "crates/hyp-store" }
 hyp-node = { path = "crates/hyp-node" }
+hyp-pairing-client = { path = "crates/hyp-pairing-client" }
 hyp-harness = { path = "crates/hyp-harness" }
 hyp-daemon = { path = "crates/hyp-harness/daemon" }
 hyp-harness-client = { path = "crates/hyp-harness/client" }

@@ -10,6 +10,7 @@ Hyphae uses a pure-Rust workspace (Rust 1.87+, `edition = "2024"`).
 - `crates/hyp-crypto` — Zeroized Ed25519 & RFC 7748 X25519 (`ring`), RFC 9180 HPKE Base Mode, E2EE DMs/`#channels`/KV, streaming AEAD `tar.gz` (`flate2`), `hp2p1_`/`am2_`/v1 compat, `SecretStore`.
 - `crates/hyp-store` — Single WAL `node.sqlite` (`rusqlite` bundled), atomic migrations, `EventStore`, `MessageStore`, `ChannelStore`, `KvStore`, `TransferStore`, `LocalStateStore` (`gate_audit` immutability triggers), `PeerStore`, exact `next_deadline_ms()` scheduler.
 - `crates/hyp-node` — `UnifiedNode` engine, `hyper 1` HTTP/SSE Peer Server & `PeerLink`, `SecurityGatePipeline` + 6 filter plugins, `DeliveryEngine` (delivery policy, burst protection, token-budget hybrid packer, paginated inbox), compiled-in webhook adapters & deduplicated `github-public` ETag poller.
+- `crates/hyp-pairing-client` — Outbound P2P and Admin-CA handshakes, signed manifest fetching, and guest and delegated enrollment over the node HTTP and SSH transports.
 - `crates/hyp-harness` — Compatibility re-exports and cross-harness integration tests. New consumers can depend directly on the package they use.
   - `ipc/` (`hyp-harness-ipc`) owns local socket framing, wire fields, session identifiers, loopback KV authentication, and the shared test-environment switch.
   - `client/` (`hyp-harness-client`) implements synchronous hooks, MCP stdio, and wait/watch on top of IPC.

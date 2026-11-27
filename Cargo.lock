@@ -480,6 +480,7 @@ dependencies = [
  "hyp-harness-transport",
  "hyp-mycelium",
  "hyp-node",
+ "hyp-pairing-client",
  "hyp-proto",
  "hyp-store",
  "hyper",
@@ -649,6 +650,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "hyp-pairing-client"
+version = "0.7.0"
+dependencies = [
+ "http",
+ "hyp-crypto",
+ "hyp-node",
+ "hyp-proto",
+ "hyp-store",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

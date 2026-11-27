@@ -16,6 +16,7 @@ hyp-proto.workspace = true
 hyp-crypto.workspace = true
 hyp-store.workspace = true
 hyp-node.workspace = true
+hyp-pairing-client.workspace = true
 hyp-daemon.workspace = true
 hyp-harness-client.workspace = true
 hyp-harness-ipc.workspace = true

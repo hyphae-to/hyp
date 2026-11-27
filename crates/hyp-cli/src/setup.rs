@@ -14,7 +14,7 @@ use crate::config_file::{
 use crate::harness_spec::{HarnessSpec, spec};
 use crate::node_cmd::CliNodeProfile;
 use crate::pair::{
-    LiveHandshakeError, OnboardJoinResult, live_join_url_for_onboard, live_pair_am2_for_onboard,
+    OnboardJoinResult, live_join_url_for_onboard, live_pair_am2_for_onboard,
     live_pair_hp2p1_for_onboard,
 };
 use crate::service;
@@ -39,6 +39,7 @@ use hyp_harness_client::hooks::shell_quote_cli;
 use hyp_harness_ipc::protocol::HarnessKind;
 use hyp_node::engine::NodeProfile;
 use hyp_node::node_file::NodeFile;
+use hyp_pairing_client::LiveHandshakeError;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_store::{NodeDb, PeerInput, PeerProfile, PeerStatus, TrustTier, now_ms};
 use serde::Serialize;
