@@ -191,9 +191,7 @@ impl Skillshare {
                 .get(index + 1)
                 .ok_or("Existing --backend has no value")?;
             if value != kind.as_str() {
-                return Err(format!(
-                    "Existing backend {value} does not match {target}; preserved explicit override"
-                ));
+                return Err("Existing explicit backend does not match the selected client; preserved its configuration".into());
             }
             args.drain(index..=index + 1);
         }
