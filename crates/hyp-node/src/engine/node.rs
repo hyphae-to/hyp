@@ -2329,7 +2329,8 @@ impl UnifiedNode {
             } else {
                 db.peers().claim_grant(&grant.id, &entry_json, now)?;
             }
-            db.peers().upsert_peer(
+            persist_peer_with_keys(
+                &db,
                 &PeerInput {
                     peer_id: binding.node_id.clone(),
                     endpoint: None,
@@ -2339,28 +2340,17 @@ impl UnifiedNode {
                     scopes: expanded_scopes.clone(),
                     auth_credential_ref: None,
                 },
-                now,
-            )?;
-            db.peers().rotate_peer_key(
-                &PeerKeyInput {
-                    peer_id: binding.node_id.clone(),
-                    kid: sign_kid.clone(),
-                    key_use: KeyUse::Signing,
-                    jwk_json: serde_json::to_string(&binding.signing_jwk)?,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
-                now,
-            )?;
-            db.peers().rotate_peer_key(
-                &PeerKeyInput {
-                    peer_id: binding.node_id.clone(),
-                    kid: enc_kid.clone(),
-                    key_use: KeyUse::Encryption,
-                    jwk_json: serde_json::to_string(&binding.encryption_jwk)?,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
+                PeerKeyPersistence::Rotate,
+                [
+                    (
+                        sign_kid.clone(),
+                        serde_json::to_string(&binding.signing_jwk),
+                    ),
+                    (
+                        enc_kid.clone(),
+                        serde_json::to_string(&binding.encryption_jwk),
+                    ),
+                ],
                 now,
             )?;
 
@@ -2522,7 +2512,8 @@ impl UnifiedNode {
                 }
             }
 
-            db.peers().upsert_peer(
+            persist_peer_with_keys(
+                &db,
                 &PeerInput {
                     peer_id: req.node_id.clone(),
                     endpoint: None,
@@ -2532,28 +2523,11 @@ impl UnifiedNode {
                     scopes: guest_scopes.clone(),
                     auth_credential_ref: None,
                 },
-                now,
-            )?;
-            db.peers().upsert_peer_key(
-                &PeerKeyInput {
-                    peer_id: req.node_id.clone(),
-                    kid: signing_kid,
-                    key_use: KeyUse::Signing,
-                    jwk_json: sign_jwk_json,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
-                now,
-            )?;
-            db.peers().upsert_peer_key(
-                &PeerKeyInput {
-                    peer_id: req.node_id.clone(),
-                    kid: enc_kid,
-                    key_use: KeyUse::Encryption,
-                    jwk_json: enc_jwk_json,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
+                PeerKeyPersistence::Upsert,
+                [
+                    (signing_kid, Ok(sign_jwk_json)),
+                    (enc_kid, Ok(enc_jwk_json)),
+                ],
                 now,
             )?;
         }
@@ -2990,26 +2964,14 @@ impl UnifiedNode {
                 now,
             )?;
 
-            db.peers().rotate_peer_key(
-                &PeerKeyInput {
-                    peer_id: req.node_id.clone(),
-                    kid: sign_kid.clone(),
-                    key_use: KeyUse::Signing,
-                    jwk_json: sign_jwk_json,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
-                now,
-            )?;
-            db.peers().rotate_peer_key(
-                &PeerKeyInput {
-                    peer_id: req.node_id.clone(),
-                    kid: enc_kid.clone(),
-                    key_use: KeyUse::Encryption,
-                    jwk_json: enc_jwk_json,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
+            persist_peer_key_pair(
+                &db,
+                &req.node_id,
+                PeerKeyPersistence::Rotate,
+                [
+                    (sign_kid.clone(), Ok(sign_jwk_json)),
+                    (enc_kid.clone(), Ok(enc_jwk_json)),
+                ],
                 now,
             )?;
 
@@ -3634,26 +3596,20 @@ impl UnifiedNode {
                 },
                 now,
             )?;
-            db.peers().upsert_peer_key(
-                &PeerKeyInput {
-                    peer_id: verified.bob_node_id.clone(),
-                    kid: bob_sign_kid.clone(),
-                    key_use: KeyUse::Signing,
-                    jwk_json: serde_json::to_string(&verified.bob_signing_pk.to_jwk())?,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
-                now,
-            )?;
-            db.peers().upsert_peer_key(
-                &PeerKeyInput {
-                    peer_id: verified.bob_node_id.clone(),
-                    kid: bob_enc_kid,
-                    key_use: KeyUse::Encryption,
-                    jwk_json: serde_json::to_string(&verified.bob_encryption_pk.to_jwk())?,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
+            persist_peer_key_pair(
+                &db,
+                &verified.bob_node_id,
+                PeerKeyPersistence::Upsert,
+                [
+                    (
+                        bob_sign_kid.clone(),
+                        serde_json::to_string(&verified.bob_signing_pk.to_jwk()),
+                    ),
+                    (
+                        bob_enc_kid,
+                        serde_json::to_string(&verified.bob_encryption_pk.to_jwk()),
+                    ),
+                ],
                 now,
             )?;
         }
@@ -3824,7 +3780,8 @@ impl UnifiedNode {
 
         {
             let db = self.db();
-            db.peers().upsert_peer(
+            persist_peer_with_keys(
+                &db,
                 &PeerInput {
                     peer_id: offer.node_id.clone(),
                     endpoint: Some(offer.endpoint.clone()),
@@ -3835,28 +3792,17 @@ impl UnifiedNode {
                     scopes: expanded_to_alice.clone(),
                     auth_credential_ref: Some(cred_ref),
                 },
-                now,
-            )?;
-            db.peers().upsert_peer_key(
-                &PeerKeyInput {
-                    peer_id: offer.node_id.clone(),
-                    kid: alice_sign_pk.kid(),
-                    key_use: KeyUse::Signing,
-                    jwk_json: serde_json::to_string(&offer.signing_jwk)?,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
-                now,
-            )?;
-            db.peers().upsert_peer_key(
-                &PeerKeyInput {
-                    peer_id: offer.node_id.clone(),
-                    kid: alice_enc_pk.kid(),
-                    key_use: KeyUse::Encryption,
-                    jwk_json: serde_json::to_string(&offer.encryption_jwk)?,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
+                PeerKeyPersistence::Upsert,
+                [
+                    (
+                        alice_sign_pk.kid(),
+                        serde_json::to_string(&offer.signing_jwk),
+                    ),
+                    (
+                        alice_enc_pk.kid(),
+                        serde_json::to_string(&offer.encryption_jwk),
+                    ),
+                ],
                 now,
             )?;
             let _ = db.peers().add_grant(
@@ -4837,26 +4783,20 @@ impl UnifiedNode {
                 .next()
                 .map(|k| k.kid);
 
-            db.peers().rotate_peer_key(
-                &PeerKeyInput {
-                    peer_id: caller_node.to_string(),
-                    kid: new_sign_kid.clone(),
-                    key_use: KeyUse::Signing,
-                    jwk_json: serde_json::to_string(&req.signing_jwk)?,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
-                now,
-            )?;
-            db.peers().rotate_peer_key(
-                &PeerKeyInput {
-                    peer_id: caller_node.to_string(),
-                    kid: new_enc_kid.clone(),
-                    key_use: KeyUse::Encryption,
-                    jwk_json: serde_json::to_string(&req.encryption_jwk)?,
-                    status: KeyStatus::Active,
-                    expires_at: None,
-                },
+            persist_peer_key_pair(
+                &db,
+                caller_node,
+                PeerKeyPersistence::Rotate,
+                [
+                    (
+                        new_sign_kid.clone(),
+                        serde_json::to_string(&req.signing_jwk),
+                    ),
+                    (
+                        new_enc_kid.clone(),
+                        serde_json::to_string(&req.encryption_jwk),
+                    ),
+                ],
                 now,
             )?;
 
@@ -9818,6 +9758,48 @@ fn ensure_private_dir(path: &std::path::Path) -> Result<(), NodeError> {
         hyp_crypto::CryptoError::Io(error) => NodeError::Io(error),
         error => NodeError::Crypto(error),
     })
+}
+
+#[derive(Clone, Copy)]
+enum PeerKeyPersistence {
+    Upsert,
+    Rotate,
+}
+
+fn persist_peer_with_keys(
+    db: &NodeDb,
+    peer: &PeerInput,
+    persistence: PeerKeyPersistence,
+    keys: [(String, serde_json::Result<String>); 2],
+    now: i64,
+) -> Result<(), NodeError> {
+    db.peers().upsert_peer(peer, now)?;
+    persist_peer_key_pair(db, &peer.peer_id, persistence, keys, now)
+}
+
+fn persist_peer_key_pair(
+    db: &NodeDb,
+    peer_id: &str,
+    persistence: PeerKeyPersistence,
+    keys: [(String, serde_json::Result<String>); 2],
+    now: i64,
+) -> Result<(), NodeError> {
+    let peers = db.peers();
+    for ((kid, jwk_json), key_use) in keys.into_iter().zip([KeyUse::Signing, KeyUse::Encryption]) {
+        let input = PeerKeyInput {
+            peer_id: peer_id.to_owned(),
+            kid,
+            key_use,
+            jwk_json: jwk_json?,
+            status: KeyStatus::Active,
+            expires_at: None,
+        };
+        match persistence {
+            PeerKeyPersistence::Upsert => peers.upsert_peer_key(&input, now),
+            PeerKeyPersistence::Rotate => peers.rotate_peer_key(&input, now),
+        }?;
+    }
+    Ok(())
 }
 
 fn expand_node_scopes<S: AsRef<str>>(raw_scopes: &[S]) -> Result<Vec<String>, NodeError> {
