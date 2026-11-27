@@ -179,15 +179,23 @@ jobs:
           echo "All JS/TS, Python, shell, PowerShell, and raw script parity checks passed."
 
   rust-workspace:
-    name: Rust (${{ matrix.os }})
+    name: Rust (${{ matrix.os }}, test-debug=${{ matrix.test_debug }})
     needs: detect-changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.detect-changes.result == 'success' && needs.detect-changes.outputs.run_rust == 'true')) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.os != 'all' && format('["{0}"]', inputs.os) || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+        include:
+          - os: ubuntu-latest
+            test_debug: default
+          - os: ubuntu-latest
+            test_debug: line-tables-only
+          - os: macos-latest
+            test_debug: default
+          - os: windows-latest
+            test_debug: default
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -207,6 +215,11 @@ jobs:
         with:
           shared-key: rust-ci-workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Experiment only: matched cold targets; retain the registry download cache.
+      - name: Clear restored build artifacts for matched comparison
+        if: runner.os == 'Linux'
+        run: cargo clean
 
       - name: Formatting check (rustfmt)
         if: runner.os == 'Linux'
@@ -264,14 +277,25 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
 
+      - name: Compile workspace test executables (timed separately)
+        env:
+          CARGO_PROFILE_TEST_DEBUG: ${{ matrix.test_debug == 'default' && '2' || matrix.test_debug }}
+        run: cargo test --workspace --locked --no-run --timings
+
       - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
+        env:
+          CARGO_PROFILE_TEST_DEBUG: ${{ matrix.test_debug == 'default' && '2' || matrix.test_debug }}
         # The dedicated Linux live plugin step captures output to detect skips.
         run: cargo nextest run --workspace --locked --no-fail-fast ${{ runner.os == 'Linux' && '-E "not binary(=real_plugins_e2e)"' || '' }}
 
       - name: Workspace doctests
+        env:
+          CARGO_PROFILE_TEST_DEBUG: ${{ matrix.test_debug == 'default' && '2' || matrix.test_debug }}
         run: cargo test --workspace --locked --doc
 
       - name: Verify live Node.js & Python external plugin E2E (zero skips)
+        env:
+          CARGO_PROFILE_TEST_DEBUG: ${{ matrix.test_debug == 'default' && '2' || matrix.test_debug }}
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -386,3 +410,12 @@ jobs:
             }
           }
           Write-Host "PowerShell AST parse, dry-run & isolated uninstall verified."
+
+      - name: Upload Cargo experiment timings
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-${{ matrix.os }}-${{ matrix.test_debug }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
