@@ -43,6 +43,7 @@ use hyp_crypto::keystore::SecretStore;
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
+use hyp_node::engine::pairing_client::{AuthClaimHttpError, collect_auth_claim_reply};
 use hyp_node::engine::{AuthClaimReply, AuthClaimRequest};
 use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
@@ -1693,27 +1694,26 @@ fn post_auth_claim(
             .body(Full::new(Bytes::from(body_bytes)))
             .map_err(|e| ("HTTP_ERROR", format!("Failed to build claim request: {e}")))?;
 
-        let resp =
-            tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
-                .await
-                .map_err(|_| {
-                    (
-                        "CLAIM_TIMEOUT",
-                        format!("POST {url} timed out after {HTTP_TIMEOUT_SECS}s"),
-                    )
-                })?
-                .map_err(|e| ("CLAIM_FAILED", format!("POST {url} failed: {e}")))?;
-
-        let status = resp.status().as_u16();
-        let bytes = read_hyper_body_bounded(resp.into_body(), MAX_HTTP_RESP_BYTES)
-            .await
-            .map_err(|_| {
-                (
-                    "CLAIM_FAILED",
-                    format!("Failed to read response from {url}"),
-                )
-            })?;
-        Ok::<(u16, Vec<u8>), (&'static str, String)>((status, bytes))
+        collect_auth_claim_reply(
+            client.request(req),
+            Some(Duration::from_secs(HTTP_TIMEOUT_SECS)),
+            MAX_HTTP_RESP_BYTES,
+        )
+        .await
+        .map(|(status, bytes)| (status.as_u16(), bytes))
+        .map_err(|error| match error {
+            AuthClaimHttpError::Timeout => (
+                "CLAIM_TIMEOUT",
+                format!("POST {url} timed out after {HTTP_TIMEOUT_SECS}s"),
+            ),
+            AuthClaimHttpError::Request(error) => {
+                ("CLAIM_FAILED", format!("POST {url} failed: {error}"))
+            }
+            AuthClaimHttpError::Body(_) => (
+                "CLAIM_FAILED",
+                format!("Failed to read response from {url}"),
+            ),
+        })
     })?;
 
     if status != 200 {

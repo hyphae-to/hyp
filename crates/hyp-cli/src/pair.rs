@@ -19,10 +19,7 @@ use http::{Method, Request, header};
 use hyp_crypto::compat_v1::{
     PairingCodeV1, derive_pairing_key_v1, issue_grant_v1, parse_pairing_code_v1,
 };
-use hyp_crypto::human::{
-    DelegatedPairProofV1, SignedNodeCertV1, encode_hcert1, node_cert_sha256,
-    sign_delegated_pair_proof,
-};
+use hyp_crypto::human::{SignedNodeCertV1, encode_hcert1};
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{
     Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk as CryptoOkpJwk, SignedPayload,
@@ -36,21 +33,23 @@ use hyp_crypto::manifest::{
 };
 use hyp_crypto::pairing::{
     AM2_PREFIX, AdminInviteMetadata, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES,
-    P2pOfferMetadata, P2pOfferToken, P2pPairConfirmation, P2pPairResponse, SshEndpoint,
-    create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1, encode_am2_with_metadata,
+    P2pOfferMetadata, P2pOfferToken, P2pPairResponse, SshEndpoint, create_p2p_offer,
+    create_p2p_response, decode_am2, decode_hp2p1, encode_am2_with_metadata,
     encode_hp2p1_with_metadata, parse_ssh_endpoint, sign_grant_v2, validate_endpoint_origin,
     validate_http_endpoint_origin, validate_ssh_posix_path, verify_grant_v2,
-    verify_p2p_confirmation,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_node::engine::http_util::{
     BoundedBodyError, HttpClient, consume_bounded_body, empty_body, full_body, percent_encode,
     resolve_ssh_binary,
 };
-use hyp_node::engine::peer_link::{PairBindingV2, PairRequestV2};
+use hyp_node::engine::pairing_client::{
+    AdminPairReplyError, AdminPairRequestError, build_admin_pair_request,
+    build_delegated_pair_request, p2p_counter_grant,
+};
 use hyp_node::engine::{
-    DelegatedPairReply, DelegatedPairRequest, GuestPairReply, GuestPairRequest, P2pPairServerReply,
-    PairServerReply, guest_pair_proof_canonical, p2p_offer_secret_name,
+    DelegatedPairReply, GuestPairReply, GuestPairRequest, P2pPairServerReply, PairServerReply,
+    guest_pair_proof_canonical, p2p_offer_secret_name,
 };
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{
@@ -2742,19 +2741,14 @@ fn execute_live_p2p_handshake(
 ) -> Result<LiveP2pHandshakeResult, LiveHandshakeError> {
     let now_db = now_ms();
     let bob_grant_id = format!("p2p-{}", offer.offer_id);
-    let bob_grant = GrantV2 {
-        v: 2,
-        id: bob_grant_id.clone(),
-        node_id: offer.node_id.clone(),
-        scopes: granted_scopes.to_vec(),
-        trust_tier: Some(trust_tier.as_str().to_string()),
-        pairing_key: None,
-        subject_signing_jwk: Some(offer.signing_jwk.clone()),
-        subject_encryption_jwk: Some(offer.encryption_jwk.clone()),
-        issued_at: format_rfc3339_millis(now_db),
-        pair_by: None,
-        expires_at: None,
-    };
+    let bob_grant = p2p_counter_grant(
+        offer,
+        bob_grant_id.clone(),
+        granted_scopes.to_vec(),
+        trust_tier.as_str(),
+        format_rfc3339_millis(now_db),
+        None,
+    );
     let bob_grant_signed = sign_grant_v2(&bob_grant, &local_keys.signing).map_err(|e| {
         LiveHandshakeError::Rejected {
             code: "GRANT_ERROR",
@@ -2798,11 +2792,8 @@ fn execute_live_p2p_handshake(
         });
     }
 
-    let confirmation = P2pPairConfirmation {
-        offer_id: server_reply.offer_id.clone(),
-        alice_grant_to_bob: server_reply.alice_grant_to_bob.clone(),
-    };
-    let alice_grant_verified = verify_p2p_confirmation(offer, &confirmation, local_node_id)
+    let alice_grant_verified = server_reply
+        .verify_grant(offer, local_node_id)
         .map_err(|e| LiveHandshakeError::Rejected {
             code: "INVALID_SIGNATURE",
             message: format!(
@@ -2848,53 +2839,29 @@ fn execute_live_am2_handshake(
     local_keys: &NodeIdentityKeys,
     inline_signed_grant: Option<&SignedPayload>,
 ) -> Result<LiveAm2HandshakeResult, LiveHandshakeError> {
-    let pair_kp = derive_pairing_key_v1(&parsed_v1.secret, &parsed_v1.grant_id).map_err(|e| {
-        LiveHandshakeError::Rejected {
-            code: "INVALID_TOKEN",
-            message: format!("Failed to derive one-time pairing key from am2_ bundle: {e}"),
-        }
-    })?;
-
-    let binding = PairBindingV2 {
-        v: 2,
-        grant_id: parsed_v1.grant_id.clone(),
-        node_id: local_node_id.to_string(),
-        signing_jwk: local_keys.signing_jwk(),
-        encryption_jwk: local_keys.encryption_jwk(),
-        bound_at: format_rfc3339_millis(now_ms()),
-    };
-    let payload = to_canonical_json(&binding).map_err(|e| LiveHandshakeError::Rejected {
-        code: "ENCODE_ERROR",
-        message: format!("Failed to canonicalize PairBindingV2: {e}"),
-    })?;
-    let pairing_sig = pair_kp.sign_domain_b64("binding", payload.as_bytes());
-    let self_sig = local_keys
-        .signing
-        .sign_domain_b64("binding-self", payload.as_bytes());
-
-    let pair_req = PairRequestV2 {
-        grant_id: parsed_v1.grant_id.clone(),
-        payload,
-        pairing_sig,
-        self_sig,
-    };
-    let mut req_val =
-        serde_json::to_value(&pair_req).map_err(|e| LiveHandshakeError::Rejected {
-            code: "ENCODE_ERROR",
-            message: format!("Failed to serialize PairRequestV2: {e}"),
-        })?;
-    if let Some(sg) = inline_signed_grant {
-        if let Some(obj) = req_val.as_object_mut() {
-            let sg_val = serde_json::to_value(sg).map_err(|e| LiveHandshakeError::Rejected {
-                code: "ENCODE_ERROR",
-                message: format!("Failed to serialize inline signedGrant: {e}"),
-            })?;
-            obj.insert("signedGrant".to_string(), sg_val);
-        }
-    }
-    let req_bytes = serde_json::to_vec(&req_val).map_err(|e| LiveHandshakeError::Rejected {
-        code: "ENCODE_ERROR",
-        message: format!("Failed to serialize PairRequestV2: {e}"),
+    let req_bytes = build_admin_pair_request(
+        parsed_v1,
+        local_node_id,
+        local_keys,
+        inline_signed_grant,
+        || format_rfc3339_millis(now_ms()),
+    )
+    .map_err(|error| {
+        let (code, message) = match error {
+            AdminPairRequestError::PairingKey(error) => (
+                "INVALID_TOKEN",
+                format!("Failed to derive one-time pairing key from am2_ bundle: {error}"),
+            ),
+            AdminPairRequestError::Canonicalization(error) => (
+                "ENCODE_ERROR",
+                format!("Failed to canonicalize PairBindingV2: {error}"),
+            ),
+            AdminPairRequestError::Serialization(error) => (
+                "ENCODE_ERROR",
+                format!("Failed to serialize PairRequestV2: {error}"),
+            ),
+        };
+        LiveHandshakeError::Rejected { code, message }
     })?;
 
     let url = format!("{}/v1/pair", invite.router.trim_end_matches('/'));
@@ -2941,22 +2908,18 @@ fn execute_live_am2_handshake(
         }
     }
 
-    let verified_grant =
-        verify_grant_v2(&reply.grant, admin_pk).map_err(|e| LiveHandshakeError::Rejected {
-            code: "INVALID_SIGNATURE",
-            message: format!(
-                "Hub /v1/pair returned grant that failed Admin-CA signature verification: {e}"
-            ),
-        })?;
-    if verified_grant.node_id != local_node_id {
-        return Err(LiveHandshakeError::Rejected {
-            code: "PAIR_REJECTED",
-            message: format!(
-                "Hub returned grant for nodeId '{}' which does not match local nodeId '{local_node_id}'",
-                verified_grant.node_id
-            ),
-        });
-    }
+    let verified_grant = reply.verify_grant(admin_pk, local_node_id).map_err(|error| {
+        match error {
+            AdminPairReplyError::Signature(error) => LiveHandshakeError::Rejected {
+                code: "INVALID_SIGNATURE",
+                message: format!("Hub /v1/pair returned grant that failed Admin-CA signature verification: {error}"),
+            },
+            AdminPairReplyError::WrongNode(actual) => LiveHandshakeError::Rejected {
+                code: "PAIR_REJECTED",
+                message: format!("Hub returned grant for nodeId '{actual}' which does not match local nodeId '{local_node_id}'"),
+            },
+        }
+    })?;
 
     let (manifest_payload, hub_signing_pk, hub_encryption_pk) =
         verify_signed_manifest_strict(&reply.signed_manifest, Some(&reply.node_id), None, None)
@@ -5295,34 +5258,17 @@ pub(crate) fn attempt_delegated_pair_enroll(
         )
     })?;
 
-    let ed25519_jwk = local_keys.signing_jwk();
-    let x25519_jwk = local_keys.encryption_jwk();
-    let timestamp = format_rfc3339_millis(now_unix_ms());
-    let trimmed_cert = hcert1.trim();
-    let proof = DelegatedPairProofV1 {
-        hub_node_id: hub_node_id.to_string(),
-        node_id: local_node_id.to_string(),
-        ed25519_jwk: ed25519_jwk.clone(),
-        x25519_jwk: x25519_jwk.clone(),
-        node_cert_sha256: node_cert_sha256(trimmed_cert),
-        timestamp: timestamp.clone(),
-    };
-    let proof_sig = sign_delegated_pair_proof(&proof, &local_keys.signing).map_err(|e| {
-        (
-            0u16,
-            "SIGN_ERROR",
-            format!("Failed to sign DelegatedPairProofV1: {e}"),
-        )
-    })?;
-
-    let req_body = DelegatedPairRequest {
-        node_id: local_node_id.to_string(),
-        ed25519_jwk,
-        x25519_jwk,
-        node_cert: trimmed_cert.to_string(),
-        timestamp,
-        proof_sig,
-    };
+    let req_body =
+        build_delegated_pair_request(hub_node_id, local_node_id, local_keys, hcert1, || {
+            format_rfc3339_millis(now_unix_ms())
+        })
+        .map_err(|e| {
+            (
+                0u16,
+                "SIGN_ERROR",
+                format!("Failed to sign DelegatedPairProofV1: {e}"),
+            )
+        })?;
     let req_bytes = serde_json::to_vec(&req_body).map_err(|e| {
         (
             0u16,
