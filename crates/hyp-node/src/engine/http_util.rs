@@ -628,49 +628,91 @@ pub struct HttpClient {
     ssh_shutdown: Arc<watch::Sender<bool>>,
 }
 
-/// Builds a shared `hyper 1` + `hyper-rustls` client (ring + webpki-roots, HTTPS + loopback HTTP).
-pub fn build_http_client<B>()
--> Result<Client<hyper_rustls::HttpsConnector<HttpConnector>, B>, String>
+/// HTTP protocol advertisement remains an explicit caller policy.
+#[derive(Clone, Copy)]
+pub enum HttpProtocols {
+    Http1,
+    Http1And2,
+}
+
+fn finish_http_client<B>(
+    tls: HttpsConnectorBuilder<hyper_rustls::builderstates::WantsSchemes>,
+    protocols: HttpProtocols,
+    max_idle_per_host: Option<usize>,
+) -> Client<HttpsConnector<HttpConnector>, B>
 where
-    B: hyper::body::Body + Send + 'static + Unpin,
+    B: Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let connector = tls.https_or_http().enable_http1();
+    let connector = match protocols {
+        HttpProtocols::Http1 => connector.build(),
+        HttpProtocols::Http1And2 => connector.enable_http2().build(),
+    };
+    let mut builder = Client::builder(TokioExecutor::new());
+    if let Some(max_idle) = max_idle_per_host {
+        builder.pool_max_idle_per_host(max_idle);
+    }
+    builder.build(connector)
+}
+
+/// Explicit ring + Mozilla roots, without changing the process's default crypto provider.
+/// Callers retain their own TLS-initialization diagnostics and URL validation.
+pub fn build_ring_http_client<B>(
+    protocols: HttpProtocols,
+) -> Result<Client<HttpsConnector<HttpConnector>, B>, rustls::Error>
+where
+    B: Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let tls = HttpsConnectorBuilder::new()
+        .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())?;
+    Ok(finish_http_client(tls, protocols, None))
+}
+
+/// Uses the process's existing default crypto provider, Mozilla roots and HTTP/1.1+2.
+pub fn build_default_http_client<B>() -> Client<HttpsConnector<HttpConnector>, B>
+where
+    B: Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    finish_http_client(
+        HttpsConnectorBuilder::new().with_webpki_roots(),
+        HttpProtocols::Http1And2,
+        None,
+    )
+}
+
+/// Builds a shared `hyper 1` + `hyper-rustls` client (ring + webpki-roots, HTTPS + loopback HTTP).
+pub fn build_http_client<B>() -> Result<Client<HttpsConnector<HttpConnector>, B>, String>
+where
+    B: Body + Send + 'static + Unpin,
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let connector = HttpsConnectorBuilder::new()
-        .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
-        .map_err(|e| format!("TLS connector initialization failed: {e}"))?
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
+    build_ring_http_client(HttpProtocols::Http1And2)
+        .map_err(|e| format!("TLS connector initialization failed: {e}"))
 }
 
 /// Builds the HTTP/1.1 client used by short-lived wake and probe requests.
 pub fn build_unpooled_http1_client() -> Client<HttpsConnector<HttpConnector>, Full<Bytes>> {
-    let connector = HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .build();
-    Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(0)
-        .build(connector)
+    finish_http_client(
+        HttpsConnectorBuilder::new().with_webpki_roots(),
+        HttpProtocols::Http1,
+        Some(0),
+    )
 }
 
 impl HttpClient {
     /// Constructs a new `HttpClient` with `rustls` (`ring` + `webpki-roots`),
     /// permitting HTTPS, loopback HTTP, and strictly validated `ssh://` peer transports.
     pub fn new() -> Result<Self, NodeError> {
-        let connector = HttpsConnectorBuilder::new()
-            .with_provider_and_webpki_roots(rustls::crypto::ring::default_provider())
-            .map_err(|e| NodeError::Http(format!("TLS connector init failed: {e}")))?
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-        let inner = Client::builder(TokioExecutor::new()).build(connector);
+        let inner = build_ring_http_client(HttpProtocols::Http1And2)
+            .map_err(|e| NodeError::Http(format!("TLS connector init failed: {e}")))?;
         let (ssh_shutdown, _) = watch::channel(false);
         Ok(Self {
             inner,

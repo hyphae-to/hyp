@@ -18,7 +18,6 @@ hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
-webpki-roots.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 serde.workspace = true
