@@ -24,6 +24,10 @@ lint-js:
 test-js:
     npm run test:js
 
+# Regenerate the repository and Claude plugin copies of the runtime mesh skill
+generate-runtime-skills:
+    HYP_REGENERATE_RUNTIME_SKILLS=1 cargo test -p hyp-cli --bin hyp skill_render::tests::static_runtime_skills_match_renderer -- --exact
+
 # Activate repo-tracked git hooks (.githooks/pre-push)
 install-hooks:
     git config core.hooksPath .githooks
