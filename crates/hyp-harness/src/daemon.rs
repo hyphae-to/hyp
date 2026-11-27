@@ -659,6 +659,9 @@ struct SessionRuntime {
     gate_retry: Option<GateHoldRetry>,
     /// Serializes inbox reconciliation across async gate evaluations.
     reconcile_lock: Option<Arc<AsyncMutex<()>>>,
+    quarantine_notices: Vec<QuarantineNoticeMeta>,
+    herdr_bare_shell_rejection: Option<String>,
+    openclaw_session_missing: bool,
 }
 
 impl SessionRuntime {
@@ -670,6 +673,9 @@ impl SessionRuntime {
             && self.transport_retry.is_none()
             && self.gate_retry.is_none()
             && self.reconcile_lock.is_none()
+            && self.quarantine_notices.is_empty()
+            && self.herdr_bare_shell_rejection.is_none()
+            && !self.openclaw_session_missing
     }
 }
 
@@ -689,8 +695,6 @@ struct LocalDaemonInner {
     /// hydrated from SQLite `sessions.backend_json` on startup and updated on every backend merge.
     /// Ensures `active_transport_kind` / `daemon.status` / `ui/state.json` NEVER re-enter `node.db()`.
     openclaw_targets: Mutex<HashMap<String, (String, String)>>,
-    /// OpenClaw sessions whose target was reported missing (`createIfMissing: false`) until new activity.
-    openclaw_missing_sessions: Mutex<HashSet<String>>,
     /// Attached native external push transports (`Herdr`, `T3`, `OpenClaw`, `CodexQueue`, or test doubles).
     session_transports: Mutex<HashMap<String, AttachedPushTransport>>,
     /// Deterministic 256-bit HMAC-SHA256 key loaded/persisted in `SecretStore` under
@@ -709,9 +713,6 @@ struct LocalDaemonInner {
     herdr_terminal_index: Mutex<HashMap<String, Vec<String>>>,
     /// Active background auto-detection probe watchers keyed by `session_id`.
     pending_probes: Mutex<HashMap<String, watch::Receiver<bool>>>,
-    /// Sessions whose Herdr probe proved a live bare shell (`status == null` / `status.app == null`):
-    /// maps `session_id -> terminal_id` so `--backend herdr` enrollment fails closed explicitly.
-    herdr_bare_shell_rejections: Mutex<HashMap<String, String>>,
     flushing: Mutex<HashSet<String>>,
     /// Per-session classified metadata for `Pending` receipts (`receipt -> meta`).
     item_meta: Mutex<HashMap<String, HashMap<String, ClassifiedItemMeta>>>,
@@ -719,8 +720,6 @@ struct LocalDaemonInner {
     sub_meta: Mutex<HashMap<String, Vec<SubscriptionRecordMeta>>>,
     /// Receipts dismissed by Security Gate (`Block` or `Quarantine` in pipeline) so they never surface.
     dismissed_receipts: Mutex<HashSet<String>>,
-    /// Per-session coalesced metadata-only quarantine notices (`G10`).
-    quarantine_notices: Mutex<HashMap<String, Vec<QuarantineNoticeMeta>>>,
     /// Registered pluggable outbound bridge handlers keyed by lowercase plugin slug.
     bridge_posters: Mutex<HashMap<String, Arc<dyn BridgePoster>>>,
     /// Optional custom async hook invoked on `"peers.reload"` IPC RPCs.
@@ -1859,19 +1858,16 @@ impl LocalDaemonInner {
             channels: Mutex::new(HashMap::new()),
             openclaw_service: Mutex::new(None),
             openclaw_targets: Mutex::new(hydrated_openclaw_targets),
-            openclaw_missing_sessions: Mutex::new(HashSet::new()),
             session_transports: Mutex::new(HashMap::new()),
             session_token_key,
             env_file_exported_sessions: Mutex::new(hydrated_env_exported),
             hook_registered_sessions: Mutex::new(HashSet::new()),
             herdr_terminal_index: Mutex::new(hydrated_herdr_index),
             pending_probes: Mutex::new(HashMap::new()),
-            herdr_bare_shell_rejections: Mutex::new(HashMap::new()),
             flushing: Mutex::new(HashSet::new()),
             item_meta: Mutex::new(HashMap::new()),
             sub_meta: Mutex::new(hydrated_sub_meta),
             dismissed_receipts: Mutex::new(HashSet::new()),
-            quarantine_notices: Mutex::new(HashMap::new()),
             bridge_posters: Mutex::new(HashMap::new()),
             peers_reloader: Mutex::new(None),
             wake_hooks: Mutex::new(Vec::new()),
@@ -2594,15 +2590,6 @@ impl LocalDaemonInner {
             }
             {
                 let mut guard = self
-                    .quarantine_notices
-                    .lock()
-                    .expect("quarantine_notices lock poisoned");
-                for sid in &pruned {
-                    guard.remove(sid);
-                }
-            }
-            {
-                let mut guard = self
                     .herdr_terminal_index
                     .lock()
                     .expect("herdr_terminal_index lock poisoned");
@@ -2631,16 +2618,17 @@ impl LocalDaemonInner {
                 }
             }
             {
-                let mut guard = self
-                    .herdr_bare_shell_rejections
-                    .lock()
-                    .expect("herdr_bare_shell_rejections lock poisoned");
-                for sid in &pruned {
-                    guard.remove(sid);
+                let mut sessions = self.session_runtime();
+                for session_id in &pruned {
+                    if let Some(runtime) = sessions.get_mut(session_id) {
+                        runtime.herdr_bare_shell_rejection = None;
+                        runtime.lazy_hydrate_attempt_at = None;
+                        runtime.quarantine_notices.clear();
+                        if runtime.is_empty() {
+                            sessions.remove(session_id);
+                        }
+                    }
                 }
-            }
-            for session_id in &pruned {
-                self.clear_lazy_hydrate_cooldown(session_id);
             }
             self.bump_ui_rev();
         }
@@ -2688,11 +2676,11 @@ impl LocalDaemonInner {
         let Some(rcpt) = receipt.filter(|r| !r.is_empty()) else {
             return;
         };
-        let mut guard = self
-            .quarantine_notices
-            .lock()
-            .expect("quarantine_notices lock poisoned");
-        let list = guard.entry(session_id.to_string()).or_default();
+        let mut sessions = self.session_runtime();
+        let list = &mut sessions
+            .entry(session_id.to_owned())
+            .or_default()
+            .quarantine_notices;
         if list.iter().any(|n| n.receipt == rcpt) {
             return;
         }
@@ -2710,21 +2698,17 @@ impl LocalDaemonInner {
     }
 
     fn clear_quarantine_notice(&self, session_id: Option<&str>, receipt: &str) {
-        let mut guard = self
-            .quarantine_notices
-            .lock()
-            .expect("quarantine_notices lock poisoned");
-        if let Some(sid) = session_id {
-            if let Some(list) = guard.get_mut(sid) {
-                list.retain(|n| n.receipt != receipt);
-                if list.is_empty() {
-                    guard.remove(sid);
-                }
-            }
+        let remove = |runtime: &mut SessionRuntime| {
+            runtime
+                .quarantine_notices
+                .retain(|notice| notice.receipt != receipt);
+        };
+        if let Some(session_id) = session_id {
+            self.clear_runtime_field(session_id, remove);
         } else {
-            guard.retain(|_, list| {
-                list.retain(|n| n.receipt != receipt);
-                !list.is_empty()
+            self.session_runtime().retain(|_, runtime| {
+                remove(runtime);
+                !runtime.is_empty()
             });
         }
     }
@@ -2732,14 +2716,11 @@ impl LocalDaemonInner {
     /// Returns active (still `gate_state == 'quarantined'` in SQLite) metadata-only notices for
     /// `session_id`, pruning any receipts already approved or rejected (`G10`).
     fn live_quarantine_notices_json(&self, session_id: &str) -> Vec<Value> {
-        let snapshot: Vec<QuarantineNoticeMeta> = {
-            let guard = self
-                .quarantine_notices
-                .lock()
-                .expect("quarantine_notices lock poisoned");
-            guard.get(session_id).cloned().unwrap_or_default()
-        };
-        if snapshot.is_empty() {
+        let has_notices = self
+            .session_runtime()
+            .get(session_id)
+            .is_some_and(|runtime| !runtime.quarantine_notices.is_empty());
+        if !has_notices {
             return Vec::new();
         }
         let still_quarantined: HashSet<String> = {
@@ -2752,27 +2733,19 @@ impl LocalDaemonInner {
                 .collect()
         };
         let mut live = Vec::new();
-        {
-            let mut guard = self
-                .quarantine_notices
-                .lock()
-                .expect("quarantine_notices lock poisoned");
-            if let Some(list) = guard.get_mut(session_id) {
-                list.retain(|n| still_quarantined.contains(&n.receipt));
-                for n in list.iter() {
-                    live.push(json!({
-                        "receipt": n.receipt,
-                        "source": n.source,
-                        "trustTier": n.trust_tier,
-                        "reason": n.reason,
-                        "quarantinedAt": n.quarantined_at,
-                    }));
-                }
-                if list.is_empty() {
-                    guard.remove(session_id);
-                }
+        self.clear_runtime_field(session_id, |runtime| {
+            let list = &mut runtime.quarantine_notices;
+            list.retain(|n| still_quarantined.contains(&n.receipt));
+            for n in list.iter() {
+                live.push(json!({
+                    "receipt": n.receipt,
+                    "source": n.source,
+                    "trustTier": n.trust_tier,
+                    "reason": n.reason,
+                    "quarantinedAt": n.quarantined_at,
+                }));
             }
-        }
+        });
         live
     }
 
@@ -2794,23 +2767,15 @@ impl LocalDaemonInner {
                 .collect()
         };
         let mut out = Vec::new();
-        {
-            let mut guard = self
-                .quarantine_notices
-                .lock()
-                .expect("quarantine_notices lock poisoned");
-            if let Some(list) = guard.get_mut(session_id) {
-                list.retain(|n| still_quarantined.contains(&n.receipt));
-                for n in list.iter() {
-                    if !n.surfaced_in_batch {
-                        out.push(n.receipt.clone());
-                    }
-                }
-                if list.is_empty() {
-                    guard.remove(session_id);
+        self.clear_runtime_field(session_id, |runtime| {
+            let list = &mut runtime.quarantine_notices;
+            list.retain(|n| still_quarantined.contains(&n.receipt));
+            for n in list.iter() {
+                if !n.surfaced_in_batch {
+                    out.push(n.receipt.clone());
                 }
             }
-        }
+        });
         out
     }
 
@@ -2818,17 +2783,13 @@ impl LocalDaemonInner {
         if receipts.is_empty() {
             return;
         }
-        let mut guard = self
-            .quarantine_notices
-            .lock()
-            .expect("quarantine_notices lock poisoned");
-        if let Some(list) = guard.get_mut(session_id) {
-            for n in list.iter_mut() {
-                if !n.surfaced_in_batch && receipts.contains(&n.receipt) {
-                    n.surfaced_in_batch = true;
+        self.clear_runtime_field(session_id, |runtime| {
+            for notice in &mut runtime.quarantine_notices {
+                if !notice.surfaced_in_batch && receipts.contains(&notice.receipt) {
+                    notice.surfaced_in_batch = true;
                 }
             }
-        }
+        });
     }
 
     /// Enqueues a trusted daemon-generated metadata-only system notice into `session_id`'s
@@ -3008,12 +2969,9 @@ impl LocalDaemonInner {
         });
         interrupted_active.sort();
 
-        self.openclaw_missing_sessions
-            .lock()
-            .expect("openclaw_missing_sessions lock poisoned")
-            .clear();
         self.session_runtime().retain(|_, runtime| {
             runtime.lazy_hydrate_attempt_at = None;
+            runtime.openclaw_session_missing = false;
             !runtime.is_empty()
         });
 
@@ -3155,10 +3113,9 @@ impl LocalDaemonInner {
             return false;
         }
         if self
-            .openclaw_missing_sessions
-            .lock()
-            .expect("openclaw_missing_sessions lock poisoned")
-            .contains(session_id)
+            .session_runtime()
+            .get(session_id)
+            .is_some_and(|runtime| runtime.openclaw_session_missing)
         {
             return false;
         }
@@ -3167,10 +3124,9 @@ impl LocalDaemonInner {
     }
 
     fn clear_openclaw_session_missing(&self, session_id: &str) {
-        self.openclaw_missing_sessions
-            .lock()
-            .expect("openclaw_missing_sessions lock poisoned")
-            .remove(session_id);
+        self.clear_runtime_field(session_id, |runtime| {
+            runtime.openclaw_session_missing = false
+        });
     }
 
     fn active_transport_kind(&self, session_id: &str) -> Option<&'static str> {
@@ -3210,25 +3166,22 @@ impl LocalDaemonInner {
     }
 
     fn record_herdr_bare_shell_rejection(&self, session_id: &str, terminal_id: &str) {
-        self.herdr_bare_shell_rejections
-            .lock()
-            .expect("herdr_bare_shell_rejections lock poisoned")
-            .insert(session_id.to_string(), terminal_id.to_string());
+        self.session_runtime()
+            .entry(session_id.to_owned())
+            .or_default()
+            .herdr_bare_shell_rejection = Some(terminal_id.to_owned());
     }
 
     fn clear_herdr_bare_shell_rejection(&self, session_id: &str) {
-        self.herdr_bare_shell_rejections
-            .lock()
-            .expect("herdr_bare_shell_rejections lock poisoned")
-            .remove(session_id);
+        self.clear_runtime_field(session_id, |runtime| {
+            runtime.herdr_bare_shell_rejection = None
+        });
     }
 
     fn herdr_bare_shell_rejection(&self, session_id: &str) -> Option<String> {
-        self.herdr_bare_shell_rejections
-            .lock()
-            .expect("herdr_bare_shell_rejections lock poisoned")
+        self.session_runtime()
             .get(session_id)
-            .cloned()
+            .and_then(|runtime| runtime.herdr_bare_shell_rejection.clone())
     }
 
     fn clear_lazy_hydrate_cooldown(&self, session_id: &str) {
@@ -4746,10 +4699,10 @@ impl LocalDaemonInner {
                                     | REASON_OPENCLAW_INVALID_SESSION_KEY
                             )
                         ) {
-                            self.openclaw_missing_sessions
-                                .lock()
-                                .expect("openclaw_missing_sessions lock poisoned")
-                                .insert(session_id.to_string());
+                            self.session_runtime()
+                                .entry(session_id.to_owned())
+                                .or_default()
+                                .openclaw_session_missing = true;
                             terminal_error = ack.reason;
                             self.cancel_hold_retry(session_id);
                             self.bump_ui_rev();
@@ -7881,11 +7834,10 @@ async fn handle_connection<R, W>(
                                 tx: oc_wake_tx.clone(),
                             });
                         }
-                        daemon
-                            .openclaw_missing_sessions
-                            .lock()
-                            .expect("openclaw_missing_sessions lock poisoned")
-                            .clear();
+                        daemon.session_runtime().retain(|_, runtime| {
+                            runtime.openclaw_session_missing = false;
+                            !runtime.is_empty()
+                        });
                         is_openclaw_service = true;
                         daemon.bump_ui_rev();
                         if write_ndjson_line_async(
