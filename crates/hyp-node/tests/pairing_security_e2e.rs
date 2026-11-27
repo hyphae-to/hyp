@@ -1262,3 +1262,88 @@ async fn p1_11_anti_recon_blocks_guests_and_underscoped_peers_from_enumerating_d
     alice.shutdown();
     hub.shutdown();
 }
+
+#[tokio::test]
+async fn p2p_client_rejects_noncanonical_manifest_before_pinning_or_storing_credentials() {
+    use std::convert::Infallible;
+
+    use http::Response;
+    use hyper::body::Incoming;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(loopback_zero()).await.unwrap();
+    let issuer_dir = TempDir::new().unwrap();
+    let mut issuer_config = NodeConfig::p2p(NodeId::new("issuer@box").unwrap(), issuer_dir.path());
+    issuer_config.secret_backend = Some(SecretBackend::File);
+    issuer_config.public_endpoint = Some(format!("http://{}", listener.local_addr().unwrap()));
+    let issuer = UnifiedNode::open(issuer_config).unwrap();
+    let (token, offer) = issuer
+        .create_p2p_invite(vec!["dm:send".into()], Vec::new(), 60_000)
+        .unwrap();
+
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let service = service_fn(move |request: Request<Incoming>| {
+            let issuer = Arc::clone(&issuer);
+            let offer_id = offer.offer_id.clone();
+            async move {
+                let response =
+                    hyp_node::engine::http_util::read_json_body(request.into_body(), 64 * 1024)
+                        .await
+                        .unwrap();
+                let mut reply = issuer
+                    .handle_p2p_pair_request(&offer_id, &response)
+                    .unwrap();
+                // Keep the content and signature valid while changing its encoded layout.
+                let payload = reply.signed_manifest.decode_payload().unwrap();
+                let pretty_printed = serde_json::to_string_pretty(&payload).unwrap();
+                reply.signed_manifest.sig = issuer
+                    .identity()
+                    .signing
+                    .sign_domain_b64("manifest", pretty_printed.as_bytes());
+                reply.signed_manifest.payload = pretty_printed;
+                Ok::<_, Infallible>(Response::new(full_body(
+                    serde_json::to_vec(&reply).unwrap(),
+                )))
+            }
+        });
+        http1::Builder::new()
+            .keep_alive(false)
+            .serve_connection(TokioIo::new(socket), service)
+            .await
+            .unwrap();
+    });
+
+    let accepter_dir = TempDir::new().unwrap();
+    let mut accepter_config =
+        NodeConfig::p2p(NodeId::new("accepter@box").unwrap(), accepter_dir.path());
+    accepter_config.secret_backend = Some(SecretBackend::File);
+    let accepter = UnifiedNode::open(accepter_config).unwrap();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        accepter.accept_p2p_invite(&token, vec!["dm:send".into()]),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        matches!(error, hyp_node::engine::NodeError::BadRequest(ref message) if message.contains("not canonical"))
+    );
+    assert!(
+        accepter
+            .db()
+            .peers()
+            .get_peer("issuer@box")
+            .unwrap()
+            .is_none()
+    );
+    let secrets = SecretStore::new(accepter_dir.path(), SecretBackend::File);
+    assert!(matches!(
+        secrets.get(&peer_auth_secret_name("issuer@box")),
+        Err(hyp_crypto::CryptoError::SecretNotFound(_)),
+    ));
+    server.await.unwrap();
+}
