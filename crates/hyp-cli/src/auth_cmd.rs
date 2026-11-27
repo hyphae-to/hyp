@@ -31,7 +31,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::{Subcommand, ValueEnum};
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyp_crypto::human::{
     DEFAULT_DELEGATED_MAX_DEVICES, HumanApprovalActionKind, HumanApprovalActionV1, HumanAudience,
     HumanClaimV1, HumanDropKind, HumanInviteV1, HumanPubCardV1, HumanRevocationPayloadV1,
@@ -46,6 +46,7 @@ use hyp_crypto::keystore::{SecretStore, validate_secret_name};
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_harness::sock::daemon_rpc_sync;
+use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::engine::{
     LocalIngestConfig, NodeConfig, NodeProfile, UnifiedNode, canonical_local_event_for_signing,
     resolve_drop_portal_url, send_local_ingest_event,
@@ -3900,27 +3901,21 @@ async fn handle_enroll_callback(
         .map(ToOwned::to_owned);
 
     let mut body_bytes = Vec::new();
-    let mut body = req.into_body();
-    while let Some(frame_res) = body.frame().await {
-        let Ok(frame) = frame_res else {
-            return json_enroll_response(
-                StatusCode::BAD_REQUEST,
-                origin.as_deref(),
-                allowed,
-                json!({ "ok": false, "error": "body_read_error" }),
-            );
+    if let Err(error) = consume_bounded_body(req.into_body(), MAX_ENROLL_CALLBACK_BYTES, |chunk| {
+        body_bytes.extend_from_slice(chunk)
+    })
+    .await
+    {
+        let (status, message) = match error {
+            BoundedBodyError::Read(_) => (StatusCode::BAD_REQUEST, "body_read_error"),
+            BoundedBodyError::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
         };
-        if let Some(chunk) = frame.data_ref() {
-            if body_bytes.len() + chunk.len() > MAX_ENROLL_CALLBACK_BYTES {
-                return json_enroll_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    origin.as_deref(),
-                    allowed,
-                    json!({ "ok": false, "error": "payload_too_large" }),
-                );
-            }
-            body_bytes.extend_from_slice(chunk);
-        }
+        return json_enroll_response(
+            status,
+            origin.as_deref(),
+            allowed,
+            json!({ "ok": false, "error": message }),
+        );
     }
 
     let parsed: Value = match serde_json::from_slice(&body_bytes) {
