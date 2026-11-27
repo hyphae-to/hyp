@@ -30,11 +30,12 @@ use hyp_crypto::keys::{
 };
 use hyp_crypto::keystore::SecretStore;
 use hyp_crypto::pairing::{
-    AM2_PREFIX, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES, P2pOfferToken,
-    P2pPairConfirmation, P2pPairResponse, SshEndpoint, create_p2p_offer, create_p2p_response,
-    decode_am2, decode_hp2p1, encode_am2, encode_hp2p1, parse_ssh_endpoint, sign_grant_v2,
-    validate_endpoint_origin, validate_http_endpoint_origin, validate_ssh_posix_path,
-    verify_grant_v2, verify_p2p_confirmation,
+    AM2_PREFIX, AdminInviteMetadata, AdminInviteV2, GrantV2, HP2P1_PREFIX, P2P_SECRET_BYTES,
+    P2pOfferMetadata, P2pOfferToken, P2pPairConfirmation, P2pPairResponse, SshEndpoint,
+    create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1, encode_am2_with_metadata,
+    encode_hp2p1_with_metadata, parse_ssh_endpoint, sign_grant_v2, validate_endpoint_origin,
+    validate_http_endpoint_origin, validate_ssh_posix_path, verify_grant_v2,
+    verify_p2p_confirmation,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_node::engine::http_util::{
@@ -1217,9 +1218,10 @@ fn run_invite(
             let token = match encode_hp2p1_with_metadata(
                 &offer,
                 &keys.signing,
-                sanitized_escalation.as_ref().map(EscalationNote::as_str),
-                preset.map(|_| trust_tier),
-                peer.as_deref(),
+                P2pOfferMetadata {
+                    escalation_note: sanitized_escalation.as_ref().map(EscalationNote::as_str),
+                    trust_tier: preset.map(|_| trust_tier),
+                },
             ) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1500,12 +1502,14 @@ fn run_invite(
 
             let token = match encode_am2_with_metadata(
                 &invite,
-                &node_id,
-                &target_peer,
-                &offered_scopes,
-                trust_tier,
-                &expires_at,
-                sanitized_escalation.as_ref().map(EscalationNote::as_str),
+                AdminInviteMetadata {
+                    node_id: &node_id,
+                    peer_id: &target_peer,
+                    scopes: &offered_scopes,
+                    trust_tier,
+                    expires_at: &expires_at,
+                    escalation_note: sanitized_escalation.as_ref().map(EscalationNote::as_str),
+                },
                 &signed_grant_v2,
             ) {
                 Ok(t) => t,
@@ -1593,89 +1597,6 @@ fn run_invite(
             Ok(ExitCode::from(EXIT_OK))
         }
     }
-}
-
-fn encode_hp2p1_with_metadata(
-    offer: &hyp_crypto::pairing::P2pOfferToken,
-    signing_key: &Ed25519KeyPair,
-    escalation_note: Option<&str>,
-    trust_tier: Option<&str>,
-    peer_id: Option<&str>,
-) -> Result<String, String> {
-    // Always run strict hyp-crypto validation first.
-    let _ = encode_hp2p1(offer).map_err(|e| e.to_string())?;
-    let offer_canon = to_canonical_json(offer).map_err(|e| e.to_string())?;
-    let offer_sig = signing_key.sign_domain_b64("p2p-offer", offer_canon.as_bytes());
-    let mut map = match serde_json::to_value(offer).map_err(|e| e.to_string())? {
-        Value::Object(m) => m,
-        _ => return Err("unexpected offer serialization".to_string()),
-    };
-    map.insert("offerSig".to_string(), Value::String(offer_sig));
-    if let Some(note) = escalation_note {
-        map.insert(
-            "escalationNote".to_string(),
-            Value::String(note.to_string()),
-        );
-    }
-    if let Some(tier) = trust_tier {
-        map.insert("trustTier".to_string(), Value::String(tier.to_string()));
-    }
-    if let Some(p) = peer_id {
-        map.insert("peerId".to_string(), Value::String(p.to_string()));
-    }
-    let canon = to_canonical_json(&Value::Object(map)).map_err(|e| e.to_string())?;
-    let token = format!("{HP2P1_PREFIX}{}", URL_SAFE_NO_PAD.encode(canon.as_bytes()));
-    // Cross-verify the emitted token strictly decodes back via hyp-crypto!
-    decode_hp2p1(&token).map_err(|e| format!("self-verification failed: {e}"))?;
-    Ok(token)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn encode_am2_with_metadata(
-    invite: &AdminInviteV2,
-    node_id: &str,
-    peer_id: &str,
-    scopes: &[String],
-    trust_tier: &str,
-    expires_at: &str,
-    escalation_note: Option<&str>,
-    signed_grant_v2: &SignedPayload,
-) -> Result<String, String> {
-    // Strictly validate via hyp-crypto first.
-    let _ = encode_am2(invite).map_err(|e| e.to_string())?;
-    let mut map = match serde_json::to_value(invite).map_err(|e| e.to_string())? {
-        Value::Object(m) => m,
-        _ => return Err("unexpected am2 serialization".to_string()),
-    };
-    map.insert("nodeId".to_string(), Value::String(node_id.to_string()));
-    map.insert("peerId".to_string(), Value::String(peer_id.to_string()));
-    map.insert(
-        "scopes".to_string(),
-        Value::Array(scopes.iter().cloned().map(Value::String).collect()),
-    );
-    map.insert(
-        "trustTier".to_string(),
-        Value::String(trust_tier.to_string()),
-    );
-    map.insert(
-        "expiresAt".to_string(),
-        Value::String(expires_at.to_string()),
-    );
-    map.insert(
-        "signedGrantV2".to_string(),
-        serde_json::to_value(signed_grant_v2).map_err(|e| e.to_string())?,
-    );
-    if let Some(note) = escalation_note {
-        map.insert(
-            "escalationNote".to_string(),
-            Value::String(note.to_string()),
-        );
-    }
-    let canon = to_canonical_json(&Value::Object(map)).map_err(|e| e.to_string())?;
-    let token = format!("{AM2_PREFIX}{}", URL_SAFE_NO_PAD.encode(canon.as_bytes()));
-    // Cross-verify strict decode via hyp-crypto!
-    decode_am2(&token).map_err(|e| format!("self-verification failed: {e}"))?;
-    Ok(token)
 }
 
 // ============================================================================
@@ -7936,7 +7857,7 @@ mod tests {
             &future_exp,
         )
         .unwrap();
-        let forged_hp2p1 = encode_hp2p1(&forged_offer).unwrap();
+        let forged_hp2p1 = hyp_crypto::pairing::encode_hp2p1(&forged_offer).unwrap();
 
         let code = test_exit(accept_hp2p1(
             &forged_hp2p1,

@@ -681,10 +681,62 @@ fn validate_admin_invite(invite: &AdminInviteV2) -> Result<(), CryptoError> {
     Ok(())
 }
 
+/// Display metadata carried by an Admin-CA invite in addition to the authenticated grant.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminInviteMetadata<'a> {
+    pub node_id: &'a str,
+    pub peer_id: &'a str,
+    pub scopes: &'a [String],
+    pub trust_tier: &'a str,
+    pub expires_at: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_note: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminInviteEnvelope<'a> {
+    #[serde(flatten)]
+    invite: &'a AdminInviteV2,
+    #[serde(flatten)]
+    metadata: Option<AdminInviteMetadata<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signed_grant_v2: Option<&'a SignedPayload>,
+}
+
+fn encode_admin_invite(
+    invite: &AdminInviteV2,
+    metadata: Option<AdminInviteMetadata<'_>>,
+    signed_grant_v2: Option<&SignedPayload>,
+) -> Result<String, CryptoError> {
+    validate_admin_invite(invite)?;
+    if let Some(signed_grant) = signed_grant_v2 {
+        let admin_pk = invite.admin_jwk.to_ed25519()?;
+        let grant = verify_grant_v2(signed_grant, &admin_pk)?;
+        if invite.pairing_code.starts_with("t3mp1_") {
+            let parsed = parse_pairing_code_v1(&invite.pairing_code)?;
+            if parsed.grant_id != grant.id {
+                return Err(CryptoError::InvalidPairing(format!(
+                    "pairingCode grantId '{}' does not match signedGrantV2 id '{}'",
+                    parsed.grant_id, grant.id
+                )));
+            }
+        }
+    }
+    armor(
+        AM2_PREFIX,
+        &AdminInviteEnvelope {
+            invite,
+            metadata,
+            signed_grant_v2,
+        },
+    )
+}
+
 /// Encodes a validated `AdminInviteV2` into an `am2_<base64url>` invite string.
 pub fn encode_am2(invite: &AdminInviteV2) -> Result<String, CryptoError> {
-    validate_admin_invite(invite)?;
-    armor(AM2_PREFIX, invite)
+    encode_admin_invite(invite, None, None)
 }
 
 /// Decodes and strictly validates an `am2_<base64url>` invite string.
@@ -701,35 +753,16 @@ pub fn encode_am2_with_signed_grant(
     invite: &AdminInviteV2,
     signed_grant: &SignedPayload,
 ) -> Result<String, CryptoError> {
-    validate_admin_invite(invite)?;
-    let admin_pk = invite.admin_jwk.to_ed25519()?;
-    let grant = verify_grant_v2(signed_grant, &admin_pk)?;
-    if invite.pairing_code.starts_with("t3mp1_") {
-        let parsed = parse_pairing_code_v1(&invite.pairing_code)?;
-        if parsed.grant_id != grant.id {
-            return Err(CryptoError::InvalidPairing(format!(
-                "pairingCode grantId '{}' does not match signedGrantV2 id '{}'",
-                parsed.grant_id, grant.id
-            )));
-        }
-    }
-    let mut map = match serde_json::to_value(invite)? {
-        serde_json::Value::Object(m) => m,
-        _ => {
-            return Err(CryptoError::InvalidPairing(
-                "unexpected am2_ invite serialization".into(),
-            ));
-        }
-    };
-    map.insert(
-        "signedGrantV2".to_string(),
-        serde_json::to_value(signed_grant)?,
-    );
-    let canon = to_canonical_json(&serde_json::Value::Object(map))?;
-    Ok(format!(
-        "{AM2_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(canon.as_bytes())
-    ))
+    encode_admin_invite(invite, None, Some(signed_grant))
+}
+
+/// Encodes a signed Admin-CA invite with the additional metadata used by the CLI.
+pub fn encode_am2_with_metadata(
+    invite: &AdminInviteV2,
+    metadata: AdminInviteMetadata<'_>,
+    signed_grant: &SignedPayload,
+) -> Result<String, CryptoError> {
+    encode_admin_invite(invite, Some(metadata), Some(signed_grant))
 }
 
 /// Extracts an optional inline Admin-CA-signed `GrantV2` (`signedGrantV2` / `signedGrant`)
@@ -961,6 +994,45 @@ pub fn encode_hp2p1(offer: &P2pOfferToken) -> Result<String, CryptoError> {
     armor(HP2P1_PREFIX, offer)
 }
 
+/// Display metadata carried by a signed P2P offer.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct P2pOfferMetadata<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub escalation_note: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_tier: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignedP2pOfferEnvelope<'a> {
+    #[serde(flatten)]
+    offer: &'a P2pOfferToken,
+    offer_sig: String,
+    #[serde(flatten)]
+    metadata: P2pOfferMetadata<'a>,
+}
+
+/// Signs only the base offer, then encodes it with the CLI's optional display metadata.
+pub fn encode_hp2p1_with_metadata(
+    offer: &P2pOfferToken,
+    signing_key: &Ed25519KeyPair,
+    metadata: P2pOfferMetadata<'_>,
+) -> Result<String, CryptoError> {
+    validate_p2p_offer(offer)?;
+    let canonical_offer = to_canonical_json(offer)?;
+    let offer_sig = signing_key.sign_domain_b64("p2p-offer", canonical_offer.as_bytes());
+    armor(
+        HP2P1_PREFIX,
+        &SignedP2pOfferEnvelope {
+            offer,
+            offer_sig,
+            metadata,
+        },
+    )
+}
+
 /// Decodes and strictly validates an `hp2p1_<base64url>` pairing offer token.
 pub fn decode_hp2p1(token: &str) -> Result<P2pOfferToken, CryptoError> {
     let offer: P2pOfferToken = dearmor(HP2P1_PREFIX, token, CryptoError::InvalidPairing)?;
@@ -1156,6 +1228,74 @@ mod tests {
     }
 
     #[test]
+    fn admin_invite_envelopes_match_previous_wire_bytes() {
+        let admin = Ed25519KeyPair::from_seed([42; 32]).unwrap();
+        let issued =
+            issue_grant_v1(&admin, "alice@macbook", &["*"], 60_000, 1_795_516_800_000).unwrap();
+        let invite = AdminInviteV2 {
+            v: 2,
+            router: "https://mesh.acme.internal".into(),
+            admin_jwk: admin.to_jwk(),
+            pairing_code: issued.code,
+            require_e2ee: Some(true),
+        };
+        let grant = GrantV2 {
+            v: 2,
+            id: issued.grant.id,
+            node_id: "alice@macbook".into(),
+            scopes: vec!["dm:send".into()],
+            trust_tier: Some("org".into()),
+            pairing_key: None,
+            subject_signing_jwk: None,
+            subject_encryption_jwk: None,
+            issued_at: issued.grant.issued_at,
+            pair_by: None,
+            expires_at: None,
+        };
+        let signed_grant = sign_grant_v2(&grant, &admin).unwrap();
+        let mut previous = serde_json::to_value(&invite).unwrap();
+        assert!(encode_am2(&invite).unwrap() == armor(AM2_PREFIX, &previous).unwrap());
+        previous["signedGrantV2"] = serde_json::to_value(&signed_grant).unwrap();
+        assert!(
+            encode_am2_with_signed_grant(&invite, &signed_grant).unwrap()
+                == armor(AM2_PREFIX, &previous).unwrap()
+        );
+        for note in [None, Some("UTC verification: café / 🔑")] {
+            let mut previous = previous.clone();
+            previous["nodeId"] = serde_json::json!("mesh@router");
+            previous["peerId"] = serde_json::json!(grant.node_id);
+            previous["scopes"] = serde_json::json!(grant.scopes);
+            previous["trustTier"] = serde_json::json!("org");
+            previous["expiresAt"] = serde_json::json!("2026-11-24T13:00:00Z");
+            if let Some(note) = note {
+                previous["escalationNote"] = serde_json::json!(note);
+            }
+            let token = encode_am2_with_metadata(
+                &invite,
+                AdminInviteMetadata {
+                    node_id: "mesh@router",
+                    peer_id: &grant.node_id,
+                    scopes: &grant.scopes,
+                    trust_tier: "org",
+                    expires_at: "2026-11-24T13:00:00Z",
+                    escalation_note: note,
+                },
+                &signed_grant,
+            )
+            .unwrap();
+            assert!(
+                token == armor(AM2_PREFIX, &previous).unwrap(),
+                "admin invite wire bytes drifted"
+            );
+            assert!(decode_am2(&token).unwrap() == invite);
+            assert_eq!(
+                extract_am2_signed_grant(&token).unwrap(),
+                Some(signed_grant.clone())
+            );
+        }
+    }
+
+    #[test]
     fn hp2p1_mutual_pairing_handshake_and_mutations() {
         let alice = NodeIdentityKeys::generate().unwrap();
         let bob = NodeIdentityKeys::generate().unwrap();
@@ -1177,6 +1317,44 @@ mod tests {
         assert!(token.starts_with("hp2p1_"));
         let bob_decoded = decode_hp2p1(&token).unwrap();
         assert_eq!(bob_decoded, offer);
+
+        for peer in [None, Some("bob@laptop")] {
+            let mut targeted_offer = offer.clone();
+            targeted_offer.peer_id = peer.map(str::to_owned);
+            let canonical_offer = to_canonical_json(&targeted_offer).unwrap();
+            let signature = alice
+                .signing
+                .sign_domain_b64("p2p-offer", canonical_offer.as_bytes());
+            for note in [None, Some("café / 🔑")] {
+                for tier in [None, Some("peer")] {
+                    let mut previous = serde_json::to_value(&targeted_offer).unwrap();
+                    previous["offerSig"] = serde_json::json!(signature);
+                    for (key, value) in [
+                        ("escalationNote", note),
+                        ("trustTier", tier),
+                        ("peerId", peer),
+                    ] {
+                        if let Some(value) = value {
+                            previous[key] = serde_json::json!(value);
+                        }
+                    }
+                    let issued = encode_hp2p1_with_metadata(
+                        &targeted_offer,
+                        &alice.signing,
+                        P2pOfferMetadata {
+                            escalation_note: note,
+                            trust_tier: tier,
+                        },
+                    )
+                    .unwrap();
+                    assert!(
+                        issued == armor(HP2P1_PREFIX, &previous).unwrap(),
+                        "P2P offer wire bytes drifted"
+                    );
+                    assert!(decode_hp2p1(&issued).unwrap() == targeted_offer);
+                }
+            }
+        }
 
         let bob_grant = GrantV2 {
             v: 2,
