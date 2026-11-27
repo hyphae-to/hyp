@@ -33,10 +33,8 @@ const windows = [
 ].join("\n");
 const targets = new Map([
   ["scripts/uninstall.sh", unix],
-  ["site/uninstall.sh", unix],
   ["uninstall.sh", unix],
   ["scripts/uninstall.ps1", windows],
-  ["site/uninstall.ps1", windows],
 ]);
 const markers = /^( *# BEGIN GENERATED HARNESS SKILL ROOTS)\r?\n[\s\S]*?^( *# END GENERATED HARNESS SKILL ROOTS)/m;
 const check = process.argv.includes("--check");

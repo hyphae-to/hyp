@@ -5,6 +5,9 @@ on:
     branches: ["main"]
     paths:
       - "site/**"
+      - "scripts/install*"
+      - "scripts/uninstall*"
+      - "scripts/stage-pages.sh"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -34,9 +37,11 @@ jobs:
           node --check site/drop/crypto.js
           node --check site/drop/drop.js
           node scripts/test-drop-crypto.mjs
-          sh -n site/install.sh
-          cmp -s scripts/install.sh site/install.sh
-          cmp -s scripts/install.ps1 site/install.ps1
+          sh -n scripts/install.sh
+          sh -n scripts/uninstall.sh
+
+      - name: Stage site and installer scripts
+        run: sh scripts/stage-pages.sh "${{ runner.temp }}/hyphae-pages"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -44,7 +49,7 @@ jobs:
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site
+          path: ${{ runner.temp }}/hyphae-pages
 
   deploy:
     name: Deploy to GitHub Pages

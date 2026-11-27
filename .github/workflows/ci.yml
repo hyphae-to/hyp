@@ -135,7 +135,7 @@ jobs:
           npm install --prefix "$runtime_dir" --no-audit --no-fund --loglevel=error @anthropic-ai/claude-code@2.1.332
           "$runtime_dir/node_modules/.bin/claude" plugin test "$GITHUB_WORKSPACE/plugins/claude-code"
 
-      - name: Syntax-check JS, Python, shell, PowerShell, and verify installer mirror parity
+      - name: Syntax-check JS, Python, shell, PowerShell, and verify raw script parity
         shell: bash
         run: |
           set -euo pipefail
@@ -150,23 +150,21 @@ jobs:
             python3 -m py_compile "$file"
           done < <(find plugins -type f -name '*.py' | sort)
 
-          sh -n install.sh scripts/install.sh site/install.sh uninstall.sh scripts/uninstall.sh site/uninstall.sh plugins/herdr-mod/scripts/install.sh
+          for script in install.sh uninstall.sh scripts/install.sh scripts/uninstall.sh scripts/stage-pages.sh plugins/herdr-mod/scripts/install.sh; do
+            sh -n "$script"
+          done
           bash -n scripts/test-installer.sh scripts/uninstall.sh scripts/reset-local.sh
           if command -v shellcheck >/dev/null 2>&1; then
             shellcheck -s sh scripts/install.sh
           fi
 
-          cmp -s scripts/install.sh site/install.sh
           cmp -s scripts/install.sh install.sh
-          cmp -s scripts/install.ps1 site/install.ps1
-          cmp -s scripts/uninstall.sh site/uninstall.sh
           cmp -s scripts/uninstall.sh uninstall.sh
-          cmp -s scripts/uninstall.ps1 site/uninstall.ps1
 
           if command -v pwsh >/dev/null 2>&1; then
             pwsh -NoProfile -Command '
               $ErrorActionPreference = "Stop"
-              foreach ($path in @("scripts/install.ps1", "site/install.ps1", "scripts/uninstall.ps1", "site/uninstall.ps1")) {
+              foreach ($path in @("scripts/install.ps1", "scripts/uninstall.ps1")) {
                 $tokens = $null
                 $errors = $null
                 $resolved = (Resolve-Path $path).Path
@@ -178,7 +176,7 @@ jobs:
               }
             '
           fi
-          echo "All JS/TS, Python, shell, PowerShell, and installer mirror checks passed."
+          echo "All JS/TS, Python, shell, PowerShell, and raw script parity checks passed."
 
   rust-workspace:
     name: Rust (${{ matrix.os }})
@@ -303,12 +301,12 @@ jobs:
             throw "Unexpected hyp.exe version --json output: $out"
           }
 
-      - name: Verify Windows PowerShell installer & uninstaller (AST, parity & dry-run)
+      - name: Verify Windows PowerShell installer & uninstaller (AST, dry-run & isolated uninstall)
         if: runner.os == 'Windows' && (github.event_name != 'workflow_dispatch' || !inputs.skip_release_build)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($path in @("scripts/install.ps1", "site/install.ps1", "scripts/uninstall.ps1", "site/uninstall.ps1")) {
+          foreach ($path in @("scripts/install.ps1", "scripts/uninstall.ps1")) {
             $tokens = $null
             $errors = $null
             $resolved = (Resolve-Path $path).Path
@@ -316,21 +314,6 @@ jobs:
             if ($errors -and $errors.Count -gt 0) {
               $msg = ($errors | ForEach-Object { $_.ToString() }) -join "`n"
               throw "PowerShell syntax error(s) in ${path}:`n$msg"
-            }
-          }
-          foreach ($pair in @(
-            @("scripts/install.ps1", "site/install.ps1"),
-            @("scripts/uninstall.ps1", "site/uninstall.ps1")
-          )) {
-            $a = [System.IO.File]::ReadAllBytes((Resolve-Path $pair[0]).Path)
-            $b = [System.IO.File]::ReadAllBytes((Resolve-Path $pair[1]).Path)
-            if ($a.Length -ne $b.Length) {
-              throw "$($pair[0]) and $($pair[1]) differ in length ($($a.Length) vs $($b.Length))."
-            }
-            for ($i = 0; $i -lt $a.Length; $i++) {
-              if ($a[$i] -ne $b[$i]) {
-                throw "$($pair[0]) and $($pair[1]) differ at byte offset $i."
-              }
             }
           }
           $dryOut = (& .\scripts\install.ps1 -Version v0.2.0-test -BaseUrl "http://127.0.0.1:1/test" -DryRun) | Out-String
@@ -374,4 +357,4 @@ jobs:
               Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
             }
           }
-          Write-Host "PowerShell AST parse, byte-identical mirror parity, dry-run & isolated uninstall verified."
+          Write-Host "PowerShell AST parse, dry-run & isolated uninstall verified."
