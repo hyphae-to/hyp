@@ -1926,10 +1926,16 @@ async fn b3_bridge_enforces_configured_targets_on_link_handoff_and_send() {
     let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
         .await
         .unwrap();
+    let original_count = Arc::new(AtomicUsize::new(0));
     let sent_count = Arc::new(AtomicUsize::new(0));
     daemon.register_bridge_poster_with_targets(
         "telegram",
         vec!["allowed-chat".to_string()],
+        Arc::new(CountingPoster(Arc::clone(&original_count))),
+    );
+    // Re-registering a poster without targets must preserve the configured allowlist.
+    daemon.register_bridge_poster(
+        " Telegram ",
         Arc::new(CountingPoster(Arc::clone(&sent_count))),
     );
     let sock = daemon.socket_path().to_path_buf();
@@ -2020,6 +2026,7 @@ async fn b3_bridge_enforces_configured_targets_on_link_handoff_and_send() {
         )
         .await;
     assert!(!s_ok_err, "configured target send failed: {s_ok_txt}");
+    assert_eq!(original_count.load(Ordering::SeqCst), 0);
     assert_eq!(sent_count.load(Ordering::SeqCst), 1);
 
     mcp.close().await;
