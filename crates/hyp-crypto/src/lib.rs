@@ -9,6 +9,7 @@ pub mod compat_v1;
 pub mod e2ee;
 pub mod error;
 pub mod hpke;
+pub mod http_auth;
 pub mod human;
 pub mod jcs;
 pub mod keys;

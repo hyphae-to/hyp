@@ -334,12 +334,14 @@ pub(crate) fn build_ed25519_auth_header(
         .fill(&mut nonce_bytes)
         .map_err(|_| "OS CSPRNG failure".to_string())?;
     let nonce = hex::encode(nonce_bytes);
-    let signing_input = format!("{method}\n{path_and_query}\n{ts}\n{nonce}\n{body_sha}");
-    let sig = identity
-        .signing
-        .sign_domain_b64("http-auth", signing_input.as_bytes());
-    Ok(format!(
-        "Hyphae-Ed25519 node=\"{node_id}\",ts=\"{ts}\",nonce=\"{nonce}\",sig=\"{sig}\""
+    Ok(hyp_crypto::http_auth::sign_http_auth(
+        node_id,
+        &identity.signing,
+        method,
+        path_and_query,
+        ts,
+        &nonce,
+        &body_sha,
     ))
 }
 

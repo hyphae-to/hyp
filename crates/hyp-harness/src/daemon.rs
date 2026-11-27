@@ -9668,14 +9668,14 @@ async fn create_external_drop(
     let ts = now_ms();
     let nonce = uuid_v4();
     let path_and_query = "/v1/drops";
-    let input = format!("POST\n{path_and_query}\n{ts}\n{nonce}\n{body_sha}");
-    let sig = node
-        .identity()
-        .signing
-        .sign_domain_b64("http-auth", input.as_bytes());
-    let auth_header = format!(
-        "Hyphae-Ed25519 node=\"{}\",ts=\"{ts}\",nonce=\"{nonce}\",sig=\"{sig}\"",
-        node.node_id().as_str()
+    let auth_header = hyp_crypto::http_auth::sign_http_auth(
+        node.node_id().as_str(),
+        &node.identity().signing,
+        "POST",
+        path_and_query,
+        ts,
+        &nonce,
+        &body_sha,
     );
 
     let url = format!("{relay_url}{path_and_query}");
