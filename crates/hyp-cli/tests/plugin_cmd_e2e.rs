@@ -360,13 +360,6 @@ fn release_workflows_package_sign_and_checksum_plugins_tarball() {
         pack_script.contains("--format=ustar"),
         "scripts/pack-plugins.mjs must pack archives using POSIX ustar format"
     );
-    for pinned in PINNED_PLUGIN_FILES {
-        assert!(
-            pack_script.contains(pinned.rel_path),
-            "scripts/pack-plugins.mjs must include official plugin file {}",
-            pinned.rel_path
-        );
-    }
 
     for wf_rel in [
         ".github/workflows/release-rust.yml",

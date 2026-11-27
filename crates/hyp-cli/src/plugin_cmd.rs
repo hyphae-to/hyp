@@ -43,6 +43,7 @@ use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
 use hyp_harness::executable::{
     PathSearchPolicy, WindowsSuffixes, find_in_path as search_path, is_executable_file,
 };
+use hyp_harness::plugin_registry::BRIDGE_CONSUMER_IDS;
 use hyp_node::adapters::telegram::{
     DEFAULT_TELEGRAM_SECRET_NAME, resolve_telegram_default_target_from_store,
 };
@@ -73,20 +74,6 @@ const SDK_PLUGIN_ID: &str = "sdk";
 const CLAUDE_PANEL_ID: &str = "claude-panel";
 const CLAUDE_CODE_ID: &str = "claude-code";
 const HERDR_MOD_ID: &str = "herdr-mod";
-
-const BRIDGE_CONSUMER_IDS: &[&str] = &[
-    "telegram",
-    "slack",
-    "whatsapp",
-    "webhook",
-    "prometheus",
-    "agentmail",
-    "sentry",
-    "gmail",
-    "google-calendar",
-    "vercel",
-    "notion",
-];
 
 /// File name of the structured onboarding tree (`hyphae.onboarding/v1`) an official plugin may ship
 /// next to its script. Surfaced as `onboardingPath` so setup agents can walk it without guessing paths.

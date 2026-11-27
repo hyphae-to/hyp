@@ -14,7 +14,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum SpecKind {
     Bridge,
     Harness,
@@ -29,144 +30,14 @@ impl SpecKind {
     }
 }
 
-struct BuildPluginSpec {
-    id: &'static str,
+#[derive(serde::Deserialize)]
+struct BuildPluginSpec<'a> {
+    id: &'a str,
     kind: SpecKind,
     /// `(rel_path_under_plugins_dir, is_binary)`
-    files: &'static [(&'static str, bool)],
+    #[serde(borrow)]
+    files: Vec<(&'a str, bool)>,
 }
-
-const PLUGIN_SPECS: &[BuildPluginSpec] = &[
-    BuildPluginSpec {
-        id: "sdk",
-        kind: SpecKind::Bridge,
-        files: &[
-            ("sdk/client.mjs", false),
-            ("sdk/client.py", false),
-            ("sdk/google-oauth.mjs", false),
-            ("sdk/source-kit.mjs", false),
-        ],
-    },
-    BuildPluginSpec {
-        id: "telegram",
-        kind: SpecKind::Bridge,
-        files: &[("telegram/index.mjs", false)],
-    },
-    BuildPluginSpec {
-        id: "slack",
-        kind: SpecKind::Bridge,
-        files: &[("slack/index.mjs", false)],
-    },
-    BuildPluginSpec {
-        id: "whatsapp",
-        kind: SpecKind::Bridge,
-        files: &[("whatsapp/index.mjs", false)],
-    },
-    BuildPluginSpec {
-        id: "webhook",
-        kind: SpecKind::Bridge,
-        files: &[("webhook/index.mjs", false)],
-    },
-    BuildPluginSpec {
-        id: "prometheus",
-        kind: SpecKind::Bridge,
-        files: &[("prometheus/index.mjs", false)],
-    },
-    BuildPluginSpec {
-        id: "agentmail",
-        kind: SpecKind::Bridge,
-        files: &[
-            ("agentmail/index.mjs", false),
-            ("agentmail/onboarding.json", false),
-        ],
-    },
-    BuildPluginSpec {
-        id: "sentry",
-        kind: SpecKind::Bridge,
-        files: &[
-            ("sentry/index.mjs", false),
-            ("sentry/onboarding.json", false),
-        ],
-    },
-    BuildPluginSpec {
-        id: "gmail",
-        kind: SpecKind::Bridge,
-        files: &[("gmail/index.mjs", false), ("gmail/onboarding.json", false)],
-    },
-    BuildPluginSpec {
-        id: "google-calendar",
-        kind: SpecKind::Bridge,
-        files: &[
-            ("google-calendar/index.mjs", false),
-            ("google-calendar/onboarding.json", false),
-        ],
-    },
-    BuildPluginSpec {
-        id: "vercel",
-        kind: SpecKind::Bridge,
-        files: &[
-            ("vercel/index.mjs", false),
-            ("vercel/onboarding.json", false),
-        ],
-    },
-    BuildPluginSpec {
-        id: "notion",
-        kind: SpecKind::Bridge,
-        files: &[
-            ("notion/index.mjs", false),
-            ("notion/onboarding.json", false),
-        ],
-    },
-    BuildPluginSpec {
-        id: "claude-panel",
-        kind: SpecKind::Harness,
-        files: &[
-            ("claude-code/hooks/register.tsx", false),
-            ("claude-code/hooks/state.ts", false),
-            ("claude-code/hooks/kv-view.mjs", false),
-            ("claude-code/hooks/ui-snapshot.mjs", false),
-        ],
-    },
-    BuildPluginSpec {
-        id: "claude-code",
-        kind: SpecKind::Harness,
-        files: &[
-            ("claude-code/.claude-plugin/plugin.json", false),
-            ("claude-code/.claude-plugin/icon.png", true),
-            ("claude-code/.mcp.json", false),
-            ("claude-code/hooks/hooks.json", false),
-            ("claude-code/hooks/register.tsx", false),
-            ("claude-code/hooks/state.ts", false),
-            ("claude-code/hooks/kv-view.mjs", false),
-            ("claude-code/hooks/ui-snapshot.mjs", false),
-            ("claude-code/commands/hyp.md", false),
-            ("claude-code/commands/hyp-focus.md", false),
-            ("claude-code/commands/hyp-mute.md", false),
-            ("claude-code/commands/hyp-subs.md", false),
-            ("claude-code/skills/hyp-mesh/SKILL.md", false),
-            ("claude-code/README.md", false),
-        ],
-    },
-    BuildPluginSpec {
-        id: "herdr-mod",
-        kind: SpecKind::Harness,
-        files: &[
-            ("herdr-mod/mods/hyphae-pane/mod.json", false),
-            ("herdr-mod/mods/hyphae-pane/main.js", false),
-            ("herdr-mod/mods/hyphae-pane/pill.js", false),
-            ("herdr-mod/mods/hyphae-pane/shared-client.js", false),
-            ("herdr-mod/mods/hyphae-pane/kv-view.js", false),
-            ("herdr-mod/mods/hyphae-pane/ui-snapshot.js", false),
-            ("herdr-mod/mods/hyphae-pane/hyphae.svg", false),
-            ("herdr-mod/mods/hyphae-panel/mod.json", false),
-            ("herdr-mod/mods/hyphae-panel/main.js", false),
-            ("herdr-mod/mods/hyphae-panel/shared-client.js", false),
-            ("herdr-mod/mods/hyphae-panel/kv-view.js", false),
-            ("herdr-mod/mods/hyphae-panel/ui-snapshot.js", false),
-            ("herdr-mod/mods/hyphae-panel/hyphae.svg", false),
-        ],
-    },
-];
 
 const SHA256_H_INIT: [u32; 8] = [
     0x6a09_e667,
@@ -427,13 +298,18 @@ fn main() {
         .join("..")
         .join("plugins");
 
+    println!("cargo:rerun-if-changed=../hyp-harness/plugin_specs.json");
+    let plugin_specs: Vec<BuildPluginSpec<'static>> =
+        serde_json::from_str(include_str!("../hyp-harness/plugin_specs.json"))
+            .expect("invalid official plugin registry");
+
     // Hash every unique official plugin file once, keeping track of canonical owner & binary flag.
     let mut file_digests: BTreeMap<&'static str, (String, bool)> = BTreeMap::new();
     let mut unique_files_ordered: Vec<(&'static str, &'static str, bool)> = Vec::new();
     let mut seen_rel: BTreeSet<&'static str> = BTreeSet::new();
 
-    for spec in PLUGIN_SPECS {
-        for &(rel_path, is_binary) in spec.files {
+    for spec in &plugin_specs {
+        for &(rel_path, is_binary) in &spec.files {
             if let Some((_, prev_binary)) = file_digests.get(rel_path) {
                 assert_eq!(
                     *prev_binary, is_binary,
@@ -515,7 +391,7 @@ fn main() {
     generated.push_str("];\n\n");
 
     generated.push_str("#[allow(dead_code)]\npub const PINNED_PLUGINS: &[PinnedPluginSpec] = &[\n");
-    for spec in PLUGIN_SPECS {
+    for spec in &plugin_specs {
         let mut sorted_files: Vec<(&'static str, bool, &str)> = spec
             .files
             .iter()

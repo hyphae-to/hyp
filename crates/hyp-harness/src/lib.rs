@@ -14,6 +14,10 @@ pub mod local_kv;
 pub mod mcp;
 pub mod node_config;
 pub mod paths;
+/// Official plugin ID policies generated from the shared registry.
+pub mod plugin_registry {
+    include!(concat!(env!("OUT_DIR"), "/plugin_ids.rs"));
+}
 pub mod plugin_runtime;
 pub mod protocol;
 pub mod sock;

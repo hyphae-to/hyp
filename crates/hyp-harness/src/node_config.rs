@@ -1,5 +1,6 @@
 //! Configuration for the local daemon loaded from node.json.
 
+use crate::plugin_registry::OFFICIAL_SOURCE_PLUGIN_IDS;
 use crate::plugin_runtime::{ParsedPlugin, plugin_kind_str};
 use hyp_crypto::{CryptoError, keystore::validate_secret_name};
 use hyp_node::adapters::supervisor::is_secret_like_env_key;
@@ -13,17 +14,6 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Official event-source plugins whose `plugins[]` entry defaults to `kind: "source"` (1-to-many
-/// `hyp_stream` topic) when `kind` is omitted. An explicit `kind` always wins.
-const OFFICIAL_SOURCE_PLUGIN_IDS: &[&str] = &[
-    "agentmail",
-    "sentry",
-    "gmail",
-    "google-calendar",
-    "vercel",
-    "notion",
-];
 
 fn push_plugin_error(
     id: &str,
