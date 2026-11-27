@@ -431,7 +431,7 @@ function initEnrollMode(payload) {
   $("enrollHumanId").textContent = humanId;
   $("enrollAuthEpoch").textContent = String(authEpoch);
   $("enrollPrfSalt").textContent = prfSalt;
-  $("enrollRpId").textContent = getRpId() || window.location.hostname || "localhost";
+  $("enrollRpId").textContent = window.location.hostname || "localhost";
 
   let lastBundleJson = "";
 

@@ -1083,4 +1083,43 @@ await test("live operation approval fields remain signed and schema-checked", as
   assert.notEqual(toCanonicalJson(action), toCanonicalJson(changed));
 });
 
+await test("drop enrollment bootstraps the relying-party label and Passkey action", async () => {
+  const elements = new Map();
+  const hash = "#enroll=" + base64urlEncode(utf8Bytes(JSON.stringify({ humanId: "fixture" })));
+  const location = { hash, hostname: "hyphae.to", pathname: "/drop/" };
+  const win = { location };
+  win.self = win;
+  win.top = win;
+  const doc = {
+    getElementById(id) {
+      if (!elements.has(id)) {
+        elements.set(id, {
+          hidden: true,
+          classList: {
+            remove(name) {
+              assert.equal(name, "hidden");
+              elements.get(id).hidden = false;
+            },
+          },
+          addEventListener(event, listener) {
+            this[event] = listener;
+          },
+        });
+      }
+      return elements.get(id);
+    },
+  };
+  try {
+    globalThis.window = win;
+    globalThis.document = doc;
+    await import("../site/drop/drop.js?enrollment-bootstrap-test");
+    assert.equal(elements.get("viewEnroll").hidden, false);
+    assert.equal(elements.get("enrollRpId").textContent, "hyphae.to");
+    assert.equal(typeof elements.get("btnEnrollPasskey").click, "function");
+  } finally {
+    delete globalThis.document;
+    delete globalThis.window;
+  }
+});
+
 console.log(`\nAll ${passed} test groups passed!`);
