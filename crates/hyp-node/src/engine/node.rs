@@ -38,7 +38,7 @@ use hyp_crypto::human::{
     encode_hcert1, sign_node_cert, verify_human_revocation,
 };
 use hyp_crypto::manifest::{ManifestVerificationError, verify_manifest_integrity};
-use hyp_crypto::pairing::{P2P_SECRET_BYTES, P2pOfferToken};
+use hyp_crypto::pairing::P2pOfferToken;
 use hyp_crypto::rfc3339::format_rfc3339_millis;
 use hyp_crypto::{
     Ed25519KeyPair, Ed25519PublicKey, NodeIdentityKeys, OkpJwk as CryptoOkpJwk, SecretStore,
@@ -4133,7 +4133,3 @@ fn expand_node_scopes<S: AsRef<str>>(raw_scopes: &[S]) -> Result<Vec<String>, No
     let normal: Vec<&str> = raw_scopes.iter().map(|s| s.as_ref().trim()).collect();
     expand_v2_scopes(&normal).map_err(|e| NodeError::BadRequest(format!("invalid scopes: {e}")))
 }
-
-/// Helper to generate a random 160-bit P2P secret (re-exported constant check).
-#[allow(dead_code)]
-const _P2P_SECRET_LEN_CHECK: usize = P2P_SECRET_BYTES;

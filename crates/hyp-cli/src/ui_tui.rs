@@ -695,7 +695,7 @@ fn find_preferred_session(
 // ============================================================================
 
 /// Returns visible column count ignoring ANSI SGR escape sequences (`ESC [ ... m`).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn visible_width(line: &str) -> usize {
     let mut width = 0usize;
     let mut chars = line.chars().peekable();
