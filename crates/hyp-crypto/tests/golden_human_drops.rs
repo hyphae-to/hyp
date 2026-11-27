@@ -11,10 +11,10 @@ use hyp_crypto::human::{
     MAX_HUMAN_DRAFT_CONTEXT_CHARS, NodeCertPayloadV1, SecretDropSpec, SignedHumanClaimV1,
     decode_hcert1, decode_hdrop1, derive_prf_ed25519_keypair, derive_prf_x25519_keypair,
     encode_hcert1, encode_hdrop1, human_draft_hpke_aad, human_draft_hpke_info, human_drop_hpke_aad,
-    human_drop_hpke_info, human_prf_input, is_reserved_secret_name, open_human_draft,
-    open_human_drop, seal_human_draft, seal_human_drop, sign_human_claim, sign_human_revocation,
-    sign_local_ingest_event, sign_node_cert, validate_draft_text, verify_human_revocation,
-    verify_local_ingest_event, verify_node_cert,
+    human_drop_hpke_info, human_prf_input, is_reserved_drop_secret_name, is_reserved_secret_name,
+    open_human_draft, open_human_drop, seal_human_draft, seal_human_drop, sign_human_claim,
+    sign_human_revocation, sign_local_ingest_event, sign_node_cert, validate_draft_text,
+    verify_human_revocation, verify_local_ingest_event, verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, parse_rfc3339_millis};
@@ -633,6 +633,8 @@ fn reserved_secret_names_fail_closed_case_insensitively_on_seal_and_open() {
             "'{name}' MUST be flagged as reserved"
         );
 
+        assert!(is_reserved_drop_secret_name(name));
+
         // Seal rejects reserved name
         let claim = sample_secret_claim(&human, &node_enc, "", name);
         assert!(
@@ -657,6 +659,16 @@ fn reserved_secret_names_fail_closed_case_insensitively_on_seal_and_open() {
         );
     }
 
+    // Drop ingestion keeps its stricter policy without changing the general crypto policy.
+    for name in [
+        "node-ed25519-legacy",
+        " NODE-X25519-primary ",
+        "Peer-Auth-router",
+    ] {
+        assert!(!is_reserved_secret_name(name));
+        assert!(is_reserved_drop_secret_name(name));
+    }
+
     // Legitimate application secret names are allowed
     for allowed in [
         "stripe-prod-key",
@@ -668,6 +680,7 @@ fn reserved_secret_names_fail_closed_case_insensitively_on_seal_and_open() {
             !is_reserved_secret_name(allowed),
             "'{allowed}' must NOT be flagged as reserved"
         );
+        assert!(!is_reserved_drop_secret_name(allowed));
         let claim = sample_secret_claim(&human, &node_enc, "", allowed);
         let env = seal_human_drop(&claim, &human, &node_enc.public_key()).unwrap();
         let opened = open_human_drop(&env, &node_enc, "prod@eu-1", T0 + 1_000, |_, _| {

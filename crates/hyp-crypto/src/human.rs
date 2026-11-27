@@ -500,6 +500,17 @@ pub fn is_reserved_secret_name(name: &str) -> bool {
             .any(|prefix| lower.starts_with(prefix))
 }
 
+/// Reserved names for drop ingestion, including legacy node keys and peer credentials.
+pub fn is_reserved_drop_secret_name(name: &str) -> bool {
+    if is_reserved_secret_name(name) {
+        return true;
+    }
+    let lower = name.trim().to_ascii_lowercase();
+    lower.starts_with("node-ed25519-")
+        || lower.starts_with("node-x25519-")
+        || lower.starts_with("peer-auth-")
+}
+
 // ============================================================================
 // Validation & Domain-Separated Ed25519 Signing Helpers
 // ============================================================================
