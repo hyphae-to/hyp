@@ -2,11 +2,13 @@
 resolver = "3"
 members = [
   "crates/hyp-mycelium",
+  "crates/hyp-session-view",
   "crates/hyp-proto",
   "crates/hyp-crypto",
   "crates/hyp-store",
   "crates/hyp-node",
   "crates/hyp-pairing-client",
+  "crates/hyp-delivery-digest",
   "crates/hyp-harness",
   "crates/hyp-harness/daemon",
   "crates/hyp-harness/client",
@@ -25,6 +27,8 @@ repository = "https://github.com/hyphae-to/hyp"
 homepage = "https://hyphae.to"
 
 [workspace.dependencies]
+hyp-session-view = { path = "crates/hyp-session-view" }
+hyp-delivery-digest = { path = "crates/hyp-delivery-digest" }
 hyp-mycelium = { path = "crates/hyp-mycelium" }
 hyp-proto = { path = "crates/hyp-proto" }
 hyp-crypto = { path = "crates/hyp-crypto" }

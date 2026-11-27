@@ -1,0 +1,13 @@
+[package]
+name = "hyp-delivery-digest"
+description = "Pure metadata-only delivery digest selection and rendering"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hyp-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

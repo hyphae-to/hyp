@@ -246,6 +246,17 @@ jobs:
             exit 1
           fi
 
+          digest=$(tree hyp-delivery-digest)
+          view=$(tree hyp-session-view)
+          if grep -E '^(hyp-daemon|hyp-harness[^ ]*|hyp-node|tokio) v' <<< "$digest"; then
+            echo "The digest renderer depends on a runtime."
+            exit 1
+          fi
+          if grep -E '^(hyp-daemon|hyp-harness[^ ]*|hyp-node|hyp-store|rusqlite|libsqlite3-sys|tokio) v' <<< "$view"; then
+            echo "The session view depends on a runtime or storage."
+            exit 1
+          fi
+
       - name: Clippy (zero warnings across workspace & all targets)
         run: cargo clippy --workspace --all-targets --keep-going --locked -- -D warnings
 

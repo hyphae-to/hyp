@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+hyp-session-view.workspace = true
+hyp-delivery-digest.workspace = true
 hyp-harness-ipc.workspace = true
 hyp-harness-transport.workspace = true
 hyp-proto.workspace = true
