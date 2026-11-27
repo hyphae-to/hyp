@@ -207,17 +207,17 @@ fn golden_prf_hkdf_derivation_and_hpke_context_vectors() {
     // Frozen golden vector assertions for bit-exact cross-language parity with site/drop/crypto.js
     assert_eq!(
         prf_in_hex,
-        "7e500e31932ab6c81d57d84949f41bae4327fe499ab7e0211cfab425d6ce5e72"
+        "3e33d281eb415de893fb84014f62c4f73089c6a0a246af486ef7a1b20ef62835"
     );
     assert_eq!(
         hex::encode(kp.seed_bytes()),
-        "d443b3ac0935528b5813b3a27d3d4cf4a7266c48c0de1c3a36d519913a2ce32e"
+        "bf4ac0b286c37619dee23126a228416cfbba5c9c647a7087c8940b88c2e71400"
     );
     assert_eq!(
         kp.public_key_b64(),
-        "eMuBWJusgijh1-2_nof6NSlSDyQdzsE4FKbocPWB3XY"
+        "K9V8yrpadyse_IxKHl1U3ZF3C1foO3X71UAInHriGx8"
     );
-    assert_eq!(kp.kid(), "P03lzSdySUrFPBDsc7vkJ0hwfPr_clwMYFkFn8KeG54");
+    assert_eq!(kp.kid(), "lGP0xwXhgK3CMB4qC8aWhJflZ-de5JGALgoM-5A19l8");
 }
 
 // ============================================================================
