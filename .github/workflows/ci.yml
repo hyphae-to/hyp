@@ -21,11 +21,19 @@ on:
         type: boolean
         default: false
 
+      compiler_cache:
+        description: "Linux experiment cache policy"
+        type: choice
+        default: dependencies
+        options:
+          - dependencies
+          - sccache
+
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.compiler_cache || 'default' }}
   cancel-in-progress: true
 
 env:
@@ -205,8 +213,32 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust-ci-workspace
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: rust-ci-linux-sccache-control-v1
+          save-if: ${{ github.ref == 'refs/heads/experiment/linux-sccache-gha' && github.event_name == 'workflow_dispatch' && inputs.compiler_cache == 'dependencies' }}
+
+      - name: Install pinned sccache
+        if: github.ref == 'refs/heads/experiment/linux-sccache-gha' && runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.compiler_cache == 'sccache'
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.20.1
+          disable_annotations: "true"
+
+      - name: Start sccache with GitHub Actions remote storage
+        if: github.ref == 'refs/heads/experiment/linux-sccache-gha' && runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.compiler_cache == 'sccache'
+        shell: bash
+        env:
+          SCCACHE_GHA_ENABLED: "on"
+          SCCACHE_GHA_RW_MODE: READ_WRITE
+          SCCACHE_GHA_VERSION: hyp-linux-compilation-v1
+        run: |
+          set -euo pipefail
+          test -n "$ACTIONS_RESULTS_URL"
+          test -n "$ACTIONS_RUNTIME_TOKEN"
+          sccache --version
+          sccache --start-server
+          sccache --zero-stats
+          sccache --show-stats | grep -Ei '^Cache location.*(ghac?|github)'
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Formatting check (rustfmt)
         if: runner.os == 'Linux'
@@ -288,6 +320,12 @@ jobs:
       - name: Build release binary (hyp)
         if: github.event_name != 'workflow_dispatch' || !inputs.skip_release_build
         run: cargo build --release --locked -p hyp-cli
+
+      - name: Report sccache stats
+        if: always() && github.ref == 'refs/heads/experiment/linux-sccache-gha' && runner.os == 'Linux' && github.event_name == 'workflow_dispatch' && inputs.compiler_cache == 'sccache' && env.RUSTC_WRAPPER == 'sccache'
+        run: |
+          sccache --show-stats
+          sccache --show-stats --stats-format json
 
       - name: Verify bidirectional JS <-> Rust Verified Human Drops interop (H19)
         if: runner.os == 'Linux'
