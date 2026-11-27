@@ -662,6 +662,9 @@ struct SessionRuntime {
     quarantine_notices: Vec<QuarantineNoticeMeta>,
     herdr_bare_shell_rejection: Option<String>,
     openclaw_session_missing: bool,
+    waiters: Vec<LiveWaiter>,
+    channel: Option<LiveChannel>,
+    attached_transport: Option<AttachedPushTransport>,
 }
 
 impl SessionRuntime {
@@ -676,6 +679,9 @@ impl SessionRuntime {
             && self.quarantine_notices.is_empty()
             && self.herdr_bare_shell_rejection.is_none()
             && !self.openclaw_session_missing
+            && self.waiters.is_empty()
+            && self.channel.is_none()
+            && self.attached_transport.is_none()
     }
 }
 
@@ -687,16 +693,12 @@ struct LocalDaemonInner {
     calls: Arc<CallRegistry>,
     config: LocalDaemonConfig,
     socket_path: PathBuf,
-    waiters: Mutex<HashMap<String, Vec<LiveWaiter>>>,
-    channels: Mutex<HashMap<String, LiveChannel>>,
     /// Connected native OpenClaw Gateway plugin wake service (`openclaw.service.ready`).
     openclaw_service: Mutex<Option<LiveOpenClawService>>,
     /// In-memory lock-free-of-DB index mapping `openclaw:*` `session_id -> (sessionKey, agentId)`,
     /// hydrated from SQLite `sessions.backend_json` on startup and updated on every backend merge.
     /// Ensures `active_transport_kind` / `daemon.status` / `ui/state.json` NEVER re-enter `node.db()`.
     openclaw_targets: Mutex<HashMap<String, (String, String)>>,
-    /// Attached native external push transports (`Herdr`, `T3`, `OpenClaw`, `CodexQueue`, or test doubles).
-    session_transports: Mutex<HashMap<String, AttachedPushTransport>>,
     /// Deterministic 256-bit HMAC-SHA256 key loaded/persisted in `SecretStore` under
     /// [`DAEMON_SESSION_TOKEN_KEY_SECRET`] (`"daemon-session-token-key"`).
     /// NEVER serialized into `ui/state.json`, SQLite, or logs.
@@ -1854,11 +1856,8 @@ impl LocalDaemonInner {
             calls: Arc::new(CallRegistry::new()),
             config,
             socket_path,
-            waiters: Mutex::new(HashMap::new()),
-            channels: Mutex::new(HashMap::new()),
             openclaw_service: Mutex::new(None),
             openclaw_targets: Mutex::new(hydrated_openclaw_targets),
-            session_transports: Mutex::new(HashMap::new()),
             session_token_key,
             env_file_exported_sessions: Mutex::new(hydrated_env_exported),
             hook_registered_sessions: Mutex::new(HashSet::new()),
@@ -2023,14 +2022,22 @@ impl LocalDaemonInner {
             .expect("session_runtime lock poisoned")
     }
 
-    fn clear_runtime_field(&self, session_id: &str, clear: impl FnOnce(&mut SessionRuntime)) {
+    fn update_runtime<T>(
+        &self,
+        session_id: &str,
+        update: impl FnOnce(&mut SessionRuntime) -> T,
+    ) -> Option<T> {
         let mut sessions = self.session_runtime();
-        if let Some(runtime) = sessions.get_mut(session_id) {
-            clear(runtime);
-            if runtime.is_empty() {
-                sessions.remove(session_id);
-            }
+        let runtime = sessions.get_mut(session_id)?;
+        let result = update(runtime);
+        if runtime.is_empty() {
+            sessions.remove(session_id);
         }
+        Some(result)
+    }
+
+    fn clear_runtime_field(&self, session_id: &str, clear: impl FnOnce(&mut SessionRuntime)) {
+        self.update_runtime(session_id, clear);
     }
 
     fn cancel_activity_grace(&self, session_id: &str) {
@@ -2461,22 +2468,19 @@ impl LocalDaemonInner {
         let herdr_tid = transport.herdr_terminal_id().map(ToString::to_string);
         let target_meta = transport.target_metadata();
         {
-            let mut map = self
-                .session_transports
-                .lock()
-                .expect("session_transports lock poisoned");
-            if let Some(existing) = map.get(session_id) {
-                if existing.priority > priority {
-                    return false;
-                }
+            let mut sessions = self.session_runtime();
+            let runtime = sessions.entry(session_id.to_owned()).or_default();
+            if runtime
+                .attached_transport
+                .as_ref()
+                .is_some_and(|existing| existing.priority > priority)
+            {
+                return false;
             }
-            map.insert(
-                session_id.to_string(),
-                AttachedPushTransport {
-                    transport,
-                    priority,
-                },
-            );
+            runtime.attached_transport = Some(AttachedPushTransport {
+                transport,
+                priority,
+            });
         }
         if let Some(ref tid) = herdr_tid {
             self.record_herdr_terminal(tid, session_id);
@@ -2498,21 +2502,19 @@ impl LocalDaemonInner {
     }
 
     fn current_transport_priority(&self, session_id: &str) -> u8 {
-        self.session_transports
-            .lock()
-            .expect("session_transports lock poisoned")
+        self.session_runtime()
             .get(session_id)
+            .and_then(|runtime| runtime.attached_transport.as_ref())
             .map(|t| t.priority)
             .unwrap_or(0)
     }
 
     fn unregister_session_transport(&self, session_id: &str) -> bool {
         let removed = self
-            .session_transports
-            .lock()
-            .expect("session_transports lock poisoned")
-            .remove(session_id)
-            .is_some();
+            .update_runtime(session_id, |runtime| {
+                runtime.attached_transport.take().is_some()
+            })
+            .unwrap_or(false);
         if removed {
             self.cancel_hold_retry(session_id);
             self.bump_ui_rev();
@@ -2528,10 +2530,9 @@ impl LocalDaemonInner {
         transport: &Arc<dyn PushTransport>,
     ) -> bool {
         let should_remove = self
-            .session_transports
-            .lock()
-            .expect("session_transports lock poisoned")
+            .session_runtime()
             .get(session_id)
+            .and_then(|runtime| runtime.attached_transport.as_ref())
             .is_some_and(|attached| Arc::ptr_eq(&attached.transport, transport));
         if should_remove {
             return self.unregister_session_transport(session_id);
@@ -2540,22 +2541,15 @@ impl LocalDaemonInner {
     }
 
     fn active_session_ids(&self) -> HashSet<String> {
-        let mut active = HashSet::new();
-        for sid in self.channels.lock().expect("channels lock poisoned").keys() {
-            active.insert(sid.clone());
-        }
-        for sid in self.waiters.lock().expect("waiters lock poisoned").keys() {
-            active.insert(sid.clone());
-        }
-        for sid in self
-            .session_transports
-            .lock()
-            .expect("session_transports lock poisoned")
-            .keys()
-        {
-            active.insert(sid.clone());
-        }
-        active
+        self.session_runtime()
+            .iter()
+            .filter(|(_, runtime)| {
+                runtime.channel.is_some()
+                    || !runtime.waiters.is_empty()
+                    || runtime.attached_transport.is_some()
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect()
     }
 
     /// Safely prunes idle sessions older than `config.session_prune_after_ms` while skipping
@@ -3131,10 +3125,9 @@ impl LocalDaemonInner {
 
     fn active_transport_kind(&self, session_id: &str) -> Option<&'static str> {
         if self
-            .channels
-            .lock()
-            .expect("channels lock poisoned")
-            .contains_key(session_id)
+            .session_runtime()
+            .get(session_id)
+            .is_some_and(|runtime| runtime.channel.is_some())
         {
             return Some("claude_channel");
         }
@@ -3142,15 +3135,14 @@ impl LocalDaemonInner {
             return Some("openclaw_plugin");
         }
         if let Some(attached) = self
-            .session_transports
-            .lock()
-            .expect("session_transports lock poisoned")
+            .session_runtime()
             .get(session_id)
+            .and_then(|runtime| runtime.attached_transport.as_ref())
         {
             return Some(attached.transport.kind());
         }
-        let waiters = self.waiters.lock().expect("waiters lock poisoned");
-        if let Some(list) = waiters.get(session_id) {
+        let sessions = self.session_runtime();
+        if let Some(list) = sessions.get(session_id).map(|runtime| &runtime.waiters) {
             if list.iter().any(|w| w.mode == WaiterKind::Stream) {
                 return Some("watch");
             }
@@ -4580,10 +4572,9 @@ impl LocalDaemonInner {
 
             // Priority 1: Live Claude native channel (`--claude-channel`)
             let channel_entry = self
-                .channels
-                .lock()
-                .expect("channels lock poisoned")
+                .session_runtime()
                 .get(session_id)
+                .and_then(|runtime| runtime.channel.as_ref())
                 .map(|c| (c.conn_id, c.tx.clone()));
             if let Some((channel_conn_id, tx)) = channel_entry {
                 let delivery_id = self.next_seq();
@@ -4614,10 +4605,9 @@ impl LocalDaemonInner {
                 // spinning on the stalled channel. If the channel disconnected, fall through to
                 // any live `watch`/`wait` transport!
                 let still_attached = self
-                    .channels
-                    .lock()
-                    .expect("channels lock poisoned")
+                    .session_runtime()
                     .get(session_id)
+                    .and_then(|runtime| runtime.channel.as_ref())
                     .is_some_and(|c| c.conn_id == channel_conn_id);
                 if still_attached {
                     break;
@@ -4734,10 +4724,9 @@ impl LocalDaemonInner {
                 self.maybe_lazy_hydrate_transport(session_id).await;
             }
             let push_transport = self
-                .session_transports
-                .lock()
-                .expect("session_transports lock poisoned")
+                .session_runtime()
                 .get(session_id)
+                .and_then(|runtime| runtime.attached_transport.as_ref())
                 .map(|a| Arc::clone(&a.transport));
             if let Some(transport) = push_transport {
                 // Notify-only FYI batches NEVER wake an idle agent via an external L2 push
@@ -4853,10 +4842,9 @@ impl LocalDaemonInner {
 
             // Priority 3: Streaming watcher (`hyp watch` / streaming `wait.subscribe`)
             let stream_tx = self
-                .waiters
-                .lock()
-                .expect("waiters lock poisoned")
+                .session_runtime()
                 .get(session_id)
+                .map(|runtime| &runtime.waiters)
                 .and_then(|list| {
                     list.iter()
                         .find(|w| w.mode == WaiterKind::Stream)
@@ -4881,18 +4869,15 @@ impl LocalDaemonInner {
             }
 
             // Priority 3: One-shot blocking waiter (`hyp wait` / one-shot `wait.subscribe`)
-            let once_waiter = {
-                let mut map = self.waiters.lock().expect("waiters lock poisoned");
-                let extracted = map.get_mut(session_id).and_then(|list| {
-                    list.iter()
-                        .position(|w| w.mode == WaiterKind::Once)
-                        .map(|idx| list.remove(idx))
-                });
-                if map.get(session_id).is_some_and(Vec::is_empty) {
-                    map.remove(session_id);
-                }
-                extracted
-            };
+            let once_waiter = self
+                .update_runtime(session_id, |runtime| {
+                    runtime
+                        .waiters
+                        .iter()
+                        .position(|waiter| waiter.mode == WaiterKind::Once)
+                        .map(|index| runtime.waiters.remove(index))
+                })
+                .flatten();
             if let Some(waiter) = once_waiter {
                 let pkt = json!({
                     "type": "wait.items",
@@ -7561,9 +7546,9 @@ async fn handle_connection<R, W>(
             Ev::Shutdown => break,
             Ev::Push(Some(pkt)) => {
                 let is_once_done = attached_waiter.as_ref().is_some_and(|(sid, wid)| {
-                    let map = daemon.waiters.lock().expect("waiters lock poisoned");
-                    !map.get(sid)
-                        .is_some_and(|list| list.iter().any(|w| w.id == *wid))
+                    !daemon.session_runtime().get(sid).is_some_and(|runtime| {
+                        runtime.waiters.iter().any(|waiter| waiter.id == *wid)
+                    })
                 }) && pkt.get("type").and_then(Value::as_str)
                     == Some("wait.items");
 
@@ -7784,12 +7769,16 @@ async fn handle_connection<R, W>(
 
                         let waiter_id = daemon.next_seq();
                         {
-                            let mut map = daemon.waiters.lock().expect("waiters lock poisoned");
-                            map.entry(session_id.clone()).or_default().push(LiveWaiter {
-                                id: waiter_id,
-                                mode,
-                                tx: out_tx.clone(),
-                            });
+                            daemon
+                                .session_runtime()
+                                .entry(session_id.clone())
+                                .or_default()
+                                .waiters
+                                .push(LiveWaiter {
+                                    id: waiter_id,
+                                    mode,
+                                    tx: out_tx.clone(),
+                                });
                         }
                         attached_waiter = Some((session_id.clone(), waiter_id));
                         daemon.mark_session_idle(&session_id);
@@ -8032,25 +8021,30 @@ async fn handle_connection<R, W>(
     // Cleanup registered live waiter / channel transport on disconnect.
     let mut transport_changed = false;
     if let Some((sid, wid)) = attached_waiter {
-        let mut map = daemon.waiters.lock().expect("waiters lock poisoned");
-        if let Some(list) = map.get_mut(&sid) {
-            let before = list.len();
-            list.retain(|w| w.id != wid);
-            if list.len() != before {
-                transport_changed = true;
-            }
-            if list.is_empty() {
-                map.remove(&sid);
-            }
-        }
+        transport_changed |= daemon
+            .update_runtime(&sid, |runtime| {
+                let before = runtime.waiters.len();
+                runtime.waiters.retain(|waiter| waiter.id != wid);
+                runtime.waiters.len() != before
+            })
+            .unwrap_or(false);
     }
     if let Some(ref ctx) = mcp_ctx {
         if let Some(ref sid) = ctx.channel_session_id {
-            let mut map = daemon.channels.lock().expect("channels lock poisoned");
-            if map.get(sid).is_some_and(|c| c.conn_id == conn_id) {
-                map.remove(sid);
-                transport_changed = true;
-            }
+            transport_changed |= daemon
+                .update_runtime(sid, |runtime| {
+                    if runtime
+                        .channel
+                        .as_ref()
+                        .is_some_and(|channel| channel.conn_id == conn_id)
+                    {
+                        runtime.channel = None;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
         }
     }
     if is_openclaw_service {
@@ -8083,16 +8077,14 @@ fn bind_channel(
     session_id: &str,
     chan_tx: &mpsc::UnboundedSender<ChannelDeliverCommand>,
 ) {
-    {
-        let mut map = daemon.channels.lock().expect("channels lock poisoned");
-        map.insert(
-            session_id.to_string(),
-            LiveChannel {
-                conn_id,
-                tx: chan_tx.clone(),
-            },
-        );
-    }
+    daemon
+        .session_runtime()
+        .entry(session_id.to_owned())
+        .or_default()
+        .channel = Some(LiveChannel {
+        conn_id,
+        tx: chan_tx.clone(),
+    });
     daemon.bump_ui_rev();
     let flush_daemon = Arc::clone(daemon);
     let sid = session_id.to_string();
@@ -10907,10 +10899,9 @@ type HerdrCandidateRank = (bool, i64, bool, bool);
 impl LocalDaemonInner {
     fn session_herdr_terminal_id(&self, sess: &hyp_store::Session) -> Option<String> {
         let from_transport = self
-            .session_transports
-            .lock()
-            .expect("session_transports lock poisoned")
+            .session_runtime()
             .get(&sess.id)
+            .and_then(|runtime| runtime.attached_transport.as_ref())
             .and_then(|attached| {
                 attached
                     .transport
@@ -10925,10 +10916,9 @@ impl LocalDaemonInner {
 
     fn session_herdr_created_ms(&self, sess: &hyp_store::Session) -> Option<i64> {
         let from_transport = self
-            .session_transports
-            .lock()
-            .expect("session_transports lock poisoned")
+            .session_runtime()
             .get(&sess.id)
+            .and_then(|runtime| runtime.attached_transport.as_ref())
             .and_then(|attached| attached.transport.herdr_created_ms());
         from_transport.or_else(|| extract_backend_i64(&sess.backend_json, "herdrCreatedMs"))
     }
@@ -10972,11 +10962,13 @@ impl LocalDaemonInner {
                 .cloned()
                 .unwrap_or_default();
             let transport_ids: Vec<String> = self
-                .session_transports
-                .lock()
-                .expect("session_transports lock poisoned")
+                .session_runtime()
                 .iter()
-                .filter(|(_, attached)| attached.transport.herdr_terminal_id() == Some(terminal_id))
+                .filter(|(_, runtime)| {
+                    runtime.attached_transport.as_ref().is_some_and(|attached| {
+                        attached.transport.herdr_terminal_id() == Some(terminal_id)
+                    })
+                })
                 .map(|(sid, _)| sid.clone())
                 .collect();
             for sid in indexed_ids.into_iter().chain(transport_ids.into_iter()) {
