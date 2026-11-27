@@ -4,14 +4,13 @@
 
 use crate::address::{NodeId, is_valid_topic};
 use crate::cloudevent::parse_rfc3339_utc_nanos;
-use crate::jcs::{JcsError, serialize_jcs, to_jcs_string};
+use crate::jcs::{JcsError, serialize_jcs};
 use crate::problem::ProblemDetails;
 use crate::scopes::EscalationConfig;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -66,13 +65,23 @@ impl OkpCurve {
 
 /// RFC 7517 / RFC 8037 OKP JSON Web Key for Ed25519 / X25519 public keys.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct OkpJwk {
-    pub kty: String,
-    pub crv: OkpCurve,
-    pub x: String,
+pub struct OkpJwk<Curve = OkpCurve, Text = String> {
+    pub kty: Text,
+    pub crv: Curve,
+    pub x: Text,
 }
 
-impl OkpJwk {
+/// RFC 7638 thumbprint for a validated OKP curve and raw 32-byte public key.
+pub fn okp_key_thumbprint(crv: OkpCurve, raw_public_key: &[u8; 32]) -> String {
+    let x = URL_SAFE_NO_PAD.encode(raw_public_key);
+    let canonical = format!(
+        "{{\"crv\":\"{}\",\"kty\":\"OKP\",\"x\":\"{x}\"}}",
+        crv.as_str()
+    );
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
+}
+
+impl OkpJwk<OkpCurve> {
     pub fn new(crv: OkpCurve, raw_public_key: &[u8; 32]) -> Self {
         Self {
             kty: "OKP".to_string(),
@@ -118,15 +127,8 @@ impl OkpJwk {
     /// Per RFC 8037 §2, the required members for OKP JWKs in lexicographical order are
     /// `crv`, `kty`, and `x`: `{"crv":"<crv>","kty":"OKP","x":"<x>"}`.
     pub fn thumbprint_sha256(&self) -> Result<String, ManifestError> {
-        self.validate(None)?;
-        let canonical = to_jcs_string(&json!({
-            "crv": self.crv.as_str(),
-            "kty": "OKP",
-            "x": self.x,
-        }))
-        .map_err(|e| ManifestError::Canonicalization(e.to_string()))?;
-        let digest = Sha256::digest(canonical.as_bytes());
-        Ok(URL_SAFE_NO_PAD.encode(digest))
+        let raw = self.validate(None)?;
+        Ok(okp_key_thumbprint(self.crv, &raw))
     }
 }
 

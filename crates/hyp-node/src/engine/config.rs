@@ -1173,14 +1173,6 @@ pub(crate) fn crypto_jwk_to_proto(jwk: &hyp_crypto::OkpJwk) -> Result<ProtoOkpJw
     Ok(out)
 }
 
-pub(crate) fn proto_jwk_to_crypto(jwk: &ProtoOkpJwk) -> hyp_crypto::OkpJwk {
-    hyp_crypto::OkpJwk {
-        kty: jwk.kty.clone(),
-        crv: jwk.crv.as_str().to_string(),
-        x: jwk.x.clone(),
-    }
-}
-
 pub(crate) fn proto_filter_to_store(f: &hyp_proto::filter::Filter) -> hyp_store::Filter {
     match f {
         hyp_proto::filter::Filter::Exact(m) => hyp_store::Filter::Exact(m.clone()),

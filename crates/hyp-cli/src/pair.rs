@@ -2371,14 +2371,6 @@ fn proto_profile_to_store(profile: ProtoNodeProfile) -> PeerProfile {
     }
 }
 
-fn proto_jwk_to_crypto(jwk: &hyp_proto::manifest::OkpJwk) -> CryptoOkpJwk {
-    CryptoOkpJwk {
-        kty: jwk.kty.clone(),
-        crv: jwk.crv.as_str().to_string(),
-        x: jwk.x.clone(),
-    }
-}
-
 pub(crate) fn credential_secret_name(prefix: &str, peer_id: &str) -> String {
     let hash = hex::encode(Sha256::digest(peer_id.as_bytes()));
     format!("{prefix}-{}", &hash[..12])
@@ -2622,8 +2614,8 @@ fn verify_signed_manifest_strict(
                 .to_string(),
         ));
     }
-    let crypto_sign_jwk = proto_jwk_to_crypto(&payload.identity.signing_jwk);
-    let crypto_enc_jwk = proto_jwk_to_crypto(&payload.identity.encryption_jwk);
+    let crypto_sign_jwk = CryptoOkpJwk::from(&payload.identity.signing_jwk);
+    let crypto_enc_jwk = CryptoOkpJwk::from(&payload.identity.encryption_jwk);
     let signing_pk = crypto_sign_jwk.to_ed25519().map_err(|e| {
         (
             "INVALID_KEY",
@@ -4197,8 +4189,8 @@ fn accept_am2(
     }
 
     if let Some(ref live) = live_res {
-        let hub_sign_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.signing_jwk);
-        let hub_enc_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.encryption_jwk);
+        let hub_sign_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.signing_jwk);
+        let hub_enc_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.encryption_jwk);
         let hub_sign_json = match serde_json::to_string(&hub_sign_jwk) {
             Ok(s) => s,
             Err(e) => {
@@ -4774,8 +4766,8 @@ pub(crate) fn live_pair_am2_for_onboard(
             code: "ENCODE_ERROR",
             message: e.to_string(),
         })?;
-    let hub_sign_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.signing_jwk);
-    let hub_enc_jwk = proto_jwk_to_crypto(&live.manifest_payload.identity.encryption_jwk);
+    let hub_sign_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.signing_jwk);
+    let hub_enc_jwk = CryptoOkpJwk::from(&live.manifest_payload.identity.encryption_jwk);
     let hub_sign_json =
         serde_json::to_string(&hub_sign_jwk).map_err(|e| LiveHandshakeError::Rejected {
             code: "ENCODE_ERROR",
@@ -4994,8 +4986,8 @@ pub(crate) fn live_join_url_for_onboard(
             message: format!("Failed to register peer '{peer_id}': {e}"),
         })?;
 
-    let sign_jwk = proto_jwk_to_crypto(&v.payload.identity.signing_jwk);
-    let enc_jwk = proto_jwk_to_crypto(&v.payload.identity.encryption_jwk);
+    let sign_jwk = CryptoOkpJwk::from(&v.payload.identity.signing_jwk);
+    let enc_jwk = CryptoOkpJwk::from(&v.payload.identity.encryption_jwk);
     let sign_json = serde_json::to_string(&sign_jwk).map_err(|e| LiveHandshakeError::Rejected {
         code: "ENCODE_ERROR",
         message: e.to_string(),
@@ -5211,8 +5203,8 @@ fn fetch_and_verify_manifest(
         ));
     }
 
-    let crypto_sign_jwk = proto_jwk_to_crypto(&payload.identity.signing_jwk);
-    let crypto_enc_jwk = proto_jwk_to_crypto(&payload.identity.encryption_jwk);
+    let crypto_sign_jwk = CryptoOkpJwk::from(&payload.identity.signing_jwk);
+    let crypto_enc_jwk = CryptoOkpJwk::from(&payload.identity.encryption_jwk);
     let signing_pk = crypto_sign_jwk.to_ed25519().map_err(|e| {
         (
             "INVALID_KEY",
@@ -5825,7 +5817,7 @@ pub(crate) fn attempt_delegated_pair_enroll(
                 .to_string(),
         ));
     }
-    let manifest_sign_pk = proto_jwk_to_crypto(&manifest_payload.identity.signing_jwk)
+    let manifest_sign_pk = CryptoOkpJwk::from(&manifest_payload.identity.signing_jwk)
         .to_ed25519()
         .map_err(|e| {
             (
@@ -6185,8 +6177,8 @@ fn run_join(
         let signed_to_cache = effective_signed_manifest.as_ref().unwrap_or(&v.signed);
         let payload_to_cache = effective_manifest_payload.as_ref().unwrap_or(&v.payload);
 
-        let sign_jwk = proto_jwk_to_crypto(&v.payload.identity.signing_jwk);
-        let enc_jwk = proto_jwk_to_crypto(&v.payload.identity.encryption_jwk);
+        let sign_jwk = CryptoOkpJwk::from(&v.payload.identity.signing_jwk);
+        let enc_jwk = CryptoOkpJwk::from(&v.payload.identity.encryption_jwk);
         let k = v.signing_pk.kid();
         let ek = v.encryption_pk.kid();
         let fp = v.signing_pk.fingerprint();

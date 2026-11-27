@@ -44,7 +44,7 @@ use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_mill
 use hyp_node::engine::{AuthClaimReply, AuthClaimRequest};
 use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
-use hyp_proto::manifest::{NodeProfile, OkpCurve as ProtoOkpCurve, OkpJwk as ProtoOkpJwk};
+use hyp_proto::manifest::NodeProfile;
 use hyp_proto::problem::ProblemDetails;
 use hyp_proto::scopes::matches_node_prefix;
 use hyp_store::{
@@ -1511,9 +1511,8 @@ fn finalize_join(
         ));
     }
 
-    let hub_sign_jwk = proto_jwk_to_crypto_local(&delegated.manifest_payload.identity.signing_jwk);
-    let hub_enc_jwk =
-        proto_jwk_to_crypto_local(&delegated.manifest_payload.identity.encryption_jwk);
+    let hub_sign_jwk = OkpJwk::from(&delegated.manifest_payload.identity.signing_jwk);
+    let hub_enc_jwk = OkpJwk::from(&delegated.manifest_payload.identity.encryption_jwk);
     let hub_sign_kid = hub_sign_jwk.thumbprint().unwrap_or_default();
     let hub_enc_kid = hub_enc_jwk.thumbprint().unwrap_or_default();
     if let (Ok(sign_json), Ok(enc_json)) = (
@@ -1915,15 +1914,4 @@ fn resolve_join_node_id(
         return propose_node_id_for_human(hid);
     }
     default_node_id()
-}
-
-fn proto_jwk_to_crypto_local(jwk: &ProtoOkpJwk) -> OkpJwk {
-    OkpJwk {
-        kty: jwk.kty.clone(),
-        crv: match jwk.crv {
-            ProtoOkpCurve::Ed25519 => "Ed25519".to_string(),
-            ProtoOkpCurve::X25519 => "X25519".to_string(),
-        },
-        x: jwk.x.clone(),
-    }
 }

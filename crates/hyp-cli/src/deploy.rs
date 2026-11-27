@@ -2767,11 +2767,7 @@ async fn probe_manifest_url(
             }
         };
         // Verify Ed25519 signature over `"hyphae/v2/manifest\n" || payload` against embedded signingJwk.
-        let crypto_jwk = CryptoOkpJwk {
-            kty: payload.identity.signing_jwk.kty.clone(),
-            crv: payload.identity.signing_jwk.crv.as_str().to_string(),
-            x: payload.identity.signing_jwk.x.clone(),
-        };
+        let crypto_jwk = CryptoOkpJwk::from(&payload.identity.signing_jwk);
         let sig_ok = match crypto_jwk.to_ed25519() {
             Ok(pk) => {
                 match pk.verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig) {
