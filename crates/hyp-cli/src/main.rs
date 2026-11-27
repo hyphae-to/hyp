@@ -29,6 +29,7 @@ mod setup;
 mod skill_render;
 mod status_doctor;
 mod statusline_cmd;
+mod term;
 mod ui;
 mod ui_tui;
 mod uninstall_cmd;

@@ -16,6 +16,8 @@
 use crate::inspect_cmd::{InspectArgs, format_age_ms, run_inspect};
 use crate::statusline_cmd::sanitize_terminal_text;
 #[cfg(unix)]
+use crate::term::{AltScreenGuard, RawTtyGuard};
+#[cfg(unix)]
 use crate::ui::EXIT_OK;
 use crate::wizard::ColorMode;
 #[cfg(unix)]
@@ -31,19 +33,15 @@ use hyp_harness::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env
 use serde_json::Value;
 #[cfg(any(unix, test))]
 use serde_json::json;
-#[cfg(unix)]
-use std::fs;
 #[cfg(not(unix))]
 use std::io::{self, IsTerminal};
 #[cfg(unix)]
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::ExitCode;
-#[cfg(unix)]
-use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
@@ -1497,123 +1495,6 @@ pub fn parse_tui_key(bytes: &[u8]) -> TuiKey {
 }
 
 #[cfg(unix)]
-struct AltScreenGuard {
-    active: bool,
-}
-
-#[cfg(unix)]
-impl AltScreenGuard {
-    fn enter_if(enabled: bool) -> Self {
-        if enabled {
-            let mut out = io::stdout().lock();
-            let _ = out.write_all(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
-            let _ = out.flush();
-        } else {
-            let mut out = io::stdout().lock();
-            let _ = out.write_all(b"\x1b[?25l");
-            let _ = out.flush();
-        }
-        Self { active: enabled }
-    }
-
-    fn leave(&mut self) {
-        let mut out = io::stdout().lock();
-        if self.active {
-            self.active = false;
-            let _ = out.write_all(b"\x1b[?25h\x1b[0m\x1b[?1049l");
-        } else {
-            let _ = out.write_all(b"\x1b[?25h\x1b[0m\r\n");
-        }
-        let _ = out.flush();
-    }
-}
-
-#[cfg(unix)]
-impl Drop for AltScreenGuard {
-    fn drop(&mut self) {
-        self.leave();
-    }
-}
-
-#[cfg(unix)]
-struct RawTtyGuard {
-    saved_state: String,
-    tty: fs::File,
-    active: bool,
-}
-
-#[cfg(unix)]
-impl RawTtyGuard {
-    fn run_stty(tty: &fs::File, args: &[&str]) -> io::Result<std::process::Output> {
-        let stdin_file = tty.try_clone()?;
-        Command::new("stty")
-            .args(args)
-            .stdin(Stdio::from(stdin_file))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-    }
-
-    fn enter() -> io::Result<Self> {
-        let tty = fs::File::open("/dev/tty")?;
-        let saved_out = Self::run_stty(&tty, &["-g"])?;
-        if !saved_out.status.success() {
-            return Err(io::Error::other("stty -g failed on /dev/tty"));
-        }
-        let saved_state = String::from_utf8_lossy(&saved_out.stdout)
-            .trim()
-            .to_string();
-        if saved_state.is_empty() {
-            return Err(io::Error::other("stty -g returned empty state"));
-        }
-
-        let mut guard = Self {
-            saved_state,
-            tty,
-            active: true,
-        };
-        let raw_out = Self::run_stty(&guard.tty, &["raw", "-echo", "min", "0", "time", "1"])?;
-        if !raw_out.status.success() {
-            guard.restore();
-            return Err(io::Error::other("stty raw -echo failed on /dev/tty"));
-        }
-        Ok(guard)
-    }
-
-    fn read_key_timeout(&mut self) -> io::Result<Option<TuiKey>> {
-        let mut buf = [0u8; 8];
-        match self.tty.read(&mut buf) {
-            Ok(0) => Ok(None),
-            Ok(n) => {
-                let mut total = n;
-                if total == 1 && buf[0] == 0x1b {
-                    if let Ok(extra) = self.tty.read(&mut buf[1..]) {
-                        total += extra;
-                    }
-                }
-                Ok(Some(parse_tui_key(&buf[..total])))
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn restore(&mut self) {
-        if self.active {
-            self.active = false;
-            let _ = Self::run_stty(&self.tty, &[self.saved_state.as_str()]);
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawTtyGuard {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
-
-#[cfg(unix)]
 enum WatchEvent {
     Snapshot(Value),
     Disconnected { reason: String, attempt: u32 },
@@ -1963,10 +1844,10 @@ pub fn run_ui(args: &UiArgs) -> crate::ui::CommandResult {
 
     #[cfg(unix)]
     {
-        let Ok(mut tty) = RawTtyGuard::enter() else {
+        let Ok(mut tty) = RawTtyGuard::enter(false) else {
             return fallback_to_inspect(args);
         };
-        let _alt = AltScreenGuard::enter_if(!args.no_alt_screen);
+        let _alt = AltScreenGuard::inspector(!args.no_alt_screen);
 
         let socket_path = args.socket.clone().unwrap_or_else(default_socket_path);
         let prefer_session = args.session.clone().or_else(infer_session_id_from_env);
@@ -2061,7 +1942,7 @@ pub fn run_ui(args: &UiArgs) -> crate::ui::CommandResult {
                 dirty = false;
             }
 
-            match tty.read_key_timeout() {
+            match tty.read_key_timeout(parse_tui_key) {
                 Ok(Some(key)) => {
                     idle_ticks = 0;
                     let was_kv = state.active_tab == UiTab::Kv;
