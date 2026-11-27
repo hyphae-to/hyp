@@ -4,7 +4,7 @@
 
 use crate::address::{NodeId, is_valid_topic};
 use crate::cloudevent::parse_rfc3339_utc_nanos;
-use crate::jcs::{JcsError, serialize_jcs, to_jcs_string};
+use crate::jcs::{JcsError, serialize_jcs};
 use crate::problem::ProblemDetails;
 use crate::scopes::EscalationConfig;
 use base64::Engine as _;
