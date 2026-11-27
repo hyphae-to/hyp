@@ -55,13 +55,9 @@ use hyp_store::{
     TrustTier as StoreTrustTier, now_ms,
 };
 use hyper::body::{Bytes, Incoming};
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::convert::Infallible;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -69,7 +65,6 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 pub const DEFAULT_JOIN_LOOPBACK_PORT: u16 = 47891;
@@ -726,12 +721,12 @@ async fn run_loopback_join_server(
         generate_six_digit_code().map_err(|e| ("CSPRNG_ERROR", e))?;
 
     let listener = match args.port {
-        Some(p) => TcpListener::bind(("127.0.0.1", p))
+        Some(p) => crate::oneshot_loopback::bind(p)
             .await
             .map_err(|e| ("BIND_FAILED", format!("Failed to bind 127.0.0.1:{p}: {e}")))?,
-        None => match TcpListener::bind(("127.0.0.1", DEFAULT_JOIN_LOOPBACK_PORT)).await {
+        None => match crate::oneshot_loopback::bind(DEFAULT_JOIN_LOOPBACK_PORT).await {
             Ok(l) => l,
-            Err(_) => TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| {
+            Err(_) => crate::oneshot_loopback::bind(0).await.map_err(|e| {
                 (
                     "BIND_FAILED",
                     format!("Failed to bind ephemeral loopback port: {e}"),
@@ -747,7 +742,7 @@ async fn run_loopback_join_server(
     })?;
     let listen_url = format!("http://127.0.0.1:{}", local_addr.port());
 
-    let (done_tx, mut done_rx) = oneshot::channel::<
+    let (done_tx, done_rx) = oneshot::channel::<
         Result<(ValidatedHandoff, Arc<NodeIdentityKeys>), (&'static str, String)>,
     >();
     let state = Arc::new(LoopbackJoinState {
@@ -796,40 +791,28 @@ async fn run_loopback_join_server(
         let _ = io::stdout().flush();
     }
 
-    let timeout = tokio::time::sleep(Duration::from_secs(args.timeout.max(1)));
-    tokio::pin!(timeout);
-
-    loop {
-        tokio::select! {
-            res = &mut done_rx => {
-                // Brief grace period so the 200 OK / 429 response flushes to the browser cleanly.
-                tokio::time::sleep(Duration::from_millis(40)).await;
-                return res.map_err(|_| ("CHANNEL_CLOSED", "Join handoff channel closed unexpectedly".to_string()))?;
-            }
-            _ = &mut timeout => {
-                return Err((
-                    "JOIN_TIMEOUT",
-                    format!("Timed out after {}s waiting for browser confirmation on {listen_url}", args.timeout),
-                ));
-            }
-            accept = listener.accept() => {
-                let Ok((stream, _)) = accept else {
-                    continue;
-                };
-                let st = Arc::clone(&state);
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let st = Arc::clone(&st);
-                        async move { Ok::<_, Infallible>(handle_join_http_request(st, req).await) }
-                    });
-                    let _ = AutoServerBuilder::new(TokioExecutor::new())
-                        .serve_connection(io, svc)
-                        .await;
-                });
-            }
-        }
-    }
+    crate::oneshot_loopback::serve(
+        listener,
+        state,
+        done_rx,
+        Duration::from_secs(args.timeout.max(1)),
+        Duration::from_millis(40),
+        handle_join_http_request,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::oneshot_loopback::WaitError::ChannelClosed => (
+            "CHANNEL_CLOSED",
+            "Join handoff channel closed unexpectedly".to_string(),
+        ),
+        crate::oneshot_loopback::WaitError::TimedOut => (
+            "JOIN_TIMEOUT",
+            format!(
+                "Timed out after {}s waiting for browser confirmation on {listen_url}",
+                args.timeout
+            ),
+        ),
+    })?
 }
 
 async fn handle_join_http_request(

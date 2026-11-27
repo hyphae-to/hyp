@@ -21,6 +21,7 @@ mod join_cmd;
 mod kv_cmd;
 mod node_cmd;
 mod node_identity;
+mod oneshot_loopback;
 mod pair;
 mod plugin_cmd;
 mod secret_cmd;
