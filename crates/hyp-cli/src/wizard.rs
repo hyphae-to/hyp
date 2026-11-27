@@ -636,18 +636,7 @@ pub fn apply_desktop_mcp_config(
 /// RFC 3986 percent-encoding for URI query parameters (encodes everything except unreserved
 /// `ALPHA / DIGIT / "-" / "." / "_" / "~"`).
 pub fn percent_encode_uri_component(input: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(input.len() + input.len() / 4);
-    for &b in input.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0x0f) as usize] as char);
-        }
-    }
-    out
+    hyp_node::engine::http_util::percent_encode(input)
 }
 
 fn percent_encode_uri_path(path: &Path) -> String {

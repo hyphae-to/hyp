@@ -1784,33 +1784,7 @@ fn parse_form_urlencoded(body: &[u8]) -> std::collections::HashMap<String, Strin
 }
 
 fn percent_decode_form(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    out.push(((h << 4) | l) as u8);
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    hyp_node::engine::http_util::percent_decode_form(s)
 }
 
 fn read_bounded_stdin() -> Result<String, String> {

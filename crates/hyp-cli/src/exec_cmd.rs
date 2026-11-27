@@ -447,31 +447,11 @@ pub fn parse_env_binding(raw: &str) -> Result<EnvBinding, (&'static str, String)
 }
 
 fn percent_encode_lower(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for &b in input.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02x}"));
-        }
-    }
-    out
+    hyp_node::engine::http_util::percent_encode_lowercase(input)
 }
 
 fn form_urlencode(input: &str, lowercase_hex: bool) -> String {
-    let mut out = String::with_capacity(input.len());
-    for &b in input.as_bytes() {
-        if b == b' ' {
-            out.push('+');
-        } else if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else if lowercase_hex {
-            out.push_str(&format!("%{b:02x}"));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    hyp_node::engine::http_util::form_urlencode(input, lowercase_hex)
 }
 
 fn push_unique_pattern(

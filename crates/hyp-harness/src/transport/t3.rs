@@ -885,18 +885,7 @@ fn compute_ws_accept(sec_websocket_key: &str) -> String {
 }
 
 fn percent_encode_query_component(raw: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(raw.len());
-    for &b in raw.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push(HEX[(b >> 4) as usize] as char);
-            out.push(HEX[(b & 0x0f) as usize] as char);
-        }
-    }
-    out
+    hyp_node::engine::http_util::percent_encode(raw)
 }
 
 fn header_has_token_ignore_case(

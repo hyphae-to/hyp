@@ -474,8 +474,17 @@ pub fn parse_query(query: Option<&str>) -> BTreeMap<String, String> {
     out
 }
 
-/// Decodes RFC 3986 `%XX` escape sequences (plus `+` as space in query parameters).
+/// Decodes RFC 3986 `%XX` sequences, preserving literal `+` and malformed escapes.
 pub fn percent_decode(input: &str) -> String {
+    decode_percent(input, false)
+}
+
+/// Decodes form escapes, including literal `+` as space.
+pub fn percent_decode_form(input: &str) -> String {
+    decode_percent(input, true)
+}
+
+fn decode_percent(input: &str, form: bool) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -487,20 +496,47 @@ pub fn percent_decode(input: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i]);
+        out.push(if form && bytes[i] == b'+' {
+            b' '
+        } else {
+            bytes[i]
+        });
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Percent-encodes a single URL path segment or query value (RFC 3986 unreserved set).
+/// Percent-encodes a path segment or query value (RFC 3986 unreserved set).
 pub fn percent_encode(input: &str) -> String {
+    encode_percent(input, false, false)
+}
+
+/// Lowercase escape spelling used alongside uppercase escapes by secret redaction.
+pub fn percent_encode_lowercase(input: &str) -> String {
+    encode_percent(input, false, true)
+}
+
+/// Form spelling of the same unreserved set, with spaces encoded as `+`.
+pub fn form_urlencode(input: &str, lowercase_hex: bool) -> String {
+    encode_percent(input, true, lowercase_hex)
+}
+
+fn encode_percent(input: &str, form: bool, lowercase_hex: bool) -> String {
+    let hex = if lowercase_hex {
+        b"0123456789abcdef"
+    } else {
+        b"0123456789ABCDEF"
+    };
     let mut out = String::with_capacity(input.len());
-    for &b in input.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
+    for &byte in input.as_bytes() {
+        if form && byte == b' ' {
+            out.push('+');
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            out.push('%');
+            out.push(hex[(byte >> 4) as usize] as char);
+            out.push(hex[(byte & 0x0f) as usize] as char);
         }
     }
     out
@@ -965,5 +1001,20 @@ mod tests {
 
         kv_headers.insert(IF_MATCH, HeaderValue::from_static("not-a-number"));
         assert!(parse_if_match_version(&kv_headers).is_err());
+    }
+}
+
+#[cfg(test)]
+mod percent_codec_tests {
+    use super::*;
+    #[test]
+    fn uri_form_and_hex_case_policies_remain_distinct() {
+        assert_eq!(percent_decode("+%2B%20%GG%"), "++ %GG%");
+        assert_eq!(percent_decode_form("+%2B%20%GG%"), " + %GG%");
+        assert_eq!(percent_decode("%ff"), "\u{fffd}");
+        assert_eq!(percent_encode("a +/é~"), "a%20%2B%2F%C3%A9~");
+        assert_eq!(percent_encode_lowercase("a +/é~"), "a%20%2b%2f%c3%a9~");
+        assert_eq!(form_urlencode("a +/é~", false), "a+%2B%2F%C3%A9~");
+        assert_eq!(form_urlencode("a +/é~", true), "a+%2b%2f%c3%a9~");
     }
 }
