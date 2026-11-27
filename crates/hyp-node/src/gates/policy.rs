@@ -1175,6 +1175,15 @@ pub struct SecurityGateConfig {
 }
 
 impl SecurityGateConfig {
+    /// Bind the authority snapshot and return the policy hash for a live Passkey ceremony.
+    pub fn prepare_passkey_seal(&mut self, authorities_digest: &str) -> Result<String, GateError> {
+        self.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_owned();
+        self.human_authorities_digest = Some(authorities_digest.to_owned());
+        self.require_signed_policy = true;
+        self.policy_signature = None;
+        gate_policy_sha256(self)
+    }
+
     /// Validates the complete Local Security Gate configuration fail-closed.
     ///
     /// - Rejects any non-default `policy_signing_secret` value (only empty or
