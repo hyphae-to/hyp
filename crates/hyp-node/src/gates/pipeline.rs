@@ -15,6 +15,7 @@
 //! - Stage 2 / filter plugins can NEVER undo a Stage 1 urgency ceiling or `Block`/`Quarantine`.
 //! - The `NodeDb` mutex is NEVER held across `.await` points.
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use hyp_crypto::SecretStore;
@@ -76,6 +77,38 @@ struct PolicySigCacheEntry {
     seal_fingerprint: Option<String>,
 }
 
+#[derive(Clone)]
+enum RuntimeFilter {
+    Stage2(Arc<Stage2Guard>),
+    Plugin(Arc<dyn FilterPlugin>),
+}
+
+impl RuntimeFilter {
+    async fn evaluate_if_matched(
+        &self,
+        ctx: &InboundContext,
+        secrets: Option<&SecretStore>,
+    ) -> Option<(Cow<'_, str>, FilterOutcome)> {
+        match self {
+            Self::Stage2(stage2) if stage2.config().matchers.matches(ctx) => {
+                Some((Cow::Borrowed("stage2"), stage2.evaluate(ctx, secrets).await))
+            }
+            Self::Plugin(plugin)
+                if plugin
+                    .matchers()
+                    .is_none_or(|matchers| matchers.matches(ctx)) =>
+            {
+                let stage = format!("filter:{}", plugin.id());
+                Some((
+                    Cow::Owned(stage),
+                    plugin.evaluate(ctx, &ctx.event, secrets).await,
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Unified Local Security Gate pipeline backed by [`Stage1Engine`], [`Stage2Guard`],
 /// composable [`FilterPlugin`] chain, [`NodeDb`], and an optional [`SecretStore`].
 #[derive(Clone)]
@@ -83,8 +116,7 @@ pub struct SecurityGatePipeline {
     config: SecurityGateConfig,
     config_hash: String,
     stage1: Arc<Stage1Engine>,
-    stage2: Option<Stage2Guard>,
-    filters: Vec<Arc<dyn FilterPlugin>>,
+    filters: Vec<RuntimeFilter>,
     db: Arc<Mutex<NodeDb>>,
     secrets: Option<Arc<SecretStore>>,
     policy_sig_cache: Arc<Mutex<Option<PolicySigCacheEntry>>>,
@@ -92,10 +124,21 @@ pub struct SecurityGatePipeline {
 
 impl std::fmt::Debug for SecurityGatePipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let filter_ids: Vec<&str> = self.filters.iter().map(|p| p.id()).collect();
+        let stage2 = self.filters.iter().find_map(|filter| match filter {
+            RuntimeFilter::Stage2(guard) => Some(guard),
+            RuntimeFilter::Plugin(_) => None,
+        });
+        let filter_ids: Vec<&str> = self
+            .filters
+            .iter()
+            .filter_map(|filter| match filter {
+                RuntimeFilter::Stage2(_) => None,
+                RuntimeFilter::Plugin(plugin) => Some(plugin.id()),
+            })
+            .collect();
         f.debug_struct("SecurityGatePipeline")
             .field("stage1", &self.stage1)
-            .field("stage2", &self.stage2)
+            .field("stage2", &stage2)
             .field("filters", &filter_ids)
             .field("require_signed_policy", &self.config.require_signed_policy)
             .finish()
@@ -112,15 +155,15 @@ impl SecurityGatePipeline {
     ) -> Result<Self, GateError> {
         config.validate()?;
         let stage1 = Arc::new(Stage1Engine::new(config.stage1.clone())?);
-        let stage2 = if config.stage2.enabled {
-            Some(Stage2Guard::new(config.stage2.clone())?)
-        } else {
-            None
-        };
-        let mut filters = Vec::with_capacity(config.filters.len());
+        let mut filters =
+            Vec::with_capacity(config.filters.len() + usize::from(config.stage2.enabled));
+        if config.stage2.enabled {
+            let guard = Stage2Guard::new(config.stage2.clone())?;
+            filters.push(RuntimeFilter::Stage2(Arc::new(guard)));
+        }
         for fcfg in &config.filters {
             if fcfg.enabled {
-                filters.push(build_filter_plugin(fcfg)?);
+                filters.push(RuntimeFilter::Plugin(build_filter_plugin(fcfg)?));
             } else {
                 // Disabled filter configs still pass non-URL invariant validation (`G17` skipped).
                 fcfg.validate()?;
@@ -134,7 +177,6 @@ impl SecurityGatePipeline {
             config,
             config_hash,
             stage1,
-            stage2,
             filters,
             db,
             secrets,
@@ -144,7 +186,7 @@ impl SecurityGatePipeline {
 
     /// Appends a custom in-process [`FilterPlugin`] to the ordered filter chain.
     pub fn with_custom_plugin(mut self, plugin: Arc<dyn FilterPlugin>) -> Self {
-        self.filters.push(plugin);
+        self.filters.push(RuntimeFilter::Plugin(plugin));
         self
     }
 
@@ -154,7 +196,7 @@ impl SecurityGatePipeline {
 
     /// Returns the number of active runtime filter plugins loaded in this pipeline.
     pub fn active_filter_count(&self) -> usize {
-        self.filters.len()
+        self.filters.len() - usize::from(self.config.stage2.enabled)
     }
 
     pub fn db(&self) -> Arc<Mutex<NodeDb>> {
@@ -558,37 +600,13 @@ impl SecurityGatePipeline {
         let mut last_confidence: Option<f64> = Some(1.0);
         let mut collected_categories = stage1_out.categories;
 
-        if self.config.stage2.enabled && self.config.stage2.matchers.matches(ctx) {
-            if let Some(ref stage2) = self.stage2 {
-                let outcome = stage2.evaluate(ctx, self.secrets.as_deref()).await;
-                if let Some(short_circuit) = self.handle_filter_outcome(
-                    existing_receipt,
-                    ctx,
-                    &payload_text,
-                    &payload_sha256,
-                    traceparent.clone(),
-                    "stage2",
-                    outcome,
-                    &mut last_stage,
-                    &mut last_confidence,
-                    &mut collected_categories,
-                    now_ms,
-                )? {
-                    return Ok(short_circuit);
-                }
-            }
-        }
-
-        for plugin in &self.filters {
-            if let Some(matchers) = plugin.matchers() {
-                if !matchers.matches(ctx) {
-                    continue;
-                }
-            }
-            let stage_label = format!("filter:{}", plugin.id());
-            let outcome = plugin
-                .evaluate(ctx, &ctx.event, self.secrets.as_deref())
-                .await;
+        for filter in &self.filters {
+            let Some((stage_label, outcome)) = filter
+                .evaluate_if_matched(ctx, self.secrets.as_deref())
+                .await
+            else {
+                continue;
+            };
             if let Some(short_circuit) = self.handle_filter_outcome(
                 existing_receipt,
                 ctx,
@@ -891,37 +909,13 @@ impl SecurityGatePipeline {
         let mut last_confidence: Option<f64> = Some(1.0);
         let mut collected_categories = stage1_out.categories;
 
-        if self.config.stage2.enabled && self.config.stage2.matchers.matches(ctx) {
-            if let Some(ref stage2) = self.stage2 {
-                let outcome = stage2.evaluate(ctx, self.secrets.as_deref()).await;
-                if let Some(short_circuit) = self.handle_filter_outcome(
-                    None,
-                    ctx,
-                    &payload_text,
-                    &payload_sha256,
-                    traceparent.clone(),
-                    "stage2",
-                    outcome,
-                    &mut last_stage,
-                    &mut last_confidence,
-                    &mut collected_categories,
-                    now_ms,
-                )? {
-                    return Ok(short_circuit);
-                }
-            }
-        }
-
-        for plugin in &self.filters {
-            if let Some(matchers) = plugin.matchers() {
-                if !matchers.matches(ctx) {
-                    continue;
-                }
-            }
-            let stage_label = format!("filter:{}", plugin.id());
-            let outcome = plugin
-                .evaluate(ctx, &ctx.event, self.secrets.as_deref())
-                .await;
+        for filter in &self.filters {
+            let Some((stage_label, outcome)) = filter
+                .evaluate_if_matched(ctx, self.secrets.as_deref())
+                .await
+            else {
+                continue;
+            };
             if let Some(short_circuit) = self.handle_filter_outcome(
                 None,
                 ctx,
