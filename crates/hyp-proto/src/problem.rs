@@ -45,11 +45,6 @@ impl ProblemDetails {
         }
     }
 
-    pub fn with_instance(mut self, instance: impl Into<String>) -> Self {
-        self.instance = Some(instance.into());
-        self
-    }
-
     pub fn with_extension(mut self, key: impl Into<String>, value: Value) -> Self {
         self.extensions.insert(key.into(), value);
         self

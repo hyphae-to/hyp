@@ -323,10 +323,6 @@ impl LineSplitter {
         }
     }
 
-    pub fn overflowing(&self) -> bool {
-        self.overflow
-    }
-
     /// Feeds a chunk of bytes and invokes `on_line(text, truncated)` for each completed line.
     pub fn push(&mut self, chunk: &[u8], mut on_line: impl FnMut(String, bool)) {
         let mut start = 0;

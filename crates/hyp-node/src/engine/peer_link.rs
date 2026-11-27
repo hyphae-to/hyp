@@ -703,13 +703,6 @@ impl PeerLink {
         Ok(ManifestFetchOutcome::Signed { manifest, etag })
     }
 
-    pub async fn put_keys(&self, req: &PutKeyRequest) -> Result<(), NodeError> {
-        let _: serde_json::Value = self
-            .send_json(Method::PUT, "/v1/keys", Some(req), &[])
-            .await?;
-        Ok(())
-    }
-
     pub async fn get_keys(&self, node_id: Option<&str>) -> Result<PeerKeysResponse, NodeError> {
         let path = match node_id {
             Some(id) => format!("/v1/keys?nodeId={}", percent_encode(id)),
@@ -721,11 +714,6 @@ impl PeerLink {
     pub async fn get_kv_member_keys(&self, namespace: &str) -> Result<PeerKeysResponse, NodeError> {
         let path = format!("/v1/keys?kvNamespace={}", percent_encode(namespace));
         self.send_json::<(), _>(Method::GET, &path, None, &[]).await
-    }
-
-    pub async fn put_handles(&self, handles: Vec<String>) -> Result<HandlesResponse, NodeError> {
-        self.put_handles_with_descriptions(&handles, &BTreeMap::new())
-            .await
     }
 
     pub async fn put_handles_with_descriptions(

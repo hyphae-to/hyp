@@ -16,11 +16,7 @@ use thiserror::Error;
 
 pub const TYPE_DM_V1: &str = "to.hyphae.dm.v1";
 pub const TYPE_CHANNEL_V1: &str = "to.hyphae.channel.v1";
-pub const TYPE_KV_SET: &str = "to.hyphae.kv.set";
-pub const TYPE_KV_DELETED: &str = "to.hyphae.kv.deleted";
 pub const TYPE_TRANSFER_V1: &str = "to.hyphae.transfer.v1";
-pub const TYPE_NODE_MANIFEST: &str = "to.hyphae.node.manifest";
-pub const TYPE_NODE_DIRECTORY: &str = "to.hyphae.node.directory";
 pub const TYPE_SCHEDULED_MESSAGE_V1: &str = "to.hyphae.scheduled.v1";
 pub const TYPE_LOCAL_EVENT_V1: &str = "to.hyphae.local.v1";
 pub const TYPE_HUMAN_DROP_V1: &str = "to.hyphae.human.drop.v1";
@@ -29,7 +25,6 @@ pub const TYPE_HUMAN_REVOCATION_V1: &str = "to.hyphae.human.revocation.v1";
 
 pub const CONTENT_TYPE_JSON: &str = "application/json";
 pub const CONTENT_TYPE_E2EE_JSON: &str = "application/hyphae-e2ee+json";
-pub const CONTENT_TYPE_TEXT_PLAIN: &str = "text/plain";
 
 // ---- Standard CloudEvents extension attribute names ----
 
@@ -61,13 +56,6 @@ impl CloudEventLimits {
     pub const DEFAULT: Self = Self {
         max_data_bytes: MAX_DATA_BYTES,
         max_event_bytes: MAX_EVENT_BYTES,
-        max_attribute_chars: MAX_ATTRIBUTE_CHARS,
-    };
-
-    /// Higher envelope limit for E2EE DM / channel ciphertext payloads (32 KiB data, 36 KiB event).
-    pub const E2EE_ENVELOPE: Self = Self {
-        max_data_bytes: 32 * 1024,
-        max_event_bytes: 36 * 1024,
         max_attribute_chars: MAX_ATTRIBUTE_CHARS,
     };
 }

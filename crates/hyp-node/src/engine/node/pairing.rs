@@ -191,15 +191,6 @@ impl UnifiedNode {
         Ok((token, record))
     }
 
-    /// Server-side handler for `POST /v1/pair` (Org Admin-CA `am2_` single-use binding claim)
-    /// when the signed grant is already persisted in Hub SQLite.
-    pub fn handle_admin_pair_request(
-        &self,
-        req: &PairRequestV2,
-    ) -> Result<PairServerReply, NodeError> {
-        self.handle_admin_pair_request_with_grant(req, None)
-    }
-
     /// Server-side handler for `POST /v1/pair` supporting BOTH:
     /// 1. True Offline Admin-CA pairing: client presents an inline `signed_grant` (`GrantV2`
     ///    signed by the offline Org Admin-CA key), verified purely against `config.admin_jwk`

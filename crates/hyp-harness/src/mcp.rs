@@ -26,7 +26,6 @@ use tokio::time::Instant;
 
 pub const ERR_METHOD_NOT_FOUND: i64 = -32601;
 pub const ERR_INVALID_PARAMS: i64 = -32602;
-pub const ERR_INTERNAL: i64 = -32603;
 
 const CAPS_TIMEOUT: Duration = Duration::from_millis(300);
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);

@@ -25,9 +25,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use hyp_proto::rpc::{
-    DeliveryFailedParams, JsonRpcNotification, JsonRpcRequest, METHOD_DELIVERY_FAILED, METHOD_POST,
-    METHOD_STATUS, METHOD_SYSTEM_WAKE, PluginFrame, PostParams, RpcId, StatusParams,
-    SystemWakeParams, encode_frame,
+    JsonRpcNotification, JsonRpcRequest, METHOD_POST, METHOD_STATUS, METHOD_SYSTEM_WAKE,
+    PluginFrame, PostParams, RpcId, StatusParams, SystemWakeParams, encode_frame,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -464,30 +463,6 @@ impl SubprocessSupervisor {
             serde_json::to_value(status).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         let frame =
             PluginFrame::JsonRpcNotification(JsonRpcNotification::new(METHOD_STATUS, Some(value)));
-
-        let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
-        tx.send(wire)
-            .map_err(|_| AdapterError::NotRunning(self.inner.config.id.clone()))
-    }
-
-    /// Sends a `delivery_failed` / `hyphae/deliveryFailed` notification to the running subprocess.
-    pub async fn send_delivery_failed(
-        &self,
-        params: DeliveryFailedParams,
-    ) -> Result<(), AdapterError> {
-        let tx = {
-            let guard = self.inner.active.lock().await;
-            let Some(conn) = guard.as_ref() else {
-                return Err(AdapterError::NotRunning(self.inner.config.id.clone()));
-            };
-            conn.tx.clone()
-        };
-        let value =
-            serde_json::to_value(params).map_err(|e| AdapterError::Protocol(e.to_string()))?;
-        let frame = PluginFrame::JsonRpcNotification(JsonRpcNotification::new(
-            METHOD_DELIVERY_FAILED,
-            Some(value),
-        ));
 
         let wire = encode_frame(&frame).map_err(|e| AdapterError::Protocol(e.to_string()))?;
         tx.send(wire)

@@ -165,23 +165,6 @@ impl BurstTracker {
             .is_none_or(|last| now_ms.saturating_sub(last) >= min_interval_ms)
     }
 
-    /// Returns all sources currently in Noisy Mode at `now_ms` (sorted deterministically).
-    pub fn noisy_sources(&self, now_ms: i64) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .sources
-            .iter()
-            .filter(|(_, s)| s.noisy_until_ms.is_some_and(|until| now_ms < until))
-            .map(|(k, _)| k.clone())
-            .collect();
-        out.sort();
-        out
-    }
-
-    /// Resets burst history for a specific source.
-    pub fn reset_source(&mut self, source_key: &str) {
-        self.sources.remove(&normalize_source_key(source_key));
-    }
-
     fn events_in_window(&self, key: &str, config: &BurstProtectionConfig, now_ms: i64) -> usize {
         let window_ms = (config.window_secs as i64).saturating_mul(1_000);
         let cutoff = now_ms.saturating_sub(window_ms);

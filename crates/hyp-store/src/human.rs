@@ -789,19 +789,6 @@ impl<'a> HumanAuthorityStore<'a> {
         )
     }
 
-    /// Lists all configured delegated human admission policies ordered by `human_id ASC`.
-    pub fn list_delegation_policies(&self) -> StoreResult<Vec<HumanDelegationPolicy>> {
-        let rows = query_vec(
-            self.db.conn(),
-            "SELECT human_id, node_prefix, scopes_json, max_devices, delegation_enabled, updated_at
-             FROM human_delegation_policies
-             ORDER BY human_id ASC",
-            [],
-            row_to_delegation_policy,
-        )?;
-        rows.into_iter().collect()
-    }
-
     /// Toggles `delegation_enabled` on an existing `human_delegation_policies` row.
     pub fn set_delegation_enabled(
         &self,

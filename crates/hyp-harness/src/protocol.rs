@@ -133,12 +133,6 @@ impl FromStr for HarnessKind {
     }
 }
 
-/// Rust v2 4-tool core MCP surface (`hyp_send`, `hyp_inbox`, `hyp_mesh`, `hyp_stream`).
-pub const V2_CORE_MCP_TOOLS: &[&str] = &["hyp_send", "hyp_inbox", "hyp_mesh", "hyp_stream"];
-
-/// Conditional bridge tool (included in `tools/list` ONLY when `hasPlugins == true`).
-pub const BRIDGE_MCP_TOOL: &str = "hyp_bridge";
-
 /// Documented Hyphae tools recognized by PreToolUse hook normalization.
 const KNOWN_MESH_TOOLS: &[&str] = &[
     // Rust v2 4 core + conditional tools (`hyp_bridge`, `hyp_kv`)

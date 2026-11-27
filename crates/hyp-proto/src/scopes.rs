@@ -104,8 +104,6 @@ pub const V1_ALL_SCOPES: &[&str] = &[
     "forks:receive/full-access",
 ];
 
-pub const V1_UNPAIRED_SCOPES: &[&str] = &["messages:send", "messages:receive", "events:subscribe"];
-
 /// Exact v1 scope expansion matching `expandScopes` in `src/core/identity/scopes.ts` 100%.
 pub fn expand_v1_scopes<S: AsRef<str>>(input: &[S]) -> Result<Vec<String>, ScopeError> {
     if input.is_empty() {
@@ -1448,17 +1446,6 @@ pub struct UntrustedEscalationNote {
     pub untrusted: bool,
     pub provenance: String,
     pub text: String,
-}
-
-/// Structured MCP `not_granted` error envelope wrapping a remote escalation note (§4.2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NotGrantedMcpError {
-    pub error: String,
-    pub missing_scope: String,
-    pub current_scopes: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_escalation_note: Option<UntrustedEscalationNote>,
 }
 
 /// Returns `true` if a raw scope token is forbidden in delegated human admission policies

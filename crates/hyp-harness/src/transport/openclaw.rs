@@ -287,11 +287,6 @@ impl OpenClawTarget {
         self
     }
 
-    /// Returns the sole permitted `SecretStore` key name (`"openclaw-hooks-token"`).
-    pub fn effective_token_secret_name(&self) -> &str {
-        DEFAULT_OPENCLAW_TOKEN_SECRET
-    }
-
     /// Resolves the validated full endpoint URI (`<origin><hooks_path>/<mode>`).
     pub fn endpoint_url(&self) -> Result<String, String> {
         let origin = normalize_openclaw_base_url_with_remote(&self.base_url, self.allow_remote)?;
