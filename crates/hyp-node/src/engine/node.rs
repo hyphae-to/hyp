@@ -277,6 +277,14 @@ pub struct SubscribeResult {
     pub pushdown_shards: usize,
 }
 
+#[derive(Clone, Copy)]
+struct HumanDropAudit<'a> {
+    source: Option<&'a str>,
+    session_id: Option<&'a str>,
+    payload_digest_input: &'a [u8],
+    now: i64,
+}
+
 /// Metadata-only result returned by [`UnifiedNode::ingest_human_drop`].
 ///
 /// **Zero-leak invariant:** Never contains secret payload bytes.
@@ -8692,37 +8700,30 @@ impl UnifiedNode {
             Ok(env) => env,
             Err(e) => {
                 let reason = format!("invalid hdrop1_ token: {e}");
-                self.record_human_drop_rejected_audit(
-                    None,
-                    None,
-                    None,
-                    Some("human.invalid_token"),
-                    &reason,
-                    b"redacted-hdrop1",
-                    now_ms(),
+                return self.reject_human_drop(
+                    HumanDropAudit {
+                        source: None,
+                        session_id: None,
+                        payload_digest_input: b"redacted-hdrop1",
+                        now: now_ms(),
+                    },
+                    "human.invalid_token",
+                    reason,
+                    NodeError::Unauthorized,
                 );
-                return Err(NodeError::Unauthorized(reason));
             }
         };
         self.ingest_human_drop(&envelope, gate, overwrite_secret)
             .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn record_human_drop_rejected_audit(
         &self,
-        source: Option<String>,
-        session_id: Option<String>,
-        event_type: Option<&str>,
-        extra_category: Option<&str>,
+        audit: HumanDropAudit<'_>,
+        category: &str,
         reason: &str,
-        payload_digest_input: &[u8],
-        now: i64,
     ) {
-        let mut categories = vec!["gate.human_drop_rejected".to_string()];
-        if let Some(cat) = extra_category {
-            categories.push(cat.to_string());
-        }
+        let categories = vec!["gate.human_drop_rejected".to_string(), category.to_string()];
         let db = self.db();
         let _ = db.local().append_gate_audit(
             &GateAuditInput {
@@ -8730,20 +8731,32 @@ impl UnifiedNode {
                 stage: "human_authority".to_string(),
                 decision: StoreGateDecision::Block,
                 origin_node: Some(self.node_id().to_string()),
-                source,
-                session_id,
+                source: audit.source.map(str::to_owned),
+                session_id: audit.session_id.map(str::to_owned),
                 receipt_id: None,
-                event_type: Some(event_type.unwrap_or(TYPE_HUMAN_DROP_V1).to_string()),
+                event_type: Some(TYPE_HUMAN_DROP_V1.to_string()),
                 trust_tier: Some("unverified".to_string()),
                 confidence: None,
                 categories,
                 reason: Some(reason.to_string()),
                 traceparent: None,
-                payload_sha256: sha256_hex(payload_digest_input),
+                payload_sha256: sha256_hex(audit.payload_digest_input),
                 reviewer: None,
             },
-            now,
+            audit.now,
         );
+    }
+
+    fn reject_human_drop(
+        &self,
+        audit: HumanDropAudit<'_>,
+        category: &str,
+        reason: impl Into<String>,
+        error: fn(String) -> NodeError,
+    ) -> Result<IngestedHumanDrop, NodeError> {
+        let reason = reason.into();
+        self.record_human_drop_rejected_audit(audit, category, &reason);
+        Err(error(reason))
     }
 
     /// Strictly opens, verifies, replay-guards, and ingests a sealed [`HumanDropEnvelopeV1`]:
@@ -8770,18 +8783,20 @@ impl UnifiedNode {
         overwrite_secret: bool,
     ) -> Result<IngestedHumanDrop, NodeError> {
         let now = now_ms();
+        let audit = HumanDropAudit {
+            source: None,
+            session_id: None,
+            payload_digest_input: envelope.ct.as_bytes(),
+            now,
+        };
         if let Some(g) = gate {
             if g.is_policy_tampered() {
-                self.record_human_drop_rejected_audit(
-                    None,
-                    None,
-                    None,
-                    Some("gate.policy_tampered"),
+                return self.reject_human_drop(
+                    audit,
+                    "gate.policy_tampered",
                     "gate_policy_tampered",
-                    envelope.ct.as_bytes(),
-                    now,
+                    NodeError::Unauthorized,
                 );
-                return Err(NodeError::Unauthorized("gate_policy_tampered".into()));
             }
         }
 
@@ -8827,16 +8842,7 @@ impl UnifiedNode {
                     "human.verification_failed"
                 };
                 let reason = format!("human drop verification failed: {err_msg}");
-                self.record_human_drop_rejected_audit(
-                    None,
-                    None,
-                    None,
-                    Some(extra_cat),
-                    &reason,
-                    envelope.ct.as_bytes(),
-                    now,
-                );
-                return Err(NodeError::Unauthorized(reason));
+                return self.reject_human_drop(audit, extra_cat, reason, NodeError::Unauthorized);
             }
         };
 
@@ -8844,21 +8850,21 @@ impl UnifiedNode {
             Some(rec) => rec,
             None => {
                 let reason = "verified human authority record unavailable";
-                self.record_human_drop_rejected_audit(
-                    None,
-                    None,
-                    None,
-                    Some("human.revoked_or_unknown"),
+                return self.reject_human_drop(
+                    audit,
+                    "human.revoked_or_unknown",
                     reason,
-                    envelope.ct.as_bytes(),
-                    now,
+                    NodeError::Unauthorized,
                 );
-                return Err(NodeError::Unauthorized(reason.into()));
             }
         };
 
         let kid8: String = auth_rec.kid.chars().take(8).collect();
         let source = format!("human:{}:{}", auth_rec.human_id, kid8);
+        let verified_audit = HumanDropAudit {
+            source: Some(&source),
+            ..audit
+        };
 
         // H5: Enforce exact epoch binding (`claim.auth_epoch == rec.auth_epoch`), preventing an
         // old-epoch key from claiming a forged higher epoch.
@@ -8867,53 +8873,45 @@ impl UnifiedNode {
                 "human claim authEpoch {} does not match enrolled authority key epoch {}",
                 claim.auth_epoch, auth_rec.auth_epoch
             );
-            self.record_human_drop_rejected_audit(
-                Some(source),
-                None,
-                None,
-                Some("human.epoch_mismatch"),
-                &reason,
-                envelope.ct.as_bytes(),
-                now,
+            return self.reject_human_drop(
+                verified_audit,
+                "human.epoch_mismatch",
+                reason,
+                NodeError::Unauthorized,
             );
-            return Err(NodeError::Unauthorized(reason));
         }
 
         let issued_at_ms = match parse_rfc3339_millis(&claim.issued_at) {
             Ok(ms) => ms,
             Err(e) => {
                 let reason = format!("invalid claim issuedAt: {e}");
-                self.record_human_drop_rejected_audit(
-                    Some(source),
-                    None,
-                    None,
-                    Some("human.invalid_timestamp"),
-                    &reason,
-                    envelope.ct.as_bytes(),
-                    now,
+                return self.reject_human_drop(
+                    verified_audit,
+                    "human.invalid_timestamp",
+                    reason,
+                    NodeError::BadRequest,
                 );
-                return Err(NodeError::BadRequest(reason));
             }
         };
         let expires_at_ms = match parse_rfc3339_millis(&claim.expires_at) {
             Ok(ms) => ms,
             Err(e) => {
                 let reason = format!("invalid claim expiresAt: {e}");
-                self.record_human_drop_rejected_audit(
-                    Some(source),
-                    None,
-                    None,
-                    Some("human.invalid_timestamp"),
-                    &reason,
-                    envelope.ct.as_bytes(),
-                    now,
+                return self.reject_human_drop(
+                    verified_audit,
+                    "human.invalid_timestamp",
+                    reason,
+                    NodeError::BadRequest,
                 );
-                return Err(NodeError::BadRequest(reason));
             }
         };
 
         let target_handle = claim.audience.handle.clone();
         let target_session = self.resolve_human_drop_target_session(target_handle.as_deref())?;
+        let targeted_audit = HumanDropAudit {
+            session_id: Some(&target_session),
+            ..verified_audit
+        };
 
         let verified_claim = VerifiedHumanClaim {
             human_id: auth_rec.human_id.clone(),
@@ -8927,63 +8925,51 @@ impl UnifiedNode {
 
         match claim.kind {
             HumanDropKind::Secret => {
+                let secret_audit = HumanDropAudit {
+                    payload_digest_input: b"redacted-secret",
+                    ..targeted_audit
+                };
                 let spec = match claim.secret_spec.as_ref() {
                     Some(s) => s,
                     None => {
                         let reason = "secret drop claim missing secretSpec";
-                        self.record_human_drop_rejected_audit(
-                            Some(source),
-                            Some(target_session),
-                            Some(TYPE_HUMAN_DROP_V1),
-                            Some("human.invalid_secret_spec"),
+                        return self.reject_human_drop(
+                            secret_audit,
+                            "human.invalid_secret_spec",
                             reason,
-                            b"redacted-secret",
-                            now,
+                            NodeError::BadRequest,
                         );
-                        return Err(NodeError::BadRequest(reason.into()));
                     }
                 };
                 let secret_name = spec.name.trim();
                 if secret_name.is_empty() {
                     let reason = "secret drop name must not be empty";
-                    self.record_human_drop_rejected_audit(
-                        Some(source),
-                        Some(target_session),
-                        Some(TYPE_HUMAN_DROP_V1),
-                        Some("human.invalid_secret_name"),
+                    return self.reject_human_drop(
+                        secret_audit,
+                        "human.invalid_secret_name",
                         reason,
-                        b"redacted-secret",
-                        now,
+                        NodeError::BadRequest,
                     );
-                    return Err(NodeError::BadRequest(reason.into()));
                 }
                 if is_reserved_drop_secret_name(secret_name) {
                     let reason = format!(
                         "reserved system secret name '{secret_name}' cannot be written via human drop"
                     );
-                    self.record_human_drop_rejected_audit(
-                        Some(source),
-                        Some(target_session),
-                        Some(TYPE_HUMAN_DROP_V1),
-                        Some("human.reserved_secret"),
-                        &reason,
-                        b"redacted-secret",
-                        now,
+                    return self.reject_human_drop(
+                        secret_audit,
+                        "human.reserved_secret",
+                        reason,
+                        NodeError::Unauthorized,
                     );
-                    return Err(NodeError::Unauthorized(reason));
                 }
                 if let Err(e) = validate_secret_name(secret_name) {
                     let reason = format!("invalid secret name: {e}");
-                    self.record_human_drop_rejected_audit(
-                        Some(source),
-                        Some(target_session),
-                        Some(TYPE_HUMAN_DROP_V1),
-                        Some("human.invalid_secret_name"),
-                        &reason,
-                        b"redacted-secret",
-                        now,
+                    return self.reject_human_drop(
+                        secret_audit,
+                        "human.invalid_secret_name",
+                        reason,
+                        NodeError::BadRequest,
                     );
-                    return Err(NodeError::BadRequest(reason));
                 }
 
                 // H15: Human-signed `spec.overwrite` governs fail-closed; a local
@@ -8994,16 +8980,12 @@ impl UnifiedNode {
                     let reason = format!(
                         "secret '{secret_name}' already exists and signed claim specifies overwrite=false"
                     );
-                    self.record_human_drop_rejected_audit(
-                        Some(source),
-                        Some(target_session),
-                        Some(TYPE_HUMAN_DROP_V1),
-                        Some("human.secret_exists"),
-                        &reason,
-                        b"redacted-secret",
-                        now,
+                    return self.reject_human_drop(
+                        secret_audit,
+                        "human.secret_exists",
+                        reason,
+                        NodeError::Conflict,
                     );
-                    return Err(NodeError::Conflict(reason));
                 }
 
                 // Atomically consume single-use claim nonce before writing to SecretStore.
@@ -9019,16 +9001,12 @@ impl UnifiedNode {
                 };
                 if !fresh {
                     let reason = "human drop claim replay detected";
-                    self.record_human_drop_rejected_audit(
-                        Some(source),
-                        Some(target_session),
-                        Some(TYPE_HUMAN_DROP_V1),
-                        Some("human.claim_replay"),
+                    return self.reject_human_drop(
+                        secret_audit,
+                        "human.claim_replay",
                         reason,
-                        b"redacted-secret",
-                        now,
+                        NodeError::Unauthorized,
                     );
-                    return Err(NodeError::Unauthorized(reason.into()));
                 }
 
                 // Zero-knowledge secret sink: write directly to SecretStore; NEVER persist secret
@@ -9123,16 +9101,12 @@ impl UnifiedNode {
                 };
                 if !fresh {
                     let reason = "human drop claim replay detected";
-                    self.record_human_drop_rejected_audit(
-                        Some(source),
-                        Some(target_session),
-                        Some(TYPE_HUMAN_DROP_V1),
-                        Some("human.claim_replay"),
+                    return self.reject_human_drop(
+                        targeted_audit,
+                        "human.claim_replay",
                         reason,
-                        envelope.ct.as_bytes(),
-                        now,
+                        NodeError::Unauthorized,
                     );
-                    return Err(NodeError::Unauthorized(reason.into()));
                 }
 
                 let body = claim.body.clone();
@@ -9277,14 +9251,15 @@ impl UnifiedNode {
                 }
             }
             HumanDropKind::Approval => {
+                let approval_source = format!("human:{}:{}", auth_rec.human_id, auth_rec.kid);
                 self.record_human_drop_rejected_audit(
-                    Some(format!("human:{}:{}", auth_rec.human_id, auth_rec.kid)),
-                    None,
-                    Some(TYPE_HUMAN_DROP_V1),
-                    Some("human.approval_wrong_entrypoint"),
+                    HumanDropAudit {
+                        source: Some(&approval_source),
+                        payload_digest_input: claim.claim_id.as_bytes(),
+                        ..audit
+                    },
+                    "human.approval_wrong_entrypoint",
                     "approval drops must be verified by the target ceremony command (not `hyp drop ingest`)",
-                    claim.claim_id.as_bytes(),
-                    now,
                 );
                 Err(NodeError::BadRequest(
                     "approval drops cannot be ingested via `hyp drop ingest`; submit to the currently waiting live ceremony (e.g. `hyp gate apply`)"
