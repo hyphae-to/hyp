@@ -16,7 +16,9 @@
 //!   - Non-zero exit with offline/daemon stderr -> `PushOutcome::Hold("codex_queue_unavailable")`
 //!   - Any other failure -> `PushOutcome::Reject("codex_queue_outcome_unknown")`
 
-use crate::executable::is_executable_file;
+use crate::executable::{
+    PathSearchPolicy, WindowsSuffixes, find_in_path as search_path, is_executable_file,
+};
 use std::collections::HashMap;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -311,26 +313,16 @@ fn resolve_codex_binary_path(bin: &str) -> Option<PathBuf> {
         let p = PathBuf::from(trimmed);
         return is_executable_file(&p).then_some(p);
     }
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let direct = dir.join(trimmed);
-        if is_executable_file(&direct) {
-            return Some(direct);
-        }
-        #[cfg(windows)]
-        {
-            for ext in ["exe", "cmd", "bat"] {
-                let with_ext = dir.join(format!("{trimmed}.{ext}"));
-                if with_ext.is_file() {
-                    return Some(with_ext);
-                }
-            }
-        }
-    }
-    None
+    let paths = std::env::var_os("PATH")?;
+    search_path(
+        Path::new(trimmed),
+        &paths,
+        PathSearchPolicy {
+            include_empty: false,
+            executable: true,
+            windows_suffixes: WindowsSuffixes::AppendCommon,
+        },
+    )
 }
 
 fn codex_probe_cache_key(resolved: &Path) -> String {

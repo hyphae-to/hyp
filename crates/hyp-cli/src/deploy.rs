@@ -11,7 +11,7 @@ use http_body_util::{BodyExt, Empty};
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::pairing::{validate_endpoint_origin, validate_http_endpoint_origin};
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
-use hyp_harness::executable::is_executable_file;
+use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
 use hyp_node::engine::{DropRelayConfig, normalize_drop_portal_url};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, SignedNodeManifest};
@@ -267,21 +267,16 @@ const DEPLOY_TOOL_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn find_in_path(bin: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(bin);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let candidate = candidate.with_extension("exe");
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    let paths = std::env::var_os("PATH")?;
+    search_path(
+        Path::new(bin),
+        &paths,
+        PathSearchPolicy {
+            include_empty: true,
+            executable: true,
+            windows_suffixes: WindowsSuffixes::ReplaceExe,
+        },
+    )
 }
 
 pub fn detect_local_tools() -> Vec<DetectedTool> {
