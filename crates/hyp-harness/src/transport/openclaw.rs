@@ -25,6 +25,9 @@
 //!   - `404` -> [`PushOutcome::Reject`] (`"openclaw_hooks_disabled"`, terminal — daemon detaches)
 
 use crate::paths::transport_config_dir as default_hyphae_config_dir;
+use hyp_node::engine::http_util::{
+    build_unpooled_http1_client as build_http1_client, consume_bounded_body,
+};
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -32,12 +35,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyp_crypto::{SecretBackend, SecretStore};
 use hyp_store::{sha256_hex, uuid_v4};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -531,30 +531,8 @@ pub fn resolve_openclaw_token(target: &OpenClawTarget) -> Option<String> {
         .filter(|s| is_valid_header_token(s))
 }
 
-fn build_http1_client() -> Client<HttpsConnector<HttpConnector>, Full<Bytes>> {
-    let connector = HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .build();
-    Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(0)
-        .build(connector)
-}
-
-async fn drain_bounded_http_body(mut body: hyper::body::Incoming, max_bytes: usize) {
-    let mut seen = 0usize;
-    while let Some(frame_res) = body.frame().await {
-        let Ok(frame) = frame_res else {
-            break;
-        };
-        if let Ok(data) = frame.into_data() {
-            seen = seen.saturating_add(data.len());
-            if seen > max_bytes {
-                break;
-            }
-        }
-    }
+async fn drain_bounded_http_body(body: hyper::body::Incoming, max_bytes: usize) {
+    let _ = consume_bounded_body(body, max_bytes, |_| {}).await;
 }
 
 // ============================================================================

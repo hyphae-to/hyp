@@ -14,6 +14,9 @@
 use crate::paths::{
     transport_config_dir as default_hyphae_config_dir, transport_home_dir as home_dir,
 };
+use hyp_node::engine::http_util::{
+    BoundedBodyError, build_unpooled_http1_client as build_http1_client, consume_bounded_body,
+};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -22,12 +25,10 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use http::{HeaderValue, Method, Request, StatusCode, Uri, Version, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyp_crypto::{CryptoError, SecretBackend, SecretStore};
 use hyp_store::uuid_v4;
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use ring::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -699,31 +700,17 @@ fn resolve_bearer_token(target: &T3Target) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn build_http1_client() -> Client<HttpsConnector<HttpConnector>, Full<Bytes>> {
-    let connector = HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .build();
-    Client::builder(TokioExecutor::new())
-        .pool_max_idle_per_host(0)
-        .build(connector)
-}
-
 async fn read_bounded_http_body(
-    mut body: hyper::body::Incoming,
+    body: hyper::body::Incoming,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    while let Some(frame_res) = body.frame().await {
-        let frame = frame_res.map_err(|e| format!("HTTP body read error: {e}"))?;
-        if let Ok(data) = frame.into_data() {
-            if out.len().saturating_add(data.len()) > max_bytes {
-                return Err(format!("HTTP response exceeded {max_bytes} byte cap"));
-            }
-            out.extend_from_slice(&data);
-        }
-    }
+    consume_bounded_body(body, max_bytes, |data| out.extend_from_slice(data))
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(err) => format!("HTTP body read error: {err}"),
+            BoundedBodyError::TooLarge => format!("HTTP response exceeded {max_bytes} byte cap"),
+        })?;
     Ok(out)
 }
 
