@@ -9,6 +9,8 @@
 //! Mirrors `src/secrets.ts` and `src/identity.ts` naming & safety invariants, including
 //! automatic `File` backend selection for ephemeral temp directories so tests NEVER touch live OS keyrings.
 
+mod backend;
+
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -873,37 +875,8 @@ impl SecretStore {
             )));
         }
 
-        let (location, recorded_service) = match self.backend {
-            SecretBackend::File => (self.write_file_secret(name, trimmed)?, None),
-            SecretBackend::Keychain => {
-                let loc = self.write_mac_keychain(name, trimmed)?;
-                let _ = fs::remove_file(self.secret_file_path(name)?);
-                (loc, Some(self.service.clone()))
-            }
-            SecretBackend::SecretService => {
-                let loc = self.write_linux_secret_service(name, trimmed)?;
-                let _ = fs::remove_file(self.secret_file_path(name)?);
-                (loc, Some(self.service.clone()))
-            }
-            SecretBackend::OnePassword => {
-                let vault = self.resolved_op_vault()?;
-                let loc = self.write_onepassword(name, trimmed, &vault)?;
-                let _ = fs::remove_file(self.secret_file_path(name)?);
-                (loc, Some(vault))
-            }
-            SecretBackend::LastPass => {
-                let prefix = self.resolved_lpass_prefix()?;
-                let loc = self.write_lastpass(name, trimmed, &prefix)?;
-                let _ = fs::remove_file(self.secret_file_path(name)?);
-                (loc, Some(prefix))
-            }
-            SecretBackend::Pass => {
-                let prefix = self.resolved_pass_prefix()?;
-                let loc = self.write_pass(name, trimmed, &prefix)?;
-                let _ = fs::remove_file(self.secret_file_path(name)?);
-                (loc, Some(prefix))
-            }
-        };
+        let (location, recorded_service) =
+            backend::for_kind(self.backend).write(self, name, trimmed)?;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -933,52 +906,11 @@ impl SecretStore {
         let index = self.read_index();
         let entry = index.secrets.get(name);
         let backend = entry.map(|e| e.backend).unwrap_or(self.backend);
-        let service = entry
-            .and_then(|e| e.service.as_deref())
-            .unwrap_or(&self.service);
-
-        match backend {
-            SecretBackend::File => self.read_file_secret(name),
-            SecretBackend::Keychain => self
-                .read_mac_keychain(name, service)?
-                .ok_or_else(|| CryptoError::SecretNotFound(name.to_string())),
-            SecretBackend::SecretService => self
-                .read_linux_secret_service(name, service)?
-                .ok_or_else(|| CryptoError::SecretNotFound(name.to_string())),
-            SecretBackend::OnePassword => {
-                let vault = match entry.and_then(|e| e.service.as_deref()) {
-                    Some(v) => {
-                        validate_onepassword_vault(v)?;
-                        v.to_string()
-                    }
-                    None => self.resolved_op_vault()?,
-                };
-                self.read_onepassword(name, &vault)?
-                    .ok_or_else(|| CryptoError::SecretNotFound(name.to_string()))
-            }
-            SecretBackend::LastPass => {
-                let prefix = match entry.and_then(|e| e.service.as_deref()) {
-                    Some(p) => {
-                        validate_lastpass_prefix(p)?;
-                        p.to_string()
-                    }
-                    None => self.resolved_lpass_prefix()?,
-                };
-                self.read_lastpass(name, &prefix)?
-                    .ok_or_else(|| CryptoError::SecretNotFound(name.to_string()))
-            }
-            SecretBackend::Pass => {
-                let prefix = match entry.and_then(|e| e.service.as_deref()) {
-                    Some(p) => {
-                        validate_pass_prefix(p)?;
-                        p.to_string()
-                    }
-                    None => self.resolved_pass_prefix()?,
-                };
-                self.read_pass(name, &prefix)?
-                    .ok_or_else(|| CryptoError::SecretNotFound(name.to_string()))
-            }
-        }
+        backend::for_kind(backend).read(
+            self,
+            name,
+            entry.and_then(|entry| entry.service.as_deref()),
+        )
     }
 
     /// Deletes a secret from the configured backend and index. Returns `true` if anything was removed.
@@ -986,52 +918,10 @@ impl SecretStore {
         validate_secret_name(name)?;
         let mut index = self.read_index();
         let entry = index.secrets.get(name).cloned();
-        let service = entry
-            .as_ref()
-            .and_then(|e| e.service.as_deref())
-            .unwrap_or(&self.service);
         let mut removed = false;
 
         if let Some(e) = &entry {
-            match e.backend {
-                SecretBackend::Keychain => {
-                    removed |= self.delete_mac_keychain(name, service);
-                }
-                SecretBackend::SecretService => {
-                    removed |= self.delete_linux_secret_service(name, service);
-                }
-                SecretBackend::OnePassword => {
-                    let vault = match e.service.as_deref() {
-                        Some(v) => {
-                            validate_onepassword_vault(v)?;
-                            v.to_string()
-                        }
-                        None => self.resolved_op_vault()?,
-                    };
-                    removed |= self.delete_onepassword(name, &vault)?;
-                }
-                SecretBackend::LastPass => {
-                    let prefix = match e.service.as_deref() {
-                        Some(p) => {
-                            validate_lastpass_prefix(p)?;
-                            p.to_string()
-                        }
-                        None => self.resolved_lpass_prefix()?,
-                    };
-                    removed |= self.delete_lastpass(name, &prefix)?;
-                }
-                SecretBackend::Pass => {
-                    let prefix = match e.service.as_deref() {
-                        Some(p) => {
-                            validate_pass_prefix(p)?;
-                            p.to_string()
-                        }
-                        None => self.resolved_pass_prefix()?,
-                    };
-                    removed |= self.delete_pass(name, &prefix)?;
-                }
-                SecretBackend::File => {}
-            }
+            removed |= backend::for_kind(e.backend).delete(self, name, e.service.as_deref())?;
         }
 
         let file_path = self.secret_file_path(name)?;
@@ -1045,25 +935,7 @@ impl SecretStore {
             self.write_index(&index)?;
             removed = true;
         } else if !removed {
-            match self.backend {
-                SecretBackend::Keychain => removed = self.delete_mac_keychain(name, service),
-                SecretBackend::SecretService => {
-                    removed = self.delete_linux_secret_service(name, service);
-                }
-                SecretBackend::OnePassword => {
-                    let vault = self.resolved_op_vault()?;
-                    removed = self.delete_onepassword(name, &vault)?;
-                }
-                SecretBackend::LastPass => {
-                    let prefix = self.resolved_lpass_prefix()?;
-                    removed = self.delete_lastpass(name, &prefix)?;
-                }
-                SecretBackend::Pass => {
-                    let prefix = self.resolved_pass_prefix()?;
-                    removed = self.delete_pass(name, &prefix)?;
-                }
-                SecretBackend::File => {}
-            }
+            removed = backend::for_kind(self.backend).delete(self, name, None)?;
         }
         Ok(removed)
     }
@@ -1076,78 +948,12 @@ impl SecretStore {
             if validate_secret_name(name).is_err() {
                 continue;
             }
-            let service = entry.service.as_deref().unwrap_or(&self.service);
-            match entry.backend {
-                SecretBackend::Keychain | SecretBackend::SecretService => {
-                    by_name.insert(
-                        name.clone(),
-                        SecretMetadata {
-                            name: name.clone(),
-                            backend: entry.backend,
-                            location: format!("{}:{service}/{name}", entry.backend.as_str()),
-                            mode_ok: true,
-                            bytes: None,
-                        },
-                    );
-                }
-                SecretBackend::OnePassword => {
-                    let vault = entry.service.as_deref().unwrap_or(DEFAULT_OP_VAULT);
-                    by_name.insert(
-                        name.clone(),
-                        SecretMetadata {
-                            name: name.clone(),
-                            backend: SecretBackend::OnePassword,
-                            location: format!("1password:{vault}/hyphae/{name}"),
-                            mode_ok: true,
-                            bytes: None,
-                        },
-                    );
-                }
-                SecretBackend::LastPass => {
-                    let prefix = entry.service.as_deref().unwrap_or(DEFAULT_LPASS_PREFIX);
-                    by_name.insert(
-                        name.clone(),
-                        SecretMetadata {
-                            name: name.clone(),
-                            backend: SecretBackend::LastPass,
-                            location: format!("lastpass:{prefix}/{name}"),
-                            mode_ok: true,
-                            bytes: None,
-                        },
-                    );
-                }
-                SecretBackend::Pass => {
-                    let prefix = entry.service.as_deref().unwrap_or(DEFAULT_PASS_PREFIX);
-                    by_name.insert(
-                        name.clone(),
-                        SecretMetadata {
-                            name: name.clone(),
-                            backend: SecretBackend::Pass,
-                            location: format!("pass:{prefix}/{name}"),
-                            mode_ok: true,
-                            bytes: None,
-                        },
-                    );
-                }
-                SecretBackend::File => {
-                    let path = self.secret_file_path(name)?;
-                    if path.exists() {
-                        let (mode_ok, bytes) = match check_private_owner_and_mode(&path, false) {
-                            Ok(sz) => (true, Some(sz)),
-                            Err(_) => (false, fs::symlink_metadata(&path).ok().map(|m| m.len())),
-                        };
-                        by_name.insert(
-                            name.clone(),
-                            SecretMetadata {
-                                name: name.clone(),
-                                backend: SecretBackend::File,
-                                location: path.display().to_string(),
-                                mode_ok,
-                                bytes,
-                            },
-                        );
-                    }
-                }
+            if let Some(metadata) = backend::for_kind(entry.backend).indexed_metadata(
+                self,
+                name,
+                entry.service.as_deref(),
+            )? {
+                by_name.insert(name.clone(), metadata);
             }
         }
 
@@ -1181,51 +987,7 @@ impl SecretStore {
             }
         }
 
-        match self.backend {
-            SecretBackend::OnePassword => {
-                let vault = self.resolved_op_vault()?;
-                for name in self.list_onepassword(&vault)? {
-                    by_name
-                        .entry(name.clone())
-                        .or_insert_with(|| SecretMetadata {
-                            name: name.clone(),
-                            backend: SecretBackend::OnePassword,
-                            location: format!("1password:{vault}/hyphae/{name}"),
-                            mode_ok: true,
-                            bytes: None,
-                        });
-                }
-            }
-            SecretBackend::LastPass => {
-                let prefix = self.resolved_lpass_prefix()?;
-                for name in self.list_lastpass(&prefix)? {
-                    by_name
-                        .entry(name.clone())
-                        .or_insert_with(|| SecretMetadata {
-                            name: name.clone(),
-                            backend: SecretBackend::LastPass,
-                            location: format!("lastpass:{prefix}/{name}"),
-                            mode_ok: true,
-                            bytes: None,
-                        });
-                }
-            }
-            SecretBackend::Pass => {
-                let prefix = self.resolved_pass_prefix()?;
-                for name in self.list_pass_metadata(&prefix)? {
-                    by_name
-                        .entry(name.clone())
-                        .or_insert_with(|| SecretMetadata {
-                            name: name.clone(),
-                            backend: SecretBackend::Pass,
-                            location: format!("pass:{prefix}/{name}"),
-                            mode_ok: true,
-                            bytes: None,
-                        });
-                }
-            }
-            SecretBackend::File | SecretBackend::Keychain | SecretBackend::SecretService => {}
-        }
+        backend::for_kind(self.backend).discover(self, &mut by_name)?;
 
         Ok(by_name.into_values().collect())
     }
