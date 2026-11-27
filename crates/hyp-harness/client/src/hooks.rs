@@ -6,15 +6,15 @@
 //! across all 9 harnesses (`antigravity`, `claude`, `codex`, `cursor`, `opencode`, `gemini`,
 //! `openclaw`, `herdr`, `t3`).
 
-use crate::call_registry::is_valid_session_id;
-use crate::protocol::{
-    HarnessKind, TransportHintFields, UNTRUSTED_PROVENANCE, normalize_mesh_tool_name,
-};
-use crate::sock::{DEFAULT_HOOK_TIMEOUT, DaemonRpcResult, daemon_rpc_sync};
-use crate::transport::openclaw::{
+use hyp_harness_ipc::caller::is_valid_session_id;
+use hyp_harness_ipc::hints::{
     canonical_openclaw_session_id, parse_openclaw_agent_id_from_session_key,
     validate_openclaw_session_key,
 };
+use hyp_harness_ipc::protocol::{
+    HarnessKind, TransportHintFields, UNTRUSTED_PROVENANCE, normalize_mesh_tool_name,
+};
+use hyp_harness_ipc::sock::{DEFAULT_HOOK_TIMEOUT, DaemonRpcResult, daemon_rpc_sync};
 use serde_json::{Map, Value, json};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -92,12 +92,12 @@ impl HookTransportHints {
     /// Captures transport environment variables from the current hook process.
     pub fn from_env() -> Self {
         let non_empty = |key: &str| {
-            crate::ambient_env_var(key)
+            hyp_harness_ipc::ambient_env_var(key)
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
         Self {
-            herdr_terminal_id: crate::transport::herdr::detect_env_terminal_id(),
+            herdr_terminal_id: hyp_harness_ipc::hints::detect_env_terminal_id(),
             codex_home: non_empty("CODEX_HOME"),
             codex_remote: non_empty("CODEX_REMOTE"),
             t3_base_dir: non_empty("T3CODE_HOME"),
@@ -380,7 +380,7 @@ fn insert_transport_hints(
                 .or_else(|| payload.get("terminalId"))
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|s| crate::transport::herdr::is_valid_terminal_id(s))
+                .filter(|s| hyp_harness_ipc::hints::is_valid_terminal_id(s))
         });
         if let Some(tid) = herdr_tid {
             fields.herdr_terminal_id = Some(tid.to_owned());
@@ -441,23 +441,11 @@ fn insert_transport_hints(
     added
 }
 
-/// Validates a per-session socket authentication token (`HYPHAE_SESSION_TOKEN`).
-///
-/// Strictly allows ASCII `[A-Za-z0-9._-]` (1..=256 bytes) with zero quotes, whitespace, or
-/// control characters so it is safe both on wire JSON and in shell env files.
-pub fn is_valid_session_token(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    if bytes.is_empty() || bytes.len() > 256 {
-        return false;
-    }
-    bytes
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
+pub use hyp_harness_ipc::caller::is_valid_session_token;
 
 /// Reads and validates `HYPHAE_SESSION_TOKEN` from the current process environment.
 pub fn infer_session_token_from_env() -> Option<String> {
-    let raw = crate::ambient_env_var("HYPHAE_SESSION_TOKEN")?;
+    let raw = hyp_harness_ipc::ambient_env_var("HYPHAE_SESSION_TOKEN")?;
     let trimmed = raw.trim();
     if is_valid_session_token(trimmed) {
         Some(trimmed.to_string())
@@ -624,7 +612,7 @@ where
 
     if options.event == HookEvent::SessionStart {
         let claude_env_file = if options.harness == HarnessKind::Claude {
-            crate::ambient_env_var_os("CLAUDE_ENV_FILE").filter(|v| !v.is_empty())
+            hyp_harness_ipc::ambient_env_var_os("CLAUDE_ENV_FILE").filter(|v| !v.is_empty())
         } else {
             None
         };

@@ -1,4 +1,4 @@
-//! End-to-end tests for the native Rust T3 Code transport (`crates/hyp-harness/src/transport/t3.rs`):
+//! End-to-end tests for the native Rust T3 Code transport (`crates/hyp-harness/transport/src/transport/t3.rs`):
 //! - Read-only `statev2.sqlite` resolution across v2 (`orchestration_v2_projection_*`) and v1
 //!   (`projection_thread_*`) schemas, deleted/archived exclusion, fail-closed `CallerAmbiguous`,
 //!   missing DB `CallerNotFound`, `verify_t3_thread_exists`, and `resolve_t3_caller_by_call_id`.

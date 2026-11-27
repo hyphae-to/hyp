@@ -24,7 +24,7 @@
 //!   - `401`/`403` -> [`PushOutcome::Reject`] (`"openclaw_auth_failed"`, terminal — daemon detaches)
 //!   - `404` -> [`PushOutcome::Reject`] (`"openclaw_hooks_disabled"`, terminal — daemon detaches)
 
-use crate::paths::transport_config_dir as default_hyphae_config_dir;
+use hyp_harness_ipc::paths::transport_config_dir as default_hyphae_config_dir;
 use hyp_node::engine::http_util::{
     build_unpooled_http1_client as build_http1_client, consume_bounded_body,
 };
@@ -37,11 +37,10 @@ use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri, header};
 use http_body_util::Full;
 use hyp_crypto::{SecretBackend, SecretStore};
-use hyp_store::{sha256_hex, uuid_v4};
+use hyp_store::uuid_v4;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::call_registry::is_valid_session_id;
 use crate::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 
 /// Default loopback OpenClaw Gateway base URL.
@@ -62,10 +61,6 @@ pub const DEFAULT_OPENCLAW_DELIVER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OPENCLAW_HTTP_BODY_BYTES: usize = 256 * 1024;
 /// Maximum allowed length for `hooks_path`.
 const MAX_HOOKS_PATH_LEN: usize = 256;
-/// Maximum allowed length for `agent_id`.
-const MAX_AGENT_ID_LEN: usize = 128;
-/// Maximum allowed length for an OpenClaw `sessionKey`.
-const MAX_SESSION_KEY_LEN: usize = 256;
 
 /// Reject reason when the configured OpenClaw hooks secret is missing or empty.
 pub const REASON_OPENCLAW_TOKEN_MISSING: &str = "openclaw_token_missing";
@@ -88,7 +83,6 @@ pub const REASON_OPENCLAW_REQUEST_REJECTED: &str = "openclaw_request_rejected";
 
 const INVALID_URL_ERR: &str = "OpenClaw Gateway URL must be a loopback origin (e.g. http://127.0.0.1:18789) unless allowRemote=true with https://";
 const INVALID_HOOKS_PATH_ERR: &str = "OpenClaw hooks path must start with '/' and contain no traversal, query, or control characters";
-const INVALID_SESSION_KEY_ERR: &str = "OpenClaw sessionKey must be a non-empty string (<=256 bytes) without whitespace or control characters";
 
 /// Returns `true` iff `name` is the sole allowed OpenClaw Gateway hooks secret name
 /// (`"openclaw-hooks-token"`). Arbitrary `tokenSecret` names from config MUST fail closed
@@ -97,49 +91,11 @@ pub fn is_allowed_openclaw_token_secret(name: &str) -> bool {
     name.trim() == DEFAULT_OPENCLAW_TOKEN_SECRET
 }
 
-/// Strictly validates an OpenClaw `sessionKey` (e.g. `"agent:main:main"` or
-/// `"agent:main:explicit:thread-2"`), rejecting empty strings, excessive length, whitespace,
-/// or ASCII control characters fail-closed.
-pub fn validate_openclaw_session_key(raw: &str) -> Result<String, String> {
-    if raw.is_empty()
-        || raw.len() > MAX_SESSION_KEY_LEN
-        || raw.bytes().any(|b| b <= 0x20 || b == 0x7f)
-    {
-        return Err(INVALID_SESSION_KEY_ERR.to_string());
-    }
-    Ok(raw.to_string())
-}
-
-/// Extracts `<agentId>` from a canonical OpenClaw session key (`"agent:<agentId>:<rest>"`).
-pub fn parse_openclaw_agent_id_from_session_key(session_key: &str) -> Option<String> {
-    let rest = session_key.strip_prefix("agent:")?;
-    let (aid, tail) = rest.split_once(':')?;
-    if aid.is_empty()
-        || tail.is_empty()
-        || aid.len() > MAX_AGENT_ID_LEN
-        || aid.bytes().any(|b| b <= 0x20 || b == 0x7f)
-    {
-        return None;
-    }
-    Some(aid.to_string())
-}
-
-/// Deterministically maps a validated OpenClaw `sessionKey` (or fallback OpenClaw ID) to its
-/// canonical Hyphae `session_id` (`openclaw:<key>`, or `openclaw:sk_<sha256[..32]>` when the
-/// key contains characters outside `[A-Za-z0-9._:-]` or exceeds 256 bytes with the prefix).
-///
-/// Matches `canonicalOpenClawSessionId()` in `plugins/openclaw/index.js` bit-for-bit.
-pub fn canonical_openclaw_session_id(raw_key: &str) -> Result<String, String> {
-    let stripped = raw_key.strip_prefix("openclaw:").unwrap_or(raw_key);
-    let key = validate_openclaw_session_key(stripped)?;
-    let direct = format!("openclaw:{key}");
-    if is_valid_session_id(&direct) {
-        Ok(direct)
-    } else {
-        let digest = sha256_hex(key.as_bytes());
-        Ok(format!("openclaw:sk_{}", &digest[..32]))
-    }
-}
+use hyp_harness_ipc::hints::MAX_OPENCLAW_AGENT_ID_LEN;
+pub use hyp_harness_ipc::hints::{
+    canonical_openclaw_session_id, parse_openclaw_agent_id_from_session_key,
+    validate_openclaw_session_key,
+};
 
 /// OpenClaw Gateway webhook endpoint mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,7 +416,7 @@ pub fn normalize_openclaw_hooks_path(raw: &str) -> Result<String, String> {
 fn sanitize_agent_id(raw: &str) -> &str {
     let trimmed = raw.trim();
     if trimmed.is_empty()
-        || trimmed.len() > MAX_AGENT_ID_LEN
+        || trimmed.len() > MAX_OPENCLAW_AGENT_ID_LEN
         || trimmed.chars().any(char::is_control)
     {
         DEFAULT_OPENCLAW_AGENT_ID
@@ -1061,7 +1017,7 @@ mod tests {
         let hashed = canonical_openclaw_session_id("agent:main:slack:team/chan@1").unwrap();
         assert!(hashed.starts_with("openclaw:sk_"), "hashed={hashed}");
         assert_eq!(hashed.len(), "openclaw:sk_".len() + 32);
-        assert!(crate::call_registry::is_valid_session_id(&hashed));
+        assert!(hyp_harness_ipc::caller::is_valid_session_id(&hashed));
 
         for bad in [
             "",

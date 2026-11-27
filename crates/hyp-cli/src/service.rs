@@ -12,7 +12,7 @@ use crate::ui::{
     CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
 use clap::Subcommand;
-use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync, default_socket_path};
+use hyp_harness_ipc::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync, default_socket_path};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};

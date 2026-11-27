@@ -1,0 +1,27 @@
+[package]
+name = "hyp-harness-transport"
+description = "Hyphae external harness wake transports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hyp-harness-ipc.workspace = true
+hyp-node.workspace = true
+hyp-crypto.workspace = true
+hyp-store.workspace = true
+base64.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+ring.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

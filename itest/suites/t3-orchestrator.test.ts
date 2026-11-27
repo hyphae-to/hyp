@@ -491,7 +491,7 @@ test("T3 Orchestrator — mutated negative security: bad auth token 401 detaches
     await mcpMidDel.close();
 
     // 3f. Mid-session ARCHIVED thread observation:
-    // NEW-ISSUE: `crates/hyp-harness/src/transport/t3.rs` (`execute_rpc_delivery`) checks
+    // NEW-ISSUE: `crates/hyp-harness/transport/src/transport/t3.rs` (`execute_rpc_delivery`) checks
     // `thread.get("deletedAt")` from `orchestration.getThreadProjection`, but DOES NOT check
     // `thread.get("archivedAt")`. Real `t3 serve` (`v0.0.46`) permits `message.dispatch` on an
     // archived thread (`archivedAt != null, deletedAt == null`), so a thread archived mid-session

@@ -347,32 +347,7 @@ impl PushTransport for HerdrTransport {
     }
 }
 
-/// Inspects `HC_TERMINAL_ID` from the current process environment.
-///
-/// Returns `None` when unset, blank, or not a safe terminal address.
-pub fn detect_env_terminal_id() -> Option<String> {
-    parse_env_terminal_id(crate::ambient_env_var("HC_TERMINAL_ID").as_deref())
-}
-
-fn parse_env_terminal_id(raw: Option<&str>) -> Option<String> {
-    let trimmed = raw?.trim();
-    if is_valid_terminal_id(trimmed) {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
-}
-
-/// Validates that a Herdr terminal identifier is non-empty, cannot be interpreted
-/// as a CLI flag (does not start with `'-'`), and contains no whitespace or
-/// control characters.
-pub fn is_valid_terminal_id(terminal_id: &str) -> bool {
-    !terminal_id.is_empty()
-        && !terminal_id.starts_with('-')
-        && !terminal_id
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
-}
+pub use hyp_harness_ipc::hints::{detect_env_terminal_id, is_valid_terminal_id};
 
 /// Validates a Herdr launch template name for allowlisted Tier 4 cold revival:
 /// non-empty, `<= 128` ASCII chars, does not start with `'-'`, and consists solely
@@ -914,26 +889,6 @@ mod tests {
                 "expected invalid JSON to fail closed: {raw:?}"
             );
         }
-    }
-
-    #[test]
-    fn validates_terminal_ids_and_env_parsing() {
-        assert!(is_valid_terminal_id("t3"));
-        assert!(is_valid_terminal_id("macbook:t12"));
-        assert!(is_valid_terminal_id("dev-box.local:t1"));
-
-        assert!(!is_valid_terminal_id(""));
-        assert!(!is_valid_terminal_id("-t3"));
-        assert!(!is_valid_terminal_id("--json"));
-        assert!(!is_valid_terminal_id("t3 extra"));
-        assert!(!is_valid_terminal_id("t3\n"));
-        assert!(!is_valid_terminal_id("t3\0"));
-
-        assert_eq!(parse_env_terminal_id(None), None);
-        assert_eq!(parse_env_terminal_id(Some("")), None);
-        assert_eq!(parse_env_terminal_id(Some("   ")), None);
-        assert_eq!(parse_env_terminal_id(Some("--flag")), None);
-        assert_eq!(parse_env_terminal_id(Some(" t9 \n")), Some("t9".into()));
     }
 
     #[test]

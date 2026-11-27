@@ -1,6 +1,6 @@
 //! Supervision and local or federated delivery for configured subprocess plugins.
 
-use crate::daemon::{BoxFuture as DaemonBoxFuture, BridgePoster, LocalDaemon};
+use hyp_daemon::daemon::{BoxFuture as DaemonBoxFuture, BridgePoster, LocalDaemon};
 use hyp_node::adapters::webhooks::{EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK};
 use hyp_node::adapters::{
     AdapterError, AdapterHealth, AdapterKind, BoxFuture as AdapterBoxFuture, NodeAdapter,

@@ -15,7 +15,11 @@ hyp-proto.workspace = true
 hyp-crypto.workspace = true
 hyp-store.workspace = true
 hyp-node.workspace = true
-hyp-harness.workspace = true
+hyp-daemon.workspace = true
+hyp-harness-client.workspace = true
+hyp-harness-ipc.workspace = true
+hyp-harness-plugins.workspace = true
+hyp-harness-transport.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -33,6 +37,7 @@ hyper-rustls.workspace = true
 rustls.workspace = true
 
 [dev-dependencies]
+hyp-harness.workspace = true
 tempfile.workspace = true
 
 [build-dependencies]

@@ -571,7 +571,7 @@ fn authenticate_daemon_local_kv(
     keystore: &hyp_crypto::SecretStore,
     request: &Value,
 ) -> Option<BufReader<std::net::TcpStream>> {
-    use crate::local_kv::tcp_auth;
+    use crate::kv_auth as tcp_auth;
     use serde_json::json;
 
     fn send(stream: &mut std::net::TcpStream, packet: &Value) -> Option<()> {
@@ -582,7 +582,7 @@ fn authenticate_daemon_local_kv(
 
     let endpoint = stream.peer_addr().ok()?;
     let mut peer = BufReader::new(stream);
-    let key = tcp_auth::key(&crate::daemon::read_session_token_key(keystore)?);
+    let key = tcp_auth::key(&tcp_auth::read_session_token_key(keystore)?);
     let client_nonce = tcp_auth::nonce()?;
     send(
         peer.get_mut(),

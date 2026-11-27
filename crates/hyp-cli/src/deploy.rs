@@ -12,7 +12,9 @@ use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::manifest::verify_manifest_signature;
 use hyp_crypto::pairing::{validate_endpoint_origin, validate_http_endpoint_origin};
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
-use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
+use hyp_harness_transport::executable::{
+    PathSearchPolicy, WindowsSuffixes, find_in_path as search_path,
+};
 use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::engine::{DropRelayConfig, normalize_drop_portal_url};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};

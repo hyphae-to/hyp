@@ -3,7 +3,7 @@
 //! Performance contract:
 //! - Executed from `try_statusline_fast_path()` in `main.rs` BEFORE `clap::Parser` or Tokio
 //!   runtime initialization so hot-path execution completes in ~1–5 ms.
-//! - Uses zero-Tokio synchronous `hyp_harness::sock::daemon_rpc_sync` with a tight 150 ms
+//! - Uses zero-Tokio synchronous `hyp_harness_ipc::sock::daemon_rpc_sync` with a tight 150 ms
 //!   timeout (`connector.sock` on Unix, `connector.addr` loopback TCP on Windows).
 //! - Fails safe (exit 0) when the daemon is offline, stdin is malformed/oversized, or a
 //!   chained user statusLine command fails, so it never breaks the host prompt bar.
@@ -15,9 +15,9 @@
 
 use crate::ui::{EXIT_OK, EXIT_USAGE};
 use clap::{Args, ValueEnum};
-use hyp_harness::call_registry::is_valid_session_id;
-use hyp_harness::sock::{daemon_rpc_sync, default_socket_path};
-use hyp_harness::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
+use hyp_harness_client::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
+use hyp_harness_ipc::caller::is_valid_session_id;
+use hyp_harness_ipc::sock::{daemon_rpc_sync, default_socket_path};
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};

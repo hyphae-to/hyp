@@ -44,7 +44,7 @@ pub struct PushReason(PushReasonKind);
 macro_rules! push_reasons {
     ($($variant:ident => $wire:expr),+ $(,)?) => {
         #[derive(Debug, Clone, PartialEq, Eq)]
-        pub(crate) enum PushReasonKind {
+        enum PushReasonKind {
             $($variant,)+
             Other(String),
         }
@@ -95,8 +95,45 @@ impl PushReason {
         self.0.as_str()
     }
 
-    pub(crate) fn kind(&self) -> &PushReasonKind {
-        &self.0
+    /// Whether Herdr is active or guards delivery, requiring a deferred retry.
+    pub fn is_herdr_active_or_guarded(&self) -> bool {
+        matches!(
+            self.0,
+            PushReasonKind::HerdrWorking
+                | PushReasonKind::HerdrSendGuardRefused
+                | PushReasonKind::HerdrAgentNotReady
+        )
+    }
+
+    /// Whether transport availability may recover after a bounded retry.
+    pub fn is_transiently_unavailable(&self) -> bool {
+        matches!(
+            self.0,
+            PushReasonKind::T3ServerUnreachable
+                | PushReasonKind::CodexQueueUnavailable
+                | PushReasonKind::OpenclawGatewayUnavailable
+                | PushReasonKind::OpenclawRateLimited
+        )
+    }
+
+    /// Whether the target binding must be discarded before transport rediscovery.
+    pub fn is_terminal_target_error(&self) -> bool {
+        matches!(
+            self.0,
+            PushReasonKind::HerdrTargetUnavailable
+                | PushReasonKind::T3ThreadDeleted
+                | PushReasonKind::T3ThreadArchived
+                | PushReasonKind::T3ThreadNotFound
+                | PushReasonKind::T3AuthMissing
+                | PushReasonKind::T3AuthFailed
+                | PushReasonKind::T3InvalidServerUrl
+                | PushReasonKind::OpenclawAuthFailed
+                | PushReasonKind::OpenclawHooksDisabled
+                | PushReasonKind::OpenclawInvalidUrl
+                | PushReasonKind::OpenclawInvalidSessionKey
+                | PushReasonKind::OpenclawSessionMissing
+                | PushReasonKind::OpenclawTokenMissing
+        )
     }
 }
 
@@ -206,7 +243,7 @@ pub trait PushTransport: Send + Sync {
     ///
     /// Even a string that looks like a digest cannot be sent through this API.
     /// ```compile_fail
-    /// use hyp_harness::transport::{PushMode, PushTransport};
+    /// use hyp_harness_transport::transport::{PushMode, PushTransport};
     ///
     /// fn send(transport: &dyn PushTransport) {
     ///     let _ = transport.deliver("<hyphae-inbox>message body</hyphae-inbox>", PushMode::Queue);
@@ -248,8 +285,11 @@ mod tests {
                 PushReasonKind::Other("unrecognized_reason".into()),
             ),
         ] {
-            assert_eq!(PushReason::from(reason).kind(), &expected);
-            assert_eq!(PushReason::from(reason.to_owned()).kind(), &expected);
+            assert_eq!(PushReason::from(reason), PushReason(expected.clone()));
+            assert_eq!(
+                PushReason::from(reason.to_owned()),
+                PushReason(expected.clone())
+            );
             let packet = serde_json::json!({"outcome": "hold", "reason": reason});
             let outcome = serde_json::from_value::<PushOutcome>(packet.clone()).unwrap();
             assert_eq!(

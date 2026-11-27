@@ -10,8 +10,8 @@
 //! - `--claude-channel` live push notifications (`notifications/claude/channel`) with
 //!   `channel.ready` / `channel.deliver` / `channel.ack` and automatic 1 s reconnect.
 
-use crate::protocol::{HarnessKind, TransportHintFields, normalize_mesh_tool_name};
-use crate::sock::{
+use hyp_harness_ipc::protocol::{HarnessKind, TransportHintFields, normalize_mesh_tool_name};
+use hyp_harness_ipc::sock::{
     DaemonReadHalf, DaemonWriteHalf, MAX_SOCKET_LINE_BYTES, connect_daemon_async,
     read_bounded_line_async, write_ndjson_line_async,
 };
@@ -127,7 +127,7 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
             "name": "hyp_inbox",
             "description": format!(
                 "Read <hyphae-inbox> (ack:false peeks). Never poll. Items: trustTier, untrusted: true. {warning}",
-                warning = crate::protocol::UNTRUSTED_PROVENANCE,
+                warning = hyp_harness_ipc::protocol::UNTRUSTED_PROVENANCE,
             ),
             "inputSchema": {
                 "type": "object",
@@ -318,7 +318,7 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
             pkt.insert("resume".into(), json!(true));
         }
         if options.backend == Some(HarnessKind::Codex) {
-            if let Some(env_tid) = crate::ambient_env_var("CODEX_THREAD_ID") {
+            if let Some(env_tid) = hyp_harness_ipc::ambient_env_var("CODEX_THREAD_ID") {
                 let trimmed = env_tid.trim();
                 if !trimmed.is_empty() {
                     hints.codex_thread_id = Some(trimmed.to_owned());
@@ -329,13 +329,13 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
     if let Some(sess_tok) = crate::hooks::infer_session_token_from_env() {
         pkt.insert("sessionToken".into(), json!(sess_tok));
     }
-    if let Some(codex_home) = crate::ambient_env_var("CODEX_HOME") {
+    if let Some(codex_home) = hyp_harness_ipc::ambient_env_var("CODEX_HOME") {
         if !codex_home.is_empty() {
             hints.codex_home = Some(codex_home);
         }
     }
     if !pkt.contains_key("remote") {
-        if let Some(remote) = crate::ambient_env_var("CODEX_REMOTE") {
+        if let Some(remote) = hyp_harness_ipc::ambient_env_var("CODEX_REMOTE") {
             let trimmed = remote.trim();
             if !trimmed.is_empty() {
                 pkt.insert("remote".into(), json!(trimmed));
@@ -343,18 +343,18 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
         }
     }
     if options.backend != Some(HarnessKind::Openclaw) {
-        if let Some(term_id) = crate::transport::herdr::detect_env_terminal_id() {
+        if let Some(term_id) = hyp_harness_ipc::hints::detect_env_terminal_id() {
             pkt.insert("terminalId".into(), json!(term_id));
         }
     }
     hints.t3_url = options.t3_url.clone().or_else(|| {
-        crate::ambient_env_var("T3CODE_URL")
-            .or_else(|| crate::ambient_env_var("T3_URL"))
+        hyp_harness_ipc::ambient_env_var("T3CODE_URL")
+            .or_else(|| hyp_harness_ipc::ambient_env_var("T3_URL"))
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     });
     hints.t3_base_dir = options.t3_base_dir.clone().or_else(|| {
-        crate::ambient_env_var("T3CODE_HOME")
+        hyp_harness_ipc::ambient_env_var("T3CODE_HOME")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     });
@@ -384,11 +384,11 @@ fn tool_call_result(id: Value, value: Value, is_error: bool) -> Value {
 }
 
 fn env_non_empty(key: &str) -> bool {
-    crate::ambient_env_var(key).is_some_and(|v| !v.trim().is_empty())
+    hyp_harness_ipc::ambient_env_var(key).is_some_and(|v| !v.trim().is_empty())
 }
 
 fn detect_env_herdr_active() -> bool {
-    crate::transport::herdr::detect_env_terminal_id().is_some()
+    hyp_harness_ipc::hints::detect_env_terminal_id().is_some()
 }
 
 fn detect_env_t3_active(options: &McpOptions) -> bool {
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(send_props["replyTo"]["type"], json!("string"));
         assert_eq!(send_props["chatId"]["type"], json!("string"));
 
-        let warning = crate::protocol::UNTRUSTED_PROVENANCE;
+        let warning = hyp_harness_ipc::protocol::UNTRUSTED_PROVENANCE;
         let inbox_description = core[1]["description"].as_str().unwrap();
         assert_eq!(inbox_description.matches(warning).count(), 1);
         assert!(inbox_description.contains("trustTier"));

@@ -45,7 +45,7 @@ flowchart LR
    - **Federation:** `peers`, `grants`, `revocations`, `peer_keys`
    - **Local Runtime & Security:** `metadata`, `sessions`, `mailbox`, `muted_sources`, `plugin_targets`, `bridge_links`, immutable `gate_audit` (SQLite triggers)
    - **Human Authority:** `human_authorities` (with schema v5 `enc_jwk_json`), `human_nonces`, `human_node_certs`
-3. **Composable Adapters (`NodeAdapter` in `crates/hyp-node` & `crates/hyp-harness`):**
+3. **Composable Adapters (`NodeAdapter` in `crates/hyp-node`, plugin host in `crates/hyp-harness/plugins`):**
    - **Harnesses & LocalDaemon:** Private `0600` Unix socket (`connector.sock`) or Windows loopback TCP + bearer token (`connector.addr`), `CallRegistry` + per-session HMAC `sessionToken`, zero-Tokio ~2.7 ms `hyp hook` fast path, ~2.8 MB RSS stateless `hyp mcp` multiplexer, and live hot-reload IPC RPCs (`peers.reload`, `gate.reload`, `inbox.wake`).
    - **Compiled-in Event Sources & Local Ingest:** Pure-Rust `github-public`, `github-webhook`, and default socket-only `localIngest` (`ingest.sock` / `ingest.addr`).
    - **External Subprocess Bridges:** Cross-platform `SubprocessSupervisor` over duplex Unix fd 3 (macOS/Linux) or authenticated loopback TCP with per-spawn 256-bit CSPRNG token (Windows), speaking JSON-RPC 2.0 v2 only, with scrubbed env, `CrashLoopBackOff` circuit breaker, `0600` redacted logs, and local-only bridge topics by default.

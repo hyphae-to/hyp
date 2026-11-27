@@ -29,7 +29,7 @@ import { pathToFileURL } from "node:url";
 
 /** Shared with Rust checksum pinning and the harness's generated plugin ID lists. */
 export const PLUGIN_SPECS = JSON.parse(
-  fs.readFileSync(new URL("../crates/hyp-harness/plugin_specs.json", import.meta.url), "utf8"),
+  fs.readFileSync(new URL("../crates/hyp-harness/plugins/plugin_specs.json", import.meta.url), "utf8"),
 ).map(({ id, kind, files }) => ({
   id,
   kind,

@@ -37,7 +37,7 @@ pub fn resolve_home_dir(home_override: Option<&Path>) -> Option<PathBuf> {
     if let Some(home) = home_override {
         return Some(home.to_path_buf());
     }
-    hyp_harness::paths::home_dir_from_env(|key| std::env::var(key).ok())
+    hyp_harness_ipc::paths::home_dir_from_env(|key| std::env::var(key).ok())
 }
 
 /// Resolves the effective state directory holding `node.sqlite`, `secrets/`, and `node.pid`.
@@ -298,7 +298,7 @@ fn resolve_daemon_socket_path_with(
             }
         }
     }
-    state_dir.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME)
+    state_dir.join(hyp_harness_ipc::sock::DEFAULT_SOCKET_FILENAME)
 }
 
 pub use hyp_crypto::constant_time_eq as ct_eq;
@@ -336,7 +336,7 @@ mod tests {
         );
         assert_eq!(
             resolve("", SocketEnvPolicy::PreserveOsValue),
-            state.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME)
+            state.join(hyp_harness_ipc::sock::DEFAULT_SOCKET_FILENAME)
         );
         for policy in [
             SocketEnvPolicy::TrimmedUtf8,
@@ -346,7 +346,7 @@ mod tests {
                 resolve_daemon_socket_path_with(state, false, policy, |_| panic!(
                     "explicit state must ignore ambient sockets"
                 )),
-                state.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME)
+                state.join(hyp_harness_ipc::sock::DEFAULT_SOCKET_FILENAME)
             );
         }
         #[cfg(unix)]

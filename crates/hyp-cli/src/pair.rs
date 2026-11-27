@@ -2943,7 +2943,7 @@ pub(crate) fn try_reload_live_daemon(
 }
 
 pub(crate) fn try_reload_live_daemon_at_socket(socket_path: &Path) -> DaemonReloadOutcome {
-    let resp = hyp_harness::sock::daemon_rpc_sync(
+    let resp = hyp_harness_ipc::sock::daemon_rpc_sync(
         socket_path,
         &json!({ "type": "peers.reload" }),
         LIVE_DAEMON_RELOAD_TIMEOUT,

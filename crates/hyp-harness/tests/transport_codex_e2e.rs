@@ -1,5 +1,5 @@
 //! Unit & real-subprocess E2E tests for the native Codex Queue push transport
-//! (`crates/hyp-harness/src/transport/codex.rs`).
+//! (`crates/hyp-harness/transport/src/transport/codex.rs`).
 //!
 //! Pure unit tests and missing-binary/validation tests run on all operating systems
 //! (including Windows). Real `#!/bin/sh` subprocess E2E tests are `#[cfg(unix)]`-gated

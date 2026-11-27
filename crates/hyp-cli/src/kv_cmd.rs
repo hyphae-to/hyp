@@ -10,8 +10,8 @@ use crate::config_file::{
 use crate::statusline_cmd::sanitize_terminal_text;
 use crate::ui::{CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, print_json};
 use clap::{Subcommand, ValueEnum};
-use hyp_harness::local_kv::{LocalKvAction, LocalKvError, LocalKvRequest, LocalKvResponse};
-use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_local_kv_rpc, default_socket_path};
+use hyp_daemon::local_kv::{LocalKvAction, LocalKvError, LocalKvRequest, LocalKvResponse};
+use hyp_harness_ipc::sock::{DEFAULT_SOCKET_FILENAME, daemon_local_kv_rpc, default_socket_path};
 use hyp_store::{NodeDb, WriteModel};
 use serde_json::{Value, json};
 use std::io::ErrorKind;

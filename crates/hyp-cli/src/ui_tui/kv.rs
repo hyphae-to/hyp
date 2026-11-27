@@ -7,7 +7,7 @@ use super::{compute_window, format_age_ms, render_selectable_row, truncate_plain
 use std::path::Path;
 
 #[cfg(unix)]
-use hyp_harness::local_kv::{LocalKvAction, LocalKvRequest, LocalKvResponse};
+use hyp_daemon::local_kv::{LocalKvAction, LocalKvRequest, LocalKvResponse};
 
 #[derive(Debug, Default, Clone)]
 pub(super) struct KvBrowser {

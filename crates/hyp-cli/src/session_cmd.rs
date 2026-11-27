@@ -6,8 +6,8 @@
 use crate::statusline_cmd::sanitize_terminal_text;
 use crate::ui::{CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json};
 use clap::{Args, Subcommand, ValueEnum};
-use hyp_harness::sock::{daemon_rpc_sync, default_socket_path};
-use hyp_harness::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
+use hyp_harness_client::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
+use hyp_harness_ipc::sock::{daemon_rpc_sync, default_socket_path};
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use std::process::ExitCode;

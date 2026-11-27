@@ -24,12 +24,12 @@ use crate::wizard::ColorMode;
 use crate::wizard::{detect_color_mode, detect_terminal_size};
 use clap::Args;
 #[cfg(unix)]
-use hyp_harness::sock::{
+use hyp_harness_client::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
+#[cfg(unix)]
+use hyp_harness_ipc::sock::{
     MAX_SOCKET_LINE_BYTES, connect_daemon_async, daemon_rpc_sync, default_socket_path,
     read_bounded_line_async, write_ndjson_line_async,
 };
-#[cfg(unix)]
-use hyp_harness::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
 use serde_json::Value;
 #[cfg(any(unix, test))]
 use serde_json::json;
