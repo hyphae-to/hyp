@@ -11,7 +11,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
