@@ -1,0 +1,167 @@
+name: Build Rust release archives
+
+on:
+  workflow_call:
+    inputs:
+      git_sha:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+      artifact_prefix:
+        required: true
+        type: string
+      nightly_version:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64-and-x64
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+            os: macos-latest
+            smoke_target: aarch64-apple-darwin
+          - label: x86_64-unknown-linux-gnu
+            targets: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            smoke_target: x86_64-unknown-linux-gnu
+          - label: x86_64-unknown-linux-musl
+            targets: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+            smoke_target: x86_64-unknown-linux-musl
+          - label: aarch64-unknown-linux-gnu
+            targets: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            smoke_target: aarch64-unknown-linux-gnu
+          - label: x86_64-pc-windows-msvc
+            targets: x86_64-pc-windows-msvc
+            os: windows-latest
+            smoke_target: x86_64-pc-windows-msvc
+    env:
+      HYPHAE_BUILD_VERSION: ${{ inputs.nightly_version }}
+      HYPHAE_BUILD_CHANNEL: ${{ inputs.nightly_version != '' && 'nightly' || '' }}
+      HYPHAE_RELEASE_TAG: ${{ inputs.nightly_version != '' && inputs.tag || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_sha }}
+
+      - name: Install Rust 1.87.0 (${{ matrix.targets }})
+        uses: dtolnay/rust-toolchain@1.87.0
+        with:
+          targets: ${{ matrix.targets }}
+
+      - name: Rust cache (shared by release and nightly)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.label }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install musl-tools (for x86_64-unknown-linux-musl)
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build stripped release binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGETS: ${{ matrix.targets }}
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra TRIPLE_LIST <<< "$TARGETS"
+          for TARGET in "${TRIPLE_LIST[@]}"; do
+            echo "=== Building ${TARGET} ==="
+            cargo build --release --locked --target "$TARGET" -p hyp-cli
+          done
+
+      - name: Build stripped release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.targets }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked --target $env:TARGET -p hyp-cli
+
+      - name: Package archive (Unix tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          TARGETS: ${{ matrix.targets }}
+          SMOKE_TARGET: ${{ matrix.smoke_target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          IFS=',' read -ra TRIPLE_LIST <<< "$TARGETS"
+          for TARGET in "${TRIPLE_LIST[@]}"; do
+            ARCHIVE="hyp-${TAG}-${TARGET}.tar.gz"
+            STAGE="$(mktemp -d)"
+
+            cp "target/${TARGET}/release/hyp" "${STAGE}/hyp"
+            chmod 0755 "${STAGE}/hyp"
+
+            if [ "$TARGET" = "$SMOKE_TARGET" ]; then
+              out="$("${STAGE}/hyp" version --json)"
+              echo "$out"
+              python3 -c 'import json, sys; j = json.loads(sys.argv[1]); assert j.get("ok") is True and j.get("command") == "version" and j.get("data", {}).get("version"), j' "$out"
+            fi
+
+            tar -C "$STAGE" -czf "dist/${ARCHIVE}" hyp
+            rm -rf "$STAGE"
+            ls -lh "dist/${ARCHIVE}"
+          done
+
+      - name: Package archive (Windows zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+          TARGET: ${{ matrix.targets }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = "hyp-$($env:TAG)-$($env:TARGET).zip"
+          $stage = Join-Path $env:RUNNER_TEMP "hyp-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $bin = Join-Path $stage "hyp.exe"
+          Copy-Item -Path "target\$($env:TARGET)\release\hyp.exe" -Destination $bin -Force
+          $out = & $bin version --json
+          Write-Output $out
+          $json = $out | ConvertFrom-Json
+          if (-not $json.ok -or $json.command -ne "version" -or -not $json.data.version) {
+            throw "Unexpected hyp.exe version --json output: $out"
+          }
+
+          Compress-Archive -Path $bin -DestinationPath "dist\$archive" -Force
+          Get-Item "dist\$archive" | Format-List Name, Length
+
+      - name: Upload target archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-${{ matrix.label }}
+          path: dist/hyp-*
+          retention-days: 7
+          if-no-files-found: error
