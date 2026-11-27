@@ -129,8 +129,12 @@ test("Bridges E2E — Telegram: full inbound->Claude->outbound+reaction loop, 42
 
     await hyp.startDaemon();
 
-    // Wait for the real Telegram plugin subprocess to start polling our mock.
-    await waitUntil(() => tgMock.getUpdatesCalls.length >= 1, "telegram initial getUpdates", 15_000);
+    // Polling can start before the daemon registers the bridge poster for MCP discovery.
+    await waitUntil(async () => {
+      if (tgMock.getUpdatesCalls.length === 0) return false;
+      const caps = await hyp.daemonRpc({ type: "mcp.caps", id: 1 }, 1_000);
+      return caps?.result?.hasPlugins === true;
+    }, "telegram initial getUpdates and daemon bridge capability", 15_000);
 
     const shim = await LlmShimServer.start({
       sandbox,
