@@ -2,7 +2,7 @@
   "mcpServers": {
     "hyphae": {
       "command": "hyp",
-      "args": ["mcp", "--backend", "claude"]
+      "args": ["mcp"]
     }
   }
 }

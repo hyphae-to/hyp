@@ -1241,7 +1241,7 @@ fn assist_claude_desktop_codex_desktop_and_cursor_ide_emit_manual_guides() {
     let fresh_entry = &fresh_snippet["mcp_servers"]["hyphae"];
     assert_eq!(
         fresh_entry["args"].as_array().unwrap().to_string().trim(),
-        r#"["mcp", "--backend", "codex"]"#
+        r#"["mcp"]"#
     );
     assert_eq!(
         fresh_entry["env_vars"]
@@ -1292,7 +1292,7 @@ env_vars = ["CUSTOM_ENV"]
             .unwrap()
             .to_string()
             .trim(),
-        r#"["mcp", "custom socket", "--backend", "codex"]"#
+        r#"["mcp", "custom socket"]"#
     );
     assert_eq!(
         existing_entry["env_vars"]

@@ -13,7 +13,7 @@ What this configures:
   - Scoped `before_tool_call` / `after_tool_call` hooks that bind every Hyphae MCP call to the exact OpenClaw `(agentId, sessionKey)` via single-use `_meshCall` tokens (no `--ephemeral` split-brain).
   - Native `hyphae-wake` Gateway service (`api.registerService`) delivering metadata-only wakeups directly into the exact existing `(agentId, sessionKey)` session via `enqueueSessionEvent` (strictly without `createIfMissing`, never spawning isolated cron jobs).
   - Optional `before_prompt_build` turn-start context injection (`--openclaw-prompt-injection`) and observational `agent_end` / `run_stopped` Queue flushing.
-- Managed MCP server entry in `~/.openclaw/openclaw.json` (`hyp mcp --backend openclaw`).
+- Managed MCP server entry in `~/.openclaw/openclaw.json` (`hyp mcp`).
 - Orchestrator-aware skill in `~/.openclaw/skills/hyp-mesh/SKILL.md` (intentionally avoids duplicating OpenClaw's native `cron`, `HEARTBEAT.md`, or `sessions_send`).
 
 ### Optional Fallback: OpenClaw Gateway `/hooks/wake` Webhook

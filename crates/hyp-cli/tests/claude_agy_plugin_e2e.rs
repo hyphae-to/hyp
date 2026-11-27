@@ -123,10 +123,7 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
     let mcp_raw = fs::read_to_string(plugin_dir.join(".mcp.json")).expect("read .mcp.json");
     let mcp: Value = serde_json::from_str(&mcp_raw).expect("valid .mcp.json");
     assert_eq!(mcp["mcpServers"]["hyphae"]["command"], "hyp");
-    assert_eq!(
-        mcp["mcpServers"]["hyphae"]["args"],
-        json!(["mcp", "--backend", "claude"])
-    );
+    assert_eq!(mcp["mcpServers"]["hyphae"]["args"], json!(["mcp"]));
 
     // 3. `hooks/hooks.json`
     let hooks_raw =

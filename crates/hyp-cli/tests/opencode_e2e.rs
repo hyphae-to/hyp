@@ -153,7 +153,7 @@ fn setup_opencode_writes_real_hooks_command_skill_and_is_idempotent() {
     assert_eq!(cfg["mcp"]["hyphae"]["enabled"], true);
     assert_eq!(
         cfg["mcp"]["hyphae"]["command"],
-        json!([fake_bin, "mcp", fake_sock_str, "--backend", "opencode"])
+        json!([fake_bin, "mcp", fake_sock_str])
     );
     // `--ephemeral` MUST be absent now that real PreToolUse hooks verify per-session callers.
     assert!(

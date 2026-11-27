@@ -29,6 +29,7 @@ mod service;
 mod session_cmd;
 mod setup;
 mod skill_render;
+mod skillshare;
 mod status_doctor;
 mod statusline_cmd;
 mod term;
@@ -83,7 +84,7 @@ enum Commands {
         /// Opt-in Claude CLI native push channel (`notifications/claude/channel`)
         #[arg(long)]
         claude_channel: bool,
-        /// Optional explicit backend override
+        /// Explicit backend override (normally inferred from MCP client initialization)
         #[arg(long)]
         backend: Option<String>,
         /// Explicit standalone thread UUID (e.g. codex or t3)
