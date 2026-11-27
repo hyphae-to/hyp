@@ -624,7 +624,8 @@ export function createHyphaeClient(host) {
       if (!activeWatchDir && dirs.length > 0) {
         activeWatchDir = dirs[0];
       }
-      return localSnapshot;
+      localSnapshot = null;
+      return null;
     } finally {
       localLoadInFlight = false;
     }

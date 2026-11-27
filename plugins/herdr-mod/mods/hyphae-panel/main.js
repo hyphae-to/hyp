@@ -77,6 +77,7 @@ export default class HyphaePanel extends View {
     this.tab = "subs";
     this.kv = new KvBrowser();
     this.kvMachine = null;
+    this.kvOnline = false;
     this.kvRevision = null;
     this.kvCursor = 0;
     this.overrideTerminal = initialProps?.terminal ?? null;
@@ -1342,8 +1343,13 @@ export default class HyphaePanel extends View {
     cx.notify();
   }
 
+  kvTargetOnline(target) {
+    return Boolean(target.snapshot?.daemon?.online)
+      && !(target.machine && this.client.getRemoteStatus(target.machine)?.error);
+  }
+
   runKv(target, cx, action) {
-    if (checking() || this.kv.busy) return;
+    if (checking() || this.kv.busy || !this.kvTargetOnline(target)) return;
     const runKv = async (args) => {
       const opts = { timeout: 7_000 };
       if (target.machine) opts.on = target.machine;
@@ -1407,6 +1413,8 @@ export default class HyphaePanel extends View {
       rows.push(h_flex().gap(6).children([
         back(),
         this.kvButton(t, "kv-copy", "Copy", (cx) => {
+          const active = this.resolveTarget();
+          if (this.kv.preview !== preview || active.machine !== target.machine || !this.kvTargetOnline(active)) return;
           cx.write_to_clipboard(preview.text);
           this.statusNote = "Copied KV preview.";
           cx.notify();
@@ -1509,17 +1517,21 @@ export default class HyphaePanel extends View {
       this.client.ensureRemoteFresh(target.machine, cx, false);
     }
 
-    if (target.machine !== this.kvMachine) {
+    const kvOnline = this.kvTargetOnline(target);
+    if (target.machine !== this.kvMachine || kvOnline !== this.kvOnline) {
       this.kv.reset();
       this.kvMachine = target.machine;
+      this.kvOnline = kvOnline;
       this.kvRevision = null;
       this.kvCursor = 0;
+      if (this.tab === "kv" && kvOnline) this.runKv(target, cx, (runKv) => this.kv.inspect(runKv));
     }
-    if (target.snapshot?.daemon?.online === false) this.kv.reset();
-    this.kv.reconcileSnapshot(target.snapshot?.kv, target.snapshot?.daemon?.nodeId);
-    if (this.tab === "kv" && target.snapshot?.rev !== this.kvRevision && !this.kv.busy) {
-      this.kvRevision = target.snapshot?.rev;
-      if (this.kv.namespace) this.runKv(target, cx, (runKv) => this.kv.refreshPage(runKv));
+    if (kvOnline) {
+      this.kv.reconcileSnapshot(target.snapshot.kv, target.snapshot.daemon.nodeId);
+      if (this.tab === "kv" && target.snapshot.rev !== this.kvRevision && !this.kv.busy) {
+        this.kvRevision = target.snapshot.rev;
+        if (this.kv.namespace) this.runKv(target, cx, (runKv) => this.kv.refreshPage(runKv));
+      }
     }
     const entry = target.entry;
     const showMuteInput = Boolean(entry) && this.tab === "rules";
@@ -1527,7 +1539,7 @@ export default class HyphaePanel extends View {
 
     let bodyRows;
     if (this.tab === "kv") {
-      bodyRows = this.renderKvTab(t, target);
+      bodyRows = kvOnline ? this.renderKvTab(t, target) : this.renderEmptyState(t, target);
     } else if (!entry && this.tab !== "mesh") {
       bodyRows = this.renderEmptyState(t, target);
     } else if (this.tab === "subs") {

@@ -362,10 +362,11 @@ test("createHyphaeClient cancels watchFolder cleanly on dispose and deduplicates
 
   const sharedStore = {};
   let execCalls = 0;
+  let localPresent = true;
   const host = {
     home: () => "/Users/alice",
     readTextFile: async (p) => {
-      if (p.endsWith("/ui/state.json")) {
+      if (localPresent && p.endsWith("/ui/state.json")) {
         return JSON.stringify({
           schemaVersion: 1,
           rev: 3,
@@ -420,6 +421,10 @@ test("createHyphaeClient cancels watchFolder cleanly on dispose and deduplicates
   await new Promise((r) => setTimeout(r, 15));
   assert.equal(execCalls, 1);
   assert.equal(client.resolveTerminal("solace/t2").entry?.handle, "remote-bob");
+
+  localPresent = false;
+  await client.refreshNow(null, fakeCx);
+  assert.equal(client.getSnapshot(), null);
 
   // Dispose must call watch.cancel() cleanly.
   client.dispose();
@@ -736,6 +741,10 @@ test("KV snapshots and cursor navigation keep values behind an explicit preview"
   assert.equal(browser.preview.truncated, true);
   assert.ok(!browser.preview.text.includes("\u001b"));
   assert.ok(!browser.preview.text.includes("\u202e"));
+  let finishPreview;
+  const pending = browser.show(key, () => new Promise((resolve) => { finishPreview = resolve; }), sanitizeUiText);
   browser.reset();
+  finishPreview({ text: "late preview" });
+  await pending;
   assert.equal(browser.preview, null);
 });
