@@ -73,7 +73,8 @@ use crate::call_registry::{
 };
 use crate::hooks::is_valid_session_token;
 use crate::protocol::{
-    HarnessKind, is_bridge_destination, is_valid_router_name, normalize_mesh_tool_name,
+    HarnessKind, TransportHintFields, is_bridge_destination, is_valid_router_name,
+    normalize_mesh_tool_name,
 };
 use crate::sock::{
     DEFAULT_SOCKET_FILENAME, MAX_SOCKET_LINE_BYTES, read_bounded_line_async,
@@ -349,6 +350,17 @@ struct TransportHints {
 
 impl TransportHints {
     fn from_packet(packet: &Map<String, Value>, default_harness: Option<HarnessKind>) -> Self {
+        let fields = TransportHintFields::from_packet(packet);
+        let clean = |value: Option<String>| {
+            value.and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            })
+        };
         let non_empty_str = |key: &str| {
             packet
                 .get(key)
@@ -361,38 +373,39 @@ impl TransportHints {
             .or_else(|| non_empty_str("backend"))
             .and_then(|s| s.parse::<HarnessKind>().ok())
             .or(default_harness);
-        let herdr_terminal_id = non_empty_str("herdrTerminalId")
+        let herdr_terminal_id = clean(fields.herdr_terminal_id)
             .or_else(|| non_empty_str("terminalId"))
             .filter(|tid| is_valid_terminal_id(tid));
-        let herdr_created_ms = packet
-            .get("herdrCreatedMs")
-            .or_else(|| packet.get("herdr_created_ms"))
-            .and_then(Value::as_i64);
-        let herdr_template = non_empty_str("herdrTemplate")
+        let herdr_created_ms = if packet.contains_key("herdrCreatedMs") {
+            fields.herdr_created_ms
+        } else {
+            packet.get("herdr_created_ms").and_then(Value::as_i64)
+        };
+        let herdr_template = clean(fields.herdr_template)
             .or_else(|| non_empty_str("herdr_template"))
             .filter(|tpl| is_valid_herdr_template(tpl));
         let explicit_thread = non_empty_str("threadId");
         let codex_thread_id = explicit_thread
             .clone()
-            .or_else(|| non_empty_str("codexThreadId"));
-        let codex_home = non_empty_str("codexHome").map(PathBuf::from);
-        let codex_remote = non_empty_str("codexRemote").or_else(|| non_empty_str("remote"));
+            .or_else(|| clean(fields.codex_thread_id));
+        let codex_home = clean(fields.codex_home).map(PathBuf::from);
+        let codex_remote = clean(fields.codex_remote).or_else(|| non_empty_str("remote"));
         let codex_resume = packet.get("resume").and_then(Value::as_bool) == Some(true);
         let explicit_codex_queue =
             explicit_thread.is_some() || codex_remote.is_some() || codex_resume;
-        let t3_thread_id = non_empty_str("t3ThreadId")
+        let t3_thread_id = clean(fields.t3_thread_id)
             .filter(|s| s.len() <= 256 && !s.chars().any(char::is_control));
-        let t3_base_dir = non_empty_str("t3BaseDir").map(PathBuf::from);
-        let t3_url = non_empty_str("t3Url");
-        let openclaw_session_key = non_empty_str("openclawSessionKey")
+        let t3_base_dir = clean(fields.t3_base_dir).map(PathBuf::from);
+        let t3_url = clean(fields.t3_url);
+        let openclaw_session_key = clean(fields.openclaw_session_key)
             .or_else(|| non_empty_str("sessionKey"))
             .and_then(|raw| {
                 let stripped = raw.strip_prefix("openclaw:").unwrap_or(&raw);
                 validate_openclaw_session_key(stripped).ok()
             });
-        let openclaw_session_id = non_empty_str("openclawSessionId")
+        let openclaw_session_id = clean(fields.openclaw_session_id)
             .filter(|s| s.len() <= 200 && !s.bytes().any(|b| b <= 0x20 || b == 0x7f));
-        let openclaw_agent_id = non_empty_str("openclawAgentId")
+        let openclaw_agent_id = clean(fields.openclaw_agent_id)
             .or_else(|| non_empty_str("agentId"))
             .filter(|s| s.len() <= 128 && !s.bytes().any(|b| b <= 0x20 || b == 0x7f))
             .or_else(|| {
@@ -400,8 +413,7 @@ impl TransportHints {
                     .as_deref()
                     .and_then(parse_openclaw_agent_id_from_session_key)
             });
-        let cwd =
-            non_empty_str("cwd").filter(|s| s.len() <= 1024 && !s.chars().any(char::is_control));
+        let cwd = clean(fields.cwd).filter(|s| s.len() <= 1024 && !s.chars().any(char::is_control));
 
         Self {
             harness,
@@ -451,59 +463,32 @@ impl TransportHints {
     }
 
     fn backend_patch(&self, explicit_harness: Option<HarnessKind>) -> Map<String, Value> {
+        let path = |value: &Option<PathBuf>| {
+            value
+                .as_ref()
+                .filter(|value| !value.as_os_str().is_empty())
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let fields = TransportHintFields {
+            herdr_terminal_id: self.herdr_terminal_id.clone(),
+            herdr_created_ms: self.herdr_created_ms,
+            herdr_template: self.herdr_template.clone(),
+            codex_thread_id: self.codex_thread_id.clone(),
+            codex_home: path(&self.codex_home),
+            codex_remote: self.codex_remote.clone(),
+            t3_thread_id: self.t3_thread_id.clone(),
+            t3_base_dir: path(&self.t3_base_dir),
+            t3_url: self.t3_url.clone(),
+            openclaw_session_key: self.openclaw_session_key.clone(),
+            openclaw_session_id: self.openclaw_session_id.clone(),
+            openclaw_agent_id: self.openclaw_agent_id.clone(),
+            cwd: self.cwd.clone(),
+        };
         let mut patch = Map::new();
-        if let Some(h) = explicit_harness.or(self.harness) {
-            patch.insert("kind".into(), json!(h.as_str()));
+        if let Some(harness) = explicit_harness.or(self.harness) {
+            patch.insert("kind".into(), json!(harness.as_str()));
         }
-        if let Some(ref tid) = self.herdr_terminal_id {
-            patch.insert("herdrTerminalId".into(), json!(tid));
-        }
-        if let Some(created_ms) = self.herdr_created_ms {
-            patch.insert("herdrCreatedMs".into(), json!(created_ms));
-        }
-        if let Some(ref tpl) = self.herdr_template {
-            patch.insert("herdrTemplate".into(), json!(tpl));
-        }
-        if let Some(ref codex_tid) = self.codex_thread_id {
-            patch.insert("codexThreadId".into(), json!(codex_tid));
-        }
-        if let Some(ref codex_home) = self.codex_home {
-            if !codex_home.as_os_str().is_empty() {
-                patch.insert(
-                    "codexHome".into(),
-                    json!(codex_home.to_string_lossy().as_ref()),
-                );
-            }
-        }
-        if let Some(ref codex_remote) = self.codex_remote {
-            patch.insert("codexRemote".into(), json!(codex_remote));
-        }
-        if let Some(ref t3_tid) = self.t3_thread_id {
-            patch.insert("t3ThreadId".into(), json!(t3_tid));
-        }
-        if let Some(ref t3_base_dir) = self.t3_base_dir {
-            if !t3_base_dir.as_os_str().is_empty() {
-                patch.insert(
-                    "t3BaseDir".into(),
-                    json!(t3_base_dir.to_string_lossy().as_ref()),
-                );
-            }
-        }
-        if let Some(ref t3_url) = self.t3_url {
-            patch.insert("t3Url".into(), json!(t3_url));
-        }
-        if let Some(ref sk) = self.openclaw_session_key {
-            patch.insert("openclawSessionKey".into(), json!(sk));
-        }
-        if let Some(ref oc_sid) = self.openclaw_session_id {
-            patch.insert("openclawSessionId".into(), json!(oc_sid));
-        }
-        if let Some(ref aid) = self.openclaw_agent_id {
-            patch.insert("openclawAgentId".into(), json!(aid));
-        }
-        if let Some(ref cwd) = self.cwd {
-            patch.insert("cwd".into(), json!(cwd));
-        }
+        fields.write_into(&mut patch);
         patch
     }
 }
