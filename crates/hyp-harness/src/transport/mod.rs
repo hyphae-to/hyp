@@ -34,19 +34,20 @@ pub enum PushMode {
     Interrupt,
 }
 
+/// A wake transport failure reason serialized as the existing reason string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub struct PushReason(PushReasonKind);
+
 macro_rules! push_reasons {
     ($($variant:ident => $wire:expr),+ $(,)?) => {
-        /// Standard wake transport failure reasons and additional transport-specific diagnostics.
-        ///
-        /// Serializes as the existing reason string.
-        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-        #[serde(from = "String", into = "String")]
-        pub enum PushReason {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub(crate) enum PushReasonKind {
             $($variant,)+
             Other(String),
         }
 
-        impl PushReason {
+        impl PushReasonKind {
             fn known(value: &str) -> Option<Self> {
                 match value {
                     $(candidate if candidate == $wire => Some(Self::$variant),)+
@@ -54,7 +55,7 @@ macro_rules! push_reasons {
                 }
             }
 
-            pub fn as_str(&self) -> &str {
+            fn as_str(&self) -> &str {
                 match self {
                     $(Self::$variant => $wire,)+
                     Self::Other(value) => value,
@@ -87,22 +88,32 @@ push_reasons! {
     OpenclawTokenMissing => openclaw::REASON_OPENCLAW_TOKEN_MISSING,
 }
 
+impl PushReason {
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub(crate) fn kind(&self) -> &PushReasonKind {
+        &self.0
+    }
+}
+
 impl From<String> for PushReason {
     fn from(value: String) -> Self {
-        Self::known(&value).unwrap_or(Self::Other(value))
+        Self(PushReasonKind::known(&value).unwrap_or(PushReasonKind::Other(value)))
     }
 }
 
 impl From<&str> for PushReason {
     fn from(value: &str) -> Self {
-        Self::known(value).unwrap_or_else(|| Self::Other(value.into()))
+        Self(PushReasonKind::known(value).unwrap_or_else(|| PushReasonKind::Other(value.into())))
     }
 }
 
 impl From<PushReason> for String {
     fn from(value: PushReason) -> Self {
-        match value {
-            PushReason::Other(value) => value,
+        match value.0 {
+            PushReasonKind::Other(value) => value,
             reason => reason.as_str().into(),
         }
     }
@@ -229,18 +240,20 @@ mod tests {
     #[test]
     fn push_outcome_reason_wire_format_is_compatible() {
         for (reason, expected) in [
-            ("herdr_working", PushReason::HerdrWorking),
+            ("herdr_working", PushReasonKind::HerdrWorking),
             (
                 "unrecognized_reason",
-                PushReason::Other("unrecognized_reason".into()),
+                PushReasonKind::Other("unrecognized_reason".into()),
             ),
         ] {
+            assert_eq!(PushReason::from(reason).kind(), &expected);
+            assert_eq!(PushReason::from(reason.to_owned()).kind(), &expected);
             let packet = serde_json::json!({"outcome": "hold", "reason": reason});
             let outcome = serde_json::from_value::<PushOutcome>(packet.clone()).unwrap();
             assert_eq!(
                 outcome,
                 PushOutcome::Hold {
-                    reason: expected,
+                    reason: PushReason(expected.clone()),
                     interrupted: false,
                 }
             );
