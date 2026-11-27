@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::NodeDb;
 use crate::error::{StoreError, StoreResult};
+use crate::query::{query_opt, query_vec};
 use crate::types::{
     DeliveryMode, GateDecision, GateDirection, GateState, MailboxKind, is_handle, sha256_hex,
     uuid_v4,
@@ -506,38 +507,31 @@ impl<'a> LocalStateStore<'a> {
     }
 
     pub fn get_session(&self, id: &str) -> StoreResult<Option<Session>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM sessions WHERE id = ?1",
-                params![id],
-                decode_session_row,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM sessions WHERE id = ?1",
+            params![id],
+            decode_session_row,
+        )
     }
 
     pub fn list_sessions(&self) -> StoreResult<Vec<Session>> {
-        let mut stmt = self
-            .db
-            .conn()
-            .prepare("SELECT * FROM sessions ORDER BY last_seen DESC, id ASC")?;
-        let rows = stmt
-            .query_map([], decode_session_row)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = query_vec(
+            self.db.conn(),
+            "SELECT * FROM sessions ORDER BY last_seen DESC, id ASC",
+            [],
+            decode_session_row,
+        )?;
         rows.into_iter().collect()
     }
 
     pub fn session_by_handle(&self, handle: &str) -> StoreResult<Option<Session>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM sessions WHERE handle = ?1",
-                params![handle],
-                decode_session_row,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM sessions WHERE handle = ?1",
+            params![handle],
+            decode_session_row,
+        )
     }
 
     /// Matches either exact `session_id` or `<harness>:<thread_id>` suffix.
@@ -553,14 +547,12 @@ impl<'a> LocalStateStore<'a> {
     }
 
     pub fn list_session_handles(&self) -> StoreResult<Vec<String>> {
-        let mut stmt = self
-            .db
-            .conn()
-            .prepare("SELECT handle FROM sessions WHERE handle IS NOT NULL ORDER BY handle ASC")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        query_vec(
+            self.db.conn(),
+            "SELECT handle FROM sessions WHERE handle IS NOT NULL ORDER BY handle ASC",
+            [],
+            |row| row.get::<_, String>(0),
+        )
     }
 
     /// Lists sessions whose persisted `backend_json` binds `herdrTerminalId == terminal_id`,
@@ -595,7 +587,8 @@ impl<'a> LocalStateStore<'a> {
         active_session_ids: &HashSet<String>,
     ) -> StoreResult<PruneReport> {
         let tx = self.db.immediate_tx()?;
-        let mut stmt = tx.conn().prepare(
+        let candidates: Vec<String> = query_vec(
+            tx.conn(),
             "SELECT s.id FROM sessions s
              WHERE s.last_seen > 0
                AND s.last_seen < ?1
@@ -603,11 +596,9 @@ impl<'a> LocalStateStore<'a> {
                    SELECT 1 FROM mailbox m
                    WHERE m.session_id = s.id AND m.gate_state IN ('pending', 'quarantined')
                )",
+            params![cutoff_ms],
+            |row| row.get(0),
         )?;
-        let candidates: Vec<String> = stmt
-            .query_map(params![cutoff_ms], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
 
         let stale: Vec<String> = candidates
             .into_iter()
@@ -893,10 +884,12 @@ impl<'a> LocalStateStore<'a> {
              LIMIT ?2",
             visibility.predicate()
         );
-        let mut stmt = self.db.conn().prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![session_id, limit as i64], decode_mailbox_row)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = query_vec(
+            self.db.conn(),
+            &sql,
+            params![session_id, limit as i64],
+            decode_mailbox_row,
+        )?;
         rows.into_iter().collect()
     }
 
@@ -1124,12 +1117,10 @@ impl<'a> LocalStateStore<'a> {
              ORDER BY received_at DESC",
             visibility.predicate()
         );
-        let mut stmt = self.db.conn().prepare(&sql)?;
-        let rows: Vec<(String, String, i64)> = stmt
-            .query_map(params![session_id], |row| {
+        let rows: Vec<(String, String, i64)> =
+            query_vec(self.db.conn(), &sql, params![session_id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            })?;
         let mut seen_sources = HashSet::new();
         for (kind_str, source, notified) in rows {
             digest.unread += 1;
@@ -1201,27 +1192,28 @@ impl<'a> LocalStateStore<'a> {
              LIMIT ?2",
             visibility.predicate()
         );
-        let mut stmt = self.db.conn().prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![session_id, limit as i64], decode_mailbox_meta_row)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = query_vec(
+            self.db.conn(),
+            &sql,
+            params![session_id, limit as i64],
+            decode_mailbox_meta_row,
+        )?;
         rows.into_iter().collect()
     }
 
     /// Lists distinct `local-ingest:<topic>` staging session IDs that hold human-approved
     /// (`gate_state = 'pending' AND reviewed_at IS NOT NULL`) rows waiting for fanout (`G8`).
     pub fn list_approved_local_ingest_sessions(&self) -> StoreResult<Vec<String>> {
-        let mut stmt = self.db.conn().prepare(
+        query_vec(
+            self.db.conn(),
             "SELECT DISTINCT session_id FROM mailbox
              WHERE session_id LIKE 'local-ingest:%'
                AND gate_state = 'pending'
                AND reviewed_at IS NOT NULL
              ORDER BY session_id ASC",
-        )?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            [],
+            |row| row.get::<_, String>(0),
+        )
     }
 
     /// Lists quarantined items awaiting human review (`hyp gate review`).
@@ -1231,26 +1223,26 @@ impl<'a> LocalStateStore<'a> {
         limit: usize,
     ) -> StoreResult<Vec<MailboxEntry>> {
         if let Some(sid) = session_id {
-            let mut stmt = self.db.conn().prepare(
+            let rows = query_vec(
+                self.db.conn(),
                 "SELECT * FROM mailbox
                  WHERE gate_state = 'quarantined' AND session_id = ?1
                  ORDER BY received_at ASC, receipt ASC
                  LIMIT ?2",
+                params![sid, limit as i64],
+                decode_mailbox_row,
             )?;
-            let rows = stmt
-                .query_map(params![sid, limit as i64], decode_mailbox_row)?
-                .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter().collect()
         } else {
-            let mut stmt = self.db.conn().prepare(
+            let rows = query_vec(
+                self.db.conn(),
                 "SELECT * FROM mailbox
                  WHERE gate_state = 'quarantined'
                  ORDER BY received_at ASC, receipt ASC
                  LIMIT ?1",
+                params![limit as i64],
+                decode_mailbox_row,
             )?;
-            let rows = stmt
-                .query_map(params![limit as i64], decode_mailbox_row)?
-                .collect::<Result<Vec<_>, _>>()?;
             rows.into_iter().collect()
         }
     }
@@ -1262,15 +1254,15 @@ impl<'a> LocalStateStore<'a> {
         session_id: &str,
         limit: usize,
     ) -> StoreResult<Vec<MailboxEntryEx>> {
-        let mut stmt = self.db.conn().prepare(
+        let rows = query_vec(
+            self.db.conn(),
             "SELECT * FROM mailbox
              WHERE session_id = ?1 AND gate_state = 'pending'
              ORDER BY received_at ASC, receipt ASC
              LIMIT ?2",
+            params![session_id, limit as i64],
+            decode_mailbox_row_ex,
         )?;
-        let rows = stmt
-            .query_map(params![session_id, limit as i64], decode_mailbox_row_ex)?
-            .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().collect()
     }
 
@@ -1283,18 +1275,17 @@ impl<'a> LocalStateStore<'a> {
         now_ms: i64,
     ) -> StoreResult<Vec<MailboxEntryEx>> {
         let tx = self.db.immediate_tx()?;
-        let mut stmt = tx.conn().prepare(
+        let entries = query_vec(
+            tx.conn(),
             "SELECT * FROM mailbox
              WHERE session_id = ?1 AND gate_state = 'pending'
              ORDER BY received_at ASC, receipt ASC
              LIMIT ?2",
-        )?;
-        let entries = stmt
-            .query_map(params![session_id, limit as i64], decode_mailbox_row_ex)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .collect::<StoreResult<Vec<_>>>()?;
-        drop(stmt);
+            params![session_id, limit as i64],
+            decode_mailbox_row_ex,
+        )?
+        .into_iter()
+        .collect::<StoreResult<Vec<_>>>()?;
 
         for item in &entries {
             tx.conn().execute(
@@ -1309,28 +1300,22 @@ impl<'a> LocalStateStore<'a> {
 
     /// Looks up a single mailbox entry by `receipt_id` with extended v3 metadata.
     pub fn get_mailbox_entry_ex(&self, receipt_id: &str) -> StoreResult<Option<MailboxEntryEx>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM mailbox WHERE receipt = ?1",
-                params![receipt_id],
-                decode_mailbox_row_ex,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM mailbox WHERE receipt = ?1",
+            params![receipt_id],
+            decode_mailbox_row_ex,
+        )
     }
 
     /// Looks up a single mailbox entry by `receipt_id`.
     pub fn get_mailbox_entry(&self, receipt_id: &str) -> StoreResult<Option<MailboxEntry>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM mailbox WHERE receipt = ?1",
-                params![receipt_id],
-                decode_mailbox_row,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM mailbox WHERE receipt = ?1",
+            params![receipt_id],
+            decode_mailbox_row,
+        )
     }
 
     /// Human-only quarantine approval (`hyp inbox approve <receipt>`).
@@ -1350,16 +1335,13 @@ impl<'a> LocalStateStore<'a> {
             ));
         }
         let tx = self.db.immediate_tx()?;
-        let entry: MailboxEntry = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM mailbox WHERE receipt = ?1",
-                params![receipt_id],
-                decode_mailbox_row,
-            )
-            .optional()?
-            .transpose()?
-            .ok_or_else(|| StoreError::NotFound(format!("receipt '{receipt_id}' not found")))?;
+        let entry: MailboxEntry = query_opt(
+            tx.conn(),
+            "SELECT * FROM mailbox WHERE receipt = ?1",
+            params![receipt_id],
+            decode_mailbox_row,
+        )?
+        .ok_or_else(|| StoreError::NotFound(format!("receipt '{receipt_id}' not found")))?;
 
         if entry.gate_state != GateState::Quarantined {
             return Err(StoreError::InvalidState(format!(
@@ -1427,16 +1409,13 @@ impl<'a> LocalStateStore<'a> {
             ));
         }
         let tx = self.db.immediate_tx()?;
-        let entry: MailboxEntry = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM mailbox WHERE receipt = ?1",
-                params![receipt_id],
-                decode_mailbox_row,
-            )
-            .optional()?
-            .transpose()?
-            .ok_or_else(|| StoreError::NotFound(format!("receipt '{receipt_id}' not found")))?;
+        let entry: MailboxEntry = query_opt(
+            tx.conn(),
+            "SELECT * FROM mailbox WHERE receipt = ?1",
+            params![receipt_id],
+            decode_mailbox_row,
+        )?
+        .ok_or_else(|| StoreError::NotFound(format!("receipt '{receipt_id}' not found")))?;
 
         if entry.gate_state != GateState::Quarantined {
             return Err(StoreError::InvalidState(format!(
@@ -1572,15 +1551,14 @@ impl<'a> LocalStateStore<'a> {
         }
 
         let tx = self.db.immediate_tx()?;
-        let mut stmt = tx.conn().prepare(
+        let expired: Vec<(String, String)> = query_vec(
+            tx.conn(),
             "SELECT scope, pattern FROM muted_sources
              WHERE expires_at IS NOT NULL AND expires_at <= ?1
              ORDER BY scope ASC, pattern ASC",
+            params![now_ms],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let expired: Vec<(String, String)> = stmt
-            .query_map(params![now_ms], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
 
         if !expired.is_empty() {
             tx.conn().execute(
@@ -1613,27 +1591,25 @@ impl<'a> LocalStateStore<'a> {
         now_ms: i64,
     ) -> StoreResult<Vec<MuteRule>> {
         if let Some(sid) = session_id {
-            let mut stmt = self.db.conn().prepare(
+            query_vec(
+                self.db.conn(),
                 "SELECT scope, pattern, muted_at, muted_by, expires_at FROM muted_sources
                  WHERE (scope = '*' OR scope = ?1)
                    AND (expires_at IS NULL OR expires_at > ?2)
                  ORDER BY scope ASC, pattern ASC",
-            )?;
-            let rows = stmt
-                .query_map(params![sid, now_ms], decode_mute_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+                params![sid, now_ms],
+                decode_mute_row,
+            )
         } else {
-            let mut stmt = self.db.conn().prepare(
+            query_vec(
+                self.db.conn(),
                 "SELECT scope, pattern, muted_at, muted_by, expires_at FROM muted_sources
                  WHERE scope = '*'
                    AND (expires_at IS NULL OR expires_at > ?1)
                  ORDER BY pattern ASC",
-            )?;
-            let rows = stmt
-                .query_map(params![now_ms], decode_mute_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+                params![now_ms],
+                decode_mute_row,
+            )
         }
     }
 
@@ -1763,27 +1739,25 @@ impl<'a> LocalStateStore<'a> {
     }
 
     pub fn bridge_links(&self, plugin: &str, target: &str) -> StoreResult<Vec<BridgeLink>> {
-        let mut stmt = self.db.conn().prepare(
+        query_vec(
+            self.db.conn(),
             "SELECT plugin, target, session_id, linked_at, linked_by
              FROM bridge_links WHERE plugin = ?1 AND target = ?2
              ORDER BY linked_at ASC, session_id ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![plugin, target], decode_bridge_link_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            params![plugin, target],
+            decode_bridge_link_row,
+        )
     }
 
     pub fn bridge_links_for_session(&self, session_id: &str) -> StoreResult<Vec<BridgeLink>> {
-        let mut stmt = self.db.conn().prepare(
+        query_vec(
+            self.db.conn(),
             "SELECT plugin, target, session_id, linked_at, linked_by
              FROM bridge_links WHERE session_id = ?1
              ORDER BY plugin ASC, target ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![session_id], decode_bridge_link_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            params![session_id],
+            decode_bridge_link_row,
+        )
     }
 
     // ---- Immutable Security Gate Audit Log ----
@@ -1828,10 +1802,12 @@ impl<'a> LocalStateStore<'a> {
             bind.push(SqlValue::Integer(limit as i64));
         }
 
-        let mut stmt = self.db.conn().prepare(&sql)?;
-        let rows = stmt
-            .query_map(params_from_iter(bind), decode_gate_audit_row)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = query_vec(
+            self.db.conn(),
+            &sql,
+            params_from_iter(bind),
+            decode_gate_audit_row,
+        )?;
         rows.into_iter().collect()
     }
 }

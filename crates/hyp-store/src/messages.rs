@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::NodeDb;
 use crate::error::{StoreError, StoreResult};
+use crate::query::{query_opt, query_vec};
 use crate::types::string_enum;
 use crate::types::{
     AckOutcome, format_address, is_channel_name, is_handle, is_node_id, parse_address, sha256_hex,
@@ -412,14 +413,13 @@ impl<'a> MessageStore<'a> {
             }
         }
 
-        let mut list_stmt = tx.conn().prepare(
+        let records = query_vec(
+            tx.conn(),
             "SELECT node_id, handle, session_id, description, registered_at, last_heartbeat_at
              FROM handles WHERE node_id = ?1 ORDER BY handle ASC",
+            params![node_id],
+            decode_handle_row,
         )?;
-        let records = list_stmt
-            .query_map(params![node_id], decode_handle_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(list_stmt);
         tx.commit()?;
         Ok(records)
     }
@@ -427,23 +427,21 @@ impl<'a> MessageStore<'a> {
     /// Lists enrolled handles, optionally filtered by `node_id`.
     pub fn list_handles(&self, node_id: Option<&str>) -> StoreResult<Vec<HandleRecord>> {
         if let Some(nid) = node_id {
-            let mut stmt = self.db.conn().prepare(
+            query_vec(
+                self.db.conn(),
                 "SELECT node_id, handle, session_id, description, registered_at, last_heartbeat_at
                  FROM handles WHERE node_id = ?1 ORDER BY handle ASC",
-            )?;
-            let rows = stmt
-                .query_map(params![nid], decode_handle_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+                params![nid],
+                decode_handle_row,
+            )
         } else {
-            let mut stmt = self.db.conn().prepare(
+            query_vec(
+                self.db.conn(),
                 "SELECT node_id, handle, session_id, description, registered_at, last_heartbeat_at
                  FROM handles ORDER BY node_id ASC, handle ASC",
-            )?;
-            let rows = stmt
-                .query_map([], decode_handle_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+                [],
+                decode_handle_row,
+            )
         }
     }
 
@@ -456,13 +454,12 @@ impl<'a> MessageStore<'a> {
     /// memberships and rejecting pending messages. Returns the pruned `<node_id>/<handle>` addresses.
     pub fn prune_stale_handles(&self, cutoff_ms: i64, now_ms: i64) -> StoreResult<Vec<String>> {
         let tx = self.db.immediate_tx()?;
-        let mut stmt = tx.conn().prepare(
+        let stale: Vec<(String, String)> = query_vec(
+            tx.conn(),
             "SELECT node_id, handle FROM handles WHERE last_heartbeat_at < ?1 ORDER BY node_id, handle",
+            params![cutoff_ms],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let stale: Vec<(String, String)> = stmt
-            .query_map(params![cutoff_ms], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
 
         let mut removed = Vec::with_capacity(stale.len());
         for (nid, handle) in stale {
@@ -500,19 +497,15 @@ impl<'a> MessageStore<'a> {
         let handles = self.list_handles(Some(node_id))?;
         let mut due = Vec::new();
         for h in handles {
-            let row: Option<MessageRecord> = self
-                .db
-                .conn()
-                .query_row(
-                    "SELECT * FROM messages
+            let row: Option<MessageRecord> = query_opt(
+                self.db.conn(),
+                "SELECT * FROM messages
                      WHERE to_addr = ?1 AND state = 'pending'
                      ORDER BY sent_at ASC, id ASC
                      LIMIT 1",
-                    params![&h.address],
-                    decode_message_row,
-                )
-                .optional()?
-                .transpose()?;
+                params![&h.address],
+                decode_message_row,
+            )?;
             let Some(msg) = row else {
                 continue;
             };
@@ -536,15 +529,12 @@ impl<'a> MessageStore<'a> {
         now_ms: i64,
     ) -> StoreResult<bool> {
         let tx = self.db.immediate_tx()?;
-        let msg: Option<MessageRecord> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM messages WHERE id = ?1 AND state = 'pending'",
-                params![message_id],
-                decode_message_row,
-            )
-            .optional()?
-            .transpose()?;
+        let msg: Option<MessageRecord> = query_opt(
+            tx.conn(),
+            "SELECT * FROM messages WHERE id = ?1 AND state = 'pending'",
+            params![message_id],
+            decode_message_row,
+        )?;
         let Some(msg) = msg else {
             return Ok(false);
         };
@@ -587,25 +577,22 @@ impl<'a> MessageStore<'a> {
 
     /// Looks up a message by ID.
     pub fn get_message(&self, id: &str) -> StoreResult<Option<MessageRecord>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM messages WHERE id = ?1",
-                params![id],
-                decode_message_row,
-            )
-            .optional()?
-            .transpose()
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM messages WHERE id = ?1",
+            params![id],
+            decode_message_row,
+        )
     }
 
     /// Lists all pending messages addressed to `to_addr` in FIFO order.
     pub fn list_pending(&self, to_addr: &str) -> StoreResult<Vec<MessageRecord>> {
-        let mut stmt = self.db.conn().prepare(
+        let rows = query_vec(
+            self.db.conn(),
             "SELECT * FROM messages WHERE to_addr = ?1 AND state = 'pending' ORDER BY sent_at ASC, id ASC",
+            params![to_addr],
+            decode_message_row,
         )?;
-        let rows = stmt
-            .query_map(params![to_addr], decode_message_row)?
-            .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().collect()
     }
 
@@ -807,15 +794,14 @@ impl<'a> ChannelStore<'a> {
         if address.is_empty() {
             return Ok(Vec::new());
         }
-        let mut stmt = self.db.conn().prepare(
+        query_vec(
+            self.db.conn(),
             "SELECT host_node, channel FROM channel_members
              WHERE address = ?1
              ORDER BY host_node ASC, channel ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![address], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            params![address],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
     }
 
     /// Lists non-empty channels and their enrolled members, optionally filtered by `host_node`.
@@ -962,15 +948,12 @@ impl<'a> ChannelStore<'a> {
         let members_json = serde_json::to_string(&sorted_members)?;
 
         let tx = self.db.immediate_tx()?;
-        let existing: Option<ChannelEpoch> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM channel_epochs WHERE host_node = ?1 AND channel = ?2 AND epoch = ?3",
-                params![&input.host_node, &input.channel, input.epoch as i64],
-                decode_channel_epoch_row,
-            )
-            .optional()?
-            .transpose()?;
+        let existing: Option<ChannelEpoch> = query_opt(
+            tx.conn(),
+            "SELECT * FROM channel_epochs WHERE host_node = ?1 AND channel = ?2 AND epoch = ?3",
+            params![&input.host_node, &input.channel, input.epoch as i64],
+            decode_channel_epoch_row,
+        )?;
         if let Some(prev) = existing {
             if prev.creator_node_id == input.creator_node_id
                 && prev.key_envelope_json == input.key_envelope_json
@@ -1040,17 +1023,14 @@ impl<'a> ChannelStore<'a> {
         host_node: &str,
         channel: &str,
     ) -> StoreResult<Option<ChannelEpoch>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM channel_epochs
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM channel_epochs
                  WHERE host_node = ?1 AND channel = ?2
                  ORDER BY epoch DESC LIMIT 1",
-                params![host_node, channel],
-                decode_channel_epoch_row,
-            )
-            .optional()?
-            .transpose()
+            params![host_node, channel],
+            decode_channel_epoch_row,
+        )
     }
 
     /// Looks up a specific epoch for `(host_node, channel)`.
@@ -1060,28 +1040,25 @@ impl<'a> ChannelStore<'a> {
         channel: &str,
         epoch: u64,
     ) -> StoreResult<Option<ChannelEpoch>> {
-        self.db
-            .conn()
-            .query_row(
-                "SELECT * FROM channel_epochs
+        query_opt(
+            self.db.conn(),
+            "SELECT * FROM channel_epochs
                  WHERE host_node = ?1 AND channel = ?2 AND epoch = ?3",
-                params![host_node, channel, epoch as i64],
-                decode_channel_epoch_row,
-            )
-            .optional()?
-            .transpose()
+            params![host_node, channel, epoch as i64],
+            decode_channel_epoch_row,
+        )
     }
 
     /// Lists all epochs stored for `(host_node, channel)` in ascending epoch order.
     pub fn list_epochs(&self, host_node: &str, channel: &str) -> StoreResult<Vec<ChannelEpoch>> {
-        let mut stmt = self.db.conn().prepare(
+        let rows = query_vec(
+            self.db.conn(),
             "SELECT * FROM channel_epochs
              WHERE host_node = ?1 AND channel = ?2
              ORDER BY epoch ASC",
+            params![host_node, channel],
+            decode_channel_epoch_row,
         )?;
-        let rows = stmt
-            .query_map(params![host_node, channel], decode_channel_epoch_row)?
-            .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().collect()
     }
 }
@@ -1130,14 +1107,14 @@ fn enrolled_channel_members(
     host_node: &str,
     channel: &str,
 ) -> StoreResult<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let addrs: Vec<String> = query_vec(
+        conn,
         "SELECT address FROM channel_members
          WHERE host_node = ?1 AND channel = ?2
          ORDER BY address ASC",
+        params![host_node, channel],
+        |row| row.get(0),
     )?;
-    let addrs: Vec<String> = stmt
-        .query_map(params![host_node, channel], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
     let mut out = Vec::with_capacity(addrs.len());
     for addr in addrs {
         if is_enrolled_conn(conn, &addr)? {

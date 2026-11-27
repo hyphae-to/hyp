@@ -20,6 +20,7 @@ use crate::kv::KvStore;
 use crate::local::LocalStateStore;
 use crate::messages::{ChannelStore, MessageLimits, MessageStore};
 use crate::peers::PeerStore;
+use crate::query::query_vec;
 use crate::transfers::{TransferLimits, TransferStore};
 use crate::types::now_ms;
 
@@ -840,19 +841,15 @@ fn newer_schema_error(current: i64, supported: i64, db_path: Option<&Path>) -> S
 }
 
 fn collect_foreign_key_violations(conn: &Connection) -> StoreResult<Vec<String>> {
-    let mut stmt = conn.prepare("PRAGMA foreign_key_check;")?;
-    let rows = stmt
-        .query_map([], |row| {
-            let table: String = row.get(0)?;
-            let rowid: Option<i64> = row.get(1)?;
-            let parent: String = row.get(2)?;
-            let fkid: i64 = row.get(3)?;
-            Ok(format!(
-                "table={table} rowid={rowid:?} parent={parent} fkid={fkid}"
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
+    query_vec(conn, "PRAGMA foreign_key_check;", [], |row| {
+        let table: String = row.get(0)?;
+        let rowid: Option<i64> = row.get(1)?;
+        let parent: String = row.get(2)?;
+        let fkid: i64 = row.get(3)?;
+        Ok(format!(
+            "table={table} rowid={rowid:?} parent={parent} fkid={fkid}"
+        ))
+    })
 }
 
 fn migration_lock_for(db_path: &Path) -> Arc<Mutex<()>> {

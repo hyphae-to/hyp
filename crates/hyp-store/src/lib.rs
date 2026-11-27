@@ -16,6 +16,7 @@ pub mod kv;
 pub mod local;
 pub mod messages;
 pub mod peers;
+mod query;
 pub mod scheduler;
 pub mod transfers;
 pub mod types;

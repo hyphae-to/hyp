@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::{ImmediateTx, NodeDb};
 use crate::error::{StoreError, StoreResult};
+use crate::query::{query_opt, query_vec};
 use crate::types::string_enum;
 use crate::types::{
     AckOutcome, CloudEvent, DeliveryMode, Filter, check_filters, is_node_id, is_topic,
@@ -670,15 +671,12 @@ impl<'a> EventStore<'a> {
     /// Lists all persisted subscription metadata records keyed by `subscription_id`.
     pub fn list_subscription_meta(&self) -> StoreResult<BTreeMap<String, SubscriptionMeta>> {
         let prefix_like = format!("{SUBSCRIPTION_META_PREFIX}%");
-        let mut stmt = self
-            .db
-            .conn()
-            .prepare("SELECT key, value FROM metadata WHERE key LIKE ?1")?;
-        let rows = stmt
-            .query_map(params![&prefix_like], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = query_vec(
+            self.db.conn(),
+            "SELECT key, value FROM metadata WHERE key LIKE ?1",
+            params![&prefix_like],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
         let mut out = BTreeMap::new();
         for (raw_key, raw_val) in rows {
             if let Some(sub_id) = raw_key.strip_prefix(SUBSCRIPTION_META_PREFIX) {
@@ -866,13 +864,12 @@ impl<'a> EventStore<'a> {
         if let Some(sub) = subscriber {
             load_subscriptions_of(self.db.conn(), sub)
         } else {
-            let mut stmt = self
-                .db
-                .conn()
-                .prepare("SELECT * FROM subscriptions ORDER BY created_at, id")?;
-            let rows = stmt
-                .query_map([], decode_subscription_row)?
-                .collect::<Result<Vec<_>, _>>()?;
+            let rows = query_vec(
+                self.db.conn(),
+                "SELECT * FROM subscriptions ORDER BY created_at, id",
+                [],
+                decode_subscription_row,
+            )?;
             rows.into_iter().collect()
         }
     }
@@ -941,19 +938,15 @@ impl<'a> EventStore<'a> {
         let limits = self.limits();
         let mut out = Vec::new();
         for sub in subs {
-            let batch: Option<BatchRecord> = self
-                .db
-                .conn()
-                .query_row(
-                    "SELECT * FROM batches
+            let batch: Option<BatchRecord> = query_opt(
+                self.db.conn(),
+                "SELECT * FROM batches
                      WHERE subscription_id = ?1 AND state = 'pending'
                      ORDER BY closed_at ASC, rowid ASC
                      LIMIT 1",
-                    params![&sub.id],
-                    decode_batch_row,
-                )
-                .optional()?
-                .transpose()?;
+                params![&sub.id],
+                decode_batch_row,
+            )?;
             let Some(batch) = batch else {
                 continue;
             };
@@ -1043,15 +1036,12 @@ impl<'a> EventStore<'a> {
         now_ms: i64,
     ) -> StoreResult<bool> {
         let tx = self.db.immediate_tx()?;
-        let batch: Option<BatchRecord> = tx
-            .conn()
-            .query_row(
-                "SELECT * FROM batches WHERE id = ?1 AND state = 'pending'",
-                params![batch_id],
-                decode_batch_row,
-            )
-            .optional()?
-            .transpose()?;
+        let batch: Option<BatchRecord> = query_opt(
+            tx.conn(),
+            "SELECT * FROM batches WHERE id = ?1 AND state = 'pending'",
+            params![batch_id],
+            decode_batch_row,
+        )?;
         let Some(batch) = batch else {
             return Ok(false);
         };
@@ -1090,12 +1080,12 @@ impl<'a> EventStore<'a> {
 
     /// Lists all batches for a subscription ordered by creation time.
     pub fn list_batches(&self, subscription_id: &str) -> StoreResult<Vec<BatchRecord>> {
-        let mut stmt = self.db.conn().prepare(
+        let rows = query_vec(
+            self.db.conn(),
             "SELECT * FROM batches WHERE subscription_id = ?1 ORDER BY opened_at ASC, rowid ASC",
+            params![subscription_id],
+            decode_batch_row,
         )?;
-        let rows = stmt
-            .query_map(params![subscription_id], decode_batch_row)?
-            .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter().collect()
     }
 
@@ -1190,22 +1180,19 @@ impl<'a> EventStore<'a> {
         peer_id: Option<&str>,
     ) -> StoreResult<Vec<UpstreamPushdown>> {
         if let Some(peer) = peer_id {
-            let mut stmt = self.db.conn().prepare(
+            query_vec(
+                self.db.conn(),
                 "SELECT * FROM upstream_pushdowns WHERE peer_id = ?1 ORDER BY topic, shard_index",
-            )?;
-            let rows = stmt
-                .query_map(params![peer], decode_pushdown_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+                params![peer],
+                decode_pushdown_row,
+            )
         } else {
-            let mut stmt = self
-                .db
-                .conn()
-                .prepare("SELECT * FROM upstream_pushdowns ORDER BY peer_id, topic, shard_index")?;
-            let rows = stmt
-                .query_map([], decode_pushdown_row)?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
+            query_vec(
+                self.db.conn(),
+                "SELECT * FROM upstream_pushdowns ORDER BY peer_id, topic, shard_index",
+                [],
+                decode_pushdown_row,
+            )
         }
     }
 
@@ -1255,15 +1242,9 @@ impl<'a> EventStore<'a> {
         let tx = self.db.immediate_tx()?;
 
         if has_due_open {
-            let mut stmt = tx.conn().prepare(
-                "SELECT * FROM batches WHERE state = 'open' AND flush_at <= ?1 ORDER BY flush_at ASC, rowid ASC",
-            )?;
-            let open_due = stmt
-                .query_map(params![now_ms], decode_batch_row)?
-                .collect::<Result<Vec<_>, _>>()?
+            let open_due = query_vec(tx.conn(), "SELECT * FROM batches WHERE state = 'open' AND flush_at <= ?1 ORDER BY flush_at ASC, rowid ASC", params![now_ms], decode_batch_row)?
                 .into_iter()
                 .collect::<StoreResult<Vec<_>>>()?;
-            drop(stmt);
             for batch in open_due {
                 close_batch_in_tx(tx.conn(), &batch, &limits, now_ms)?;
                 report.batches_closed += 1;
@@ -1359,15 +1340,15 @@ impl<'a> EventStore<'a> {
 
         // 4. Earliest wake-cap unblock time for any subscription with a pending batch at/over cap.
         if oldest_pending.is_some() {
-            let mut stmt = conn.prepare(
+            let pending_subs: Vec<(String, Option<i64>)> = query_vec(
+                conn,
                 "SELECT DISTINCT b.subscription_id, s.max_wakes_per_hour
                  FROM batches b
                  LEFT JOIN subscriptions s ON s.id = b.subscription_id
                  WHERE b.state = 'pending'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let pending_subs: Vec<(String, Option<i64>)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
             let mut wake_stmt = conn.prepare(
                 "SELECT settled_at FROM batches
                  WHERE subscription_id = ?1 AND state = 'delivered' AND settled_at > ?2
@@ -1582,14 +1563,14 @@ fn compiled_subscriptions_for(
         cache.misses += 1;
     }
 
-    let mut stmt = conn.prepare(
+    let rows = query_vec(
+        conn,
         "SELECT * FROM subscriptions
          WHERE origin_node = ?1 AND topic = ?2
          ORDER BY created_at ASC, id ASC",
+        params![origin_node, topic],
+        decode_subscription_row,
     )?;
-    let rows = stmt
-        .query_map(params![origin_node, topic], decode_subscription_row)?
-        .collect::<Result<Vec<_>, _>>()?;
     let mut compiled = Vec::with_capacity(rows.len());
     for sub in rows.into_iter().flatten() {
         compiled.push(CompiledSubscription {
@@ -1623,14 +1604,12 @@ fn append_to_batch_in_tx(
     let max_age_ms = sub.max_batch_age_ms.unwrap_or(limits.max_batch_age_ms);
     let coalesce_ms = sub.coalesce_seconds * 1000;
 
-    let mut open: Option<BatchRecord> = conn
-        .query_row(
-            "SELECT * FROM batches WHERE subscription_id = ?1 AND state = 'open' LIMIT 1",
-            params![&sub.id],
-            decode_batch_row,
-        )
-        .optional()?
-        .transpose()?;
+    let mut open: Option<BatchRecord> = query_opt(
+        conn,
+        "SELECT * FROM batches WHERE subscription_id = ?1 AND state = 'open' LIMIT 1",
+        params![&sub.id],
+        decode_batch_row,
+    )?;
 
     if let Some(batch) = &open {
         let is_due = now_ms >= batch.flush_at
@@ -1715,15 +1694,14 @@ fn close_batch_in_tx(
     )?;
 
     // Enforce per-subscription pending batch cap by dropping oldest pending batches.
-    let mut stmt = conn.prepare(
+    let pending_ids: Vec<String> = query_vec(
+        conn,
         "SELECT id FROM batches
          WHERE subscription_id = ?1 AND state = 'pending'
          ORDER BY closed_at ASC, rowid ASC",
+        params![&batch.subscription_id],
+        |row| row.get(0),
     )?;
-    let pending_ids: Vec<String> = stmt
-        .query_map(params![&batch.subscription_id], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(stmt);
 
     let excess = pending_ids
         .len()
@@ -1754,35 +1732,34 @@ fn recompute_open_batch_flush(
 }
 
 fn load_subscription_by_id(conn: &Connection, id: &str) -> StoreResult<Option<Subscription>> {
-    conn.query_row(
+    query_opt(
+        conn,
         "SELECT * FROM subscriptions WHERE id = ?1",
         params![id],
         decode_subscription_row,
     )
-    .optional()?
-    .transpose()
 }
 
 fn load_subscriptions_of(conn: &Connection, subscriber: &str) -> StoreResult<Vec<Subscription>> {
-    let mut stmt = conn.prepare(
+    let rows = query_vec(
+        conn,
         "SELECT * FROM subscriptions WHERE subscriber = ?1 ORDER BY created_at ASC, id ASC",
+        params![subscriber],
+        decode_subscription_row,
     )?;
-    let rows = stmt
-        .query_map(params![subscriber], decode_subscription_row)?
-        .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter().collect()
 }
 
 fn load_batch_events(conn: &Connection, batch_id: &str) -> StoreResult<Vec<CloudEvent>> {
-    let mut stmt = conn.prepare(
+    let bodies: Vec<Option<String>> = query_vec(
+        conn,
         "SELECT e.body FROM batch_events be
          JOIN events e ON e.seq = be.event_seq
          WHERE be.batch_id = ?1
          ORDER BY be.position ASC",
+        params![batch_id],
+        |row| row.get(0),
     )?;
-    let bodies: Vec<Option<String>> = stmt
-        .query_map(params![batch_id], |row| row.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
     let mut out = Vec::with_capacity(bodies.len());
     for body in bodies.into_iter().flatten() {
         let ev: CloudEvent = serde_json::from_str(&body)?;
