@@ -165,20 +165,44 @@ pub fn with_retry_after(mut resp: Response<BoxedBody>, seconds: u64) -> Response
     resp
 }
 
-/// Reads an HTTP body up to `max_bytes`, failing closed with `PayloadTooLarge` if exceeded.
-pub async fn read_body_bytes(mut body: Incoming, max_bytes: usize) -> Result<Bytes, NodeError> {
-    let mut buf = BytesMut::new();
-    while let Some(frame_res) = body.frame().await {
-        let frame = frame_res.map_err(|e| NodeError::Http(format!("body read error: {e}")))?;
+/// Failure while consuming an HTTP body with a hard byte limit.
+#[derive(Debug)]
+pub enum BoundedBodyError {
+    Read(hyper::Error),
+    TooLarge,
+}
+
+/// Passes data frames to `consume`, stopping at the first read error or limit violation.
+pub async fn consume_bounded_body(
+    mut body: Incoming,
+    max_bytes: usize,
+    mut consume: impl FnMut(&[u8]),
+) -> Result<(), BoundedBodyError> {
+    let mut seen = 0usize;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(BoundedBodyError::Read)?;
         if let Some(data) = frame.data_ref() {
-            if buf.len().saturating_add(data.len()) > max_bytes {
-                return Err(NodeError::PayloadTooLarge(format!(
-                    "request body exceeds limit of {max_bytes} bytes"
-                )));
+            seen = seen.saturating_add(data.len());
+            if seen > max_bytes {
+                return Err(BoundedBodyError::TooLarge);
             }
-            buf.extend_from_slice(data);
+            consume(data);
         }
     }
+    Ok(())
+}
+
+/// Reads an HTTP body up to `max_bytes`, failing closed with `PayloadTooLarge` if exceeded.
+pub async fn read_body_bytes(body: Incoming, max_bytes: usize) -> Result<Bytes, NodeError> {
+    let mut buf = BytesMut::new();
+    consume_bounded_body(body, max_bytes, |data| buf.extend_from_slice(data))
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(err) => NodeError::Http(format!("body read error: {err}")),
+            BoundedBodyError::TooLarge => NodeError::PayloadTooLarge(format!(
+                "request body exceeds limit of {max_bytes} bytes"
+            )),
+        })?;
     Ok(buf.freeze())
 }
 
@@ -585,6 +609,18 @@ where
         .enable_http2()
         .build();
     Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+/// Builds the HTTP/1.1 client used by short-lived wake and probe requests.
+pub fn build_unpooled_http1_client() -> Client<HttpsConnector<HttpConnector>, Full<Bytes>> {
+    let connector = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build(connector)
 }
 
 impl HttpClient {
