@@ -675,6 +675,29 @@ where
         return json!({});
     }
 
+    let drain_mailbox = |rpc: &mut F, scope: &str| {
+        let mut packet = Map::new();
+        packet.insert("type".into(), json!("mailbox.drain"));
+        packet.insert("sessionId".into(), json!(session_id));
+        packet.insert("harness".into(), json!(options.harness.as_str()));
+        packet.insert("scope".into(), json!(scope));
+        if scope == "turn_boundary" {
+            packet.insert("markIdleIfEmpty".into(), json!(true));
+        }
+        packet.insert("limit".into(), json!(5));
+        if scope == "pre_turn" && options.harness == HarnessKind::Openclaw {
+            attach_openclaw_session_hints(&mut packet, payload);
+        }
+        attach_session_token(&mut packet, session_token);
+        let response = rpc(&options.socket_path, &Value::Object(packet));
+        if response.ok {
+            if let Some(Value::Array(items)) = response.result.and_then(|mut r| r.remove("items")) {
+                return items;
+            }
+        }
+        Vec::new()
+    };
+
     match options.event {
         HookEvent::PreToolUse => {
             let info = extract_tool_info(options.harness, payload);
@@ -762,23 +785,7 @@ where
             ) {
                 return json!({});
             }
-            let mut drain_pkt = Map::new();
-            drain_pkt.insert("type".into(), json!("mailbox.drain"));
-            drain_pkt.insert("sessionId".into(), json!(session_id));
-            drain_pkt.insert("harness".into(), json!(options.harness.as_str()));
-            drain_pkt.insert("scope".into(), json!("mid_turn"));
-            drain_pkt.insert("limit".into(), json!(5));
-            attach_session_token(&mut drain_pkt, session_token);
-            let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
-            let items = drained
-                .ok
-                .then(|| drained.result?.remove("items"))
-                .flatten()
-                .and_then(|v| match v {
-                    Value::Array(arr) => Some(arr),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let items = drain_mailbox(&mut rpc, "mid_turn");
             if items.is_empty() {
                 return json!({});
             }
@@ -809,26 +816,7 @@ where
             }
         }
         HookEvent::PreInvocation => {
-            let mut drain_pkt = Map::new();
-            drain_pkt.insert("type".into(), json!("mailbox.drain"));
-            drain_pkt.insert("sessionId".into(), json!(session_id));
-            drain_pkt.insert("harness".into(), json!(options.harness.as_str()));
-            drain_pkt.insert("scope".into(), json!("pre_turn"));
-            drain_pkt.insert("limit".into(), json!(5));
-            if options.harness == HarnessKind::Openclaw {
-                attach_openclaw_session_hints(&mut drain_pkt, payload);
-            }
-            attach_session_token(&mut drain_pkt, session_token);
-            let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
-            let items = drained
-                .ok
-                .then(|| drained.result?.remove("items"))
-                .flatten()
-                .and_then(|v| match v {
-                    Value::Array(arr) => Some(arr),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let items = drain_mailbox(&mut rpc, "pre_turn");
             if items.is_empty() {
                 return match options.harness {
                     HarnessKind::Cursor => json!({ "continue": true }),
@@ -893,24 +881,7 @@ where
                 return json!({});
             }
 
-            let mut drain_pkt = Map::new();
-            drain_pkt.insert("type".into(), json!("mailbox.drain"));
-            drain_pkt.insert("sessionId".into(), json!(session_id));
-            drain_pkt.insert("harness".into(), json!(options.harness.as_str()));
-            drain_pkt.insert("scope".into(), json!("turn_boundary"));
-            drain_pkt.insert("markIdleIfEmpty".into(), json!(true));
-            drain_pkt.insert("limit".into(), json!(5));
-            attach_session_token(&mut drain_pkt, session_token);
-            let drained = rpc(&options.socket_path, &Value::Object(drain_pkt));
-            let items = drained
-                .ok
-                .then(|| drained.result?.remove("items"))
-                .flatten()
-                .and_then(|v| match v {
-                    Value::Array(arr) => Some(arr),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let items = drain_mailbox(&mut rpc, "turn_boundary");
             if !items.is_empty() {
                 let text = format_drained_messages(&items);
                 if !text.is_empty() {
