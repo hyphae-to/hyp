@@ -31,7 +31,7 @@ use hyp_node::gates::policy::{
     DEFAULT_STAGE2_MAX_OUTPUT_TOKENS, DEFAULT_STAGE2_MIN_ALLOW_CONFIDENCE,
     DEFAULT_STAGE2_TIMEOUT_MS, FilterAdapterConfig, FilterPluginConfig, LlmProvider,
     RateLimitAction, SecurityGateConfig, Stage1Config, Stage1DenyAction, Stage2ErrorAction,
-    Stage2Matchers, TierDeliveryAction, TrustTier, gate_policy_sha256, verify_gate_policy_for_node,
+    Stage2Matchers, TierDeliveryAction, TrustTier, verify_gate_policy_for_node,
 };
 use hyp_node::gates::stage2::validate_stage2_endpoint_urls;
 use hyp_node::node_file::NodeFile;
@@ -2180,16 +2180,11 @@ fn run_gate_init_or_propose(args: GateInitArgs, propose_only: bool) -> Result<Ex
             .unwrap_or_else(|| resolve_effective_node_id(loaded_cfg.as_ref(), Some(&db)));
 
         let existing_tampered = lock_state.tampered_reason.clone();
-        gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
         let auth_digest = db
             .human()
             .authorities_digest()
             .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
-        gate_cfg.human_authorities_digest = Some(auth_digest.clone());
-        gate_cfg.require_signed_policy = true;
-        gate_cfg.policy_signature = None;
-
-        let policy_sha = match gate_policy_sha256(&gate_cfg) {
+        let policy_sha = match gate_cfg.prepare_passkey_seal(&auth_digest) {
             Ok(h) => h,
             Err(e) => {
                 return Err(CliError::error("POLICY_HASH_FAILED", e.to_string()));
@@ -2547,12 +2542,7 @@ fn run_gate_apply(
         .human()
         .authorities_digest()
         .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
-    gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
-    gate_cfg.human_authorities_digest = Some(auth_digest.clone());
-    gate_cfg.require_signed_policy = true;
-    gate_cfg.policy_signature = None;
-
-    let policy_sha = match gate_policy_sha256(&gate_cfg) {
+    let policy_sha = match gate_cfg.prepare_passkey_seal(&auth_digest) {
         Ok(h) => h,
         Err(e) => {
             return Err(CliError::error("POLICY_HASH_FAILED", e.to_string()));
@@ -2809,7 +2799,6 @@ fn run_gate_remove(
     }
 
     let existing_tampered = lock_state.tampered_reason.clone();
-    after_gate.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
 
     let approved_seal_seq: Option<u64>;
     let approved_human_id: Option<String>;
@@ -2834,10 +2823,7 @@ fn run_gate_remove(
                     return Err(CliError::error("DB_ERROR", e.to_string()));
                 }
             };
-            after_gate.human_authorities_digest = Some(auth_digest.clone());
-            after_gate.require_signed_policy = true;
-            after_gate.policy_signature = None;
-            let psha = match gate_policy_sha256(&after_gate) {
+            let psha = match after_gate.prepare_passkey_seal(&auth_digest) {
                 Ok(h) => h,
                 Err(e) => {
                     return Err(CliError::error("POLICY_HASH_FAILED", e.to_string()));

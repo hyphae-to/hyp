@@ -50,10 +50,7 @@ use hyp_node::engine::{
     LocalIngestConfig, NodeConfig, NodeProfile, UnifiedNode, canonical_local_event_for_signing,
     resolve_drop_portal_url, send_local_ingest_event,
 };
-use hyp_node::gates::policy::{
-    DEFAULT_POLICY_SIGNING_SECRET, SecurityGateConfig, gate_policy_sha256,
-    local_admin_secret_names_for_kid,
-};
+use hyp_node::gates::policy::{SecurityGateConfig, local_admin_secret_names_for_kid};
 use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId, is_valid_handle, is_valid_node_id};
 use hyp_proto::cloudevent::{
@@ -775,11 +772,8 @@ impl ApprovedPolicyUpdate {
                 .map_err(|e| format!("malformed gate config in {}: {e}", config_path.display()))?,
             None => SecurityGateConfig::default(),
         };
-        gate_cfg.policy_signing_secret = DEFAULT_POLICY_SIGNING_SECRET.to_string();
-        gate_cfg.require_signed_policy = true;
-        gate_cfg.human_authorities_digest = Some(authorities_digest.to_string());
-        gate_cfg.policy_signature = None;
-        let policy_sha = gate_policy_sha256(&gate_cfg)
+        let policy_sha = gate_cfg
+            .prepare_passkey_seal(authorities_digest)
             .map_err(|e| format!("failed to compute locked gate policy SHA-256: {e}"))?;
         Ok(Self {
             cfg_map,
