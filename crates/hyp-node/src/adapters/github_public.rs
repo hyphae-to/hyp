@@ -22,7 +22,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, Request, StatusCode, header};
 use http_body_util::{BodyExt, Empty};
 use hyp_crypto::keystore::SecretStore;
-use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_crypto::rfc3339::{format_rfc3339_seconds, now_unix_ms};
 use hyp_proto::cloudevent::{CloudEvent, check_cloudevent_v2, is_valid_rfc3339_strict};
 use hyp_proto::filter::{DiagnosticCode, DiagnosticSeverity, Filter, SubscriptionDiagnostic};
 use hyper_rustls::HttpsConnector;
@@ -992,12 +992,7 @@ async fn run_repo_etag_poller(
 // ============================================================================
 
 fn now_rfc3339_seconds() -> String {
-    let full = format_rfc3339_millis(now_unix_ms());
-    if let Some((prefix, _)) = full.rsplit_once('.') {
-        format!("{prefix}Z")
-    } else {
-        full
-    }
+    format_rfc3339_seconds(now_unix_ms())
 }
 
 /// Normalizes a single GitHub REST Events API object (`GET /repos/{owner}/{repo}/events`)

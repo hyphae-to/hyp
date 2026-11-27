@@ -10,6 +10,7 @@ pub mod filter;
 pub mod jcs;
 pub mod manifest;
 pub mod problem;
+pub mod rfc3339;
 pub mod rpc;
 pub mod scopes;
 

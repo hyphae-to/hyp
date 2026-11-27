@@ -5,6 +5,7 @@ All notable changes to Hyphae (`hyp`) are documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **Timestamp parsing**: Invalid non-ASCII seconds fields now fail cleanly instead of panicking. Wire timestamps keep strict uppercase separators; compatibility timestamps retain their existing lowercase and space forms.
 - **Abandoned v1 interoperability ([#62](https://github.com/hyphae-to/hyp/issues/62))**: Removed the unused HYP1 transfer, entry-verification, revocation and key-registration compatibility routines. Missing peer manifests now fail normally instead of negotiating an unsigned TypeScript-router fallback. Active `t3mp1_` pairing codes, pairing-key derivation and grant issuance remain supported.
 - **Scheduled wakeups ([#52](https://github.com/hyphae-to/hyp/issues/52))**: Migration 11 drops the retired timer and cron table after backing up the database. Session summaries and panels omit scheduled wakeups. Use the [local ingest route and OS schedulers](docs/guides/events-and-cron.md) for timed events. Earlier binaries cannot open a database upgraded to schema 11.
 - **Canonical MCP tools ([#61](https://github.com/hyphae-to/hyp/issues/61))**: Hooks and MCP now register and forward the six documented tool names directly. Retired tool names and unused socket aliases are rejected; existing argument shorthands remain supported. Rerun `hyp setup` for obsolete hook configurations. The retired TypeScript daemon is unsupported.
