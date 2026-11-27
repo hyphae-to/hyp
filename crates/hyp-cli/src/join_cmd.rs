@@ -31,7 +31,7 @@ use crate::ui::{
 };
 use clap::Args;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyp_crypto::human::{
     HumanInviteClaimV1, NodeCertPayloadV1, SignedNodeCertV1, decode_hcert1, decode_hjoin1,
     encode_hcert1, sign_human_invite_claim, sign_node_cert, verify_human_invite_claim,
@@ -42,6 +42,7 @@ use hyp_crypto::keys::{Ed25519KeyPair, NodeIdentityKeys, OkpJwk};
 use hyp_crypto::keystore::SecretStore;
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
+use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::engine::{AuthClaimReply, AuthClaimRequest};
 use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
@@ -1753,17 +1754,14 @@ fn post_auth_claim(
     Ok(reply)
 }
 
-async fn read_hyper_body_bounded(mut body: Incoming, limit: usize) -> Result<Vec<u8>, StatusCode> {
+async fn read_hyper_body_bounded(body: Incoming, limit: usize) -> Result<Vec<u8>, StatusCode> {
     let mut out = Vec::new();
-    while let Some(frame_res) = body.frame().await {
-        let frame = frame_res.map_err(|_| StatusCode::BAD_REQUEST)?;
-        if let Some(chunk) = frame.data_ref() {
-            if out.len() + chunk.len() > limit {
-                return Err(StatusCode::PAYLOAD_TOO_LARGE);
-            }
-            out.extend_from_slice(chunk);
-        }
-    }
+    consume_bounded_body(body, limit, |chunk| out.extend_from_slice(chunk))
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(_) => StatusCode::BAD_REQUEST,
+            BoundedBodyError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        })?;
     Ok(out)
 }
 

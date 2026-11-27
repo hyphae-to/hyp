@@ -15,8 +15,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Subcommand;
 use http::{Method, Request, Response, StatusCode, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyp_crypto::keystore::{SecretMetadata, SecretStore, validate_secret_name};
+use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::node_file::NodeFile;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -1192,17 +1193,21 @@ async fn handle_web_capture_request(
         Method::GET => html_response(StatusCode::OK, state.form_html.clone()),
         Method::POST => {
             let mut body_bytes = Vec::new();
-            let mut body = req.into_body();
-            while let Some(frame_res) = body.frame().await {
-                let Ok(frame) = frame_res else {
-                    return text_response(StatusCode::BAD_REQUEST, "Failed to read request body");
-                };
-                if let Some(chunk) = frame.data_ref() {
-                    if body_bytes.len() + chunk.len() > MAX_SECRET_INPUT_BYTES as usize {
-                        return text_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload too large");
+            if let Err(error) =
+                consume_bounded_body(req.into_body(), MAX_SECRET_INPUT_BYTES as usize, |chunk| {
+                    body_bytes.extend_from_slice(chunk)
+                })
+                .await
+            {
+                let (status, message) = match error {
+                    BoundedBodyError::Read(_) => {
+                        (StatusCode::BAD_REQUEST, "Failed to read request body")
                     }
-                    body_bytes.extend_from_slice(chunk);
-                }
+                    BoundedBodyError::TooLarge => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, "Payload too large")
+                    }
+                };
+                return text_response(status, message);
             }
 
             let body_str = String::from_utf8_lossy(&body_bytes);

@@ -30,6 +30,7 @@ use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{NodeIdentityKeys, OkpJwk};
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::engine::http_util::{SseParser, percent_encode};
 use hyp_node::engine::{
     AckDropResponse, CreateDropRequest, CreateDropResponse, DROP_CAP_HEADER, DropRelayConfig,
@@ -1785,20 +1786,19 @@ async fn probe_relay_health(base_url: &str) -> Value {
 }
 
 pub(crate) async fn collect_bounded_body(
-    mut body: hyper::body::Incoming,
+    body: hyper::body::Incoming,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    while let Some(frame_res) = body.frame().await {
-        let frame = frame_res.map_err(|e| format!("HTTP body read error: {e}"))?;
-        if let Some(chunk) = frame.data_ref() {
-            if out.len().saturating_add(chunk.len()) > max_bytes {
-                return Err(format!(
-                    "HTTP response exceeded {max_bytes} byte safety cap"
-                ));
+    consume_bounded_body(body, max_bytes, |chunk| out.extend_from_slice(chunk))
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Read(error) => {
+                format!("HTTP body read error: {error}")
             }
-            out.extend_from_slice(chunk);
-        }
-    }
+            BoundedBodyError::TooLarge => {
+                format!("HTTP response exceeded {max_bytes} byte safety cap")
+            }
+        })?;
     Ok(out)
 }
