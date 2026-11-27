@@ -12,6 +12,9 @@ mod config_file;
 #[path = "../src/exec_cmd.rs"]
 mod exec_cmd;
 #[allow(dead_code)]
+#[path = "../src/node_identity.rs"]
+mod node_identity;
+#[allow(dead_code)]
 #[path = "../src/ui.rs"]
 mod ui;
 

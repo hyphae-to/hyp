@@ -23,6 +23,7 @@ use crate::config_file::{
     load_node_or_legacy_config, open_secret_store, resolve_config_path_for_read,
     resolve_config_path_for_write, resolve_effective_node_id, resolve_home_dir, resolve_state_dir,
 };
+use crate::node_identity::short_hostname;
 use crate::pair::{attempt_delegated_pair_enroll, credential_secret_name, try_reload_live_daemon};
 use crate::setup::configure_detected_harnesses_for_join;
 use crate::ui::{
@@ -1836,45 +1837,6 @@ fn read_bounded_file(path: &Path) -> Result<String, String> {
         ));
     }
     fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
-}
-
-fn short_hostname() -> String {
-    let env_host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    #[cfg(unix)]
-    let raw = env_host
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .arg("-s")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "laptop".to_string());
-    #[cfg(not(unix))]
-    let raw = env_host.unwrap_or_else(|| "laptop".to_string());
-    let first = raw.split('.').next().unwrap_or("laptop");
-    let cleaned: String = first
-        .chars()
-        .map(|c| {
-            let low = c.to_ascii_lowercase();
-            if low.is_ascii_alphanumeric() || matches!(low, '-' | '_') {
-                low
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-    if trimmed.is_empty() {
-        "laptop".to_string()
-    } else {
-        trimmed.chars().take(28).collect()
-    }
 }
 
 fn propose_node_id_for_human(human_id: &str) -> String {

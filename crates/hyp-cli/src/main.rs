@@ -20,6 +20,7 @@ mod inspect_cmd;
 mod join_cmd;
 mod kv_cmd;
 mod node_cmd;
+mod node_identity;
 mod pair;
 mod plugin_cmd;
 mod secret_cmd;

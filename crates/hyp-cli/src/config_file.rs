@@ -5,7 +5,6 @@
 
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
 use hyp_node::engine::NodeProfile;
-use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_store::NodeDb;
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -158,40 +157,7 @@ pub(crate) fn open_secret_store_with(
 }
 
 /// Generates a deterministic, valid fallback `nodeId` from current user and hostname.
-pub fn default_node_id() -> String {
-    let raw_user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "user".to_string());
-    let raw_host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "local-host".to_string());
-    let user = sanitize_id_segment(&raw_user, "user");
-    let host = sanitize_id_segment(raw_host.split('.').next().unwrap_or("local-host"), "host");
-    let candidate = format!("{user}@{host}");
-    if candidate != LOCAL_NODE_ID && is_valid_node_id(&candidate) {
-        candidate
-    } else {
-        "user@local-host".to_string()
-    }
-}
-
-fn sanitize_id_segment(raw: &str, fallback: &str) -> String {
-    let mut out = String::new();
-    for ch in raw.chars() {
-        let low = ch.to_ascii_lowercase();
-        if low.is_ascii_alphanumeric() || matches!(low, '.' | '_' | '-') {
-            out.push(low);
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let trimmed = out.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-    if trimmed.is_empty() {
-        fallback.to_string()
-    } else {
-        trimmed.chars().take(28).collect()
-    }
-}
+pub(crate) use crate::node_identity::config_default_node_id as default_node_id;
 
 /// Reads a JSON file into `serde_json::Value`.
 pub fn read_json_value(path: &Path) -> Result<Value, String> {
