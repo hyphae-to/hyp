@@ -10938,6 +10938,22 @@ impl LocalDaemonInner {
         if !is_valid_terminal_id(terminal_id) {
             return None;
         }
+        let transports: Vec<_> = self
+            .session_runtime()
+            .iter()
+            .filter_map(|(session_id, runtime)| {
+                runtime
+                    .attached_transport
+                    .as_ref()
+                    .map(|attached| (session_id.clone(), Arc::clone(&attached.transport)))
+            })
+            .collect();
+        let transport_ids: Vec<_> = transports
+            .into_iter()
+            .filter_map(|(session_id, transport)| {
+                (transport.herdr_terminal_id() == Some(terminal_id)).then_some(session_id)
+            })
+            .collect();
         let mut candidate_map: HashMap<String, hyp_store::Session> = HashMap::new();
         {
             let db = self.node.db();
@@ -10953,21 +10969,6 @@ impl LocalDaemonInner {
                 .get(terminal_id)
                 .cloned()
                 .unwrap_or_default();
-            let transports: Vec<_> = self
-                .session_runtime()
-                .iter()
-                .filter_map(|(session_id, runtime)| {
-                    runtime
-                        .attached_transport
-                        .as_ref()
-                        .map(|attached| (session_id.clone(), Arc::clone(&attached.transport)))
-                })
-                .collect();
-            let transport_ids = transports
-                .into_iter()
-                .filter_map(|(session_id, transport)| {
-                    (transport.herdr_terminal_id() == Some(terminal_id)).then_some(session_id)
-                });
             for sid in indexed_ids.into_iter().chain(transport_ids) {
                 if !candidate_map.contains_key(&sid) {
                     if let Ok(Some(sess)) = db.local().get_session(&sid) {
