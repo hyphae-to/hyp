@@ -39,7 +39,7 @@ use tokio::time::Instant;
 
 use crate::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 use hyp_harness_ipc::caller::CallerErrorCode;
-use hyp_harness_ipc::protocol::normalize_mesh_tool_name;
+use hyp_harness_ipc::protocol::{HarnessKind, normalize_mesh_tool_name};
 
 /// Default loopback T3 Code server origin.
 pub const DEFAULT_T3_URL: &str = "http://127.0.0.1:3773";
@@ -300,6 +300,15 @@ fn table_exists(conn: &Connection, name: &str) -> bool {
     .is_some()
 }
 
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        [table, column],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
 /// Resolves a provider session/thread ID (e.g. Claude `session_id` or Codex `thread_id`)
 /// to its owning active T3 Code `thread_id` via T3's read-only `statev2.sqlite` projections.
 ///
@@ -310,6 +319,21 @@ pub fn resolve_t3_thread_by_provider_session(
     provider_session_id: &str,
     base_dir: &Path,
 ) -> T3ThreadLookupResult {
+    resolve_t3_thread_by_provider_session_for_harness(provider_session_id, base_dir, None)
+}
+
+/// Also resolves strong native references within the verified harness's driver namespace.
+/// Unknown harnesses retain only the legacy exact internal-ID lookup.
+pub fn resolve_t3_thread_by_provider_session_for_harness(
+    provider_session_id: &str,
+    base_dir: &Path,
+    harness: Option<HarnessKind>,
+) -> T3ThreadLookupResult {
+    let expected_driver = match harness {
+        Some(HarnessKind::Claude) => Some("claudeAgent"),
+        Some(HarnessKind::Codex) => Some("codex"),
+        _ => None,
+    };
     if provider_session_id.is_empty() || provider_session_id.len() > 256 {
         return Err(T3LookupError::CallerNotFound(
             "Empty or invalid provider session ID".to_string(),
@@ -365,6 +389,57 @@ pub fn resolve_t3_thread_by_provider_session(
                 if let Some(tid) = r? {
                     if !tid.is_empty() {
                         matched.insert(tid);
+                    }
+                }
+            }
+
+            // Newer T3 projections namespace their internal provider IDs. The
+            // actual harness ID is an exact, strong nativeThreadRef on the
+            // currently active provider thread; never infer it from ID suffixes.
+            if expected_driver.is_some()
+                && column_exists(
+                    &conn,
+                    "orchestration_v2_projection_provider_threads",
+                    "payload_json",
+                )
+                && column_exists(
+                    &conn,
+                    "orchestration_v2_projection_threads",
+                    "active_provider_thread_id",
+                )
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT p.thread_id, p.provider_thread_id, p.payload_json
+                     FROM orchestration_v2_projection_provider_threads p
+                     JOIN orchestration_v2_projection_threads t ON t.thread_id = p.thread_id
+                     WHERE t.active_provider_thread_id = p.provider_thread_id
+                       AND t.deleted_at IS NULL AND t.archived_at IS NULL",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (thread_id, provider_thread_id, payload) = row?;
+                    let Some(payload) = payload else {
+                        continue;
+                    };
+                    let Ok(payload) = serde_json::from_str::<Value>(&payload) else {
+                        continue;
+                    };
+                    let native = &payload["nativeThreadRef"];
+                    if !thread_id.is_empty()
+                        && payload["id"].as_str() == Some(provider_thread_id.as_str())
+                        && payload["appThreadId"].as_str() == Some(thread_id.as_str())
+                        && native["nativeId"].as_str() == Some(provider_session_id)
+                        && native["strength"].as_str() == Some("strong")
+                        && native["driver"].as_str() == expected_driver
+                        && payload["driver"].as_str() == expected_driver
+                    {
+                        matched.insert(thread_id);
                     }
                 }
             }

@@ -29,11 +29,12 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use hyp_crypto::{SecretBackend, SecretStore};
 use hyp_harness::call_registry::CallerErrorCode;
+use hyp_harness::protocol::HarnessKind;
 use hyp_harness::transport::t3::{
     DEFAULT_T3_TOKEN_SECRET, FALLBACK_T3_TOKEN_SECRET, T3DispatchMode, T3LookupError,
     T3ProbeResult, T3Target, T3Transport, normalize_t3_server_url, probe_t3_server,
-    resolve_t3_caller_by_call_id, resolve_t3_thread_by_provider_session, t3_state_db_path,
-    verify_t3_thread_exists,
+    resolve_t3_caller_by_call_id, resolve_t3_thread_by_provider_session,
+    resolve_t3_thread_by_provider_session_for_harness, t3_state_db_path, verify_t3_thread_exists,
 };
 use hyp_harness::transport::{PushMode, PushOutcome, PushTransport};
 use ring::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
@@ -619,6 +620,167 @@ async fn handle_mock_conn(
 // ============================================================================
 // 1. Read-Only SQLite Thread & Caller Resolution E2E Tests
 // ============================================================================
+
+#[test]
+fn sqlite_resolves_only_exact_strong_active_native_thread_refs() {
+    let tmp = TempDir::new().unwrap();
+    let conn = create_t3_sqlite(tmp.path());
+    let resolve = |id: &str, base: &Path| {
+        resolve_t3_thread_by_provider_session_for_harness(id, base, Some(HarnessKind::Claude))
+    };
+    conn.execute_batch(
+        "ALTER TABLE orchestration_v2_projection_threads ADD COLUMN active_provider_thread_id TEXT;
+         ALTER TABLE orchestration_v2_projection_provider_threads ADD COLUMN payload_json TEXT;
+         INSERT INTO orchestration_v2_projection_threads
+             (thread_id, active_provider_thread_id) VALUES ('thread-a', 'namespaced-provider-a');
+         INSERT INTO orchestration_v2_projection_provider_threads
+             (provider_thread_id, thread_id, provider_session_id)
+             VALUES ('namespaced-provider-a', 'thread-a', 'internal-session-a');",
+    )
+    .unwrap();
+    let valid = json!({
+        "id": "namespaced-provider-a", "appThreadId": "thread-a", "driver": "claudeAgent",
+        "nativeThreadRef": {"driver": "claudeAgent", "nativeId": "native-session-a", "strength": "strong"}
+    });
+    let set_payload = |payload: &Value| {
+        conn.execute(
+            "UPDATE orchestration_v2_projection_provider_threads SET payload_json = ?1",
+            [payload.to_string()],
+        )
+        .unwrap();
+    };
+    for invalid in [None, Some("{broken-json")] {
+        conn.execute(
+            "UPDATE orchestration_v2_projection_provider_threads SET payload_json = ?1",
+            [invalid],
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve("native-session-a", tmp.path()),
+            Err(T3LookupError::CallerNotFound(_))
+        ));
+        assert_eq!(
+            resolve("internal-session-a", tmp.path()),
+            Ok("thread-a".into())
+        );
+    }
+    set_payload(&valid);
+    assert_eq!(
+        resolve("native-session-a", tmp.path()),
+        Ok("thread-a".into())
+    );
+    assert!(matches!(
+        resolve_t3_thread_by_provider_session("native-session-a", tmp.path()),
+        Err(T3LookupError::CallerNotFound(_))
+    ));
+    for harness in [None, Some(HarnessKind::T3), Some(HarnessKind::Codex)] {
+        assert!(matches!(
+            resolve_t3_thread_by_provider_session_for_harness(
+                "native-session-a",
+                tmp.path(),
+                harness
+            ),
+            Err(T3LookupError::CallerNotFound(_))
+        ));
+    }
+    let mut codex = valid.clone();
+    codex["driver"] = json!("codex");
+    codex["nativeThreadRef"]["driver"] = json!("codex");
+    set_payload(&codex);
+    assert!(matches!(
+        resolve("native-session-a", tmp.path()),
+        Err(T3LookupError::CallerNotFound(_))
+    ));
+    assert_eq!(
+        resolve_t3_thread_by_provider_session_for_harness(
+            "native-session-a",
+            tmp.path(),
+            Some(HarnessKind::Codex)
+        ),
+        Ok("thread-a".into())
+    );
+    set_payload(&valid);
+    conn.execute_batch("INSERT INTO orchestration_v2_projection_threads (thread_id, active_provider_thread_id) VALUES ('codex-thread', 'codex-provider');
+        INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, provider_session_id) VALUES ('codex-provider', 'codex-thread', 'codex-internal');").unwrap();
+    codex["id"] = json!("codex-provider");
+    codex["appThreadId"] = json!("codex-thread");
+    conn.execute("UPDATE orchestration_v2_projection_provider_threads SET payload_json = ?1 WHERE thread_id = 'codex-thread'", [codex.to_string()]).unwrap();
+    assert_eq!(
+        resolve("native-session-a", tmp.path()),
+        Ok("thread-a".into())
+    );
+    assert_eq!(
+        resolve_t3_thread_by_provider_session_for_harness(
+            "native-session-a",
+            tmp.path(),
+            Some(HarnessKind::Codex)
+        ),
+        Ok("codex-thread".into())
+    );
+    conn.execute(
+        "DELETE FROM orchestration_v2_projection_provider_threads WHERE thread_id = 'codex-thread'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM orchestration_v2_projection_threads WHERE thread_id = 'codex-thread'",
+        [],
+    )
+    .unwrap();
+    // Exact matching, never UUID suffix or substring attribution.
+    for id in ["session-a", "native-session", "native-session-a-extra"] {
+        assert!(matches!(
+            resolve(id, tmp.path()),
+            Err(T3LookupError::CallerNotFound(_))
+        ));
+    }
+    for (path, value) in [
+        ("/nativeThreadRef/strength", json!("weak")),
+        ("/nativeThreadRef/driver", json!("codex")),
+        ("/nativeThreadRef/nativeId", json!("another-session")),
+        ("/appThreadId", json!("another-thread")),
+        ("/id", json!("another-provider")),
+    ] {
+        let mut mutated = valid.clone();
+        *mutated.pointer_mut(path).unwrap() = value;
+        set_payload(&mutated);
+        assert!(
+            matches!(
+                resolve("native-session-a", tmp.path()),
+                Err(T3LookupError::CallerNotFound(_))
+            ),
+            "accepted mutation {path}"
+        );
+    }
+    set_payload(&valid);
+    for column in ["deleted_at", "archived_at", "active_provider_thread_id"] {
+        conn.execute(
+            &format!("UPDATE orchestration_v2_projection_threads SET {column} = 'different'"),
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve("native-session-a", tmp.path()),
+            Err(T3LookupError::CallerNotFound(_))
+        ));
+        conn.execute(
+            &format!("UPDATE orchestration_v2_projection_threads SET {column} = ?1"),
+            [if column == "active_provider_thread_id" {
+                Some("namespaced-provider-a")
+            } else {
+                None
+            }],
+        )
+        .unwrap();
+    }
+    // Two independently active owners remain ambiguous, including legacy exact matches.
+    conn.execute_batch("INSERT INTO orchestration_v2_projection_threads (thread_id) VALUES ('thread-b');
+        INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('native-session-a', 'thread-b');").unwrap();
+    assert!(matches!(
+        resolve("native-session-a", tmp.path()),
+        Err(T3LookupError::CallerAmbiguous(_))
+    ));
+}
 
 #[tokio::test]
 async fn sqlite_resolves_v2_and_v1_schemas_ignores_deleted_archived_and_fails_closed_on_ambiguous()

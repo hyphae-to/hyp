@@ -90,7 +90,7 @@ use hyp_harness_transport::transport::t3::{
     DEFAULT_PROBE_TIMEOUT, DEFAULT_T3_TOKEN_SECRET, DEFAULT_T3_URL, FALLBACK_T3_TOKEN_SECRET,
     T3Target, T3Transport, default_t3_base_dir, is_allowed_t3_token_secret,
     normalize_t3_server_url_with_remote, probe_t3_server_with_remote,
-    resolve_t3_thread_by_provider_session, t3_state_db_path, verify_t3_thread_exists,
+    resolve_t3_thread_by_provider_session_for_harness, t3_state_db_path, verify_t3_thread_exists,
 };
 use hyp_harness_transport::transport::{PushOutcome, PushTransport};
 
@@ -4714,7 +4714,25 @@ fn maybe_spawn_transport_probe(
             {
                 Some(raw_id.to_string())
             } else {
-                resolve_t3_thread_by_provider_session(raw_id, &t3_base_candidate).ok()
+                // Native IDs are owned by this enrolled session, not by a
+                // possibly stale inherited transport hint. Preserve legacy
+                // exact-ID lookup for hints, but never infer a native owner.
+                let canonical_native_id = sid.split_once(':').map(|(_, id)| id);
+                let harness = if canonical_native_id != Some(raw_id) {
+                    None
+                } else if sid.starts_with("claude:") {
+                    Some(HarnessKind::Claude)
+                } else if sid.starts_with("codex:") {
+                    Some(HarnessKind::Codex)
+                } else {
+                    None
+                };
+                resolve_t3_thread_by_provider_session_for_harness(
+                    raw_id,
+                    &t3_base_candidate,
+                    harness,
+                )
+                .ok()
             };
 
             if let Some(thread_id) = resolved_t3_thread {

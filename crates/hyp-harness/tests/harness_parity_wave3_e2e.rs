@@ -1076,6 +1076,32 @@ async fn x9_daemon_honors_node_json_t3_block_and_explicit_hint_precedence() {
     let custom_t3_base = tmp.path().join("custom-t3-home");
     fs::create_dir_all(&state_dir).unwrap();
     seed_t3_state_db(&custom_t3_base, "sess-nodejson-t3", "thr-nodejson-t3");
+    {
+        // Current T3 uses internal provider namespaces and a strong native ref.
+        // Discovery must use the enrolled Claude driver's namespace, without
+        // requiring a manufactured exact provider-session binding.
+        let conn = Connection::open(t3_state_db_path(&custom_t3_base)).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE orchestration_v2_projection_threads ADD COLUMN active_provider_thread_id TEXT;
+             DELETE FROM orchestration_v2_projection_provider_session_bindings;
+             UPDATE orchestration_v2_projection_threads SET active_provider_thread_id = 'internal-provider-thread';
+             CREATE TABLE orchestration_v2_projection_provider_threads (
+                 provider_thread_id TEXT PRIMARY KEY, thread_id TEXT, provider_session_id TEXT, payload_json TEXT
+             );",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO orchestration_v2_projection_provider_threads VALUES (?1, ?2, ?3, ?4)",
+            [
+                "internal-provider-thread",
+                "thr-nodejson-t3",
+                "internal-provider-session",
+                &json!({
+                    "id": "internal-provider-thread", "appThreadId": "thr-nodejson-t3", "driver": "claudeAgent",
+                    "nativeThreadRef": {"nativeId": "sess-nodejson-t3", "driver": "claudeAgent", "strength": "strong"}
+                }).to_string(),
+            ],
+        ).unwrap();
+    }
 
     let custom_secret_val = "node-json-t3-secret-555";
     let (t3_url, t3_srv) = spawn_mock_t3_auth_server(custom_secret_val.to_string()).await;
@@ -1147,6 +1173,21 @@ async fn x9_daemon_honors_node_json_t3_block_and_explicit_hint_precedence() {
         "daemon must honor node.json 't3' block (url, baseDir, tokenSecret): {join_val}"
     );
     assert_eq!(join_val["transport"]["kind"], "t3");
+
+    // A stale same-driver hint must not borrow another enrolled native session.
+    let stale_call = rpc(
+        &sock,
+        &json!({
+            "type": "call.start", "harness": "claude",
+            "sessionId": "claude:sess-stale-native-hint",
+            "tool": "hyp_mesh", "callId": "call-x9-stale",
+            "t3ThreadId": "sess-nodejson-t3"
+        }),
+    )
+    .await;
+    assert!(stale_call.ok, "{stale_call:?}");
+    let stale = session_status(&sock, "claude:sess-stale-native-hint").await;
+    assert_eq!(stale["hasLiveTransport"], false, "{stale}");
 
     // Precedence check: explicit hook `t3_url` pointing at an unauthenticated server overrides `node.json`!
     let (bad_t3_url, bad_t3_srv) = spawn_mock_t3_auth_server("different-secret".into()).await;
