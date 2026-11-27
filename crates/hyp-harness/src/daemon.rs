@@ -755,6 +755,58 @@ impl Drop for LocalDaemon {
     }
 }
 
+enum DaemonListener {
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+    Tcp(tokio::net::TcpListener, SocketAddr),
+}
+
+enum DaemonConnection {
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+    Tcp(tokio::net::TcpStream, SocketAddr),
+}
+
+impl DaemonListener {
+    fn tcp_addr(&self) -> Option<SocketAddr> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(_) => None,
+            Self::Tcp(_, addr) => Some(*addr),
+        }
+    }
+
+    async fn accept(&self) -> std::io::Result<DaemonConnection> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(DaemonConnection::Unix(stream))
+            }
+            Self::Tcp(listener, addr) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(DaemonConnection::Tcp(stream, *addr))
+            }
+        }
+    }
+}
+
+impl DaemonConnection {
+    async fn serve(self, daemon: Arc<LocalDaemonInner>, shutdown: watch::Receiver<bool>) {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(stream) => {
+                let (reader, writer) = stream.into_split();
+                handle_connection(daemon, reader, writer, shutdown, None).await;
+            }
+            Self::Tcp(stream, addr) => {
+                let (reader, writer) = stream.into_split();
+                handle_connection(daemon, reader, writer, shutdown, Some(addr)).await;
+            }
+        }
+    }
+}
+
 impl LocalDaemon {
     /// Starts the native Rust `LocalDaemon` on the platform-native local transport:
     /// - Unix: Unix domain socket (`connector.sock`, `0600` permissions, stale-socket cleanup).
@@ -788,74 +840,14 @@ impl LocalDaemon {
         let listener = tokio::net::UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
 
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let inner = Arc::new(LocalDaemonInner::new(
+        Ok(Self::start_with_listener(
             node,
             gate,
             config,
             socket_path,
-            shutdown_tx.subscribe(),
-        ));
-
-        let accept_inner = Arc::clone(&inner);
-        let accept_task = tokio::spawn(async move {
-            loop {
-                let accepted = tokio::select! {
-                    res = listener.accept() => res,
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let Ok((stream, _)) = accepted else {
-                    continue;
-                };
-                let conn_inner = Arc::clone(&accept_inner);
-                let conn_shutdown = shutdown_rx.clone();
-                tokio::spawn(async move {
-                    let (r, w) = stream.into_split();
-                    handle_connection(conn_inner, r, w, conn_shutdown, None).await;
-                });
-            }
-        });
-
-        inner.sweep_expired_mutes_and_policies(now_ms());
-        let _ = inner.prune_stale_sessions_now();
-        sweep_approved_local_ingest_on_startup(&inner).await;
-        let inbox_task = spawn_inbox_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
-        let startup_pending = inner.collect_pending_sessions_for_flush();
-        let startup_rehydrate = inner.collect_sessions_for_transport_rehydration(&startup_pending);
-        let startup_flush_task = if startup_pending.is_empty() && startup_rehydrate.is_empty() {
-            None
-        } else {
-            let flush_inner = Arc::clone(&inner);
-            Some(tokio::spawn(async move {
-                tokio::join!(
-                    flush_inner.rehydrate_persisted_transports(startup_rehydrate),
-                    flush_inner.flush_pending_session_list(startup_pending),
-                );
-            }))
-        };
-        let _ = inner.write_ui_state_snapshot();
-        let projector_task = spawn_ui_state_projector(Arc::clone(&inner), shutdown_tx.subscribe());
-        let maintenance_task = spawn_maintenance_task(Arc::clone(&inner), shutdown_tx.subscribe());
-        let wake_watcher_task =
-            spawn_daemon_wake_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
-
-        Ok(Self {
-            inner,
-            tcp_addr: None,
-            shutdown_tx,
-            stopped: AtomicBool::new(false),
-            accept_task: Mutex::new(Some(accept_task)),
-            inbox_task: Mutex::new(Some(inbox_task)),
-            startup_flush_task: Mutex::new(startup_flush_task),
-            projector_task: Mutex::new(Some(projector_task)),
-            maintenance_task: Mutex::new(Some(maintenance_task)),
-            wake_watcher_task: Mutex::new(wake_watcher_task),
-        })
+            DaemonListener::Unix(listener),
+        )
+        .await)
     }
 
     /// Starts the native Rust `LocalDaemon` on loopback TCP (`127.0.0.1:0` -> `connector.addr`) on Windows.
@@ -897,12 +889,30 @@ impl LocalDaemon {
                 std::fs::set_permissions(&addr_file_path, std::fs::Permissions::from_mode(0o600));
         }
 
+        Ok(Self::start_with_listener(
+            node,
+            gate,
+            config,
+            addr_file_path,
+            DaemonListener::Tcp(listener, local_addr),
+        )
+        .await)
+    }
+
+    async fn start_with_listener(
+        node: Arc<UnifiedNode>,
+        gate: Option<Arc<SecurityGatePipeline>>,
+        config: LocalDaemonConfig,
+        socket_path: PathBuf,
+        listener: DaemonListener,
+    ) -> Self {
+        let tcp_addr = listener.tcp_addr();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let inner = Arc::new(LocalDaemonInner::new(
             node,
             gate,
             config,
-            addr_file_path,
+            socket_path,
             shutdown_tx.subscribe(),
         ));
 
@@ -918,15 +928,12 @@ impl LocalDaemon {
                         continue;
                     }
                 };
-                let Ok((stream, _)) = accepted else {
+                let Ok(connection) = accepted else {
                     continue;
                 };
                 let conn_inner = Arc::clone(&accept_inner);
                 let conn_shutdown = shutdown_rx.clone();
-                tokio::spawn(async move {
-                    let (r, w) = stream.into_split();
-                    handle_connection(conn_inner, r, w, conn_shutdown, Some(local_addr)).await;
-                });
+                tokio::spawn(connection.serve(conn_inner, conn_shutdown));
             }
         });
 
@@ -953,9 +960,9 @@ impl LocalDaemon {
         let wake_watcher_task =
             spawn_daemon_wake_watcher(Arc::clone(&inner), shutdown_tx.subscribe());
 
-        Ok(Self {
+        Self {
             inner,
-            tcp_addr: Some(local_addr),
+            tcp_addr,
             shutdown_tx,
             stopped: AtomicBool::new(false),
             accept_task: Mutex::new(Some(accept_task)),
@@ -964,7 +971,7 @@ impl LocalDaemon {
             projector_task: Mutex::new(Some(projector_task)),
             maintenance_task: Mutex::new(Some(maintenance_task)),
             wake_watcher_task: Mutex::new(wake_watcher_task),
-        })
+        }
     }
 
     pub fn socket_path(&self) -> &Path {
