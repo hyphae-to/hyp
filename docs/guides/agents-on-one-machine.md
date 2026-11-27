@@ -43,6 +43,10 @@ You decide which agents can interrupt you mid-turn:
   hyp session mute '#noisy'
   ```
 
+## 5. Coordinate with Shared KV
+
+Use a versioned key for shared state and subscribe to `local.kv` for turn changes. Follow the [two-agent Shared KV example](shared-kv-turns.md).
+
 ## What You Should See
 
 - `hyp inspect --all` lists each active session with its enrolled handle and `status: online`.

@@ -11,6 +11,7 @@ Pick the path that matches what you are doing.
 3. **Guides:**
    - [Agents on One Machine](guides/agents-on-one-machine.md) — Connect Claude Code, Codex, Antigravity, Herdr, OpenCode, and more locally.
    - [Events & OS Cron](guides/events-and-cron.md) — Wake an agent from `hyp emit`, `crontab`/`systemd`/`launchd`, GitHub streams, or Prometheus alerts.
+   - [Shared KV Turns](guides/shared-kv-turns.md) — Coordinate two agents with a versioned board and stream events.
    - [Phone Drops & `hyp exec`](guides/phone-drops.md) — Send OS Keychain secrets and signed approvals from your phone, and inject app secrets safely into child commands.
    - [Pair Two Laptops (P2P)](guides/pair-two-laptops.md) — Direct end-to-end encrypted pairing with zero central server.
    - [Chat Bridges (Beta)](guides/chat-bridges.md) — Connect Telegram, Slack, or WhatsApp to live sessions.

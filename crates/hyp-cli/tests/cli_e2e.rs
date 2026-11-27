@@ -763,6 +763,233 @@ fn node_start_parses_kv_namespaces_advertises_manifest_and_mcp_hyp_kv() {
 }
 
 #[test]
+fn shared_kv_takes_turns_without_move_messages_or_self_wakes() {
+    use common::parse_json_stdout;
+
+    let mut daemon = start_native_rust_daemon();
+    let home = daemon.tmp.path();
+    let state = daemon.state_dir.to_str().unwrap();
+    let socket = daemon.socket_path.as_deref().unwrap();
+    let mut mcp = McpSubprocess::spawn(home, socket);
+    mcp.initialize(RPC_TIMEOUT);
+    let call = |mcp: &mut McpSubprocess, actor: &str, tool, args: Value| {
+        let (text, is_error) =
+            mcp.call_verified_claude(home, socket, actor, tool, args, RPC_TIMEOUT);
+        assert!(!is_error, "{tool}: {text}");
+        serde_json::from_str::<Value>(&text).unwrap()
+    };
+
+    let actors = ["turn-alice", "turn-bob"];
+    let subscriptions = actors.map(|actor| {
+        call(
+            &mut mcp,
+            actor,
+            "hyp_mesh",
+            json!({"action":"join","handle":actor}),
+        );
+        call(
+            &mut mcp,
+            actor,
+            "hyp_stream",
+            json!({
+                "action": "subscribe",
+                "topic": "local.kv",
+                "key": "turn-board",
+                "filters": [
+                    {"exact":{"subject":"turns/board"}},
+                    {"exact":{"type":"to.hyphae.kv.set"}},
+                    {"not":{"exact":{"writer":actor}}}
+                ]
+            }),
+        )
+    });
+    let arm_waiter = |actor| {
+        let session = format!("claude:{actor}");
+        let mut cmd = isolated_cmd(home);
+        cmd.args([
+            "wait",
+            "--session",
+            &session,
+            "--socket",
+            socket.to_str().unwrap(),
+            "--timeout",
+            "8",
+            "--json",
+        ])
+        .stdin(Stdio::null());
+        let waiter = ManagedProcess::spawn("hyp wait (KV turns)", &mut cmd);
+        wait_for_session_live(socket, &session, Duration::from_secs(5));
+        waiter
+    };
+    let receive = |mcp: &mut McpSubprocess, actor: &str, mut waiter: ManagedProcess| {
+        let (status, wake) = waiter.wait_json_output(RPC_TIMEOUT);
+        assert!(status.success(), "{wake}");
+        let digest = wake["data"]["items"][0]["text"].as_str().unwrap();
+        assert!(digest.contains("topic=\"local.kv\""), "{wake}");
+        let inbox = call(mcp, actor, "hyp_inbox", json!({}));
+        let items = inbox["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{inbox}");
+        let batch: Value = serde_json::from_str(items[0]["text"].as_str().unwrap()).unwrap();
+        let events = batch["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{batch}");
+        assert_eq!(events[0]["subject"], "turns/board");
+        events[0].clone()
+    };
+    let assert_empty = |mcp: &mut McpSubprocess, actor: &str| {
+        let inbox = call(mcp, actor, "hyp_inbox", json!({}));
+        assert!(inbox["items"].as_array().unwrap().is_empty(), "{inbox}");
+    };
+    let kv = |key, args: &[&str]| {
+        let output = isolated_cmd(home)
+            .arg("kv")
+            .args(args)
+            .args([
+                "--ns",
+                "turns",
+                "--key",
+                key,
+                "--state-dir",
+                state,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        (output.status.code(), parse_json_stdout(&output))
+    };
+
+    let alice_waiter = arm_waiter(actors[0]);
+    let bob_waiter = arm_waiter(actors[1]);
+    assert_eq!(
+        kv(
+            "decoy",
+            &[
+                "set",
+                "--writer",
+                actors[0],
+                "--ttl-seconds",
+                "300",
+                "--value",
+                "0"
+            ]
+        )
+        .0,
+        Some(0)
+    );
+    let (status, seed) = kv(
+        "board",
+        &[
+            "set",
+            "--write-model",
+            "shared",
+            "--writer",
+            actors[0],
+            "--expected-version",
+            "0",
+            "--ttl-seconds",
+            "300",
+            "--value",
+            r#"{"turn":"turn-bob","moves":["A1"]}"#,
+        ],
+    );
+    assert_eq!(status, Some(0), "{seed}");
+    let event = receive(&mut mcp, actors[1], bob_waiter);
+    assert_eq!(event["writer"], actors[0]);
+    assert_eq!(event["data"]["version"], 1);
+    assert_eq!(event["data"]["value"]["turn"], actors[1]);
+    assert_empty(&mut mcp, actors[0]);
+
+    // Both proposed writers start from version 1. Only Bob's move wins that version.
+    let alice_observed = kv("board", &["get"]).1["data"]["version"].to_string();
+    let bob_observed = event["data"]["version"].to_string();
+    assert_eq!(alice_observed, bob_observed);
+    let bob_waiter = arm_waiter(actors[1]);
+    let large_value = json!({
+        "turn": actors[0],
+        "moves": ["A1", "B2"],
+        "notes": "x".repeat(7_000)
+    })
+    .to_string();
+    let (status, bob_move) = kv(
+        "board",
+        &[
+            "set",
+            "--writer",
+            actors[1],
+            "--expected-version",
+            &bob_observed,
+            "--value",
+            &large_value,
+        ],
+    );
+    assert_eq!(status, Some(0), "{bob_move}");
+    let (_, conflict) = kv(
+        "board",
+        &[
+            "set",
+            "--writer",
+            actors[0],
+            "--expected-version",
+            &alice_observed,
+            "--value",
+            r#"{"turn":"turn-bob","moves":["A1","C3"]}"#,
+        ],
+    );
+    assert_eq!(conflict["error"]["code"], "VERSION_CONFLICT");
+    assert_eq!(conflict["data"]["currentVersion"], 2);
+
+    let event = receive(&mut mcp, actors[0], alice_waiter);
+    assert_eq!(event["writer"], actors[1]);
+    assert_eq!(event["data"]["valueTruncated"], true);
+    assert!(event["data"].get("value").is_none());
+    let (_, current) = kv("board", &["get"]);
+    assert_eq!(current["data"]["version"], 2);
+    assert_eq!(current["data"]["expiresAt"], seed["data"]["expiresAt"]);
+    assert_eq!(current["data"]["value"]["turn"], actors[0]);
+
+    let mut alice_waiter = arm_waiter(actors[0]);
+    let version = current["data"]["version"].to_string();
+    let (status, alice_move) = kv(
+        "board",
+        &[
+            "set",
+            "--writer",
+            actors[0],
+            "--expected-version",
+            &version,
+            "--value",
+            r#"{"turn":"turn-bob","moves":["A1","B2","C3"]}"#,
+        ],
+    );
+    assert_eq!(status, Some(0), "{alice_move}");
+    let event = receive(&mut mcp, actors[1], bob_waiter);
+    assert_eq!(event["writer"], actors[0]);
+    assert_eq!(event["data"]["version"], 3);
+    assert_empty(&mut mcp, actors[0]);
+    alice_waiter.shutdown_gracefully();
+
+    for (actor, sub) in actors.into_iter().zip(subscriptions) {
+        let removed = call(
+            &mut mcp,
+            actor,
+            "hyp_stream",
+            json!({"action":"unsubscribe","id":sub["id"]}),
+        );
+        assert_eq!(removed["removed"], true);
+    }
+    assert_eq!(
+        kv(
+            "board",
+            &["delete", "--writer", actors[0], "--expected-version", "3"]
+        )
+        .0,
+        Some(0)
+    );
+    assert_eq!(kv("decoy", &["delete", "--writer", actors[0]]).0, Some(0));
+    assert_eq!(mcp.close(RPC_TIMEOUT), Some(0));
+    daemon.proc.shutdown_gracefully();
+}
+
+#[test]
 fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
     use common::parse_json_stdout;
 
