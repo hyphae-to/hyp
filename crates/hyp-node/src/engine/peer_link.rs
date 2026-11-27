@@ -513,16 +513,8 @@ impl std::fmt::Debug for PeerAuth {
     }
 }
 
-/// Formats the canonical Ed25519 HTTP authentication signing input.
-pub fn http_auth_signing_input(
-    method: &str,
-    path_and_query: &str,
-    ts_ms: i64,
-    nonce: &str,
-    body_sha256: &str,
-) -> Vec<u8> {
-    format!("{method}\n{path_and_query}\n{ts_ms}\n{nonce}\n{body_sha256}").into_bytes()
-}
+/// Canonical HTTP authentication transcript, retained at its existing public path.
+pub use hyp_crypto::http_auth::http_auth_signing_input;
 
 /// Outbound HTTP/SSE link to a single remote Hyphae `Node` (Hub, Public Node, or Direct P2P peer).
 pub struct PeerLink {
@@ -621,15 +613,14 @@ impl PeerLink {
                 rng.fill(&mut nonce_bytes)
                     .map_err(|_| NodeError::Http("CSPRNG failure generating auth nonce".into()))?;
                 let nonce = hex::encode(nonce_bytes);
-                let input =
-                    http_auth_signing_input(method.as_str(), path_and_query, ts, &nonce, &body_sha);
-                let sig = self.identity.signing.sign_domain_b64("http-auth", &input);
-                format!(
-                    "Hyphae-Ed25519 node=\"{}\",ts=\"{}\",nonce=\"{}\",sig=\"{}\"",
+                hyp_crypto::http_auth::sign_http_auth(
                     self.self_node_id.as_str(),
+                    &self.identity.signing,
+                    method.as_str(),
+                    path_and_query,
                     ts,
-                    nonce,
-                    sig
+                    &nonce,
+                    &body_sha,
                 )
             }
         };
