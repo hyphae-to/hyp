@@ -21,9 +21,6 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use http::{Method, Request};
-use http_body_util::BodyExt;
 use hyp_crypto::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::human::{
     EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1, MAX_HUMAN_DRAFT_CONTEXT_CHARS,
@@ -42,11 +39,12 @@ use hyp_node::delivery::{
     urgency_cap_gate_reason,
 };
 pub use hyp_node::engine::WakeRecoveryConfig;
+use hyp_node::engine::drop_client::{self, CreateSlotOptions, RelayAuth, RelayRequestError};
 use hyp_node::engine::http_util::{HttpClient, SseParser, empty_body, full_body};
 use hyp_node::engine::{
     ChannelMode, CreateDropRequest, CreateDropResponse, DEFAULT_WAKE_CHECK_INTERVAL_SECS,
-    DROP_CAP_HEADER, DropSubscriberAuth, KvWriteRequest, NodeError, PeerReconcileReport,
-    SubscribeRequest, UnifiedNode, format_human_duration, spawn_wake_watcher,
+    DropSubscriberAuth, KvWriteRequest, NodeError, PeerReconcileReport, SubscribeRequest,
+    UnifiedNode, format_human_duration, spawn_wake_watcher,
 };
 use hyp_node::gates::{
     GateDecision, InboundContext, OutboundContext, SecurityGatePipeline, TrustTier as GateTrustTier,
@@ -9605,46 +9603,46 @@ async fn create_external_drop(
     relay_url: &str,
     ttl_seconds: u64,
 ) -> Result<CreateDropResponse, (String, String)> {
-    let req_body = CreateDropRequest {
-        ttl_seconds: Some(ttl_seconds),
-        max_items: Some(4),
-        target_node_id: Some(node.node_id().to_string()),
-        burn_after_read: true,
+    let node_id = node.node_id().as_str();
+    let sign = |method: &str, path: &str, bytes: &[u8]| {
+        let body_sha = sha256_hex(bytes);
+        let ts = now_ms();
+        let nonce = uuid_v4();
+        Ok(hyp_crypto::http_auth::sign_http_auth(
+            node_id,
+            &node.identity().signing,
+            method,
+            path,
+            ts,
+            &nonce,
+            &body_sha,
+        ))
     };
-    let body_bytes = serde_json::to_vec(&req_body).map_err(|e| {
-        (
+    let http_req = drop_client::create_slot(
+        relay_url,
+        CreateSlotOptions {
+            node_id,
+            ttl_seconds,
+            max_items: 4,
+        },
+        RelayAuth::Signed {
+            public_key: &node.identity().signing_jwk().x,
+            node_header: None,
+            sign: &sign,
+        },
+        full_body,
+    )
+    .map_err(|error| match error {
+        RelayRequestError::Encode(error) => (
             "internal_error".into(),
-            format!("serialize drop request: {e}"),
-        )
+            format!("serialize drop request: {error}"),
+        ),
+        RelayRequestError::Build(error) => (
+            "drop_relay_error".into(),
+            format!("build drop request: {error}"),
+        ),
+        RelayRequestError::Sign(error) => ("drop_relay_error".into(), error),
     })?;
-    let body_sha = sha256_hex(&body_bytes);
-    let ts = now_ms();
-    let nonce = uuid_v4();
-    let path_and_query = "/v1/drops";
-    let auth_header = hyp_crypto::http_auth::sign_http_auth(
-        node.node_id().as_str(),
-        &node.identity().signing,
-        "POST",
-        path_and_query,
-        ts,
-        &nonce,
-        &body_sha,
-    );
-
-    let url = format!("{relay_url}{path_and_query}");
-    let http_req = Request::builder()
-        .method(Method::POST)
-        .uri(&url)
-        .header(AUTHORIZATION, auth_header)
-        .header("X-Hyphae-Public-Key", node.identity().signing_jwk().x)
-        .header(CONTENT_TYPE, CONTENT_TYPE_JSON)
-        .body(full_body(body_bytes))
-        .map_err(|e| {
-            (
-                "drop_relay_error".into(),
-                format!("build drop request: {e}"),
-            )
-        })?;
 
     let resp = node.http_client().request(http_req).await.map_err(|e| {
         (
@@ -9760,7 +9758,7 @@ fn spawn_external_drop_watcher(
         let mut shutdown_rx = daemon.shutdown_rx.clone();
         let mut wake_rx = daemon.node.subscribe_wake_epoch();
         let deadline = tokio::time::Instant::now() + deadline_dur;
-        let stream_url = format!("{relay_url}/v1/drops/{drop_id}/stream");
+        let stream_path = format!("/v1/drops/{drop_id}/stream");
         let backoff_schedule: Vec<u64> = if daemon.config.drop_watcher_backoff_ms.is_empty() {
             vec![500, 1_000, 2_000, 5_000]
         } else {
@@ -9788,15 +9786,13 @@ fn spawn_external_drop_watcher(
                 return;
             }
 
-            let mut req_builder = Request::builder()
-                .method(Method::GET)
-                .uri(&stream_url)
-                .header(DROP_CAP_HEADER, &sub_cap)
-                .header(ACCEPT, "text/event-stream");
-            if let Some(ref event_id) = last_event_id {
-                req_builder = req_builder.header("Last-Event-ID", event_id);
-            }
-            let Ok(req) = req_builder.body(empty_body()) else {
+            let Ok(req) = drop_client::stream_request(
+                &relay_url,
+                &stream_path,
+                last_event_id.as_deref(),
+                RelayAuth::Capability(&sub_cap),
+                empty_body(),
+            ) else {
                 return;
             };
 
@@ -9836,7 +9832,7 @@ fn spawn_external_drop_watcher(
                     reconnect_attempt = 0;
                     let mut parser = SseParser::new();
                     loop {
-                        let frame_opt = tokio::select! {
+                        let batch = tokio::select! {
                             biased;
                             _ = shutdown_rx.changed() => {
                                 if *shutdown_rx.borrow() {
@@ -9861,16 +9857,13 @@ fn spawn_external_drop_watcher(
                                     .await;
                                 return;
                             }
-                            f = resp.body_mut().frame() => f,
+                            events = drop_client::stream_next(resp.body_mut(), &mut parser) => events,
                         };
-                        let Some(Ok(frame)) = frame_opt else {
+                        let Some(Ok(events)) = batch else {
                             // Mid-stream disconnect: reconnect with bounded backoff + Last-Event-ID!
                             break;
                         };
-                        let Some(data) = frame.data_ref() else {
-                            continue;
-                        };
-                        for ev in parser.feed(data) {
+                        for ev in events {
                             if let Some(ref eid) = ev.id {
                                 let trimmed = eid.trim();
                                 if !trimmed.is_empty() {
@@ -9893,24 +9886,18 @@ fn spawn_external_drop_watcher(
                                             .as_deref()
                                             .and_then(|s| s.trim().parse::<u64>().ok())
                                         {
-                                            let ack_url =
-                                                format!("{relay_url}/v1/drops/{drop_id}/ack");
-                                            let ack_body = serde_json::to_vec(&json!({
-                                                "seq": seq,
-                                                "burn": true,
-                                            }))
-                                            .unwrap_or_default();
-                                            if let Ok(ack_req) = Request::builder()
-                                                .method(Method::POST)
-                                                .uri(&ack_url)
-                                                .header(DROP_CAP_HEADER, &sub_cap)
-                                                .header(CONTENT_TYPE, CONTENT_TYPE_JSON)
-                                                .body(full_body(ack_body))
-                                            {
+                                            let ack_path = format!("/v1/drops/{drop_id}/ack");
+                                            if let Ok(request) = drop_client::ack(
+                                                &relay_url,
+                                                &ack_path,
+                                                seq,
+                                                RelayAuth::Capability(&sub_cap),
+                                                full_body,
+                                            ) {
                                                 let _ = daemon
                                                     .node
                                                     .http_client()
-                                                    .request(ack_req)
+                                                    .request(request)
                                                     .await;
                                             }
                                         }
