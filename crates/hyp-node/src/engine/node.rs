@@ -37,6 +37,7 @@ use hyp_crypto::human::{
     HumanRevocationPayloadV1, NodeCertPayloadV1, SignedHumanRevocationV1, SignedNodeCertV1,
     encode_hcert1, sign_node_cert, verify_human_revocation,
 };
+use hyp_crypto::manifest::{ManifestVerificationError, verify_manifest_integrity};
 use hyp_crypto::pairing::{P2P_SECRET_BYTES, P2pOfferToken};
 use hyp_crypto::rfc3339::format_rfc3339_millis;
 use hyp_crypto::{
@@ -1440,20 +1441,18 @@ impl UnifiedNode {
         let manifest_signing_jwk = hyp_crypto::OkpJwk::from(&payload.identity.signing_jwk);
         let manifest_enc_jwk = hyp_crypto::OkpJwk::from(&payload.identity.encryption_jwk);
         let pinned_signing = self.lookup_peer_signing_key(peer_id)?;
-        let verify_pk = match pinned_signing {
-            Some(pk) => {
-                let candidate_pk = manifest_signing_jwk.to_ed25519()?;
-                if pk != candidate_pk {
-                    return Err(NodeError::Unauthorized(format!(
-                        "peer '{peer_id}' manifest signing key does not match pinned key"
-                    )));
-                }
-                pk
-            }
-            None => manifest_signing_jwk.to_ed25519()?,
-        };
-
-        verify_pk.verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig)?;
+        let (verify_pk, enc_pk) =
+            verify_manifest_integrity(signed, &payload, pinned_signing.as_ref(), None).map_err(
+                |error| match error {
+                    ManifestVerificationError::SigningPinMismatch => NodeError::Unauthorized(
+                        format!("peer '{peer_id}' manifest signing key does not match pinned key"),
+                    ),
+                    ManifestVerificationError::SigningKey(error)
+                    | ManifestVerificationError::EncryptionKey(error)
+                    | ManifestVerificationError::Signature(error) => NodeError::Crypto(error),
+                    error => NodeError::BadRequest(error.to_string()),
+                },
+            )?;
 
         let history = self.build_trust_history(peer_id, accept_downgrade)?;
         let local_view = self.local_capabilities_view();
@@ -1519,7 +1518,6 @@ impl UnifiedNode {
                 },
                 now,
             );
-            let enc_pk = manifest_enc_jwk.to_x25519()?;
             let _ = db.peers().upsert_peer_key(
                 &PeerKeyInput {
                     peer_id: peer_id.to_string(),

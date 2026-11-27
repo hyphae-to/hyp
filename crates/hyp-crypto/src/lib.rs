@@ -13,6 +13,7 @@ pub mod human;
 pub mod jcs;
 pub mod keys;
 pub mod keystore;
+pub mod manifest;
 pub mod pairing;
 pub mod rfc3339;
 pub mod transfer;

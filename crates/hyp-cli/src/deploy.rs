@@ -9,6 +9,7 @@ use crate::ui::{
 use clap::{Subcommand, ValueEnum};
 use http_body_util::Empty;
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
+use hyp_crypto::manifest::verify_manifest_signature;
 use hyp_crypto::pairing::{validate_endpoint_origin, validate_http_endpoint_origin};
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
 use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
@@ -2738,25 +2739,23 @@ async fn probe_manifest_url(
         // Verify Ed25519 signature over `"hyphae/v2/manifest\n" || payload` against embedded signingJwk.
         let crypto_jwk = CryptoOkpJwk::from(&payload.identity.signing_jwk);
         let sig_ok = match crypto_jwk.to_ed25519() {
-            Ok(pk) => {
-                match pk.verify_domain_b64("manifest", signed.payload.as_bytes(), &signed.sig) {
-                    Ok(()) => {
-                        checks.push(CliCheck::ok(
-                            "manifest.signature",
-                            format!("Valid Ed25519 signature (kid {})", payload.identity.kid),
-                        ));
-                        true
-                    }
-                    Err(e) => {
-                        checks.push(CliCheck::fail(
+            Ok(pk) => match verify_manifest_signature(&signed, &pk) {
+                Ok(()) => {
+                    checks.push(CliCheck::ok(
+                        "manifest.signature",
+                        format!("Valid Ed25519 signature (kid {})", payload.identity.kid),
+                    ));
+                    true
+                }
+                Err(e) => {
+                    checks.push(CliCheck::fail(
                             "manifest.signature",
                             format!("Invalid Ed25519 manifest signature: {e}"),
                             Some("Check node signing key integrity and ensure proxies do not rewrite JSON bodies.".to_string()),
                         ));
-                        false
-                    }
+                    false
                 }
-            }
+            },
             Err(e) => {
                 checks.push(CliCheck::fail(
                     "manifest.signature",

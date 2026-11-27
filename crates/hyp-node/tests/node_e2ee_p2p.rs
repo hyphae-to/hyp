@@ -1000,6 +1000,24 @@ async fn adversarial_routing_loops_manifest_rollback_e2ee_downgrade_and_required
     let (manifest_v2, payload_v2, etag_v2) = hub.build_signed_manifest(Some(&alice_auth)).unwrap();
     assert_eq!(payload_v2.manifest_version, 2);
 
+    // A valid signature does not make a noncanonical encoding cacheable.
+    let noncanonical = serde_json::to_string_pretty(&payload_v2).unwrap();
+    let noncanonical_signed = SignedNodeManifest {
+        sig: hub
+            .identity()
+            .signing
+            .sign_domain_b64("manifest", noncanonical.as_bytes()),
+        payload: noncanonical,
+    };
+    let error = alice
+        .verify_and_cache_peer_manifest("hub-a", &noncanonical_signed, None, false)
+        .unwrap_err();
+    assert!(
+        matches!(error, NodeError::BadRequest(ref message) if message.contains("not canonical")),
+        "expected noncanonical manifest rejection, got {error}"
+    );
+    assert!(alice.db().peers().get_peer("hub-a").unwrap().is_none());
+
     // Cache v2 cleanly on Alice.
     let neg_v2 = alice
         .verify_and_cache_peer_manifest("hub-a", &manifest_v2, Some(etag_v2), false)
