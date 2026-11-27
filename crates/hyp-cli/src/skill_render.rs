@@ -618,16 +618,6 @@ pub fn runtime_skill_paths(
     claude_profiles: &[ClaudeConfigProfile],
 ) -> (PathBuf, Vec<PathBuf>) {
     match kind {
-        HarnessKind::Antigravity => (
-            home.join(".gemini")
-                .join("config")
-                .join("plugins")
-                .join("hyphae")
-                .join("skills")
-                .join("hyp-mesh")
-                .join("SKILL.md"),
-            Vec::new(),
-        ),
         HarnessKind::Claude => {
             let mut seen = BTreeSet::new();
             let mut paths = Vec::new();
@@ -639,10 +629,7 @@ pub fn runtime_skill_paths(
             }
             if paths.is_empty() {
                 (
-                    home.join(".claude")
-                        .join("skills")
-                        .join("hyp-mesh")
-                        .join("SKILL.md"),
+                    crate::harness_spec::spec(kind).runtime_skill(home),
                     Vec::new(),
                 )
             } else {
@@ -650,44 +637,8 @@ pub fn runtime_skill_paths(
                 (primary, paths)
             }
         }
-        HarnessKind::Codex | HarnessKind::T3 => {
-            (home.join(".agents/skills/hyp-mesh/SKILL.md"), Vec::new())
-        }
-        HarnessKind::Cursor => (
-            home.join(".cursor")
-                .join("skills")
-                .join("hyp-mesh")
-                .join("SKILL.md"),
-            Vec::new(),
-        ),
-        HarnessKind::Opencode => (
-            home.join(".config")
-                .join("opencode")
-                .join("skills")
-                .join("hyp-mesh")
-                .join("SKILL.md"),
-            Vec::new(),
-        ),
-        HarnessKind::Gemini => (
-            home.join(".gemini")
-                .join("skills")
-                .join("hyp-mesh")
-                .join("SKILL.md"),
-            Vec::new(),
-        ),
-        HarnessKind::Openclaw => (
-            home.join(".openclaw")
-                .join("skills")
-                .join("hyp-mesh")
-                .join("SKILL.md"),
-            Vec::new(),
-        ),
-        HarnessKind::Herdr => (
-            home.join(".config")
-                .join("herdr")
-                .join("skills")
-                .join("hyp-mesh")
-                .join("SKILL.md"),
+        _ => (
+            crate::harness_spec::spec(kind).runtime_skill(home),
             Vec::new(),
         ),
     }
