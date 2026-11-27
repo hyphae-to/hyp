@@ -19,7 +19,6 @@ use crate::statusline_cmd::sanitize_terminal_text;
 use crate::term::{AltScreenGuard, RawTtyGuard};
 #[cfg(unix)]
 use crate::ui::EXIT_OK;
-use crate::wizard::ColorMode;
 #[cfg(unix)]
 use crate::wizard::{detect_color_mode, detect_terminal_size};
 use clap::Args;
@@ -30,6 +29,7 @@ use hyp_harness_ipc::sock::{
     MAX_SOCKET_LINE_BYTES, connect_daemon_async, daemon_rpc_sync, default_socket_path,
     read_bounded_line_async, write_ndjson_line_async,
 };
+use hyp_mycelium::ColorMode;
 use serde_json::Value;
 #[cfg(any(unix, test))]
 use serde_json::json;

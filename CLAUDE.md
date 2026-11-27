@@ -4,7 +4,7 @@ See [AGENTS.md](./AGENTS.md) for full project invariants, the Differential Testi
 
 ## Quick Reference (Pure-Rust Workspace)
 
-- **Workspace**: 6 Rust crates (`crates/hyp-proto`, `crates/hyp-crypto`, `crates/hyp-store`, `crates/hyp-node`, `crates/hyp-harness`, `crates/hyp-cli`), Rust 1.87+ (`edition = "2024"`), bundled SQLite (`rusqlite`, WAL mode). Zero Node.js/Python runtime requirement for the core `hyp` static binary (`plugins/` contains optional external Node/Python subprocess bridges only).
+- **Workspace**: Rust crates listed in [Cargo.toml](./Cargo.toml), Rust 1.87+ (`edition = "2024"`), bundled SQLite (`rusqlite`, WAL mode). Zero Node.js/Python runtime requirement for the core `hyp` static binary (`plugins/` contains optional external Node/Python subprocess bridges only).
 - **MCP surface**: 4 core tools (`hyp_send`, `hyp_inbox`, `hyp_mesh`, `hyp_stream`) + conditional `hyp_bridge` and `hyp_kv`.
 - **Security invariants**:
   - Never accept or print secrets or pairing tokens (`hp2p1_`, `am2_`, `t3mp1_`) via CLI argv flags, logs, or plaintext `node.json` — use stdin (`<<<`), `--token-file`, `hyp secret set <name> --web`, or `{ "secret": "<name>" }`.

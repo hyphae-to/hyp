@@ -16,6 +16,7 @@ Hyphae uses a pure-Rust workspace (Rust 1.87+, `edition = "2024"`).
   - `transport/` (`hyp-harness-transport`) delivers metadata-only wakeups to external harnesses. It shares identity hints with clients through IPC.
   - `daemon/` (`hyp-daemon`) runs the socket server, verifies callers, and coordinates delivery through the node and transports.
   - `plugins/` (`hyp-harness-plugins`) reads plugin configuration, supervises subprocesses, and connects bridge delivery to the daemon.
+- `crates/hyp-mycelium` — Braille frame renderer for the onboarding intro, animation preview, and menu banner.
 - `crates/hyp-cli` — Single self-contained `hyp` binary (static musl on Linux x86_64, native glibc on Linux arm64).
 - `plugins/` — Optional external self-contained chat & webhook bridge scripts (Node/Python) supervised over JSON-RPC 2.0 / fd-3 NDJSON (never required for the core Rust binary).
 - `workers/drop-relay/` — Zero-dependency Cloudflare Workers kit for the Blind Drop Relay.
