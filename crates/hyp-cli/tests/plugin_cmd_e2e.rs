@@ -397,25 +397,34 @@ fn release_workflows_package_sign_and_checksum_plugins_tarball() {
     );
 
     let nightly_wf = fs::read_to_string(root.join(".github/workflows/nightly-rust.yml")).unwrap();
-    assert_eq!(
-        nightly_wf
-            .matches("HYPHAE_BUILD_VERSION: ${{ needs.prepare.outputs.version }}")
-            .count(),
-        2,
-        "nightly-rust.yml must pass HYPHAE_BUILD_VERSION to both Unix and Windows build steps"
+    assert!(
+        nightly_wf.contains("uses: ./.github/workflows/build-rust-archives.yml")
+            && nightly_wf.contains("tag: ${{ needs.prepare.outputs.tag }}")
+            && nightly_wf.contains("nightly_version: ${{ needs.prepare.outputs.version }}"),
+        "nightly must pass the resolved tag and version to the shared archive workflow"
     );
-    assert_eq!(
-        nightly_wf.matches("HYPHAE_BUILD_CHANNEL: nightly").count(),
-        2,
-        "nightly-rust.yml must pass HYPHAE_BUILD_CHANNEL: nightly to both Unix and Windows build steps"
-    );
-    assert_eq!(
-        nightly_wf
-            .matches("HYPHAE_RELEASE_TAG: ${{ needs.prepare.outputs.tag }}")
-            .count(),
-        2,
-        "nightly-rust.yml must pass HYPHAE_RELEASE_TAG to both Unix and Windows build steps"
-    );
+    let shared_wf = fs::read_to_string(root.join(".github/workflows/build-rust-archives.yml"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let (_, build_job) = shared_wf
+        .split_once("  build:\n")
+        .expect("shared build job");
+    let (_, job_environment) = build_job
+        .split_once("    env:\n")
+        .expect("build job environment");
+    let (job_environment, _) = job_environment
+        .split_once("    steps:\n")
+        .expect("build job steps");
+    for expected in [
+        "HYPHAE_BUILD_VERSION: ${{ inputs.nightly_version }}",
+        "HYPHAE_BUILD_CHANNEL: ${{ inputs.nightly_version != '' && 'nightly' || '' }}",
+        "HYPHAE_RELEASE_TAG: ${{ inputs.nightly_version != '' && inputs.tag || '' }}",
+    ] {
+        assert!(
+            job_environment.contains(expected),
+            "shared archive workflow must pass {expected} to both Unix and Windows builds"
+        );
+    }
 }
 
 #[test]
