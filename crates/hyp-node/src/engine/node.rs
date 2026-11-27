@@ -108,8 +108,8 @@ use crate::adapters::{
 use crate::delivery::DeliveryUrgency;
 use crate::engine::config::{
     ChannelMode, ChannelPolicy, NodeConfig, NodeError, NodeProfile, crypto_jwk_to_proto,
-    profile_to_store, proto_ce_to_store, proto_filter_to_store, proto_jwk_to_crypto,
-    store_ce_to_proto, store_filter_to_proto,
+    profile_to_store, proto_ce_to_store, proto_filter_to_store, store_ce_to_proto,
+    store_filter_to_proto,
 };
 use crate::engine::drop_relay::DropRelay;
 use crate::engine::http_util::{HttpClient, compute_etag, full_body};
@@ -1547,8 +1547,8 @@ impl UnifiedNode {
 
         // Verify signature against pinned Ed25519 key if already known (zero TOFU downgrade!),
         // otherwise verify against the JWK embedded in the manifest.
-        let manifest_signing_jwk = proto_jwk_to_crypto(&payload.identity.signing_jwk);
-        let manifest_enc_jwk = proto_jwk_to_crypto(&payload.identity.encryption_jwk);
+        let manifest_signing_jwk = hyp_crypto::OkpJwk::from(&payload.identity.signing_jwk);
+        let manifest_enc_jwk = hyp_crypto::OkpJwk::from(&payload.identity.encryption_jwk);
         let pinned_signing = self.lookup_peer_signing_key(peer_id)?;
         let verify_pk = match pinned_signing {
             Some(pk) => {
@@ -2169,7 +2169,7 @@ impl UnifiedNode {
         let admin_proto_jwk = self.config.admin_jwk.as_ref().ok_or_else(|| {
             NodeError::BadRequest("this node has no configured adminJwk for am2_ pairing".into())
         })?;
-        let admin_pk = proto_jwk_to_crypto(admin_proto_jwk).to_ed25519()?;
+        let admin_pk = hyp_crypto::OkpJwk::from(admin_proto_jwk).to_ed25519()?;
 
         let is_revoked = {
             let db = self.db();
@@ -2604,7 +2604,7 @@ impl UnifiedNode {
                 "this hub has no configured adminJwk for delegated human invite claims".into(),
             )
         })?;
-        let admin_pk = proto_jwk_to_crypto(admin_proto_jwk).to_ed25519()?;
+        let admin_pk = hyp_crypto::OkpJwk::from(admin_proto_jwk).to_ed25519()?;
         let now = now_ms();
 
         let signed_invite = decode_hjoin1(&req.hjoin1)
@@ -3194,7 +3194,7 @@ impl UnifiedNode {
                 payload.node_id
             )));
         }
-        let hub_pk = proto_jwk_to_crypto(&payload.identity.signing_jwk).to_ed25519()?;
+        let hub_pk = hyp_crypto::OkpJwk::from(&payload.identity.signing_jwk).to_ed25519()?;
         hub_pk.verify_domain_b64(
             "manifest",
             reply.signed_manifest.payload.as_bytes(),
@@ -4763,7 +4763,7 @@ impl UnifiedNode {
             .config
             .admin_jwk
             .as_ref()
-            .map(|j| proto_jwk_to_crypto(j).to_ed25519())
+            .map(|j| hyp_crypto::OkpJwk::from(j).to_ed25519())
             .transpose()?;
 
         if pinned_sign_pk.is_none() && admin_pk.is_none() {

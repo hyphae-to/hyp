@@ -171,11 +171,43 @@ pub fn fingerprint_bytes(raw_pub: &[u8; 32]) -> String {
 }
 
 /// Standard RFC 7517 / RFC 8037 Octet Key Pair (OKP) JSON Web Key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "hyp_proto::manifest::OkpJwk<String>")]
 pub struct OkpJwk {
     pub kty: String,
     pub crv: String,
     pub x: String,
+}
+
+impl Serialize for OkpJwk {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        hyp_proto::manifest::OkpJwk {
+            kty: self.kty.as_str(),
+            crv: self.crv.as_str(),
+            x: self.x.as_str(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl From<hyp_proto::manifest::OkpJwk<String>> for OkpJwk {
+    fn from(jwk: hyp_proto::manifest::OkpJwk<String>) -> Self {
+        Self {
+            kty: jwk.kty,
+            crv: jwk.crv,
+            x: jwk.x,
+        }
+    }
+}
+
+impl From<&hyp_proto::manifest::OkpJwk> for OkpJwk {
+    fn from(jwk: &hyp_proto::manifest::OkpJwk) -> Self {
+        Self {
+            kty: jwk.kty.clone(),
+            crv: jwk.crv.as_str().to_string(),
+            x: jwk.x.clone(),
+        }
+    }
 }
 
 impl OkpJwk {
@@ -208,20 +240,18 @@ impl OkpJwk {
                 self.kty
             )));
         }
-        if self.crv != "Ed25519" && self.crv != "X25519" {
-            return Err(CryptoError::InvalidKey(format!(
-                "unsupported OKP crv {:?}",
-                self.crv
-            )));
-        }
-        let _ = decode_raw_key_32(&self.x)?;
-        // RFC 7638 §3.2: members in lexicographical order with zero whitespace.
-        let canonical = format!(
-            "{{\"crv\":\"{}\",\"kty\":\"OKP\",\"x\":\"{}\"}}",
-            self.crv, self.x
-        );
-        let hash = Sha256::digest(canonical.as_bytes());
-        Ok(URL_SAFE_NO_PAD.encode(hash))
+        let curve = match self.crv.as_str() {
+            "Ed25519" => hyp_proto::manifest::OkpCurve::Ed25519,
+            "X25519" => hyp_proto::manifest::OkpCurve::X25519,
+            _ => {
+                return Err(CryptoError::InvalidKey(format!(
+                    "unsupported OKP crv {:?}",
+                    self.crv
+                )));
+            }
+        };
+        let raw = decode_raw_key_32(&self.x)?;
+        Ok(hyp_proto::manifest::okp_key_thumbprint(curve, &raw))
     }
 
     /// Converts and strictly validates this JWK as an `Ed25519PublicKey`.
@@ -888,6 +918,35 @@ impl NodeIdentityKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_jwk_schema_keeps_crypto_curve_strings_and_proto_curve_validation() {
+        let raw =
+            r#"{"kty":"OKP","crv":"P-256","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#;
+        let jwk: OkpJwk = serde_json::from_str(raw).unwrap();
+        assert_eq!(serde_json::to_string(&jwk).unwrap(), raw);
+        assert_eq!(jwk.crv, "P-256");
+        assert!(
+            matches!(jwk.thumbprint(), Err(CryptoError::InvalidKey(ref error)) if error == "unsupported OKP crv \"P-256\"")
+        );
+        assert!(serde_json::from_str::<hyp_proto::manifest::OkpJwk>(raw).is_err());
+
+        let key = Ed25519KeyPair::from_seed([7; 32]).unwrap();
+        let proto = hyp_proto::manifest::OkpJwk::new(
+            hyp_proto::manifest::OkpCurve::Ed25519,
+            &key.public_key().0,
+        );
+        let crypto = OkpJwk::from(&proto);
+        assert_eq!(crypto.to_ed25519().unwrap(), key.public_key());
+        assert_eq!(
+            serde_json::to_string(&crypto).unwrap(),
+            serde_json::to_string(&proto).unwrap()
+        );
+        assert_eq!(
+            crypto.thumbprint().unwrap(),
+            proto.thumbprint_sha256().unwrap()
+        );
+    }
 
     #[test]
     fn ed25519_pkcs8_spki_jwk_and_domain_signing_roundtrip() {
