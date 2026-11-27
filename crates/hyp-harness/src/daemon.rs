@@ -693,6 +693,17 @@ impl SessionRuntime {
     }
 }
 
+trait DaemonStateLock<T> {
+    fn lock_state(&self, poison_message: &'static str) -> MutexGuard<'_, T>;
+}
+
+impl<T> DaemonStateLock<T> for Mutex<T> {
+    #[track_caller]
+    fn lock_state(&self, poison_message: &'static str) -> MutexGuard<'_, T> {
+        self.lock().expect(poison_message)
+    }
+}
+
 struct LocalDaemonInner {
     node: Arc<UnifiedNode>,
     gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
@@ -1101,8 +1112,7 @@ impl LocalDaemon {
         if !key.is_empty() {
             self.inner
                 .bridge_posters
-                .lock()
-                .expect("bridge_posters lock poisoned")
+                .lock_state("bridge_posters lock poisoned")
                 .insert(key, poster);
         }
     }
@@ -1113,8 +1123,7 @@ impl LocalDaemon {
         *self
             .inner
             .peers_reloader
-            .lock()
-            .expect("peers_reloader lock poisoned") = Some(reloader);
+            .lock_state("peers_reloader lock poisoned") = Some(reloader);
     }
 
     /// Registers an async closure invoked whenever `"type": "peers.reload"` arrives on
@@ -1141,8 +1150,7 @@ impl LocalDaemon {
     pub fn add_wake_hook(&self, hook: Arc<dyn WakeHook>) {
         self.inner
             .wake_hooks
-            .lock()
-            .expect("wake_hooks lock poisoned")
+            .lock_state("wake_hooks lock poisoned")
             .push(hook);
     }
 
@@ -1204,14 +1212,12 @@ impl LocalDaemon {
         }
         self.inner
             .bridge_posters
-            .lock()
-            .expect("bridge_posters lock poisoned")
+            .lock_state("bridge_posters lock poisoned")
             .insert(key.clone(), poster);
         let mut cfg_targets = self
             .inner
             .configured_bridge_targets
-            .lock()
-            .expect("configured_bridge_targets lock poisoned");
+            .lock_state("configured_bridge_targets lock poisoned");
         cfg_targets.insert(key, clean_targets);
     }
 
@@ -1326,48 +1332,42 @@ impl LocalDaemon {
         });
         if let Some(h) = self
             .accept_task
-            .lock()
-            .expect("accept_task lock poisoned")
+            .lock_state("accept_task lock poisoned")
             .take()
         {
             h.abort();
         }
         if let Some(h) = self
             .inbox_task
-            .lock()
-            .expect("inbox_task lock poisoned")
+            .lock_state("inbox_task lock poisoned")
             .take()
         {
             h.abort();
         }
         if let Some(h) = self
             .startup_flush_task
-            .lock()
-            .expect("startup_flush_task lock poisoned")
+            .lock_state("startup_flush_task lock poisoned")
             .take()
         {
             h.abort();
         }
         if let Some(h) = self
             .projector_task
-            .lock()
-            .expect("projector_task lock poisoned")
+            .lock_state("projector_task lock poisoned")
             .take()
         {
             h.abort();
         }
         if let Some(h) = self
             .maintenance_task
-            .lock()
-            .expect("maintenance_task lock poisoned")
+            .lock_state("maintenance_task lock poisoned")
             .take()
         {
             h.abort();
         }
         if let Some(h) = self
             .wake_watcher_task
-            .lock()
-            .expect("wake_watcher_task lock poisoned")
+            .lock_state("wake_watcher_task lock poisoned")
             .take()
         {
             h.abort();
@@ -1980,8 +1980,7 @@ impl LocalDaemonInner {
         }
         let mut index = self
             .herdr_terminal_index
-            .lock()
-            .expect("herdr_terminal_index lock poisoned");
+            .lock_state("herdr_terminal_index lock poisoned");
         let list = index.entry(terminal_id.to_string()).or_default();
         list.retain(|existing| existing != session_id);
         list.insert(0, session_id.to_string());
@@ -2016,8 +2015,7 @@ impl LocalDaemonInner {
 
     fn session_runtime(&self) -> MutexGuard<'_, HashMap<String, SessionRuntime>> {
         self.session_runtime
-            .lock()
-            .expect("session_runtime lock poisoned")
+            .lock_state("session_runtime lock poisoned")
     }
 
     fn update_runtime<T>(
@@ -2401,8 +2399,7 @@ impl LocalDaemonInner {
         {
             let mut active = self
                 .active_cold_spawns
-                .lock()
-                .expect("active_cold_spawns lock poisoned");
+                .lock_state("active_cold_spawns lock poisoned");
             if !active.insert(spawn_key.to_string()) {
                 return PushOutcome::hold("herdr_spawn_already_active");
             }
@@ -2414,8 +2411,7 @@ impl LocalDaemonInner {
         impl Drop for ColdSpawnGuard<'_> {
             fn drop(&mut self) {
                 self.active
-                    .lock()
-                    .expect("active_cold_spawns lock poisoned")
+                    .lock_state("active_cold_spawns lock poisoned")
                     .remove(&self.spawn_key);
             }
         }
@@ -2443,13 +2439,11 @@ impl LocalDaemonInner {
         self.config.enable_plugins
             || !self
                 .bridge_posters
-                .lock()
-                .expect("bridge_posters lock poisoned")
+                .lock_state("bridge_posters lock poisoned")
                 .is_empty()
             || !self
                 .configured_bridge_targets
-                .lock()
-                .expect("configured_bridge_targets lock poisoned")
+                .lock_state("configured_bridge_targets lock poisoned")
                 .is_empty()
     }
 
@@ -2578,13 +2572,13 @@ impl LocalDaemonInner {
         };
         if !pruned.is_empty() {
             {
-                let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                let mut guard = self.item_meta.lock_state("item_meta lock poisoned");
                 for sid in &pruned {
                     guard.remove(sid);
                 }
             }
             {
-                let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+                let mut guard = self.sub_meta.lock_state("sub_meta lock poisoned");
                 for sid in &pruned {
                     guard.remove(sid);
                 }
@@ -2592,8 +2586,7 @@ impl LocalDaemonInner {
             {
                 let mut guard = self
                     .herdr_terminal_index
-                    .lock()
-                    .expect("herdr_terminal_index lock poisoned");
+                    .lock_state("herdr_terminal_index lock poisoned");
                 let pruned_set: HashSet<&str> = pruned.iter().map(String::as_str).collect();
                 guard.retain(|_, list| {
                     list.retain(|s| !pruned_set.contains(s.as_str()));
@@ -2603,8 +2596,7 @@ impl LocalDaemonInner {
             {
                 let mut guard = self
                     .hook_registered_sessions
-                    .lock()
-                    .expect("hook_registered_sessions lock poisoned");
+                    .lock_state("hook_registered_sessions lock poisoned");
                 for sid in &pruned {
                     guard.remove(sid);
                 }
@@ -2898,8 +2890,7 @@ impl LocalDaemonInner {
     async fn broadcast_wake_hooks(&self, slept_for: Duration) {
         let hooks: Vec<Arc<dyn WakeHook>> = self
             .wake_hooks
-            .lock()
-            .expect("wake_hooks lock poisoned")
+            .lock_state("wake_hooks lock poisoned")
             .clone();
         if hooks.is_empty() {
             return;
@@ -3097,8 +3088,7 @@ impl LocalDaemonInner {
         }
         let has_service = self
             .openclaw_service
-            .lock()
-            .expect("openclaw_service lock poisoned")
+            .lock_state("openclaw_service lock poisoned")
             .is_some();
         if !has_service {
             return false;
@@ -3204,8 +3194,7 @@ impl LocalDaemonInner {
     async fn wait_for_pending_probe(&self, session_id: &str) {
         let rx_opt = self
             .pending_probes
-            .lock()
-            .expect("pending_probes lock poisoned")
+            .lock_state("pending_probes lock poisoned")
             .get(session_id)
             .cloned();
         if let Some(mut rx) = rx_opt {
@@ -3256,7 +3245,7 @@ impl LocalDaemonInner {
         source: &str,
         pick: impl FnOnce(&SubscriptionRecordMeta) -> Option<T>,
     ) -> Option<T> {
-        let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+        let guard = self.sub_meta.lock_state("sub_meta lock poisoned");
         let list = guard.get(session_id)?;
         let src_low = source.to_ascii_lowercase();
         let origin_low = origin_node.to_ascii_lowercase();
@@ -3296,7 +3285,7 @@ impl LocalDaemonInner {
     }
 
     fn record_item_meta(&self, session_id: &str, receipt: String, meta: ClassifiedItemMeta) {
-        let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+        let mut guard = self.item_meta.lock_state("item_meta lock poisoned");
         guard
             .entry(session_id.to_string())
             .or_default()
@@ -3345,8 +3334,7 @@ impl LocalDaemonInner {
 
                 let already_dismissed = self
                     .dismissed_receipts
-                    .lock()
-                    .expect("dismissed lock poisoned")
+                    .lock_state("dismissed lock poisoned")
                     .contains(&entry.receipt);
                 if already_dismissed {
                     let db = self.node.db();
@@ -3379,13 +3367,13 @@ impl LocalDaemonInner {
                 if needs_gate {
                     // G3: Clear any stale cached classification before screening (e.g. after a
                     // coalesced UPDATE overwrote `text` and reset `reviewed_at` / `human_auth_json`).
-                    let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                    let mut guard = self.item_meta.lock_state("item_meta lock poisoned");
                     if let Some(map) = guard.get_mut(session_id) {
                         map.remove(&entry.receipt);
                     }
                 } else {
                     let existing_meta = {
-                        let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                        let mut guard = self.item_meta.lock_state("item_meta lock poisoned");
                         let cached = guard
                             .get(session_id)
                             .and_then(|m| m.get(&entry.receipt).cloned());
@@ -3490,7 +3478,7 @@ impl LocalDaemonInner {
                                         now,
                                     );
                                     let mut guard =
-                                        self.item_meta.lock().expect("item_meta lock poisoned");
+                                        self.item_meta.lock_state("item_meta lock poisoned");
                                     if let Some(map) = guard.get_mut(session_id) {
                                         map.remove(&entry.receipt);
                                     }
@@ -3506,7 +3494,7 @@ impl LocalDaemonInner {
                                         now,
                                     );
                                     let mut guard =
-                                        self.item_meta.lock().expect("item_meta lock poisoned");
+                                        self.item_meta.lock_state("item_meta lock poisoned");
                                     if let Some(map) = guard.get_mut(session_id) {
                                         map.remove(&entry.receipt);
                                     }
@@ -3544,7 +3532,7 @@ impl LocalDaemonInner {
                                     now,
                                 );
                                 let mut guard =
-                                    self.item_meta.lock().expect("item_meta lock poisoned");
+                                    self.item_meta.lock_state("item_meta lock poisoned");
                                 if let Some(map) = guard.get_mut(session_id) {
                                     map.remove(&entry.receipt);
                                 }
@@ -3816,8 +3804,7 @@ impl LocalDaemonInner {
 
         let meta_snapshot: HashMap<String, ClassifiedItemMeta> = self
             .item_meta
-            .lock()
-            .expect("item_meta lock poisoned")
+            .lock_state("item_meta lock poisoned")
             .get(session_id)
             .cloned()
             .unwrap_or_default();
@@ -4007,7 +3994,7 @@ impl LocalDaemonInner {
 
         let mut sources_delivered: HashSet<String> = HashSet::new();
         {
-            let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+            let mut guard = self.item_meta.lock_state("item_meta lock poisoned");
             if let Some(map) = guard.get_mut(session_id) {
                 for id in &batch.receipt_ids {
                     if let Some(m) = map.get_mut(id) {
@@ -4035,8 +4022,7 @@ impl LocalDaemonInner {
         let gate_active = self.current_gate().is_some();
         let meta_snapshot: HashMap<String, ClassifiedItemMeta> = self
             .item_meta
-            .lock()
-            .expect("item_meta lock poisoned")
+            .lock_state("item_meta lock poisoned")
             .get(session_id)
             .cloned()
             .unwrap_or_default();
@@ -4086,7 +4072,7 @@ impl LocalDaemonInner {
         };
 
         if !promoted.is_empty() {
-            let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+            let mut guard = self.item_meta.lock_state("item_meta lock poisoned");
             if let Some(map) = guard.get_mut(session_id) {
                 for receipt in &promoted {
                     map.remove(receipt);
@@ -4306,8 +4292,7 @@ impl LocalDaemonInner {
     async fn await_pending_probe_bounded(&self, session_id: &str, timeout: Duration) {
         let probe_rx = self
             .pending_probes
-            .lock()
-            .expect("pending_probes lock poisoned")
+            .lock_state("pending_probes lock poisoned")
             .get(session_id)
             .cloned();
         if let Some(mut rx) = probe_rx {
@@ -4340,8 +4325,7 @@ impl LocalDaemonInner {
         // If a probe is already running (e.g. startup rehydration), simply await it!
         let probe_in_flight = self
             .pending_probes
-            .lock()
-            .expect("pending_probes lock poisoned")
+            .lock_state("pending_probes lock poisoned")
             .contains_key(session_id);
         if probe_in_flight {
             self.await_pending_probe_bounded(session_id, Duration::from_secs(5))
@@ -4437,8 +4421,7 @@ impl LocalDaemonInner {
 
                     let probe_rx = daemon
                         .pending_probes
-                        .lock()
-                        .expect("pending_probes lock poisoned")
+                        .lock_state("pending_probes lock poisoned")
                         .get(&sid)
                         .cloned();
                     if let Some(mut rx) = probe_rx {
@@ -4610,8 +4593,7 @@ impl LocalDaemonInner {
             if !batch.notify_only && self.openclaw_plugin_wake_available_for(session_id) {
                 let oc_service_entry = self
                     .openclaw_service
-                    .lock()
-                    .expect("openclaw_service lock poisoned")
+                    .lock_state("openclaw_service lock poisoned")
                     .as_ref()
                     .map(|s| (s.conn_id, s.tx.clone()));
                 if let (Some((service_conn_id, tx)), Some((session_key, agent_id))) = (
@@ -4690,8 +4672,7 @@ impl LocalDaemonInner {
                         }
                         let still_connected = self
                             .openclaw_service
-                            .lock()
-                            .expect("openclaw_service lock poisoned")
+                            .lock_state("openclaw_service lock poisoned")
                             .as_ref()
                             .is_some_and(|s| s.conn_id == service_conn_id);
                         if still_connected {
@@ -4893,7 +4874,7 @@ impl LocalDaemonInner {
             // - Strictly enforces `maxConcurrentSpawns: 1` (`active_cold_spawns`) and uses a
             //   metadata-only `<hyphae-wake>` nudge (zero untrusted DM body in argv).
             let has_non_wake_deliverable = {
-                let guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                let guard = self.item_meta.lock_state("item_meta lock poisoned");
                 let map = guard.get(session_id);
                 batch.receipt_ids.iter().any(|receipt| {
                     !map.and_then(|m| m.get(receipt))
@@ -4994,10 +4975,7 @@ impl LocalDaemonInner {
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
         let action = args.get("action").and_then(Value::as_str).ok_or_else(|| {
-            (
-                "invalid_request".into(),
-                "Expected action: join | leave | peers | channels | status | drop_link".into(),
-            )
+            invalid_request("Expected action: join | leave | peers | channels | status | drop_link")
         })?;
         let has_channel = args
             .get("channel")
@@ -5012,12 +4990,9 @@ impl LocalDaemonInner {
             "leave" => self.tool_leave(session_id).await,
             "peers" => self.tool_peers(session_id).await,
             "status" => self.tool_capabilities(session_id).await,
-            other => Err((
-                "invalid_request".into(),
-                format!(
-                    "Invalid hyp_mesh action '{other}'. Expected: join | leave | peers | channels | status | drop_link"
-                ),
-            )),
+            other => Err(invalid_request(format!(
+                "Invalid hyp_mesh action '{other}'. Expected: join | leave | peers | channels | status | drop_link"
+            ))),
         }
     }
 
@@ -5035,10 +5010,9 @@ impl LocalDaemonInner {
             None | Some("directive") => "directive",
             Some("secret") => "secret",
             Some(other) => {
-                return Err((
-                    "invalid_request".into(),
-                    format!("Unsupported drop kind '{other}'. Expected 'secret' or 'directive'"),
-                ));
+                return Err(invalid_request(format!(
+                    "Unsupported drop kind '{other}'. Expected 'secret' or 'directive'"
+                )));
             }
         };
 
@@ -5046,45 +5020,37 @@ impl LocalDaemonInner {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => Some(s.as_str()),
             Some(_) => {
-                return Err(("invalid_request".into(), "Expected string 'draft'".into()));
+                return Err(invalid_request("Expected string 'draft'"));
             }
         };
         let context: Option<&str> = match args.get("context") {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) => Some(s.as_str()),
             Some(_) => {
-                return Err(("invalid_request".into(), "Expected string 'context'".into()));
+                return Err(invalid_request("Expected string 'context'"));
             }
         };
 
         // Fail-closed security invariant #1: secrets MUST NEVER carry draft/context prefill.
         if kind == "secret" && (draft.is_some() || context.is_some()) {
-            return Err((
-                "invalid_request".into(),
-                "Draft prefill is forbidden for secret drops; secrets must be entered fresh by the human"
-                    .into(),
+            return Err(invalid_request(
+                "Draft prefill is forbidden for secret drops; secrets must be entered fresh by the human",
             ));
         }
         if draft.is_none() && context.is_some() {
-            return Err((
-                "invalid_request".into(),
-                "Optional 'context' requires 'draft' for encrypted directive prefill".into(),
+            return Err(invalid_request(
+                "Optional 'context' requires 'draft' for encrypted directive prefill",
             ));
         }
         if let Some(draft_text) = draft {
-            validate_draft_text(draft_text)
-                .map_err(|e| ("invalid_request".into(), e.to_string()))?;
+            validate_draft_text(draft_text).map_err(|e| invalid_request(e.to_string()))?;
             if let Some(ctx_text) = context {
-                validate_draft_text(ctx_text)
-                    .map_err(|e| ("invalid_request".into(), e.to_string()))?;
+                validate_draft_text(ctx_text).map_err(|e| invalid_request(e.to_string()))?;
                 let ctx_chars = ctx_text.chars().count();
                 if ctx_chars > MAX_HUMAN_DRAFT_CONTEXT_CHARS {
-                    return Err((
-                        "invalid_request".into(),
-                        format!(
-                            "human draft context length {ctx_chars} exceeds maximum {MAX_HUMAN_DRAFT_CONTEXT_CHARS} chars"
-                        ),
-                    ));
+                    return Err(invalid_request(format!(
+                        "human draft context length {ctx_chars} exceeds maximum {MAX_HUMAN_DRAFT_CONTEXT_CHARS} chars"
+                    )));
                 }
             }
         }
@@ -5096,10 +5062,7 @@ impl LocalDaemonInner {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
-                    (
-                        "invalid_request".into(),
-                        "Expected non-empty 'secretName' when kind is 'secret'".into(),
-                    )
+                    invalid_request("Expected non-empty 'secretName' when kind is 'secret'")
                 })?;
             if is_reserved_drop_secret_name(raw_name) {
                 return Err((
@@ -5129,10 +5092,7 @@ impl LocalDaemonInner {
             Some(raw_handle) => {
                 let clean = raw_handle.strip_prefix('@').unwrap_or(raw_handle);
                 if !hyp_store::is_handle(clean) {
-                    return Err((
-                        "invalid_request".into(),
-                        format!("Invalid handle '{raw_handle}'"),
-                    ));
+                    return Err(invalid_request(format!("Invalid handle '{raw_handle}'")));
                 }
                 Some(clean.to_string())
             }
@@ -5149,12 +5109,9 @@ impl LocalDaemonInner {
         let ttl_seconds: u64 = match args.get("ttlSeconds") {
             None | Some(Value::Null) => 600,
             Some(v) => {
-                let n = v.as_u64().ok_or_else(|| {
-                    (
-                        "invalid_request".into(),
-                        "Expected positive integer 'ttlSeconds'".into(),
-                    )
-                })?;
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| invalid_request("Expected positive integer 'ttlSeconds'"))?;
                 n.clamp(60, 900)
             }
         };
@@ -5285,7 +5242,7 @@ impl LocalDaemonInner {
                 created_at: format_rfc3339_millis(now),
             };
             let sealed = seal_human_draft(&payload, &human_enc_pk)
-                .map_err(|e| ("invalid_request".into(), e.to_string()))?;
+                .map_err(|e| invalid_request(e.to_string()))?;
             Some(sealed)
         } else {
             None
@@ -5550,7 +5507,7 @@ impl LocalDaemonInner {
         let handle = args
             .get("handle")
             .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected handle".into()))?;
+            .ok_or_else(|| invalid_request("Expected handle"))?;
         let description = args.get("description").and_then(Value::as_str);
 
         // Wait for any in-flight transport probe BEFORE registering the handle so explicit
@@ -5837,12 +5794,10 @@ impl LocalDaemonInner {
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
-        let mode_raw = args.get("mode").and_then(Value::as_str).ok_or_else(|| {
-            (
-                "invalid_request".into(),
-                "Expected mode: 'queue' | 'notify'".into(),
-            )
-        })?;
+        let mode_raw = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_request("Expected mode: 'queue' | 'notify'"))?;
         let allow_vips = args.get("focusAllowInterruptVips").and_then(Value::as_bool);
         let extra_rules = parse_rules_arg(args)?;
 
@@ -5850,10 +5805,9 @@ impl LocalDaemonInner {
             "notify" => true,
             "queue" | "full" => false,
             other => {
-                return Err((
-                    "invalid_request".into(),
-                    format!("Expected mode 'queue' | 'full' | 'notify', got '{other}'"),
-                ));
+                return Err(invalid_request(format!(
+                    "Expected mode 'queue' | 'full' | 'notify', got '{other}'"
+                )));
             }
         };
 
@@ -5935,7 +5889,7 @@ impl LocalDaemonInner {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ("invalid_request".into(), "Expected mute target".into()))?;
+            .ok_or_else(|| invalid_request("Expected mute target"))?;
         let scope_arg = args
             .get("scope")
             .and_then(Value::as_str)
@@ -5975,7 +5929,7 @@ impl LocalDaemonInner {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ("invalid_request".into(), "Expected unmute target".into()))?;
+            .ok_or_else(|| invalid_request("Expected unmute target"))?;
         let scope_arg = args
             .get("scope")
             .and_then(Value::as_str)
@@ -6042,7 +5996,7 @@ impl LocalDaemonInner {
         let ch = args
             .get("channel")
             .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected channel name".into()))?;
+            .ok_or_else(|| invalid_request("Expected channel name"))?;
         let handle = self.require_session_handle(session_id)?;
         let resp = self
             .node
@@ -6061,7 +6015,7 @@ impl LocalDaemonInner {
         let ch = args
             .get("channel")
             .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected channel name".into()))?;
+            .ok_or_else(|| invalid_request("Expected channel name"))?;
         let handle = self.require_session_handle(session_id)?;
         let left = self
             .node
@@ -6080,12 +6034,12 @@ impl LocalDaemonInner {
         let ch = args
             .get("channel")
             .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected channel name".into()))?;
+            .ok_or_else(|| invalid_request("Expected channel name"))?;
         let text = args
             .get("text")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ("invalid_request".into(), "Expected non-empty text".into()))?;
+            .ok_or_else(|| invalid_request("Expected non-empty text"))?;
         let handle = self.require_session_handle(session_id)?;
         self.check_outbound_gate(session_id, ch, "to.hyphae.channel.v1", text)?;
         let res = self
@@ -6118,27 +6072,22 @@ impl LocalDaemonInner {
         let to = args
             .get("to")
             .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected destination 'to'".into()))?;
+            .ok_or_else(|| invalid_request("Expected destination 'to'"))?;
         let handle = self.require_session_handle(session_id)?;
 
         let reaction_present = match args.get("reaction") {
             None | Some(Value::Null) => false,
             Some(Value::String(_)) => true,
             Some(_) => {
-                return Err((
-                    "invalid_request".into(),
-                    "Expected string 'reaction'".into(),
-                ));
+                return Err(invalid_request("Expected string 'reaction'"));
             }
         };
 
         // File transfer path
         if let Some(files_val) = args.get("files").and_then(Value::as_array) {
             if reaction_present {
-                return Err((
-                    "invalid_request".into(),
-                    "Reactions are only supported on external chat bridge destinations (<bridge>:<target>)"
-                        .into(),
+                return Err(invalid_request(
+                    "Reactions are only supported on external chat bridge destinations (<bridge>:<target>)",
                 ));
             }
             let paths: Vec<PathBuf> = files_val
@@ -6147,16 +6096,10 @@ impl LocalDaemonInner {
                 .map(PathBuf::from)
                 .collect();
             if paths.is_empty() {
-                return Err((
-                    "invalid_request".into(),
-                    "Expected non-empty files array".into(),
-                ));
+                return Err(invalid_request("Expected non-empty files array"));
             }
             let (target_node, to_handle) = parse_address(to).ok_or_else(|| {
-                (
-                    "invalid_request".into(),
-                    "File transfers require <node>/<handle> destination".into(),
-                )
+                invalid_request("File transfers require <node>/<handle> destination")
             })?;
             let note = args.get("text").and_then(Value::as_str);
             if let Some(n) = note {
@@ -6190,12 +6133,9 @@ impl LocalDaemonInner {
 
         // Local bridge `<plugin>:<target>`
         if is_bridge_destination(to) {
-            let (raw_plugin, raw_target) = to.split_once(':').ok_or_else(|| {
-                (
-                    "invalid_request".into(),
-                    format!("Invalid bridge destination '{to}'"),
-                )
-            })?;
+            let (raw_plugin, raw_target) = to
+                .split_once(':')
+                .ok_or_else(|| invalid_request(format!("Invalid bridge destination '{to}'")))?;
             let (text, reaction) = parse_bridge_text_and_reaction(args)?;
             return self
                 .send_to_bridge(
@@ -6205,17 +6145,15 @@ impl LocalDaemonInner {
         }
 
         if reaction_present {
-            return Err((
-                "invalid_request".into(),
-                "Reactions are only supported on external chat bridge destinations (<bridge>:<target>)"
-                    .into(),
+            return Err(invalid_request(
+                "Reactions are only supported on external chat bridge destinations (<bridge>:<target>)",
             ));
         }
 
         let text = args
             .get("text")
             .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected 'text'".into()))?;
+            .ok_or_else(|| invalid_request("Expected 'text'"))?;
 
         // `#channel` or `<node>/#channel`
         if to.starts_with('#') || to.contains("/#") {
@@ -6415,8 +6353,7 @@ impl LocalDaemonInner {
                 };
                 let meta_map = self
                     .item_meta
-                    .lock()
-                    .expect("item_meta lock poisoned")
+                    .lock_state("item_meta lock poisoned")
                     .get(session_id)
                     .cloned()
                     .unwrap_or_default();
@@ -6461,7 +6398,7 @@ impl LocalDaemonInner {
         // reminder timer when unread queue traffic clears, and cancel any pending Tier 3 Hold retries.
         if result.acked_count > 0 {
             let any_queue_left = {
-                let mut guard = self.item_meta.lock().expect("item_meta lock poisoned");
+                let mut guard = self.item_meta.lock_state("item_meta lock poisoned");
                 guard.get_mut(session_id).is_some_and(|map| {
                     for item in &result.items {
                         map.remove(&item.receipt);
@@ -6508,9 +6445,8 @@ impl LocalDaemonInner {
             Some("subscribe") => self.tool_subscribe(session_id, args).await,
             Some("unsubscribe") => self.tool_unsubscribe(session_id, args).await,
             Some("list") => self.tool_subscriptions(session_id).await,
-            _ => Err((
-                "invalid_request".into(),
-                "Expected hyp_stream action: topics | subscribe | unsubscribe | list".into(),
+            _ => Err(invalid_request(
+                "Expected hyp_stream action: topics | subscribe | unsubscribe | list",
             )),
         }
     }
@@ -6596,7 +6532,7 @@ impl LocalDaemonInner {
             .get("topic")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ("invalid_request".into(), "Expected topic".into()))?;
+            .ok_or_else(|| invalid_request("Expected topic"))?;
         let (router, topic) = if args.contains_key("router") {
             (args.get("router").and_then(Value::as_str), raw_topic)
         } else if let Some((router, topic)) = raw_topic
@@ -6640,7 +6576,7 @@ impl LocalDaemonInner {
         // Reuse existing subscription ID if caller supplied matching `key` (in-memory or persisted).
         let existing_id = key.as_deref().and_then(|k| {
             let cached = {
-                let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+                let guard = self.sub_meta.lock_state("sub_meta lock poisoned");
                 guard
                     .get(session_id)
                     .and_then(|list| list.iter().find(|s| s.key.as_deref() == Some(k)))
@@ -6703,7 +6639,7 @@ impl LocalDaemonInner {
         }
 
         {
-            let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            let mut guard = self.sub_meta.lock_state("sub_meta lock poisoned");
             let list = guard.entry(session_id.to_string()).or_default();
             list.retain(|s| s.id != res.subscription.id);
             list.push(SubscriptionRecordMeta {
@@ -6737,7 +6673,7 @@ impl LocalDaemonInner {
 
     fn subscription_id_for_key(&self, session_id: &str, key: &str) -> String {
         let cached = {
-            let guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            let guard = self.sub_meta.lock_state("sub_meta lock poisoned");
             guard.get(session_id).and_then(|list| {
                 list.iter()
                     .find(|meta| meta.key.as_deref() == Some(key) || meta.id == key)
@@ -6769,7 +6705,7 @@ impl LocalDaemonInner {
                 .map_err(store_err_tuple)?
         };
         if removed || clear_cache_if_missing {
-            let mut guard = self.sub_meta.lock().expect("sub_meta lock poisoned");
+            let mut guard = self.sub_meta.lock_state("sub_meta lock poisoned");
             if let Some(list) = guard.get_mut(session_id) {
                 list.retain(|meta| meta.id != sub_id);
             }
@@ -6793,7 +6729,7 @@ impl LocalDaemonInner {
         } else if let Some(key) = key_arg {
             self.subscription_id_for_key(session_id, key)
         } else {
-            return Err(("invalid_request".into(), "Expected id or key".into()));
+            return Err(invalid_request("Expected id or key"));
         };
 
         let removed = self.delete_session_subscription(session_id, &sub_id, true)?;
@@ -6816,8 +6752,7 @@ impl LocalDaemonInner {
         };
         let meta_map: HashMap<String, SubscriptionRecordMeta> = self
             .sub_meta
-            .lock()
-            .expect("sub_meta lock poisoned")
+            .lock_state("sub_meta lock poisoned")
             .get(session_id)
             .map(|l| l.iter().map(|m| (m.id.clone(), m.clone())).collect())
             .unwrap_or_default();
@@ -6852,12 +6787,12 @@ impl LocalDaemonInner {
         let action = args
             .get("action")
             .and_then(Value::as_str)
-            .ok_or_else(|| ("invalid_request".into(), "Expected hyp_kv action".into()))?;
+            .ok_or_else(|| invalid_request("Expected hyp_kv action"))?;
         let namespace = args
             .get("namespace")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ("invalid_request".into(), "Expected namespace".into()))?;
+            .ok_or_else(|| invalid_request("Expected namespace"))?;
 
         let host_node = match args.get("node").and_then(Value::as_str) {
             Some(n) if !n.is_empty() => n.to_string(),
@@ -6872,7 +6807,7 @@ impl LocalDaemonInner {
                 let key = args
                     .get("key")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| ("invalid_request".into(), "Expected key".into()))?;
+                    .ok_or_else(|| invalid_request("Expected key"))?;
                 let entry = self
                     .node
                     .kv_get(&host_node, namespace, key)
@@ -6884,11 +6819,11 @@ impl LocalDaemonInner {
                 let key = args
                     .get("key")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| ("invalid_request".into(), "Expected key".into()))?;
+                    .ok_or_else(|| invalid_request("Expected key"))?;
                 let value = args
                     .get("value")
                     .cloned()
-                    .ok_or_else(|| ("invalid_request".into(), "Expected value".into()))?;
+                    .ok_or_else(|| invalid_request("Expected value"))?;
                 let write_model = match args.get("writeModel").and_then(Value::as_str) {
                     Some("shared") => WriteModel::Shared,
                     Some("allowlist") => WriteModel::Allowlist,
@@ -6939,7 +6874,7 @@ impl LocalDaemonInner {
                 let key = args
                     .get("key")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| ("invalid_request".into(), "Expected key".into()))?;
+                    .ok_or_else(|| invalid_request("Expected key"))?;
                 let expected_version = args.get("expectedVersion").and_then(Value::as_u64);
                 let res = self
                     .node
@@ -6957,10 +6892,9 @@ impl LocalDaemonInner {
                     .map_err(node_err_tuple)?;
                 Ok(json!({ "entries": entries }))
             }
-            other => Err((
-                "invalid_request".into(),
-                format!("Unsupported hyp_kv action '{other}'"),
-            )),
+            other => Err(invalid_request(format!(
+                "Unsupported hyp_kv action '{other}'"
+            ))),
         }
     }
 
@@ -6974,9 +6908,8 @@ impl LocalDaemonInner {
             Some("link") => self.tool_bridge_link(session_id, args).await,
             Some("unlink") => self.tool_bridge_unlink(session_id, args).await,
             Some("handoff") => self.tool_bridge_handoff(session_id, args).await,
-            _ => Err((
-                "invalid_request".into(),
-                "Expected hyp_bridge action: targets | link | unlink | handoff".into(),
+            _ => Err(invalid_request(
+                "Expected hyp_bridge action: targets | link | unlink | handoff",
             )),
         }
     }
@@ -6984,14 +6917,12 @@ impl LocalDaemonInner {
     async fn tool_bridge_targets(&self, session_id: &str) -> Result<Value, (String, String)> {
         let configured_snapshot: BTreeMap<String, Vec<String>> = self
             .configured_bridge_targets
-            .lock()
-            .expect("configured_bridge_targets lock poisoned")
+            .lock_state("configured_bridge_targets lock poisoned")
             .clone();
 
         let mut plugins: Vec<String> = self
             .bridge_posters
-            .lock()
-            .expect("bridge_posters lock poisoned")
+            .lock_state("bridge_posters lock poisoned")
             .keys()
             .cloned()
             .collect();
@@ -7088,8 +7019,7 @@ impl LocalDaemonInner {
     ) -> Result<(), (String, String)> {
         let cfg_guard = self
             .configured_bridge_targets
-            .lock()
-            .expect("configured_bridge_targets lock poisoned");
+            .lock_state("configured_bridge_targets lock poisoned");
         if let Some(allowed) = cfg_guard.get(plugin) {
             if allowed.iter().any(|t| t == target || t == "*") {
                 return Ok(());
@@ -7106,8 +7036,7 @@ impl LocalDaemonInner {
 
         let posters_guard = self
             .bridge_posters
-            .lock()
-            .expect("bridge_posters lock poisoned");
+            .lock_state("bridge_posters lock poisoned");
         if posters_guard.contains_key(plugin) {
             // Legacy test registration via `register_bridge_poster` without explicit target list.
             return Ok(());
@@ -7336,8 +7265,7 @@ impl LocalDaemonInner {
 
         let poster = self
             .bridge_posters
-            .lock()
-            .expect("bridge_posters lock poisoned")
+            .lock_state("bridge_posters lock poisoned")
             .get(&plugin)
             .cloned()
             .ok_or_else(|| {
@@ -7802,8 +7730,7 @@ async fn handle_connection<R, W>(
                         {
                             let mut guard = daemon
                                 .openclaw_service
-                                .lock()
-                                .expect("openclaw_service lock poisoned");
+                                .lock_state("openclaw_service lock poisoned");
                             *guard = Some(LiveOpenClawService {
                                 conn_id,
                                 tx: oc_wake_tx.clone(),
@@ -8036,8 +7963,7 @@ async fn handle_connection<R, W>(
     if is_openclaw_service {
         let mut guard = daemon
             .openclaw_service
-            .lock()
-            .expect("openclaw_service lock poisoned");
+            .lock_state("openclaw_service lock poisoned");
         if guard.as_ref().is_some_and(|s| s.conn_id == conn_id) {
             *guard = None;
             transport_changed = true;
@@ -8991,8 +8917,7 @@ fn handle_call_start(daemon: &LocalDaemonInner, packet: &Map<String, Value>) -> 
     daemon.clear_lazy_hydrate_cooldown(session_id);
     daemon
         .hook_registered_sessions
-        .lock()
-        .expect("hook_registered_sessions lock poisoned")
+        .lock_state("hook_registered_sessions lock poisoned")
         .insert(session_id.to_string());
     daemon.mark_session_active(session_id, harness);
     daemon.bump_ui_rev();
@@ -9453,8 +9378,7 @@ async fn handle_daemon_status(daemon: &Arc<LocalDaemonInner>) -> Value {
 async fn handle_peers_reload(daemon: &Arc<LocalDaemonInner>) -> Value {
     let custom = daemon
         .peers_reloader
-        .lock()
-        .expect("peers_reloader lock poisoned")
+        .lock_state("peers_reloader lock poisoned")
         .clone();
 
     let outcome = match custom {
@@ -9498,19 +9422,14 @@ fn parse_rules_arg(args: &Map<String, Value>) -> Result<Vec<DeliveryRule>, (Stri
         return Ok(Vec::new());
     };
     let Value::Array(items) = raw else {
-        return Err((
-            "invalid_request".into(),
-            "Expected 'rules' to be an array of { target, delivery }".into(),
+        return Err(invalid_request(
+            "Expected 'rules' to be an array of { target, delivery }",
         ));
     };
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let rule: DeliveryRule = serde_json::from_value(item.clone()).map_err(|e| {
-            (
-                "invalid_request".into(),
-                format!("Invalid delivery rule: {e}"),
-            )
-        })?;
+        let rule: DeliveryRule = serde_json::from_value(item.clone())
+            .map_err(|e| invalid_request(format!("Invalid delivery rule: {e}")))?;
         rule.validate().map_err(delivery_err_tuple)?;
         out.push(rule);
     }
@@ -9575,7 +9494,7 @@ fn parse_bridge_plugin_target(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| ("invalid_request".into(), "Expected target".into()))?;
+        .ok_or_else(|| invalid_request("Expected target"))?;
 
     let (plugin, target) = if let Some(p) = plugin_opt {
         (p.to_ascii_lowercase(), target_raw.to_string())
@@ -9583,14 +9502,11 @@ fn parse_bridge_plugin_target(
         let p_trim = p.trim().to_ascii_lowercase();
         let t_trim = t.trim();
         if p_trim.is_empty() || t_trim.is_empty() {
-            return Err((
-                "invalid_request".into(),
-                "Expected valid plugin and target".into(),
-            ));
+            return Err(invalid_request("Expected valid plugin and target"));
         }
         (p_trim, t_trim.to_string())
     } else {
-        return Err(("invalid_request".into(), "Expected plugin".into()));
+        return Err(invalid_request("Expected plugin"));
     };
 
     Ok((plugin, target))
@@ -9600,15 +9516,13 @@ const MAX_BRIDGE_REACTION_CHARS: usize = 32;
 
 fn validate_bridge_reaction(raw: &str) -> Result<&str, (String, String)> {
     if raw.chars().count() > MAX_BRIDGE_REACTION_CHARS {
-        return Err((
-            "invalid_request".into(),
-            format!("Reaction must be at most {MAX_BRIDGE_REACTION_CHARS} characters"),
-        ));
+        return Err(invalid_request(format!(
+            "Reaction must be at most {MAX_BRIDGE_REACTION_CHARS} characters"
+        )));
     }
     if raw.chars().any(char::is_control) {
-        return Err((
-            "invalid_request".into(),
-            "Reaction must not contain control characters".into(),
+        return Err(invalid_request(
+            "Reaction must not contain control characters",
         ));
     }
     Ok(raw)
@@ -9621,24 +9535,18 @@ fn parse_bridge_text_and_reaction(
         None | Some(Value::Null) => "",
         Some(Value::String(s)) => s.as_str(),
         Some(_) => {
-            return Err(("invalid_request".into(), "Expected string 'text'".into()));
+            return Err(invalid_request("Expected string 'text'"));
         }
     };
     let reaction = match args.get("reaction") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(validate_bridge_reaction(s.as_str())?),
         Some(_) => {
-            return Err((
-                "invalid_request".into(),
-                "Expected string 'reaction'".into(),
-            ));
+            return Err(invalid_request("Expected string 'reaction'"));
         }
     };
     if text.trim().is_empty() && reaction.is_none() {
-        return Err((
-            "invalid_request".into(),
-            "Expected non-empty 'text' or 'reaction'".into(),
-        ));
+        return Err(invalid_request("Expected non-empty 'text' or 'reaction'"));
     }
     Ok((text, reaction))
 }
@@ -9646,6 +9554,10 @@ fn parse_bridge_text_and_reaction(
 fn node_err_tuple(err: hyp_node::engine::NodeError) -> (String, String) {
     let problem = err.to_problem_details();
     (problem.error, problem.detail.unwrap_or(problem.title))
+}
+
+fn invalid_request(message: impl Into<String>) -> (String, String) {
+    ("invalid_request".into(), message.into())
 }
 
 fn store_err_tuple(err: hyp_store::StoreError) -> (String, String) {
@@ -10572,12 +10484,11 @@ async fn handle_inbox_wake_rpc(
     if let Some(ref r) = receipt {
         daemon
             .dismissed_receipts
-            .lock()
-            .expect("dismissed lock poisoned")
+            .lock_state("dismissed lock poisoned")
             .remove(r);
         daemon.clear_quarantine_notice(target_sid.as_deref(), r);
         if let Some(ref sid) = target_sid {
-            let mut guard = daemon.item_meta.lock().expect("item_meta lock poisoned");
+            let mut guard = daemon.item_meta.lock_state("item_meta lock poisoned");
             if let Some(map) = guard.get_mut(sid) {
                 map.remove(r);
             }
@@ -10945,8 +10856,7 @@ impl LocalDaemonInner {
             }
             let indexed_ids: Vec<String> = self
                 .herdr_terminal_index
-                .lock()
-                .expect("herdr_terminal_index lock poisoned")
+                .lock_state("herdr_terminal_index lock poisoned")
                 .get(terminal_id)
                 .cloned()
                 .unwrap_or_default();
@@ -11975,10 +11885,9 @@ fn parse_mute_ttl(value: Option<&Value>) -> Result<Option<u64>, (String, String)
             .filter(|secs| (1..=MAX_MUTE_TTL_SECS).contains(secs))
             .map(Some)
             .ok_or_else(|| {
-                (
-                    "invalid_request".into(),
-                    format!("Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}"),
-                )
+                invalid_request(format!(
+                    "Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}"
+                ))
             }),
     }
 }
