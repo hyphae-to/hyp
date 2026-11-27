@@ -2911,37 +2911,94 @@ async fn canonical_tools_keep_live_controls_shorthands_and_reject_retired_entrie
         true
     );
 
-    // A bare stored key is not an unsubscribe key: the public shorthand treats it as an ID.
-    let (bare, error) = mcp
+    let (other, error) = mcp
         .call_verified_claude(
             &sock,
             "canonical-session",
             "hyp_stream",
-            json!({"action":"subscribe","topic":"primary.schedule","key":"bare-key"}),
+            json!({"action":"subscribe","topic":"primary.schedule","key":"unrelated"}),
         )
         .await;
-    assert!(!error, "{bare}");
-    let bare: Value = serde_json::from_str(&bare).unwrap();
-    assert_eq!(bare["topic"], "schedule");
+    assert!(!error, "{other}");
+    let other: Value = serde_json::from_str(&other).unwrap();
+    assert_eq!(other["topic"], "schedule");
+
+    let mut previous_id = None;
+    for writer in ["claude:first", "claude:updated"] {
+        let filters = json!([
+            {"exact":{"subject":"game/board"}},
+            {"not":{"exact":{"writer":writer}}}
+        ]);
+        let (sub, error) = mcp
+            .call_verified_claude(
+                &sock,
+                "canonical-session",
+                "hyp_stream",
+                json!({"action":"subscribe","topic":"local.kv","key":"game-watch","filters":filters}),
+            )
+            .await;
+        assert!(!error, "{sub}");
+        let sub: Value = serde_json::from_str(&sub).unwrap();
+        if let Some(id) = &previous_id {
+            assert_eq!(&sub["id"], id);
+            assert_eq!(sub["outcome"], "updated");
+        } else {
+            assert_eq!(sub["outcome"], "created");
+            previous_id = Some(sub["id"].clone());
+        }
+
+        let (listed, error) = mcp
+            .call_verified_claude(
+                &sock,
+                "canonical-session",
+                "hyp_stream",
+                json!({"action":"list"}),
+            )
+            .await;
+        assert!(!error, "{listed}");
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        let subs = listed["subscriptions"].as_array().unwrap();
+        assert_eq!(subs.len(), 2);
+        let named = subs.iter().find(|entry| entry["id"] == sub["id"]).unwrap();
+        assert_eq!(named["key"], "game-watch");
+        assert_eq!(named["filters"], filters);
+    }
+
     let (removed, error) = mcp
         .call_verified_claude(
             &sock,
             "canonical-session",
             "hyp_stream",
-            json!({"action":"unsubscribe","key":"bare-key"}),
+            json!({"action":"unsubscribe","key":"game-watch"}),
         )
         .await;
     assert!(!error, "{removed}");
     assert_eq!(
         serde_json::from_str::<Value>(&removed).unwrap()["removed"],
-        false
+        true
     );
+
+    let (listed, error) = mcp
+        .call_verified_claude(
+            &sock,
+            "canonical-session",
+            "hyp_stream",
+            json!({"action":"list"}),
+        )
+        .await;
+    assert!(!error, "{listed}");
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    let subs = listed["subscriptions"].as_array().unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["id"], other["id"]);
+    assert_eq!(subs[0]["key"], "unrelated");
+
     let (removed, error) = mcp
         .call_verified_claude(
             &sock,
             "canonical-session",
             "hyp_stream",
-            json!({"action":"unsubscribe","id":bare["id"]}),
+            json!({"action":"unsubscribe","id":other["id"]}),
         )
         .await;
     assert!(!error, "{removed}");

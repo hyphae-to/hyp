@@ -59,7 +59,8 @@ Discover topics and manage CloudEvents v1.0 stream subscriptions (both local `lo
 | --- | --- | --- |
 | `action` *(required)* | `"topics" \| "subscribe" \| "unsubscribe" \| "list"` | Operation to perform |
 | `topic` | `string` | Qualified topic (e.g. `"local.schedule"`, `"public.hyphae.to.github"`) |
-| `key` | `string` | Optional stable subscription key |
+| `key` | `string` | Stable subscription key. Reuse it to update a subscription or remove it with `unsubscribe`. `list` shows stored keys. |
+| `id` | `string` | Subscription ID to remove with `unsubscribe` |
 | `filters` | `object[]` | CloudEvents Subscriptions API v1.0 filter objects (`exact`, `prefix`, `suffix`, `all`, `any`, `not`) |
 | `mode` | `"interrupt" \| "queue" \| "notify"` | Delivery urgency tier for matching events |
 | `coalesceSeconds` | `integer` (`0..=600`) | Coalescing window |
