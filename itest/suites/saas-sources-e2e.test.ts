@@ -1928,18 +1928,25 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
       404,
     );
 
-    // The SDK logs this from the listen callback, before the first signed POST.
-    const waitForWebhookListener = (plugin: string, url: string) => {
-      const log = path.join(sandbox.paths.hyphaeStateDir, "logs", `plugin-${plugin}.log`);
-      return waitUntil(
-        () => fs.existsSync(log) && fs.readFileSync(log, "utf8").includes(`${plugin} plugin webhook listening on ${url}`),
-        `${plugin} webhook listener at ${url}`,
+    const waitForWebhookListener = (plugin: string, port: number) =>
+      waitUntil(
+        () => new Promise<boolean>((resolve) => {
+          const socket = net.createConnection(port, "127.0.0.1");
+          const finish = (ready: boolean) => {
+            socket.destroy();
+            resolve(ready);
+          };
+          socket.setTimeout(250);
+          socket.once("connect", () => finish(true));
+          socket.once("error", () => finish(false));
+          socket.once("timeout", () => finish(false));
+        }),
+        `${plugin} webhook listener on 127.0.0.1:${port}`,
       );
-    };
 
     // 3. Verify Vercel HMAC-SHA1: 1-bit flip & wrong SHA-256 -> 401; valid SHA-1 -> 202!
     const vercelUrl = `http://127.0.0.1:${vercelPort}/vercel`;
-    await waitForWebhookListener("vercel", vercelUrl);
+    await waitForWebhookListener("vercel", vercelPort);
     const vercelPayload = {
       id: "evt_vrc_804",
       type: "deployment.error",
@@ -1963,7 +1970,7 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
 
     // 4. Verify Notion one-time `verification_token` handshake security (2nd hijack attempt -> 401!)
     const notionUrl = `http://127.0.0.1:${notionPort}/notion`;
-    await waitForWebhookListener("notion", notionUrl);
+    await waitForWebhookListener("notion", notionPort);
     const notionToken = "secret_NotionRealHandshakeToken_123456";
     sandbox.registerSecret("notion-verification-token", notionToken);
 
