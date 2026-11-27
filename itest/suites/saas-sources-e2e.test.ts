@@ -942,15 +942,14 @@ test("Sources E2E — webhook plugin: signed source events, expiry and body caps
     const sourceUrl = `http://127.0.0.1:${sourcePort}/webhook-source`;
     const nodeUrl = `http://127.0.0.1:${nodeWhPort}/webhook`;
 
-    // Wait for node webhook HTTP server to listen (404 on GET /webhook proves server is up).
+    // The HTTP listeners can respond before the daemon registers the bridge poster.
+    // Claude needs the capability advertised by the daemon when it discovers its MCP tools.
     await waitUntil(async () => {
-      try {
-        const ready = await Promise.all([fetch(nodeUrl), fetch(sourceUrl)]);
-        return ready.every((response) => response.status === 404);
-      } catch {
-        return false;
-      }
-    }, "node webhook plugin listening", 15_000);
+      const ready = await Promise.all([fetch(nodeUrl), fetch(sourceUrl)]);
+      if (!ready.every((response) => response.status === 404)) return false;
+      const caps = await hyp.daemonRpc({ type: "mcp.caps", id: 1 }, 1_000);
+      return caps?.result?.hasPlugins === true;
+    }, "webhook listeners and daemon bridge capability", 15_000);
 
     const shim = await LlmShimServer.start({
       sandbox,
