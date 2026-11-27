@@ -118,9 +118,12 @@ pub enum KvCommand {
         /// Writer identity (defaults to nodeId or "local")
         #[arg(long)]
         writer: Option<String>,
-        /// Optional TTL in seconds
+        /// Renew expiry from now. Omit to preserve an existing expiry.
         #[arg(long)]
         ttl_seconds: Option<i64>,
+        /// Remove the entry's expiry
+        #[arg(long, conflicts_with = "ttl_seconds")]
+        clear_ttl: bool,
         /// Host node ID (defaults to this node)
         #[arg(long, default_value = "local")]
         node: String,
@@ -220,6 +223,7 @@ pub fn run_kv(command: KvCommand) -> crate::ui::CommandResult {
             allowlist,
             writer,
             ttl_seconds,
+            clear_ttl,
             node,
             state_dir,
             json,
@@ -236,6 +240,7 @@ pub fn run_kv(command: KvCommand) -> crate::ui::CommandResult {
                 allowlist,
                 writer,
                 ttl_seconds,
+                clear_ttl,
                 node,
                 state_dir,
                 json,
@@ -595,6 +600,7 @@ fn run_kv_set(
     allowlist: Option<Vec<String>>,
     writer: Option<String>,
     ttl_seconds: Option<i64>,
+    clear_ttl: bool,
     node: String,
     state_dir: Option<PathBuf>,
     as_json: bool,
@@ -610,7 +616,10 @@ fn run_kv_set(
         Some(s) if s <= 0 => {
             return Err(CliError::usage("INVALID_TTL", "--ttl-seconds must be > 0"));
         }
-        Some(s) => Some(s.saturating_mul(1000)),
+        Some(s) => Some(
+            s.checked_mul(1000)
+                .ok_or_else(|| CliError::usage("INVALID_TTL", "--ttl-seconds is too large"))?,
+        ),
         None => None,
     };
 
@@ -623,6 +632,7 @@ fn run_kv_set(
         writer,
         expected_version,
         ttl_ms,
+        clear_ttl,
     };
     match execute_kv(&node, &ns, action, state_dir.as_deref()) {
         Ok(LocalKvResponse::Set(entry)) => {

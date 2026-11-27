@@ -873,6 +873,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: None,
                 signature: None,
                 ttl_ms: Some(10_000),
+                clear_ttl: false,
             },
             t0,
         )
@@ -898,6 +899,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: None,
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             t0 + 100,
         )
@@ -921,6 +923,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: Some(1),
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             t0 + 200,
         )
@@ -944,6 +947,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: Some(1),
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             t0 + 300,
         )
@@ -971,6 +975,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: Some(1),
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             t0 + 400,
         )
@@ -1022,6 +1027,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: None,
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             t0 + 500,
         )
@@ -1043,6 +1049,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: None,
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             t0 + 600,
         )
@@ -1064,6 +1071,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: None,
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             t0 + 700,
         ),
@@ -1106,6 +1114,7 @@ fn kv_write_models_cas_ttl_epochs_and_atomic_cloudevent_emission() {
                 e2ee_epoch: None,
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             t0 + 900,
         )
@@ -1598,6 +1607,93 @@ fn peers_manifest_anti_rollback_and_e2ee_anti_downgrade() {
 }
 
 #[test]
+fn kv_set_preserves_renews_and_clears_absolute_expiration_atomically() {
+    let db = NodeDb::open_in_memory().unwrap();
+    let kv = db.kv();
+    let t0 = 1_700_000_000_000;
+    let mut write = KvSetInput {
+        host_node: "local".into(),
+        namespace: "cache".into(),
+        key: "lease".into(),
+        value: json!(1),
+        content_type: None,
+        write_model: WriteModel::Shared,
+        owner_id: None,
+        allowlist: None,
+        writer_id: "alice".into(),
+        expected_version: Some(0),
+        e2ee_epoch: None,
+        signature: None,
+        ttl_ms: Some(1000),
+        clear_ttl: false,
+    };
+    let initial = kv.set(&write, t0).unwrap().entry;
+    assert_eq!(initial.expires_at, Some(t0 + 1000));
+
+    write.expected_version = Some(1);
+    write.value = json!(2);
+    write.ttl_ms = None;
+    let updated = kv.set(&write, t0 + 100).unwrap().entry;
+    assert_eq!(updated.version, 2);
+    assert_eq!(updated.expires_at, initial.expires_at);
+
+    write.clear_ttl = true;
+    assert!(matches!(
+        kv.set(&write, t0 + 200),
+        Err(StoreError::VersionConflict { current_version: 2 })
+    ));
+    let stored = kv
+        .get("local", "cache", "lease", t0 + 200)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, updated);
+
+    write.expected_version = Some(2);
+    write.ttl_ms = Some(1000);
+    assert!(matches!(
+        kv.set(&write, t0 + 300),
+        Err(StoreError::InvalidInput(_))
+    ));
+    write.clear_ttl = false;
+    write.ttl_ms = Some(i64::MAX);
+    assert!(matches!(
+        kv.set(&write, t0 + 300),
+        Err(StoreError::InvalidInput(_))
+    ));
+
+    write.ttl_ms = Some(1000);
+    let renewed = kv.set(&write, t0 + 300).unwrap().entry;
+    assert_eq!(renewed.expires_at, Some(t0 + 1300));
+    assert!(
+        kv.get("local", "cache", "lease", t0 + 1000)
+            .unwrap()
+            .is_some()
+    );
+    write.expected_version = Some(3);
+    write.ttl_ms = None;
+    write.clear_ttl = true;
+    let cleared = kv.set(&write, t0 + 1100).unwrap().entry;
+    assert_eq!(cleared.expires_at, None);
+    assert_eq!(
+        kv.get("local", "cache", "lease", t0 + 1300).unwrap(),
+        Some(cleared)
+    );
+
+    write.key = "fresh".into();
+    write.expected_version = Some(0);
+    write.clear_ttl = false;
+    assert_eq!(kv.set(&write, t0 + 1300).unwrap().entry.expires_at, None);
+
+    write.key = "recreated".into();
+    write.ttl_ms = Some(100);
+    kv.set(&write, t0).unwrap();
+    write.ttl_ms = None;
+    let recreated = kv.set(&write, t0 + 100).unwrap().entry;
+    assert_eq!(recreated.version, 1);
+    assert_eq!(recreated.expires_at, None);
+}
+
+#[test]
 fn scheduler_unifies_exact_earliest_deadline_across_all_subsystems() {
     let db = NodeDb::open_in_memory().unwrap();
     let t0 = 1_700_000_000_000i64;
@@ -1622,6 +1718,7 @@ fn scheduler_unifies_exact_earliest_deadline_across_all_subsystems() {
                 e2ee_epoch: None,
                 signature: None,
                 ttl_ms: Some(5_000),
+                clear_ttl: false,
             },
             t0,
         )

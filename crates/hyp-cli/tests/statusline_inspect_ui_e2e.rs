@@ -1335,6 +1335,7 @@ async fn inspect_watch_pushes_kv_metadata_and_expiry_without_sessions() {
         allowlist: None,
         expected_version: None,
         ttl_ms: Some(2000),
+        clear_ttl: false,
         encrypt: false,
         e2ee_members: None,
     })

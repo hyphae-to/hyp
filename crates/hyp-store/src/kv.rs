@@ -47,8 +47,11 @@ pub struct KvSetInput {
     pub e2ee_epoch: Option<u64>,
     /// Optional Ed25519 writer signature over the entry.
     pub signature: Option<String>,
-    /// Optional TTL in milliseconds from `now_ms`.
+    /// New TTL in milliseconds from `now_ms`. Omission preserves a live entry's expiration.
     pub ttl_ms: Option<i64>,
+    /// Remove the expiration. Mutually exclusive with `ttl_ms`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_ttl: bool,
 }
 
 /// Input to delete a Shared KV entry.
@@ -163,13 +166,20 @@ impl<'a> KvStore<'a> {
                 "invalid content_type '{content_type}'"
             )));
         }
-        if let Some(ttl) = input.ttl_ms {
-            if ttl <= 0 {
+        let renewed_expiration = match input.ttl_ms {
+            Some(_) if input.clear_ttl => {
                 return Err(StoreError::InvalidInput(
-                    "ttl_ms must be positive".to_string(),
+                    "ttl_ms and clear_ttl are mutually exclusive".into(),
                 ));
             }
-        }
+            Some(ttl) if ttl <= 0 => {
+                return Err(StoreError::InvalidInput("ttl_ms must be positive".into()));
+            }
+            Some(ttl) => Some(now_ms.checked_add(ttl).ok_or_else(|| {
+                StoreError::InvalidInput("ttl_ms produces an out-of-range expiration".into())
+            })?),
+            None => None,
+        };
         let value_json = serde_json::to_string(&input.value)?;
         if value_json.len() > MAX_KV_VALUE_BYTES {
             return Err(StoreError::TooLarge(format!(
@@ -177,8 +187,6 @@ impl<'a> KvStore<'a> {
                 value_json.len()
             )));
         }
-        let expires_at = input.ttl_ms.map(|ttl| now_ms + ttl);
-
         let tx = self.db.immediate_tx()?;
 
         let existing: Option<KvEntry> = query_opt(
@@ -190,6 +198,11 @@ impl<'a> KvStore<'a> {
 
         // Treat expired entries as absent so TTL expiry is consistent across get/set/delete.
         let live_existing = existing.filter(|e| e.expires_at.is_none_or(|exp| exp > now_ms));
+        let expires_at = if input.clear_ttl {
+            None
+        } else {
+            renewed_expiration.or_else(|| live_existing.as_ref().and_then(|entry| entry.expires_at))
+        };
 
         let (next_version, final_write_model, final_owner, final_allowlist, created_at) =
             if let Some(prev) = live_existing {

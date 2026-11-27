@@ -941,6 +941,7 @@ fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
                     e2ee_epoch: None,
                     signature: None,
                     ttl_ms: None,
+                    clear_ttl: false,
                 },
                 now_ms(),
             )
@@ -993,6 +994,95 @@ fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
     let (status, missing) = kv(&["get", "--key", "ambiguous-key"]);
     assert_eq!(status, Some(1), "{missing}");
     assert_eq!(missing["error"]["code"], "NOT_FOUND");
+}
+
+#[test]
+fn kv_cli_and_mcp_preserve_and_clear_ttl_across_daemon_and_offline_writes() {
+    let mut daemon = start_native_rust_daemon();
+    let home = daemon.tmp.path();
+    let state = daemon.state_dir.to_str().unwrap();
+    let socket = daemon.socket_path.as_deref().unwrap();
+    let cli_set = |extra: &[&str]| {
+        let output = isolated_cmd(home)
+            .args([
+                "kv", "set", "--ns", "shared", "--key", "lease", "--value", "1",
+            ])
+            .args(["--state-dir", state, "--json"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        common::parse_json_stdout(&output)["data"].clone()
+    };
+
+    let initial = cli_set(&["--ttl-seconds", "120"]);
+    let mut mcp = McpSubprocess::spawn(home, socket);
+    mcp.initialize(RPC_TIMEOUT);
+    let mcp_set = |mcp: &mut McpSubprocess, expiry: Value| {
+        let mut args =
+            json!({"action":"set","node":"local","namespace":"shared","key":"lease","value":2});
+        args.as_object_mut()
+            .unwrap()
+            .extend(expiry.as_object().unwrap().clone());
+        let (text, is_error) =
+            mcp.call_verified_claude(home, socket, "kv-ttl", "hyp_kv", args, RPC_TIMEOUT);
+        assert!(!is_error, "{text}");
+        serde_json::from_str::<Value>(&text).unwrap()["entry"].clone()
+    };
+    assert_eq!(
+        mcp_set(&mut mcp, json!({}))["expires_at"],
+        initial["expiresAt"]
+    );
+    for invalid_ttl in [
+        json!("60"),
+        json!(1.5),
+        json!(u64::MAX),
+        json!(null),
+        json!(0),
+    ] {
+        let (text, is_error) = mcp.call_verified_claude(
+            home,
+            socket,
+            "kv-ttl",
+            "hyp_kv",
+            json!({"action":"set","node":"local","namespace":"shared","key":"lease","value":999,"ttlMs":invalid_ttl}),
+            RPC_TIMEOUT,
+        );
+        assert!(is_error, "{text}");
+        assert!(text.contains("ttlMs must be a positive integer"), "{text}");
+    }
+    let output = isolated_cmd(home)
+        .args([
+            "kv",
+            "get",
+            "--ns",
+            "shared",
+            "--key",
+            "lease",
+            "--state-dir",
+            state,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let unchanged = common::parse_json_stdout(&output);
+    assert_eq!(unchanged["data"]["version"], 2);
+    assert_eq!(unchanged["data"]["value"], 2);
+    assert_eq!(unchanged["data"]["expiresAt"], initial["expiresAt"]);
+
+    let renewed = mcp_set(&mut mcp, json!({"ttlMs": 60_000}));
+    assert_eq!(
+        renewed["expires_at"].as_i64().unwrap() - renewed["updated_at"].as_i64().unwrap(),
+        60_000
+    );
+    assert!(mcp_set(&mut mcp, json!({"clearTtl": true}))["expires_at"].is_null());
+    let reset = cli_set(&["--ttl-seconds", "120"]);
+    assert_eq!(mcp.close(RPC_TIMEOUT), Some(0));
+    daemon.proc.shutdown_gracefully();
+
+    assert_eq!(cli_set(&[])["expiresAt"], reset["expiresAt"]);
+    assert!(cli_set(&["--clear-ttl"])["expiresAt"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1093,6 +1183,7 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
         allowlist: None,
         expected_version: None,
         ttl_ms: None,
+        clear_ttl: false,
         encrypt: true,
         e2ee_members: None,
     })
@@ -1241,6 +1332,7 @@ async fn kv_cli_authenticates_over_loopback_tcp() {
                 e2ee_epoch: Some(2),
                 signature: None,
                 ttl_ms: None,
+                clear_ttl: false,
             },
             hyp_store::now_ms(),
         )

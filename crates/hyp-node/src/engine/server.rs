@@ -1084,6 +1084,7 @@ async fn route_request(
                                     e2ee_epoch: body.e2ee_epoch,
                                     signature: body.signature,
                                     ttl_ms: body.ttl_ms,
+                                    clear_ttl: body.clear_ttl,
                                 },
                                 now_ms(),
                             )

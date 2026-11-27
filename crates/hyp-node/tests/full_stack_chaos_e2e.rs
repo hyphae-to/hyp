@@ -1647,6 +1647,7 @@ async fn chaos_kv_cas_thundering_herd_linearizability() {
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: true,
             e2ee_members: Some(all_members.clone()),
         })
@@ -1690,6 +1691,7 @@ async fn chaos_kv_cas_thundering_herd_linearizability() {
                     allowlist: None,
                     expected_version: Some(cur_ver),
                     ttl_ms: None,
+                    clear_ttl: false,
                     encrypt: true,
                     e2ee_members: Some(members),
                 })
@@ -1906,6 +1908,7 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
             allowlist: None,
             expected_version: None,
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })
@@ -1937,6 +1940,7 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
             allowlist: None,
             expected_version: None,
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })
@@ -1968,6 +1972,7 @@ async fn chaos_mid_session_grant_revocation_and_tampered_gate_policy() {
             allowlist: None,
             expected_version: None,
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })

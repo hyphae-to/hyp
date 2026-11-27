@@ -381,6 +381,7 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: true,
             e2ee_members: None, // auto-wrap for all active hub members!
         })
@@ -552,6 +553,7 @@ async fn delegated_human_admission_multi_device_e2ee_quota_hijack_and_cascade_re
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: true,
             e2ee_members: None,
         })

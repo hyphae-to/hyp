@@ -446,6 +446,8 @@ pub struct KvSetBody {
     pub signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_ttl: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

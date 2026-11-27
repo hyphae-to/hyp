@@ -512,6 +512,7 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })
@@ -537,6 +538,7 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })
@@ -551,23 +553,30 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
         other => panic!("expected 409 version_conflict, got {other:?}"),
     }
 
-    // Non-matching key (`deploys/billing/ignored`) MUST NOT wake Bob (dropped upstream by pushdown)!
-    alice
-        .kv_set(KvWriteRequest {
-            host_node: "acme-team".to_string(),
-            namespace: "deploys".to_string(),
-            key: "billing/ignored".to_string(),
-            value: json!({ "ignored": true }),
-            write_model: WriteModel::Shared,
-            owner_id: None,
-            allowlist: None,
-            expected_version: Some(0),
-            ttl_ms: None,
-            encrypt: false,
-            e2ee_members: None,
-        })
-        .await
-        .unwrap();
+    // Non-matching writes do not wake Bob and exercise TTL changes over peer HTTP.
+    let mut request = KvWriteRequest {
+        host_node: "acme-team".into(),
+        namespace: "deploys".into(),
+        key: "billing/ignored".into(),
+        value: json!({ "ignored": true }),
+        write_model: WriteModel::Shared,
+        owner_id: None,
+        allowlist: None,
+        expected_version: Some(0),
+        ttl_ms: Some(120_000),
+        clear_ttl: false,
+        encrypt: false,
+        e2ee_members: None,
+    };
+    let expiring = alice.kv_set(request.clone()).await.unwrap();
+    assert_eq!(expiring.expires_at, Some(expiring.updated_at + 120_000));
+    request.expected_version = Some(expiring.version);
+    request.ttl_ms = None;
+    let preserved = alice.kv_set(request.clone()).await.unwrap();
+    assert_eq!(preserved.expires_at, expiring.expires_at);
+    request.expected_version = Some(preserved.version);
+    request.clear_ttl = true;
+    assert_eq!(alice.kv_set(request).await.unwrap().expires_at, None);
 
     // E2EE KV write (`kv.e2ee.v1`) on matching key `deploys/checkout/secret_cfg`:
     let kv_secret = "TOPSECRET-KV-DATABASE-PASSWORD-8899";
@@ -582,6 +591,7 @@ async fn three_node_hub_e2ee_dm_channels_announcements_kv_and_transfers() {
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: true,
             e2ee_members: Some(vec!["alice@macbook".to_string(), "bob@laptop".to_string()]),
         })
@@ -705,6 +715,7 @@ async fn direct_two_node_p2p_hp2p1_asymmetric_scopes_and_public_manifest_isolati
             allowlist: None,
             expected_version: None,
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })
@@ -863,6 +874,7 @@ async fn direct_two_node_p2p_hp2p1_asymmetric_scopes_and_public_manifest_isolati
             allowlist: None,
             expected_version: None,
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })
@@ -1240,6 +1252,7 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: true,
             e2ee_members: None,
         })
@@ -1258,6 +1271,7 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
             allowlist: None,
             expected_version: None,
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })
@@ -1318,6 +1332,7 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
             allowlist: None,
             expected_version: None,
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: false,
             e2ee_members: None,
         })
@@ -1399,6 +1414,7 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: true,
             e2ee_members: None,
         })
@@ -1430,6 +1446,7 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
             allowlist: None,
             expected_version: Some(0),
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: true,
             e2ee_members: None,
         })
