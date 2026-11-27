@@ -5,6 +5,7 @@
 //! signed manifests with anti-rollback/anti-downgrade, and `am2_` / `hp2p1_` pairing.
 
 pub mod config;
+pub mod drop_client;
 pub mod drop_relay;
 pub mod http_fetch;
 pub mod http_util;

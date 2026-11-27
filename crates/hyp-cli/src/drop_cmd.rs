@@ -264,46 +264,9 @@ pub fn run_relay(command: RelayCommand) -> CommandResult {
 }
 
 /// Validates a Drop Relay base URL fail-closed: permits strictly `https://` or loopback
-/// `http://127.0.0.1` / `http://localhost` / `http://[::1]`, with no userinfo, query, or fragment.
+/// `http://127.0.0.1` / `http://localhost`, with no userinfo, query, or fragment.
 pub(crate) fn validate_relay_url(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err("Drop Relay URL cannot be empty".to_string());
-    }
-    if trimmed.contains('#') || trimmed.contains('?') {
-        return Err("Drop Relay URL must not contain query parameters or fragments".to_string());
-    }
-    let uri: http::Uri = trimmed
-        .parse()
-        .map_err(|e| format!("invalid Drop Relay URL '{trimmed}': {e}"))?;
-    let scheme = uri
-        .scheme_str()
-        .ok_or_else(|| format!("Drop Relay URL '{trimmed}' must include https:// scheme"))?;
-    let auth = uri
-        .authority()
-        .ok_or_else(|| format!("Drop Relay URL '{trimmed}' is missing a host"))?;
-    if auth.as_str().contains('@') {
-        return Err("Drop Relay URL must not include embedded credentials".to_string());
-    }
-    let host = auth.host().to_ascii_lowercase();
-    if host.is_empty() {
-        return Err("Drop Relay URL host cannot be empty".to_string());
-    }
-    match scheme {
-        "https" => Ok(trimmed.to_string()),
-        "http" => {
-            if is_loopback_host(&host) {
-                Ok(trimmed.to_string())
-            } else {
-                Err(format!(
-                    "refusing insecure http:// Drop Relay URL '{trimmed}'; use https:// (only loopback http://127.0.0.1 or http://localhost is permitted)"
-                ))
-            }
-        }
-        other => Err(format!(
-            "unsupported Drop Relay URL scheme '{other}' (expected https://)"
-        )),
-    }
+    hyp_node::engine::drop_client::validate_relay_url(raw).map_err(|error| error.detailed)
 }
 
 fn is_loopback_host(host: &str) -> bool {

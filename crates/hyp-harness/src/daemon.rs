@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use http::{Method, Request, Uri};
+use http::{Method, Request};
 use http_body_util::BodyExt;
 use hyp_crypto::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::human::{
@@ -9571,55 +9571,8 @@ fn delivery_err_tuple(err: hyp_node::delivery::DeliveryError) -> (String, String
 /// Validates a Drop Relay base URL matching `site/drop/drop.js` `isAllowedRelayUrl`:
 /// permits `https://...` or loopback `http://127.0.0.1[:port]` / `http://localhost[:port]` only.
 fn validate_drop_relay_url(raw: &str) -> Result<String, (String, String)> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty()
-        || trimmed.bytes().any(|b| b <= 0x20 || b == 0x7f)
-        || trimmed.contains('#')
-        || trimmed.contains('?')
-    {
-        return Err((
-            "invalid_relay_url".into(),
-            "Drop Relay URL must use https:// (or loopback http://127.0.0.1 / http://localhost)"
-                .into(),
-        ));
-    }
-    let uri: Uri = trimmed.parse().map_err(|_| {
-        (
-            "invalid_relay_url".into(),
-            "Drop Relay URL is not a valid URI".into(),
-        )
-    })?;
-    let scheme = uri.scheme_str().unwrap_or_default();
-    let authority = uri.authority().ok_or_else(|| {
-        (
-            "invalid_relay_url".into(),
-            "Drop Relay URL is missing a valid host".into(),
-        )
-    })?;
-    if authority.as_str().contains('@') {
-        return Err((
-            "invalid_relay_url".into(),
-            "Drop Relay URL must not contain userinfo credentials".into(),
-        ));
-    }
-    let host = authority.host();
-    if host.is_empty() {
-        return Err((
-            "invalid_relay_url".into(),
-            "Drop Relay URL is missing a valid host".into(),
-        ));
-    }
-    let allowed = scheme.eq_ignore_ascii_case("https")
-        || (scheme.eq_ignore_ascii_case("http")
-            && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost")));
-    if !allowed {
-        return Err((
-            "invalid_relay_url".into(),
-            "Drop Relay URL must use https:// (or loopback http://127.0.0.1 / http://localhost)"
-                .into(),
-        ));
-    }
-    Ok(trimmed.to_string())
+    hyp_node::engine::drop_client::validate_relay_url(raw)
+        .map_err(|error| ("invalid_relay_url".to_string(), error.compact))
 }
 
 fn parse_drop_payload_bytes(bytes: &[u8]) -> Result<HumanDropEnvelopeV1, String> {
