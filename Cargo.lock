@@ -520,10 +520,12 @@ version = "0.7.0"
 dependencies = [
  "base64",
  "hyp-crypto",
+ "hyp-delivery-digest",
  "hyp-harness-ipc",
  "hyp-harness-transport",
  "hyp-node",
  "hyp-proto",
+ "hyp-session-view",
  "hyp-store",
  "ring",
  "rusqlite",
@@ -531,6 +533,16 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "hyp-delivery-digest"
+version = "0.7.0"
+dependencies = [
+ "hyp-store",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -633,6 +645,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyp-crypto",
+ "hyp-delivery-digest",
  "hyp-proto",
  "hyp-store",
  "hyper",
@@ -678,6 +691,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "hyp-session-view"
+version = "0.7.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

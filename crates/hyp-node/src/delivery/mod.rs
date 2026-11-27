@@ -5,7 +5,7 @@
 
 pub mod burst;
 pub mod inbox_query;
-pub mod packer;
+pub use hyp_delivery_digest::packer;
 pub mod policy;
 
 use std::collections::HashMap;

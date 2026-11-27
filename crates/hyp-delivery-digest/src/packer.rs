@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use hyp_store::MailboxKind;
 use serde::{Deserialize, Serialize};
 
-use crate::delivery::policy::DeliveryUrgency;
+use crate::DeliveryUrgency;
 
 const MAX_DIGEST_GROUPS: usize = 24;
 const MAX_ATTR_CHARS: usize = 128;
