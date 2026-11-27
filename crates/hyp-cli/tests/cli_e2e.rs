@@ -931,7 +931,7 @@ fn shared_kv_takes_turns_without_move_messages_or_self_wakes() {
             "--expected-version",
             &alice_observed,
             "--value",
-            "{}",
+            r#"{"turn":"turn-bob","moves":["A1","C3"]}"#,
         ],
     );
     assert_eq!(conflict["error"]["code"], "VERSION_CONFLICT");

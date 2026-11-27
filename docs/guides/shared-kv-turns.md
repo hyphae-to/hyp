@@ -6,7 +6,7 @@ Two agents on one running Hyphae node can use a Shared KV entry as the board and
 
 Join the two sessions as `turn-alice` and `turn-bob` with `hyp_mesh({ "action": "join", "handle": "..." })`. Use the session's normal wake transport. For a standalone session without an attached wake transport, arm `hyp wait` before the peer writes and re-arm it after each wake.
 
-In Alice's session, call `hyp_stream` with:
+Use these `hyp_stream` arguments in Alice's session.
 
 ```json
 {
@@ -27,7 +27,7 @@ On one node, use `hyp kv set --writer` with distinct local labels. MCP `hyp_kv` 
 
 ## Play from the latest observed version
 
-After both subscriptions are ready, Alice sets up the board with the first move:
+After both subscriptions are ready, Alice sets up the board with the first move.
 
 ```sh
 hyp kv set --ns turns --key board --write-model shared --writer turn-alice \
@@ -37,14 +37,21 @@ hyp kv set --ns turns --key board --write-model shared --writer turn-alice \
 
 Bob gets a `local.kv` inbox digest. Call `hyp_inbox({})` and parse the matching item's `text` as a stream batch. A `to.hyphae.kv.set` event in `events` carries the observed version in `data.version` and the board in `data.value` when the value fits inline. When the value is absent, read it with `hyp kv get --ns turns --key board --json` and use the returned `data.value` and `data.version` together.
 
-Act only when the board's `turn` names your session. Append your move, hand the turn to the other session, and pass the version you observed as `--expected-version`. Bob's reply to version 1 is:
+Act only when the board's `turn` names your session. Append your move, hand the turn to the other session, and pass the version you observed as `--expected-version`. Bob's reply uses version 1.
 
 ```sh
 hyp kv set --ns turns --key board --writer turn-bob --expected-version 1 --json \
   --value '{"turn":"turn-alice","moves":["A1","B2"]}'
 ```
 
-Alice now wakes from the version 2 event. If two writes propose changes from version 1, the first committed write wins and the stale write returns `VERSION_CONFLICT`. Re-read the board, check whose turn it is, and recompute any still-valid move from the current board. For example, if Alice sees version 2 and it is her turn:
+Alice wakes from the version 2 event. To exercise a race between proposals based on the same version, intentionally submit a stale proposal after Bob's commit.
+
+```sh
+hyp kv set --ns turns --key board --writer turn-alice --expected-version 1 --json \
+  --value '{"turn":"turn-bob","moves":["A1","C3"]}'
+```
+
+This returns `VERSION_CONFLICT`. Re-read the board, check whose turn it is, and recompute any still-valid move from the current board. Alice's valid proposal uses version 2.
 
 ```sh
 hyp kv set --ns turns --key board --writer turn-alice --expected-version 2 --json \
@@ -53,7 +60,7 @@ hyp kv set --ns turns --key board --writer turn-alice --expected-version 2 --jso
 
 ## Clean up
 
-Each session removes its own subscription with `hyp_stream({ "action": "unsubscribe", "id": "..." })` using its saved ID. The key expires five minutes after creation. If you finish early, read the version and delete the board with that version, for example:
+Each session removes its own subscription with `hyp_stream({ "action": "unsubscribe", "id": "..." })` using its saved ID. The key expires five minutes after creation. If you finish early, read the version and delete the board with that version. This deletes version 3.
 
 ```sh
 hyp kv delete --ns turns --key board --writer turn-alice --expected-version 3 --json
