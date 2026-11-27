@@ -7,7 +7,9 @@
 //! `openclaw`, `herdr`, `t3`).
 
 use crate::call_registry::is_valid_session_id;
-use crate::protocol::{HarnessKind, UNTRUSTED_PROVENANCE, normalize_mesh_tool_name};
+use crate::protocol::{
+    HarnessKind, TransportHintFields, UNTRUSTED_PROVENANCE, normalize_mesh_tool_name,
+};
 use crate::sock::{DEFAULT_HOOK_TIMEOUT, DaemonRpcResult, daemon_rpc_sync};
 use crate::transport::openclaw::{
     canonical_openclaw_session_id, parse_openclaw_agent_id_from_session_key,
@@ -368,6 +370,7 @@ fn insert_transport_hints(
     payload: &Map<String, Value>,
     hints: &HookTransportHints,
 ) -> bool {
+    let mut fields = TransportHintFields::default();
     let mut added = false;
     if harness != HarnessKind::Openclaw {
         let herdr_tid = hints.herdr_terminal_id.as_deref().or_else(|| {
@@ -380,7 +383,7 @@ fn insert_transport_hints(
                 .filter(|s| crate::transport::herdr::is_valid_terminal_id(s))
         });
         if let Some(tid) = herdr_tid {
-            pkt.insert("herdrTerminalId".into(), json!(tid));
+            fields.herdr_terminal_id = Some(tid.to_owned());
             added = true;
         }
         if let Some(created_ms) = payload
@@ -388,7 +391,7 @@ fn insert_transport_hints(
             .or_else(|| payload.get("herdrCreatedMs"))
             .and_then(Value::as_i64)
         {
-            pkt.insert("herdrCreatedMs".into(), json!(created_ms));
+            fields.herdr_created_ms = Some(created_ms);
             added = true;
         }
     } else if attach_openclaw_session_hints(pkt, payload) {
@@ -400,7 +403,7 @@ fn insert_transport_hints(
         .map(str::trim)
         .filter(|s| !s.is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control))
     {
-        pkt.insert("cwd".into(), json!(cwd));
+        fields.cwd = Some(cwd.to_owned());
     }
 
     if harness == HarnessKind::Codex {
@@ -413,27 +416,28 @@ fn insert_transport_hints(
             .map(|s| s.strip_prefix("codex:").unwrap_or(s).trim())
             .filter(|s| !s.is_empty());
         if let Some(tid) = raw_tid {
-            pkt.insert("codexThreadId".into(), json!(tid));
+            fields.codex_thread_id = Some(tid.to_owned());
             added = true;
         }
     }
 
     if let Some(ref home) = hints.codex_home {
-        pkt.insert("codexHome".into(), json!(home));
+        fields.codex_home = Some(home.clone());
         added = true;
     }
     if let Some(ref remote) = hints.codex_remote {
-        pkt.insert("codexRemote".into(), json!(remote));
+        fields.codex_remote = Some(remote.clone());
         added = true;
     }
     if let Some(ref t3_dir) = hints.t3_base_dir {
-        pkt.insert("t3BaseDir".into(), json!(t3_dir));
+        fields.t3_base_dir = Some(t3_dir.clone());
         added = true;
     }
     if let Some(ref t3_url) = hints.t3_url {
-        pkt.insert("t3Url".into(), json!(t3_url));
+        fields.t3_url = Some(t3_url.clone());
         added = true;
     }
+    fields.write_into(pkt);
     added
 }
 

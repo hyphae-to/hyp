@@ -10,7 +10,7 @@
 //! - `--claude-channel` live push notifications (`notifications/claude/channel`) with
 //!   `channel.ready` / `channel.deliver` / `channel.ack` and automatic 1 s reconnect.
 
-use crate::protocol::{HarnessKind, normalize_mesh_tool_name};
+use crate::protocol::{HarnessKind, TransportHintFields, normalize_mesh_tool_name};
 use crate::sock::{
     DaemonReadHalf, DaemonWriteHalf, MAX_SOCKET_LINE_BYTES, connect_daemon_async,
     read_bounded_line_async, write_ndjson_line_async,
@@ -294,6 +294,7 @@ fn generate_uuid_v4() -> String {
 
 fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> Value {
     let mut pkt = Map::new();
+    let mut hints = TransportHintFields::default();
     pkt.insert("type".into(), json!("mcp.hello"));
     if let Some(backend) = options.backend {
         pkt.insert("backend".into(), json!(backend.as_str()));
@@ -321,7 +322,7 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
             if let Some(env_tid) = crate::ambient_env_var("CODEX_THREAD_ID") {
                 let trimmed = env_tid.trim();
                 if !trimmed.is_empty() {
-                    pkt.insert("codexThreadId".into(), json!(trimmed));
+                    hints.codex_thread_id = Some(trimmed.to_owned());
                 }
             }
         }
@@ -331,7 +332,7 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
     }
     if let Some(codex_home) = crate::ambient_env_var("CODEX_HOME") {
         if !codex_home.is_empty() {
-            pkt.insert("codexHome".into(), json!(codex_home));
+            hints.codex_home = Some(codex_home);
         }
     }
     if !pkt.contains_key("remote") {
@@ -347,23 +348,18 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
             pkt.insert("terminalId".into(), json!(term_id));
         }
     }
-    let t3_url = options.t3_url.clone().or_else(|| {
+    hints.t3_url = options.t3_url.clone().or_else(|| {
         crate::ambient_env_var("T3CODE_URL")
             .or_else(|| crate::ambient_env_var("T3_URL"))
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     });
-    if let Some(ref url) = t3_url {
-        pkt.insert("t3Url".into(), json!(url));
-    }
-    let t3_dir = options.t3_base_dir.clone().or_else(|| {
+    hints.t3_base_dir = options.t3_base_dir.clone().or_else(|| {
         crate::ambient_env_var("T3CODE_HOME")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     });
-    if let Some(dir) = t3_dir {
-        pkt.insert("t3BaseDir".into(), json!(dir));
-    }
+    hints.write_into(&mut pkt);
     Value::Object(pkt)
 }
 
