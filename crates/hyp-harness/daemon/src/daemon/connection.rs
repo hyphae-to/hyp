@@ -3,13 +3,12 @@
 use super::{
     ChannelDeliverCommand, DaemonStateLock, LiveChannel, LiveOpenClawService, LiveWaiter,
     LocalDaemonInner, OpenClawWakeAck, OpenClawWakeCommand, TransportHints, WaiterKind,
-    handle_call_start, handle_daemon_status, handle_drop_ingest_rpc, handle_gate_reload_rpc,
-    handle_inbox_wake_rpc, handle_mailbox_drain, handle_peers_reload, handle_session_focus,
-    handle_session_hint, handle_session_idle, handle_session_leave_channel, handle_session_mute,
-    handle_session_rule, handle_session_start, handle_session_status, handle_session_summary,
-    handle_session_unmute, handle_session_unsubscribe, handle_sessions_summary,
-    handle_system_wake_rpc, harness_natively_uses_hooks, maybe_spawn_transport_probe,
-    run_inspect_watch,
+    handle_call_start, handle_daemon_status, handle_gate_reload_rpc, handle_inbox_wake_rpc,
+    handle_mailbox_drain, handle_peers_reload, handle_session_focus, handle_session_hint,
+    handle_session_idle, handle_session_leave_channel, handle_session_mute, handle_session_rule,
+    handle_session_start, handle_session_status, handle_session_summary, handle_session_unmute,
+    handle_session_unsubscribe, handle_sessions_summary, handle_system_wake_rpc,
+    harness_natively_uses_hooks, maybe_spawn_transport_probe, run_inspect_watch,
 };
 use crate::call_registry::{
     CallerErrorCode, CallerResolution, DEFAULT_RESOLVE_WAIT, is_valid_session_id,
@@ -224,7 +223,7 @@ pub(super) async fn handle_connection<R, W>(
                     }),
                     "daemon.status" => Some(handle_daemon_status(&daemon).await),
                     "peers.reload" => Some(handle_peers_reload(&daemon).await),
-                    "drop.ingest" => Some(handle_drop_ingest_rpc(&daemon, &packet).await),
+                    "drop.ingest" => Some(daemon.handle_drop_ingest_rpc(&packet).await),
                     "gate.reload" => Some(handle_gate_reload_rpc(&daemon)),
                     "inbox.wake" => Some(handle_inbox_wake_rpc(&daemon, &packet).await),
                     "system.wake" => Some(handle_system_wake_rpc(&daemon, &packet).await),
