@@ -67,30 +67,43 @@ pub fn find_in_directory(dir: &Path, name: &Path, policy: PathSearchPolicy) -> O
             candidate.push(suffix);
             dir.join(candidate)
         };
-        let candidates = match policy.windows_suffixes {
-            WindowsSuffixes::None => Vec::new(),
-            WindowsSuffixes::ReplaceExe => vec![direct.with_extension("exe")],
-            WindowsSuffixes::AppendCommon => {
-                [".exe", ".cmd", ".bat"].iter().map(|s| append(s)).collect()
+        return match policy.windows_suffixes {
+            WindowsSuffixes::None => None,
+            WindowsSuffixes::ReplaceExe => {
+                let candidate = direct.with_extension("exe");
+                matches(&candidate).then_some(candidate)
             }
+            WindowsSuffixes::AppendCommon => [".exe", ".cmd", ".bat"]
+                .iter()
+                .map(|suffix| append(suffix))
+                .find(|path| matches(path)),
             WindowsSuffixes::ReplaceCommonIfMissing if name.extension().is_none() => {
                 ["exe", "cmd", "bat"]
                     .iter()
-                    .map(|s| direct.with_extension(s))
-                    .collect()
+                    .map(|suffix| direct.with_extension(suffix))
+                    .find(|path| matches(path))
             }
-            WindowsSuffixes::ReplaceCommonIfMissing => Vec::new(),
-            WindowsSuffixes::PathExt => std::env::var("PATHEXT")
-                .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string())
-                .split(';')
-                .filter(|s| !s.trim().is_empty())
-                .flat_map(|ext| {
-                    let ext = ext.trim();
-                    [append(ext), append(&ext.to_ascii_lowercase())]
-                })
-                .collect(),
+            WindowsSuffixes::ReplaceCommonIfMissing => None,
+            WindowsSuffixes::PathExt => {
+                let extensions: Vec<String> = std::env::var("PATHEXT")
+                    .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string())
+                    .split(';')
+                    .filter(|ext| !ext.trim().is_empty())
+                    .map(|ext| ext.trim().to_string())
+                    .collect();
+                for extension in extensions {
+                    let candidate = append(&extension);
+                    if matches(&candidate) {
+                        return Some(candidate);
+                    }
+                    let lower = append(&extension.to_ascii_lowercase());
+                    if matches(&lower) {
+                        return Some(lower);
+                    }
+                }
+                None
+            }
         };
-        return candidates.into_iter().find(|path| matches(path));
     }
     #[cfg(not(windows))]
     None
