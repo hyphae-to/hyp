@@ -20,7 +20,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Subcommand;
 use http::{Method, Request, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyp_crypto::human::{
     EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1, MAX_HUMAN_DRAFT_CONTEXT_CHARS,
     SignedNodeCertV1, decode_hdrop1, encode_hcert1, is_reserved_secret_name, seal_human_draft,
@@ -30,11 +30,12 @@ use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::{NodeIdentityKeys, OkpJwk};
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
+use hyp_node::engine::drop_client::{self, CreateSlotOptions, RelayAuth, RelayRequestError};
 use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::engine::http_util::{SseParser, percent_encode};
 use hyp_node::engine::{
-    AckDropResponse, CreateDropRequest, CreateDropResponse, DROP_CAP_HEADER, DropRelayConfig,
-    IngestedHumanDrop, NodeConfig, NodeProfile, UnifiedNode, resolve_drop_portal_url,
+    AckDropResponse, CreateDropResponse, DropRelayConfig, IngestedHumanDrop, NodeConfig,
+    NodeProfile, UnifiedNode, resolve_drop_portal_url,
 };
 use hyp_node::gates::{SecurityGateConfig, SecurityGatePipeline};
 use hyp_node::node_file::NodeFile;
@@ -860,26 +861,25 @@ pub(crate) async fn create_relay_drop_slot(
     ttl_secs: u64,
 ) -> Result<CreateDropResponse, String> {
     let client = build_http_client::<Full<Bytes>>()?;
-    let path = "/v1/drops";
-    let url = format!("{relay_base}{path}");
-    let body_req = CreateDropRequest {
-        ttl_seconds: Some(ttl_secs),
-        max_items: Some(1),
-        target_node_id: Some(node_id.to_string()),
-        burn_after_read: true,
+    let url = format!("{relay_base}{}", drop_client::CREATE_SLOT_PATH);
+    let sign = |method: &str, path: &str, bytes: &[u8]| {
+        build_ed25519_auth_header(node_id, identity, method, path, bytes)
     };
-    let body_bytes = serde_json::to_vec(&body_req).map_err(|e| e.to_string())?;
-    let auth = build_ed25519_auth_header(node_id, identity, "POST", path, &body_bytes)?;
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(&url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, auth)
-        .header("x-hyphae-node", node_id)
-        .header("X-Hyphae-Public-Key", identity.signing_jwk().x)
-        .body(Full::new(Bytes::from(body_bytes)))
-        .map_err(|e| format!("failed to build POST /v1/drops request: {e}"))?;
+    let req = drop_client::create_slot(
+        relay_base,
+        CreateSlotOptions {
+            node_id,
+            ttl_seconds: ttl_secs,
+            max_items: 1,
+        },
+        RelayAuth::Signed {
+            public_key: &identity.signing_jwk().x,
+            node_header: Some(node_id),
+            sign: &sign,
+        },
+        |bytes| Full::new(Bytes::from(bytes)),
+    )
+    .map_err(|error| relay_request_error(error, "POST /v1/drops"))?;
 
     let resp = tokio::time::timeout(
         Duration::from_secs(RELAY_HTTP_TIMEOUT_SECS),
@@ -901,6 +901,16 @@ pub(crate) async fn create_relay_drop_slot(
     }
     serde_json::from_slice::<CreateDropResponse>(&bytes)
         .map_err(|e| format!("invalid CreateDropResponse JSON from relay: {e}"))
+}
+
+fn relay_request_error(error: RelayRequestError, description: &str) -> String {
+    match error {
+        RelayRequestError::Encode(error) => error.to_string(),
+        RelayRequestError::Sign(error) => error,
+        RelayRequestError::Build(error) => {
+            format!("failed to build {description} request: {error}")
+        }
+    }
 }
 
 struct SavedLastDrop {
@@ -1133,7 +1143,18 @@ pub(crate) async fn wait_for_relay_drop<T>(
     let client = build_http_client::<Full<Bytes>>()?;
     let encoded_id = percent_encode(drop_id);
     let stream_path = format!("/v1/drops/{encoded_id}/stream");
-    let stream_url = format!("{relay_base}{stream_path}");
+    let public_key = identity.signing_jwk().x;
+    let sign = |method: &str, path: &str, bytes: &[u8]| {
+        build_ed25519_auth_header(node_id, identity, method, path, bytes)
+    };
+    let auth = || match sub_cap {
+        Some(cap) => RelayAuth::Capability(cap),
+        None => RelayAuth::Signed {
+            public_key: &public_key,
+            node_header: Some(node_id),
+            sign: &sign,
+        },
+    };
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs.max(1));
     let mut last_event_id: Option<String> = None;
@@ -1149,25 +1170,14 @@ pub(crate) async fn wait_for_relay_drop<T>(
             ));
         }
 
-        let mut req_builder = Request::builder()
-            .method(Method::GET)
-            .uri(&stream_url)
-            .header(header::ACCEPT, "text/event-stream");
-        if let Some(ref cursor) = last_event_id {
-            req_builder = req_builder.header("Last-Event-ID", cursor.as_str());
-        }
-        if let Some(cap) = sub_cap {
-            req_builder = req_builder.header(DROP_CAP_HEADER, cap);
-        } else {
-            let auth = build_ed25519_auth_header(node_id, identity, "GET", &stream_path, b"")?;
-            req_builder = req_builder
-                .header(header::AUTHORIZATION, auth)
-                .header("x-hyphae-node", node_id)
-                .header("X-Hyphae-Public-Key", identity.signing_jwk().x);
-        }
-        let req = req_builder
-            .body(Full::new(Bytes::new()))
-            .map_err(|e| format!("failed to build SSE stream request: {e}"))?;
+        let req = drop_client::stream_request(
+            relay_base,
+            &stream_path,
+            last_event_id.as_deref(),
+            auth(),
+            Full::new(Bytes::new()),
+        )
+        .map_err(|error| relay_request_error(error, "SSE stream"))?;
 
         let resp = match tokio::time::timeout_at(deadline, client.request(req)).await {
             Err(_) => {
@@ -1225,74 +1235,73 @@ pub(crate) async fn wait_for_relay_drop<T>(
         let mut received_any_event = false;
 
         loop {
-            let frame_res = match tokio::time::timeout_at(deadline, body.frame()).await {
+            let batch = match tokio::time::timeout_at(
+                deadline,
+                drop_client::stream_next(&mut body, &mut parser),
+            )
+            .await
+            {
                 Err(_) => {
                     return Err(format!(
                         "timed out after {timeout_secs}s waiting for drop '{drop_id}'"
                     ));
                 }
-                Ok(res) => res,
+                Ok(batch) => batch,
             };
-            let Some(frame_res) = frame_res else {
-                // Stream closed cleanly before a valid drop arrived -> reconnect with backoff.
+            let Some(Ok(events)) = batch else {
+                // A closed or interrupted stream reconnects with backoff and Last-Event-ID.
                 break;
             };
-            let Ok(frame) = frame_res else {
-                // Mid-stream transport error -> reconnect with backoff & Last-Event-ID.
-                break;
-            };
-            if let Some(data) = frame.data_ref() {
-                for ev in parser.feed(data) {
-                    received_any_event = true;
-                    if let Some(ref ev_id) = ev.id {
-                        let trimmed_id = ev_id.trim();
-                        if !trimmed_id.is_empty() {
-                            last_event_id = Some(trimmed_id.to_string());
-                        }
-                    } else if let Some(parsed_id) = parser.last_event_id() {
-                        let trimmed_id = parsed_id.trim();
-                        if !trimmed_id.is_empty() {
-                            last_event_id = Some(trimmed_id.to_string());
-                        }
+            for ev in events {
+                received_any_event = true;
+                if let Some(ref ev_id) = ev.id {
+                    let trimmed_id = ev_id.trim();
+                    if !trimmed_id.is_empty() {
+                        last_event_id = Some(trimmed_id.to_string());
                     }
+                } else if let Some(parsed_id) = parser.last_event_id() {
+                    let trimmed_id = parsed_id.trim();
+                    if !trimmed_id.is_empty() {
+                        last_event_id = Some(trimmed_id.to_string());
+                    }
+                }
 
-                    if ev.event.as_deref() == Some("drop") {
-                        let seq = ev
-                            .id
-                            .as_deref()
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(1);
-                        let envelope = match decode_drop_envelope(&ev.data) {
-                            Ok(env) => env,
-                            Err(err) => {
-                                let msg = format!(
-                                    "Ignored invalid drop item (seq={seq}) in slot '{drop_id}': {err}"
-                                );
-                                eprintln!("WARN  {msg}");
-                                warnings.push(msg);
-                                continue;
-                            }
-                        };
+                if ev.event.as_deref() == Some("drop") {
+                    let seq = ev
+                        .id
+                        .as_deref()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(1);
+                    let envelope = match decode_drop_envelope(&ev.data) {
+                        Ok(env) => env,
+                        Err(err) => {
+                            let msg = format!(
+                                "Ignored invalid drop item (seq={seq}) in slot '{drop_id}': {err}"
+                            );
+                            eprintln!("WARN  {msg}");
+                            warnings.push(msg);
+                            continue;
+                        }
+                    };
 
-                        match accept(envelope).await {
-                            Ok(ingested) => {
-                                accepted = Some((seq, ingested));
-                                break;
-                            }
-                            Err(err) => {
-                                let msg = format!(
-                                    "Ignored unverified drop item (seq={seq}) in slot '{drop_id}': {err}"
-                                );
-                                eprintln!("WARN  {msg}");
-                                warnings.push(msg);
-                                continue;
-                            }
+                    match accept(envelope).await {
+                        Ok(ingested) => {
+                            accepted = Some((seq, ingested));
+                            break;
+                        }
+                        Err(err) => {
+                            let msg = format!(
+                                "Ignored unverified drop item (seq={seq}) in slot '{drop_id}': {err}"
+                            );
+                            eprintln!("WARN  {msg}");
+                            warnings.push(msg);
+                            continue;
                         }
                     }
                 }
-                if accepted.is_some() {
-                    break;
-                }
+            }
+            if accepted.is_some() {
+                break;
             }
         }
 
@@ -1320,23 +1329,14 @@ pub(crate) async fn wait_for_relay_drop<T>(
 
     // Burn drop ciphertext from Drop Relay RAM immediately after verified ingestion.
     let ack_path = format!("/v1/drops/{encoded_id}/ack");
-    let ack_url = format!("{relay_base}{ack_path}");
-    let ack_body =
-        serde_json::to_vec(&json!({ "seq": seq, "burn": true })).map_err(|e| e.to_string())?;
-    let mut ack_builder = Request::builder()
-        .method(Method::POST)
-        .uri(&ack_url)
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(cap) = sub_cap {
-        ack_builder = ack_builder.header(DROP_CAP_HEADER, cap);
-    } else {
-        let auth = build_ed25519_auth_header(node_id, identity, "POST", &ack_path, &ack_body)?;
-        ack_builder = ack_builder
-            .header(header::AUTHORIZATION, auth)
-            .header("x-hyphae-node", node_id)
-            .header("X-Hyphae-Public-Key", identity.signing_jwk().x);
-    }
-    let ack_resp = if let Ok(ack_req) = ack_builder.body(Full::new(Bytes::from(ack_body))) {
+    let ack_req = match drop_client::ack(relay_base, &ack_path, seq, auth(), |bytes| {
+        Full::new(Bytes::from(bytes))
+    }) {
+        Ok(request) => Some(request),
+        Err(RelayRequestError::Build(_)) => None,
+        Err(error) => return Err(relay_request_error(error, "ack")),
+    };
+    let ack_resp = if let Some(ack_req) = ack_req {
         match tokio::time::timeout(
             Duration::from_secs(RELAY_HTTP_TIMEOUT_SECS),
             client.request(ack_req),

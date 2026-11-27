@@ -1,5 +1,11 @@
 //! Shared Drop Relay client URL policy and caller-specific diagnostics.
-use http::Uri;
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use http::{Method, Request, Uri, request::Builder};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+
+use super::drop_relay::{CreateDropRequest, DROP_CAP_HEADER};
+use super::http_util::{SseEvent, SseParser};
 
 /// The two existing callers retain detailed and compact diagnostics for the same rejection.
 #[derive(Debug)]
@@ -87,4 +93,137 @@ pub fn validate_relay_url(raw: &str) -> Result<String, RelayUrlError> {
         ));
     }
     Ok(trimmed.to_string())
+}
+
+pub const CREATE_SLOT_PATH: &str = "/v1/drops";
+
+type SignRelayRequest<'a> = dyn Fn(&str, &str, &[u8]) -> Result<String, String> + Sync + 'a;
+
+pub enum RelayAuth<'a> {
+    Capability(&'a str),
+    Signed {
+        public_key: &'a str,
+        node_header: Option<&'a str>,
+        sign: &'a SignRelayRequest<'a>,
+    },
+}
+
+#[derive(Debug)]
+pub enum RelayRequestError {
+    Encode(serde_json::Error),
+    Sign(String),
+    Build(http::Error),
+}
+
+impl RelayAuth<'_> {
+    fn apply(
+        &self,
+        builder: Builder,
+        method: &str,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<Builder, RelayRequestError> {
+        match self {
+            Self::Capability(cap) => Ok(builder.header(DROP_CAP_HEADER, *cap)),
+            Self::Signed {
+                public_key,
+                node_header,
+                sign,
+            } => {
+                let auth = sign(method, path, bytes).map_err(RelayRequestError::Sign)?;
+                let mut builder = builder
+                    .header(AUTHORIZATION, auth)
+                    .header("X-Hyphae-Public-Key", *public_key);
+                if let Some(node_id) = node_header {
+                    builder = builder.header("x-hyphae-node", *node_id);
+                }
+                Ok(builder)
+            }
+        }
+    }
+}
+
+fn json_post<B>(
+    relay_base: &str,
+    path: &str,
+    bytes: Vec<u8>,
+    auth: RelayAuth<'_>,
+    body: impl FnOnce(Vec<u8>) -> B,
+) -> Result<Request<B>, RelayRequestError> {
+    let builder = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{relay_base}{path}"))
+        .header(CONTENT_TYPE, "application/json");
+    auth.apply(builder, "POST", path, &bytes)?
+        .body(body(bytes))
+        .map_err(RelayRequestError::Build)
+}
+
+pub struct CreateSlotOptions<'a> {
+    pub node_id: &'a str,
+    pub ttl_seconds: u64,
+    pub max_items: usize,
+}
+
+/// Builds a slot creation request. The caller owns transport and response handling.
+pub fn create_slot<B>(
+    relay_base: &str,
+    slot: CreateSlotOptions<'_>,
+    auth: RelayAuth<'_>,
+    body: impl FnOnce(Vec<u8>) -> B,
+) -> Result<Request<B>, RelayRequestError> {
+    let bytes = serde_json::to_vec(&CreateDropRequest {
+        ttl_seconds: Some(slot.ttl_seconds),
+        max_items: Some(slot.max_items),
+        target_node_id: Some(slot.node_id.to_owned()),
+        burn_after_read: true,
+    })
+    .map_err(RelayRequestError::Encode)?;
+    json_post(relay_base, CREATE_SLOT_PATH, bytes, auth, body)
+}
+
+pub fn stream_request<B>(
+    relay_base: &str,
+    path: &str,
+    last_event_id: Option<&str>,
+    auth: RelayAuth<'_>,
+    body: B,
+) -> Result<Request<B>, RelayRequestError> {
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri(format!("{relay_base}{path}"))
+        .header(ACCEPT, "text/event-stream");
+    if let Some(event_id) = last_event_id {
+        builder = builder.header("Last-Event-ID", event_id);
+    }
+    auth.apply(builder, "GET", path, b"")?
+        .body(body)
+        .map_err(RelayRequestError::Build)
+}
+
+/// Reads one frame so callers can preserve their deadline, cancellation, and cursor policies.
+pub async fn stream_next(
+    body: &mut Incoming,
+    parser: &mut SseParser,
+) -> Option<Result<Vec<SseEvent>, hyper::Error>> {
+    body.frame().await.map(|result| {
+        result.map(|frame| {
+            frame
+                .data_ref()
+                .map_or_else(Vec::new, |data| parser.feed(data))
+        })
+    })
+}
+
+/// Builds a burn acknowledgement request. The caller decides whether to read the reply.
+pub fn ack<B>(
+    relay_base: &str,
+    path: &str,
+    seq: u64,
+    auth: RelayAuth<'_>,
+    body: impl FnOnce(Vec<u8>) -> B,
+) -> Result<Request<B>, RelayRequestError> {
+    let bytes = serde_json::to_vec(&serde_json::json!({ "seq": seq, "burn": true }))
+        .map_err(RelayRequestError::Encode)?;
+    json_post(relay_base, path, bytes, auth, body)
 }
