@@ -40,6 +40,7 @@ use http::{Method, Request, Uri, header};
 use http_body_util::{BodyExt, Empty};
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
+use hyp_harness::executable::is_executable_file;
 use hyp_node::adapters::telegram::{
     DEFAULT_TELEGRAM_SECRET_NAME, resolve_telegram_default_target_from_store,
 };
@@ -1674,24 +1675,6 @@ fn compare_nvm_versions(a: &str, b: &str) -> std::cmp::Ordering {
         (maj, min, pat)
     };
     parse(a).cmp(&parse(b)).then_with(|| a.cmp(b))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        (meta.permissions().mode() & 0o111) != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 /// RAII private temporary staging directory (`0700` on Unix) cleaned up unconditionally on `Drop`.

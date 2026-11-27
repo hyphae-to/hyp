@@ -11,6 +11,7 @@ use http_body_util::{BodyExt, Empty};
 use hyp_crypto::keys::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::pairing::{validate_endpoint_origin, validate_http_endpoint_origin};
 use hyp_crypto::rfc3339::{now_unix_ms, parse_rfc3339_millis};
+use hyp_harness::executable::is_executable_file;
 use hyp_node::engine::{DropRelayConfig, normalize_drop_portal_url};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, SignedNodeManifest};
@@ -281,24 +282,6 @@ pub(crate) fn find_in_path(bin: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        (meta.permissions().mode() & 0o111) != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 pub fn detect_local_tools() -> Vec<DetectedTool> {

@@ -16,6 +16,7 @@
 //!   - Non-zero exit with offline/daemon stderr -> `PushOutcome::Hold("codex_queue_unavailable")`
 //!   - Any other failure -> `PushOutcome::Reject("codex_queue_outcome_unknown")`
 
+use crate::executable::is_executable_file;
 use std::collections::HashMap;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -442,24 +443,6 @@ pub async fn codex_queue_supported(bin: &str) -> bool {
         guard.insert(key, (Instant::now(), supported));
     }
     supported
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        (meta.permissions().mode() & 0o111) != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 /// Classification of a Codex CLI rollout JSONL thread file (`sessions/YYYY/MM/DD/rollout-*.jsonl`).

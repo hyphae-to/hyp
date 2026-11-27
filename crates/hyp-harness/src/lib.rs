@@ -8,6 +8,7 @@
 
 pub mod call_registry;
 pub mod daemon;
+pub mod executable;
 pub mod hooks;
 pub mod local_kv;
 pub mod mcp;
