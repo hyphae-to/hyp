@@ -240,14 +240,8 @@ jobs:
           tool: cargo-nextest@0.9.152
 
       - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
-        shell: bash
-        run: |
-          filter=()
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            # The dedicated live plugin step below captures output to detect skips.
-            filter=(-E 'not binary(=real_plugins_e2e)')
-          fi
-          cargo nextest run --workspace --locked --no-fail-fast "${filter[@]}"
+        # The dedicated Linux live plugin step captures output to detect skips.
+        run: cargo nextest run --workspace --locked --no-fail-fast ${{ runner.os == 'Linux' && '-E "not binary(=real_plugins_e2e)"' || '' }}
 
       - name: Workspace doctests
         run: cargo test --workspace --locked --doc
