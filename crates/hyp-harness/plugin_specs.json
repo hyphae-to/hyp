@@ -1,0 +1,159 @@
+[
+  {
+    "id": "sdk",
+    "kind": "bridge",
+    "defaultSource": false,
+    "files": [
+      ["sdk/client.mjs", false],
+      ["sdk/client.py", false],
+      ["sdk/google-oauth.mjs", false],
+      ["sdk/source-kit.mjs", false]
+    ]
+  },
+  {
+    "id": "telegram",
+    "kind": "bridge",
+    "defaultSource": false,
+    "files": [
+      ["telegram/index.mjs", false]
+    ]
+  },
+  {
+    "id": "slack",
+    "kind": "bridge",
+    "defaultSource": false,
+    "files": [
+      ["slack/index.mjs", false]
+    ]
+  },
+  {
+    "id": "whatsapp",
+    "kind": "bridge",
+    "defaultSource": false,
+    "files": [
+      ["whatsapp/index.mjs", false]
+    ]
+  },
+  {
+    "id": "webhook",
+    "kind": "bridge",
+    "defaultSource": false,
+    "files": [
+      ["webhook/index.mjs", false]
+    ]
+  },
+  {
+    "id": "prometheus",
+    "kind": "bridge",
+    "defaultSource": false,
+    "files": [
+      ["prometheus/index.mjs", false]
+    ]
+  },
+  {
+    "id": "agentmail",
+    "kind": "bridge",
+    "defaultSource": true,
+    "files": [
+      ["agentmail/index.mjs", false],
+      ["agentmail/onboarding.json", false]
+    ]
+  },
+  {
+    "id": "sentry",
+    "kind": "bridge",
+    "defaultSource": true,
+    "files": [
+      ["sentry/index.mjs", false],
+      ["sentry/onboarding.json", false]
+    ]
+  },
+  {
+    "id": "gmail",
+    "kind": "bridge",
+    "defaultSource": true,
+    "files": [
+      ["gmail/index.mjs", false],
+      ["gmail/onboarding.json", false]
+    ]
+  },
+  {
+    "id": "google-calendar",
+    "kind": "bridge",
+    "defaultSource": true,
+    "files": [
+      ["google-calendar/index.mjs", false],
+      ["google-calendar/onboarding.json", false]
+    ]
+  },
+  {
+    "id": "vercel",
+    "kind": "bridge",
+    "defaultSource": true,
+    "files": [
+      ["vercel/index.mjs", false],
+      ["vercel/onboarding.json", false]
+    ]
+  },
+  {
+    "id": "notion",
+    "kind": "bridge",
+    "defaultSource": true,
+    "files": [
+      ["notion/index.mjs", false],
+      ["notion/onboarding.json", false]
+    ]
+  },
+  {
+    "id": "claude-panel",
+    "kind": "harness",
+    "defaultSource": false,
+    "files": [
+      ["claude-code/hooks/register.tsx", false],
+      ["claude-code/hooks/state.ts", false],
+      ["claude-code/hooks/kv-view.mjs", false],
+      ["claude-code/hooks/ui-snapshot.mjs", false]
+    ]
+  },
+  {
+    "id": "claude-code",
+    "kind": "harness",
+    "defaultSource": false,
+    "files": [
+      ["claude-code/.claude-plugin/plugin.json", false],
+      ["claude-code/.claude-plugin/icon.png", true],
+      ["claude-code/.mcp.json", false],
+      ["claude-code/hooks/hooks.json", false],
+      ["claude-code/hooks/register.tsx", false],
+      ["claude-code/hooks/state.ts", false],
+      ["claude-code/hooks/kv-view.mjs", false],
+      ["claude-code/hooks/ui-snapshot.mjs", false],
+      ["claude-code/commands/hyp.md", false],
+      ["claude-code/commands/hyp-focus.md", false],
+      ["claude-code/commands/hyp-mute.md", false],
+      ["claude-code/commands/hyp-subs.md", false],
+      ["claude-code/skills/hyp-mesh/SKILL.md", false],
+      ["claude-code/README.md", false]
+    ]
+  },
+  {
+    "id": "herdr-mod",
+    "kind": "harness",
+    "defaultSource": false,
+    "files": [
+      ["herdr-mod/mods/hyphae-pane/mod.json", false],
+      ["herdr-mod/mods/hyphae-pane/main.js", false],
+      ["herdr-mod/mods/hyphae-pane/pill.js", false],
+      ["herdr-mod/mods/hyphae-pane/shared-client.js", false],
+      ["herdr-mod/mods/hyphae-pane/kv-view.js", false],
+      ["herdr-mod/mods/hyphae-pane/ui-snapshot.js", false],
+      ["herdr-mod/mods/hyphae-pane/hyphae.svg", false],
+      ["herdr-mod/mods/hyphae-panel/mod.json", false],
+      ["herdr-mod/mods/hyphae-panel/main.js", false],
+      ["herdr-mod/mods/hyphae-panel/shared-client.js", false],
+      ["herdr-mod/mods/hyphae-panel/kv-view.js", false],
+      ["herdr-mod/mods/hyphae-panel/ui-snapshot.js", false],
+      ["herdr-mod/mods/hyphae-panel/hyphae.svg", false]
+    ]
+  }
+]
