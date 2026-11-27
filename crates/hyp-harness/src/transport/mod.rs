@@ -20,6 +20,7 @@ pub mod codex;
 pub mod herdr;
 pub mod openclaw;
 mod origin;
+mod process;
 pub mod t3;
 
 /// Boxed `Send` future alias used by [`PushTransport`].
