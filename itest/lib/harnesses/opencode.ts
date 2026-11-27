@@ -7,9 +7,9 @@
  * Exposes `opencodeAdapter: RealHarnessAdapter` for full live P1–P8 cross-harness parity (#30).
  */
 
+import { parseJsonLines, pickFreePort } from "../util.ts";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { resolveToolBinary } from "../../scripts/provision.mjs";
 import type { HypCli } from "../hyp-cli.ts";
@@ -27,39 +27,15 @@ export function resolveOpenCodeBin(): string | null {
   return info.path;
 }
 
+type OpenCodeRunEvent = { type?: string; sessionID?: string; part?: { text?: string } };
+
 export interface OpenCodeRunResult {
   exitCode: number | null;
   sessionId: string | null;
   stdout: string;
   stderr: string;
-  events: any[];
+  events: OpenCodeRunEvent[];
   finalText: string;
-}
-
-function parseJsonLines(stdout: string): any[] {
-  const events: any[] = [];
-  for (const raw of stdout.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || !line.startsWith("{")) continue;
-    try {
-      events.push(JSON.parse(line));
-    } catch {
-      // ignore non-JSON lines
-    }
-  }
-  return events;
-}
-
-function pickFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.once("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const addr = srv.address();
-      const port = addr && typeof addr === "object" ? addr.port : 0;
-      srv.close(() => resolve(port));
-    });
-  });
 }
 
 export class OpenCodeHarness {
@@ -302,12 +278,12 @@ export class OpenCodeHarness {
         );
       }
 
-      const events = parseJsonLines(proc.stdout);
+      const events = parseJsonLines<OpenCodeRunEvent>(proc.stdout);
       const firstWithSession = events.find((e) => typeof e?.sessionID === "string");
       const sessionId = firstWithSession?.sessionID ?? options.sessionId ?? null;
       const finalText = events
         .filter((e) => e?.type === "text" && typeof e?.part?.text === "string")
-        .map((e) => e.part.text)
+        .map((e) => e.part?.text ?? "")
         .join("");
 
       return {

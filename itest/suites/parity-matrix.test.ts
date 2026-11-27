@@ -21,6 +21,7 @@
  *   P8: Daemon Restart Survival (`SIGTERM` + restart `hyp daemon` with unread mailbox -> 0 loss, 1 delivery)
  */
 
+import { waitForCondition } from "../lib/util.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -50,19 +51,6 @@ import {
   type ScriptRule,
 } from "../lib/llm-shim/index.ts";
 import { withSandbox } from "../lib/sandbox.ts";
-
-async function waitForCondition(
-  predicate: () => Promise<boolean> | boolean,
-  timeoutMs = 20_000,
-  label = "condition",
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await predicate()) return;
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}`);
-}
 
 /**
  * Writes a tiny deterministic JSON-RPC 2.0 NDJSON Security Gate subprocess filter
@@ -581,7 +569,7 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
           const serialized = JSON.stringify(box);
           if (serialized && serialized !== "{}") sinkReceived.push(serialized);
           return sinkReceived.some((entry) => entry.includes(needle));
-        }, timeoutMs, label);
+        }, timeoutMs, label, 150);
       };
 
       const inspectEnroll = await hyp.inspect({ all: true });
@@ -786,7 +774,7 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
           return true;
         }
         return false;
-      }, 10_000, `${adapter.id} P6 quarantined receipt in hyp gate review`);
+      }, 10_000, `${adapter.id} P6 quarantined receipt in hyp gate review`, 150);
 
       await new Promise((r) => setTimeout(r, 500));
       // On turn-driven harnesses, run a turn BEFORE approval to prove 0 quarantined bytes leak!
@@ -874,7 +862,7 @@ async function runParityMatrixForAdapter(adapter: RealHarnessAdapter): Promise<O
         const ins = await hyp.inspect({ session: alpha.sessionId, allowFailure: true });
         const row = extractSessionsFromInspect(ins.json)[0];
         return (row?.counts?.queued ?? 0) >= 1;
-      }, 5_000, `${adapter.id} P8 unread parked in SQLite before SIGTERM`);
+      }, 5_000, `${adapter.id} P8 unread parked in SQLite before SIGTERM`, 150);
 
       // Restart compiled `hyp daemon` (SIGTERM -> clean exit -> fresh daemon on same node.sqlite)
       // using `hyp.restartDaemon()` so exact adapter daemon env (e.g. Herdr HC_SOCKET + HC_SESSION) is preserved!

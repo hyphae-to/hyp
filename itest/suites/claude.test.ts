@@ -16,6 +16,7 @@
  *     strict per-session routing and zero cross-session bleed).
  */
 
+import { extractSessionsFromInspect } from "../lib/util.ts";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -31,14 +32,6 @@ import {
   pauseUntil,
 } from "../lib/llm-shim/index.ts";
 import { withSandbox } from "../lib/sandbox.ts";
-
-function extractSessionsFromInspect(inspectJson: any): any[] {
-  const data = inspectJson?.data ?? inspectJson ?? {};
-  if (Array.isArray(data.sessions)) return data.sessions;
-  if (Array.isArray(data.items)) return data.items;
-  if (data.session) return [data.session];
-  return [];
-}
 
 test("Real Claude Code: verified PreToolUse enrollment, tool-boundary pauseUntil(gate) queue-hold / interrupt-inject / Stop-flush, and zero duplicates", async (t) => {
   const claudeBin = resolveClaudeBin();

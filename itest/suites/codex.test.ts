@@ -15,6 +15,7 @@
  *     `deliveryRetry.codexResume` fail-closed (`false`) vs opt-in (`true`)!
  */
 
+import { waitForCondition } from "../lib/util.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -34,19 +35,6 @@ import {
   pauseUntil,
 } from "../lib/llm-shim/index.ts";
 import { withSandbox } from "../lib/sandbox.ts";
-
-async function waitForCondition(
-  predicate: () => Promise<boolean> | boolean,
-  timeoutMs = 20_000,
-  label = "condition",
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await predicate()) return;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}`);
-}
 
 test("Real Codex CLI: hyp setup, rollout JSONL verification, codex exec no auto-attach (#35), strict developer provenance (#23), and mid-turn PostToolUse/Stop latch", async (t) => {
   const codexBin = resolveCodexBin();

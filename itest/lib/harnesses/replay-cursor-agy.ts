@@ -9,6 +9,7 @@
  * payloads and JSON-RPC 2.0 MCP traffic.
  */
 
+import { tryParseJson } from "../util.ts";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -27,24 +28,6 @@ export interface McpToolOutcome {
 export interface WaitHandle {
   proc: TrackedProcess;
   done: Promise<{ exitCode: number | null; stdout: string; stderr: string; json: any }>;
-}
-
-function tryParseJson(raw: string): any {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const idx = trimmed.indexOf("{");
-    if (idx !== -1) {
-      try {
-        return JSON.parse(trimmed.slice(idx));
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
 }
 
 function spawnHypWait(
@@ -70,7 +53,7 @@ function spawnHypWait(
       exitCode: proc.exitCode,
       stdout: proc.stdout,
       stderr: proc.stderr,
-      json: tryParseJson(proc.stdout),
+      json: tryParseJson(proc.stdout, true),
     };
   })();
   return { proc, done };
@@ -186,7 +169,7 @@ export class CursorReplayDriver {
     const text = (rpc.result.content || []).map((c: any) => c?.text || "").join("");
     const tool: McpToolOutcome = {
       text,
-      json: tryParseJson(text),
+      json: tryParseJson(text, true),
       isError: Boolean(rpc.result.isError),
       raw: rpc.result,
     };
@@ -209,7 +192,7 @@ export class CursorReplayDriver {
     const text = (rpc.result.content || []).map((c: any) => c?.text || "").join("");
     return {
       text,
-      json: tryParseJson(text),
+      json: tryParseJson(text, true),
       isError: Boolean(rpc.result.isError),
       raw: rpc.result,
     };

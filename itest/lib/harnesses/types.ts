@@ -151,14 +151,7 @@ export interface RealHarnessAdapter {
   boot(options: HarnessBootOptions): Promise<HarnessRuntime>;
 }
 
-/** Shared helper extracting sessions array from `hyp inspect --all --json` or `--session` / `--handle`. */
-export function extractSessionsFromInspect(inspectJson: any): any[] {
-  const data = inspectJson?.data ?? inspectJson ?? {};
-  if (Array.isArray(data.sessions)) return data.sessions;
-  if (Array.isArray(data.items)) return data.items;
-  if (data.session) return [data.session];
-  return [];
-}
+export { extractSessionsFromInspect } from "../util.ts";
 
 /** Counts distinct canonical Hyphae MCP tool names observed across recorded `llm-shim` turns. */
 export function countAdvertisedHyphaeTools(
