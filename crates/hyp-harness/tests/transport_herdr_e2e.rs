@@ -363,7 +363,7 @@ esac
             let mut policy = daemon.delivery().policy(&db, SESSION).unwrap();
             for source in ["first", "second", "third", "late", "isolated"] {
                 policy.upsert_rule(DeliveryRule::new(
-                    &format!("peer@net/{source}"),
+                    format!("peer@net/{source}"),
                     DeliveryUrgency::Interrupt,
                 ));
             }
