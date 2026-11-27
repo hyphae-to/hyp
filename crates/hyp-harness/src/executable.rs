@@ -67,7 +67,7 @@ pub fn find_in_directory(dir: &Path, name: &Path, policy: PathSearchPolicy) -> O
             candidate.push(suffix);
             dir.join(candidate)
         };
-        return match policy.windows_suffixes {
+        match policy.windows_suffixes {
             WindowsSuffixes::None => None,
             WindowsSuffixes::ReplaceExe => {
                 let candidate = direct.with_extension("exe");
@@ -103,7 +103,7 @@ pub fn find_in_directory(dir: &Path, name: &Path, policy: PathSearchPolicy) -> O
                 }
                 None
             }
-        };
+        }
     }
     #[cfg(not(windows))]
     None
