@@ -343,6 +343,7 @@ pub struct UnifiedNode {
     peer_reconcile_lock: tokio::sync::Mutex<()>,
     inbox_tx: broadcast::Sender<String>,
     local_inbox_tx: broadcast::Sender<String>,
+    kv_metadata_tx: watch::Sender<()>,
     in_flight_by_peer: Mutex<HashMap<String, HashSet<String>>>,
     scheduler_notify: Arc<Notify>,
     wake_epoch: watch::Sender<u64>,
@@ -479,6 +480,7 @@ impl UnifiedNode {
             peer_reconcile_lock: tokio::sync::Mutex::new(()),
             inbox_tx,
             local_inbox_tx,
+            kv_metadata_tx: watch::channel(()).0,
             in_flight_by_peer: Mutex::new(HashMap::new()),
             scheduler_notify: Arc::new(Notify::new()),
             wake_epoch,
@@ -514,6 +516,9 @@ impl UnifiedNode {
 
                 let mut closed_batches = false;
                 if let (Ok(report), _) = &step {
+                    if report.kv_expired > 0 {
+                        node.notify_kv_metadata_change();
+                    }
                     if report.events.batches_closed > 0 {
                         closed_batches = true;
                         node.notify_all_inbox_subscribers();
@@ -6379,20 +6384,20 @@ impl UnifiedNode {
             })
             .await?;
         }
-        {
-            let db = self.db();
-            let _ = db.kv().put_epoch(
-                &KvEpochInput {
-                    host_node: host_node.to_string(),
-                    namespace: namespace.to_string(),
-                    epoch: new_epoch,
-                    creator_node_id: self.config.node_id.to_string(),
-                    key_envelope_json: serde_json::to_string(&signed_bundle)?,
-                    members: all_members,
-                    signature: signed_bundle.sig.clone(),
-                },
-                now_ms(),
-            );
+        let stored = self.db().kv().put_epoch(
+            &KvEpochInput {
+                host_node: host_node.to_string(),
+                namespace: namespace.to_string(),
+                epoch: new_epoch,
+                creator_node_id: self.config.node_id.to_string(),
+                key_envelope_json: serde_json::to_string(&signed_bundle)?,
+                members: all_members,
+                signature: signed_bundle.sig.clone(),
+            },
+            now_ms(),
+        );
+        if stored.is_ok() && host_node == self.config.node_id.as_str() {
+            self.notify_kv_metadata_change();
         }
         self.cache_room_key("kv", host_node, namespace, room_key);
         Ok(new_epoch)
@@ -6493,8 +6498,7 @@ impl UnifiedNode {
                 "kv epoch bundle metadata mismatch".into(),
             ));
         }
-        let db = self.db();
-        Ok(db.kv().put_epoch(
+        let epoch = self.db().kv().put_epoch(
             &KvEpochInput {
                 host_node: self.config.node_id.to_string(),
                 namespace: req.namespace,
@@ -6505,7 +6509,9 @@ impl UnifiedNode {
                 signature: req.bundle.sig,
             },
             now_ms(),
-        )?)
+        )?;
+        self.notify_kv_metadata_change();
+        Ok(epoch)
     }
 
     /// Writes a Shared KV entry locally or on a remote peer, supporting `owner` / `shared`
@@ -6727,8 +6733,18 @@ impl UnifiedNode {
         link.kv_delete(namespace, key, expected_version).await
     }
 
+    /// Watches changes to local KV metadata, including expiry and epoch rotations.
+    pub fn subscribe_kv_metadata(&self) -> watch::Receiver<()> {
+        self.kv_metadata_tx.subscribe()
+    }
+
+    pub(crate) fn notify_kv_metadata_change(&self) {
+        self.kv_metadata_tx.send_replace(());
+    }
+
     /// Materializes locally subscribed KV change batches after their write transaction commits.
     pub fn notify_local_kv_change(&self) {
+        self.notify_kv_metadata_change();
         let _ = crate::adapters::deliver_source_topic_to_local_sessions(self, "kv");
         self.notify_all_inbox_subscribers();
         self.notify_scheduler();

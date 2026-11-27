@@ -1296,3 +1296,72 @@ fn claude_setup_preserves_existing_claude_channel_flag_x7() {
             .unwrap();
     assert_eq!(fresh_doc["mcpServers"]["hyphae"]["args"], json!(["mcp"]));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inspect_watch_pushes_kv_metadata_and_expiry_without_sessions() {
+    let dir = TempDir::new().unwrap();
+    let node = make_test_node("kv@host", &dir);
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+    let stream = tokio::net::UnixStream::connect(daemon.socket_path())
+        .await
+        .unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
+    write_ndjson_line_async(&mut writer, &json!({"type":"inspect.watch"}))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(first["sessions"], json!([]));
+    assert_eq!(first["kv"]["namespaces"], json!([]));
+
+    node.kv_set(hyp_node::engine::KvWriteRequest {
+        host_node: "local".into(),
+        namespace: "shared".into(),
+        key: "leased".into(),
+        value: json!("hidden fixture value"),
+        write_model: hyp_store::WriteModel::Owner,
+        owner_id: None,
+        allowlist: None,
+        expected_version: None,
+        ttl_ms: Some(2000),
+        encrypt: false,
+        e2ee_members: None,
+    })
+    .await
+    .unwrap();
+
+    let mut visible = false;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let frame = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!frame.contains("hidden fixture value"));
+            let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            let namespaces = frame["kv"]["namespaces"].as_array().unwrap();
+            if visible && namespaces.is_empty() {
+                break;
+            }
+            if let Some(namespace) = namespaces.first() {
+                assert_eq!(namespace["entries"][0]["key"], "leased");
+                visible = true;
+            }
+        }
+    })
+    .await
+    .expect("live KV insert and expiry snapshots");
+    daemon.stop().await;
+    node.shutdown();
+}

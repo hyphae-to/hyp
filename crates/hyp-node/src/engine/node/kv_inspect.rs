@@ -41,7 +41,7 @@ impl KvReader<'_> {
 
 const MAX_KV_PREVIEW_BYTES: usize = 4096;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KvValuePreview {
     pub text: String,
@@ -54,14 +54,14 @@ struct LocalNamespaceAccess {
     member_count: usize,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KvInspection {
     pub namespaces: Vec<KvNamespaceInspection>,
     pub namespaces_truncated: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KvNamespaceInspection {
     pub name: String,
@@ -73,7 +73,7 @@ pub struct KvNamespaceInspection {
     pub entries: Vec<KvKeyInspection>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KvKeyInspection {
     pub key: String,
@@ -84,7 +84,7 @@ pub struct KvKeyInspection {
     pub size_bytes: u64,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KvKeyPage {
     pub entries: Vec<KvKeyInspection>,

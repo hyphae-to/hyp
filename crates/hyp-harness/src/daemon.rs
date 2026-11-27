@@ -1642,6 +1642,7 @@ fn spawn_inbox_watcher(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     let mut rx = inner.node.subscribe_local_inbox();
+    let mut kv_rx = inner.node.subscribe_kv_metadata();
     tokio::spawn(async move {
         loop {
             let session_id = tokio::select! {
@@ -1668,6 +1669,13 @@ fn spawn_inbox_watcher(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
+                change = kv_rx.changed() => {
+                    if change.is_err() {
+                        break;
+                    }
+                    inner.bump_ui_rev();
+                    continue;
+                }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         break;
