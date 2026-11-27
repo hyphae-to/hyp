@@ -126,7 +126,7 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
         json!({
             "name": "hyp_inbox",
             "description": format!(
-                "Read <hyphae-inbox> (ack:false peeks). Never poll. Items: trustTier, untrusted: true. {warning}",
+                "Read <hyphae-inbox>. ack:false peeks. Never poll. ids: receipts. Items: trustTier, untrusted: true. {warning}",
                 warning = hyp_harness_ipc::protocol::UNTRUSTED_PROVENANCE,
             ),
             "inputSchema": {
@@ -138,7 +138,7 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                     "summary": {"type": "boolean"},
                     "ack": {"type": "boolean"},
-                    "ids": {"type": "array", "items": s, "description": "Receipts from returned items. Use with ack:true to acknowledge only those items."},
+                    "ids": {"type": "array", "items": s},
                     "mode": {"type": "string", "enum": ["queue", "notify"]},
                     "rules": {
                         "type": "array",
