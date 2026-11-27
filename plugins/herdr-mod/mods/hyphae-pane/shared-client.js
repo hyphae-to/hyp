@@ -6,6 +6,13 @@
 // message bodies, CloudEvent `data`, wakeup `note`s, quarantined text, or secrets.
 
 import { parseKvInspection } from "./kv-view.js";
+import {
+  parseSnapshotMetadata,
+  resolveUiStateCandidates as resolveSnapshotPaths,
+  sanitizeControlValue as stripControlChars,
+  sanitizeUiText,
+} from "./ui-snapshot.js";
+export { sanitizeControlValue as stripControlChars, sanitizeUiText } from "./ui-snapshot.js";
 
 const REMOTE_REFRESH_MS = 10_000;
 const REMOTE_MAX_BACKOFF_MS = 60_000;
@@ -14,49 +21,6 @@ const REMOTE_INFLIGHT_KEY = "hyphae.remoteInFlight";
 const CONTROL_TIMEOUT_MS = 10_000;
 const REMOTE_INSPECT_TIMEOUT_MS = 8_000;
 const REMOTE_INFLIGHT_TTL_MS = REMOTE_INSPECT_TIMEOUT_MS + 4_000;
-
-const FORBIDDEN_BODY_KEYS = new Set([
-  "body",
-  "text",
-  "note",
-  "payload",
-  "ciphertext",
-  "secret",
-  "token",
-]);
-
-/**
- * Strips ANSI escape sequences (OSC/DCS/CSI/ESC), C0/C1 control characters,
- * zero-width characters, and Unicode BiDi overrides WITHOUT truncating length.
- * Use this for CLI control arguments (`mute`, `unmute`, `unsubscribe`, `leave`, `rule`).
- */
-export function stripControlChars(raw) {
-  if (raw === null || raw === undefined) return "";
-  return String(raw)
-    // Strip OSC sequences (\x1b] ... \x07 or \x1b\\)
-    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
-    // Strip DCS / SOS / PM / APC strings
-    .replace(/\u001b[PX^_][^\u001b]*(?:\u001b\\)?/g, "")
-    // Strip CSI sequences (\x1b[ ... final byte)
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
-    // Strip remaining 2-byte ESC sequences
-    .replace(/\u001b[@-Z\\-_]/g, "")
-    // Strip remaining ESC and C0/C1 control characters
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
-    // Strip Unicode BiDi overrides/isolates/marks + zero-width / BOM
-    .replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
-    .trim();
-}
-
-/**
- * Strips ANSI escape sequences and control/BiDi characters from untrusted
- * metadata fields (`handle`, `topic`, `source`, `channel`, `label`) before display.
- */
-export function sanitizeUiText(raw, maxLen = 120) {
-  const str = stripControlChars(raw);
-  if (str.length <= maxLen) return str;
-  return str.slice(0, Math.max(0, maxLen - 1)) + "…";
-}
 
 /**
  * Qualifies a channel target as `<hostNode>/<channel>` so `hyp session leave`
@@ -131,60 +95,7 @@ export function parseTerminalAddress(terminal) {
  * Also includes `~/.config/hyphae/state/ui` as a fallback for custom layouts.
  */
 export function resolveUiStateCandidates(homeDir, nodeJsonText = null) {
-  const baseHome = typeof homeDir === "string" ? homeDir.replace(/[\\/]+$/, "") : "";
-  const cfgDir = `${baseHome}/.config/hyphae`;
-  const dirs = [];
-
-  const pushDir = (dir) => {
-    if (!dir) return;
-    const normalized = dir.replace(/\/+$/, "");
-    if (!dirs.includes(normalized)) dirs.push(normalized);
-  };
-
-  if (typeof nodeJsonText === "string" && nodeJsonText.trim()) {
-    try {
-      const parsed = JSON.parse(nodeJsonText);
-      const sd = parsed && typeof parsed.stateDir === "string" ? parsed.stateDir.trim() : "";
-      if (sd) {
-        let resolved;
-        if (sd === "~") {
-          resolved = baseHome;
-        } else if (sd.startsWith("~/")) {
-          resolved = `${baseHome}/${sd.slice(2)}`;
-        } else if (sd.startsWith("/") || /^[A-Za-z]:[\\/]/.test(sd)) {
-          resolved = sd;
-        } else {
-          resolved = `${cfgDir}/${sd}`;
-        }
-        pushDir(`${resolved.replace(/[\\/]+$/, "")}/ui`);
-      }
-    } catch {
-      // Ignore malformed config and fall back to default paths.
-    }
-  }
-
-  pushDir(`${cfgDir}/ui`);
-  pushDir(`${cfgDir}/state/ui`);
-
-  return {
-    dirs,
-    files: dirs.map((d) => `${d}/state.json`),
-  };
-}
-
-/**
- * Recursively strips any forbidden body/secret keys as defense-in-depth so UI
- * code can never accidentally retain or render untrusted message contents.
- */
-function stripMetadataOnly(value) {
-  if (Array.isArray(value)) return value.map(stripMetadataOnly);
-  if (!value || typeof value !== "object") return value;
-  const out = {};
-  for (const [k, v] of Object.entries(value)) {
-    if (FORBIDDEN_BODY_KEYS.has(k)) continue;
-    out[k] = stripMetadataOnly(v);
-  }
-  return out;
+  return resolveSnapshotPaths(homeDir, null, nodeJsonText);
 }
 
 /**
@@ -192,28 +103,13 @@ function stripMetadataOnly(value) {
  * CLI envelope (`{ ok: true, data: { ... } }`), returning a normalized metadata-only snapshot.
  */
 export function parseSnapshotJson(rawText) {
-  if (typeof rawText !== "string" || !rawText.trim()) return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object") return null;
-
-  let root = parsed;
-  if ("ok" in parsed && parsed.data && typeof parsed.data === "object") {
-    if (parsed.ok === false) return null;
-    root = parsed.data;
-  } else if ("ok" in parsed && parsed.result && typeof parsed.result === "object") {
-    if (parsed.ok === false) return null;
-    root = parsed.result;
-  }
+  const root = parseSnapshotMetadata(rawText);
+  if (!root) return null;
 
   const sessions = Array.isArray(root.sessions)
-    ? root.sessions.filter((s) => s && typeof s === "object").map(stripMetadataOnly)
+    ? root.sessions.filter((s) => s && typeof s === "object")
     : root.session && typeof root.session === "object"
-      ? [stripMetadataOnly(root.session)]
+      ? [root.session]
       : [];
 
   const byHerdrTerminal =
@@ -225,7 +121,7 @@ export function parseSnapshotJson(rawText) {
     schemaVersion: Number(root.schemaVersion) || 1,
     rev: Number(root.rev) || 0,
     updatedAt: Number(root.updatedAt) || 0,
-    daemon: root.daemon && typeof root.daemon === "object" ? stripMetadataOnly(root.daemon) : null,
+    daemon: root.daemon && typeof root.daemon === "object" ? root.daemon : null,
     sessions,
     byHerdrTerminal,
     kv: parseKvInspection(root.kv),

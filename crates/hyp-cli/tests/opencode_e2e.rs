@@ -1151,6 +1151,7 @@ fn opencode_plugin_bundle_files_exist_and_node_tests_pass() {
     for rel in [
         "hyphae.ts",
         "tui.mjs",
+        "ui-snapshot.mjs",
         "commands/hyp.md",
         "README.md",
         "test/opencode.test.mjs",
