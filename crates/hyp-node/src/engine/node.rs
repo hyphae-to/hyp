@@ -9814,13 +9814,10 @@ fn sweep_stale_transfer_staging(state_dir: &std::path::Path) {
 }
 
 fn ensure_private_dir(path: &std::path::Path) -> Result<(), NodeError> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
-    }
-    Ok(())
+    hyp_crypto::keystore::ensure_private_dir(path).map_err(|error| match error {
+        hyp_crypto::CryptoError::Io(error) => NodeError::Io(error),
+        error => NodeError::Crypto(error),
+    })
 }
 
 fn expand_node_scopes<S: AsRef<str>>(raw_scopes: &[S]) -> Result<Vec<String>, NodeError> {

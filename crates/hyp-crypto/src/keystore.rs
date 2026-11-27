@@ -424,7 +424,11 @@ fn current_euid() -> u32 {
 }
 
 #[cfg(unix)]
-fn check_private_owner_and_mode(path: &Path, expect_dir: bool) -> Result<u64, CryptoError> {
+fn check_private_path(
+    path: &Path,
+    expect_dir: bool,
+    private_mode: bool,
+) -> Result<u64, CryptoError> {
     use std::os::unix::fs::MetadataExt;
     let st = fs::symlink_metadata(path)?;
     if st.file_type().is_symlink() {
@@ -451,7 +455,7 @@ fn check_private_owner_and_mode(path: &Path, expect_dir: bool) -> Result<u64, Cr
             path.display()
         )));
     }
-    if (st.mode() & 0o077) != 0 {
+    if private_mode && (st.mode() & 0o077) != 0 {
         return Err(CryptoError::Keystore(format!(
             "{} has overly broad permissions ({:o}); expected 0600/0700",
             path.display(),
@@ -462,7 +466,11 @@ fn check_private_owner_and_mode(path: &Path, expect_dir: bool) -> Result<u64, Cr
 }
 
 #[cfg(not(unix))]
-fn check_private_owner_and_mode(path: &Path, expect_dir: bool) -> Result<u64, CryptoError> {
+fn check_private_path(
+    path: &Path,
+    expect_dir: bool,
+    _private_mode: bool,
+) -> Result<u64, CryptoError> {
     let st = fs::symlink_metadata(path)?;
     if st.file_type().is_symlink() {
         return Err(CryptoError::Keystore(format!(
@@ -485,15 +493,64 @@ fn check_private_owner_and_mode(path: &Path, expect_dir: bool) -> Result<u64, Cr
     Ok(st.len())
 }
 
-fn ensure_private_dir(dir: &Path) -> Result<(), CryptoError> {
+fn check_private_owner_and_mode(path: &Path, expect_dir: bool) -> Result<u64, CryptoError> {
+    check_private_path(path, expect_dir, true)
+}
+
+#[cfg(unix)]
+fn open_private_directory(dir: &Path) -> Result<fs::File, CryptoError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let normalized: PathBuf = dir.components().collect();
+    Ok(OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(normalized)?)
+}
+
+#[cfg(unix)]
+fn tighten_private_directory(directory: &fs::File, path: &Path) -> Result<(), CryptoError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != current_euid() {
+        return Err(CryptoError::Keystore(format!(
+            "{} is not a directory owned by current user",
+            path.display()
+        )));
+    }
+    directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    let metadata = directory.metadata()?;
+    if metadata.mode() & 0o077 != 0 {
+        return Err(CryptoError::Keystore(format!(
+            "{} has overly broad permissions after chmod",
+            path.display()
+        )));
+    }
+    let normalized: PathBuf = path.components().collect();
+    let visible = fs::symlink_metadata(&normalized)?;
+    if visible.file_type().is_symlink()
+        || visible.dev() != metadata.dev()
+        || visible.ino() != metadata.ino()
+    {
+        return Err(CryptoError::Keystore(format!(
+            "{} was replaced while setting directory permissions",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Creates or tightens a user-owned real directory to mode 0700, rejecting links before chmod.
+pub fn ensure_private_dir(dir: &Path) -> Result<(), CryptoError> {
+    // A trailing separator or `/.` must not turn a leaf symlink into a followed directory.
+    let normalized: PathBuf = dir.components().collect();
+    let dir = normalized.as_path();
     if !dir.exists() {
         fs::create_dir_all(dir)?;
     }
+    let _ = check_private_path(dir, true, false)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
+    tighten_private_directory(&open_private_directory(dir)?, dir)?;
+    #[cfg(not(unix))]
     let _ = check_private_owner_and_mode(dir, true)?;
     Ok(())
 }
@@ -2580,6 +2637,68 @@ pub fn classify_pass_show_output(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_rejects_symlink_without_changing_target_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = temp.path().join("link");
+        symlink(&target, &link).unwrap();
+        for spelling in [&link, &link.join(""), &link.join(".")] {
+            let error = ensure_private_dir(spelling).unwrap_err();
+            assert!(
+                matches!(error, CryptoError::Keystore(ref reason) if reason.contains("symlink"))
+            );
+            assert!(open_private_directory(spelling).is_err());
+        }
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        ensure_private_dir(&target).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_permissions_stay_on_opened_inode_after_path_swap() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("directory");
+        let moved = temp.path().join("moved");
+        let target = temp.path().join("unrelated-target");
+        for directory in [&path, &target] {
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let opened = open_private_directory(&path).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(open_private_directory(&path).is_err());
+        let error = tighten_private_directory(&opened, &path).unwrap_err();
+        assert!(matches!(error, CryptoError::Keystore(ref reason) if reason.contains("replaced")));
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&moved).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     #[test]
     fn secret_name_validation_blocks_path_traversal() {
