@@ -24,8 +24,8 @@
 //!   - `corrupt` (missing file / symlink / invalid target): fails closed in `verify` & `doctor`.
 
 use crate::config_file::{
-    build_http_client, ct_eq, ensure_dir, open_secret_store, resolve_config_path_for_read,
-    resolve_home_dir, resolve_state_dir, write_atomic_file, write_atomic_json,
+    ct_eq, ensure_dir, open_secret_store, resolve_config_path_for_read, resolve_home_dir,
+    resolve_state_dir, write_atomic_file, write_atomic_json,
 };
 use crate::herdr_mod::detect_herdr_app_dir;
 use crate::setup::{
@@ -36,8 +36,7 @@ use crate::ui::{
     print_checks, print_json, print_next_steps, print_warnings,
 };
 use clap::Subcommand;
-use http::{Method, Request, Uri, header};
-use http_body_util::{BodyExt, Empty};
+use http::Uri;
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
 use hyp_harness::executable::{
@@ -47,9 +46,9 @@ use hyp_harness::plugin_registry::BRIDGE_CONSUMER_IDS;
 use hyp_node::adapters::telegram::{
     DEFAULT_TELEGRAM_SECRET_NAME, resolve_telegram_default_target_from_store,
 };
+use hyp_node::engine::http_fetch::{FetchError, FetchOptions, fetch_bounded_https};
 use hyp_node::node_file::NodeFile;
 use hyp_store::now_ms;
-use hyper::body::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1734,145 +1733,39 @@ fn read_regular_file_checked(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn resolve_redirect_url(current_uri: &Uri, location: &str) -> Result<Uri, PluginInstallError> {
-    let next_url = if location.starts_with("http://") || location.starts_with("https://") {
-        location.to_string()
-    } else if location.starts_with('/') {
-        let scheme = current_uri.scheme_str().unwrap_or("https");
-        let authority = current_uri
-            .authority()
-            .map(|a| a.as_str())
-            .unwrap_or_default();
-        format!("{scheme}://{authority}{location}")
-    } else {
-        return Err(PluginInstallError::new(
-            "UNSAFE_REDIRECT",
-            format!("Refusing unsupported redirect Location '{location}'"),
-        ));
-    };
-
-    let next_uri = validate_plugin_download_url(&next_url)
-        .map_err(|e| PluginInstallError::new("UNSAFE_REDIRECT", e))?;
-    if current_uri.scheme_str() == Some("https") && next_uri.scheme_str() != Some("https") {
-        return Err(PluginInstallError::new(
-            "UNSAFE_REDIRECT",
-            format!("Refusing HTTPS-to-HTTP downgrade redirect to '{next_url}'"),
-        ));
-    }
-    Ok(next_uri)
+    hyp_node::engine::http_fetch::resolve_redirect_url(current_uri, location, false, |url| {
+        validate_plugin_download_url(url)
+            .map_err(|message| FetchError::new("UNSAFE_REDIRECT", message))
+    })
+    .map(|(uri, _)| uri)
+    .map_err(|error| PluginInstallError::new(error.code, error.message))
 }
 
 async fn download_plugin_archive(
     initial_url: &str,
 ) -> Result<(Vec<u8>, String), PluginInstallError> {
-    let mut current_url = initial_url.trim().to_string();
-    let mut current_uri = validate_plugin_download_url(&current_url)
-        .map_err(|e| PluginInstallError::new("UNSAFE_URL", e))?;
-    let client = build_http_client::<Empty<Bytes>>()
-        .map_err(|e| PluginInstallError::new("HTTP_INIT_ERROR", e))?;
-
-    for redirect_count in 0..=MAX_REDIRECTS {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(&current_uri)
-            .header(
-                header::USER_AGENT,
-                format!("hyp/{}", env!("CARGO_PKG_VERSION")),
-            )
-            .body(Empty::new())
-            .map_err(|e| {
-                PluginInstallError::new("HTTP_ERROR", format!("Failed to build request: {e}"))
-            })?;
-
-        let resp = tokio::time::timeout(HTTP_TIMEOUT, client.request(req))
-            .await
-            .map_err(|_| {
-                PluginInstallError::new(
-                    "HTTP_TIMEOUT",
-                    format!(
-                        "GET {} timed out after {}s",
-                        redact_source_location(&current_url),
-                        HTTP_TIMEOUT.as_secs()
-                    ),
-                )
-            })?
-            .map_err(|e| {
-                PluginInstallError::new(
-                    "HTTP_ERROR",
-                    format!("GET {} failed: {e}", redact_source_location(&current_url)),
-                )
-            })?;
-
-        let status = resp.status();
-        if status.is_redirection() {
-            if redirect_count >= MAX_REDIRECTS {
-                return Err(PluginInstallError::new(
-                    "TOO_MANY_REDIRECTS",
-                    format!(
-                        "GET {} exceeded {MAX_REDIRECTS} redirects",
-                        redact_source_location(&current_url)
-                    ),
-                ));
-            }
-            let location = resp
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    PluginInstallError::new(
-                        "HTTP_ERROR",
-                        format!(
-                            "GET {} returned redirect HTTP {} without Location header",
-                            redact_source_location(&current_url),
-                            status.as_u16()
-                        ),
-                    )
-                })?;
-            let next_uri = resolve_redirect_url(&current_uri, location)?;
-            current_url = next_uri.to_string();
-            current_uri = next_uri;
-            continue;
-        }
-
-        if !status.is_success() {
-            return Err(PluginInstallError::new(
-                "HTTP_STATUS",
-                format!(
-                    "GET {} returned HTTP {}",
-                    redact_source_location(&current_url),
-                    status.as_u16()
-                ),
-            ));
-        }
-
-        let mut body = resp.into_body();
-        let mut out = Vec::new();
-        while let Some(frame_res) = body.frame().await {
-            let frame = frame_res.map_err(|e| {
-                PluginInstallError::new("HTTP_ERROR", format!("body read error: {e}"))
-            })?;
-            if let Some(chunk) = frame.data_ref() {
-                if out.len().saturating_add(chunk.len()) > MAX_ARCHIVE_BYTES {
-                    return Err(PluginInstallError::new(
-                        "RESPONSE_TOO_LARGE",
-                        format!(
-                            "Download from {} exceeds {MAX_ARCHIVE_BYTES} byte limit",
-                            redact_source_location(&current_url)
-                        ),
-                    ));
-                }
-                out.extend_from_slice(chunk);
-            }
-        }
-        return Ok((out, redact_source_location(&current_url)));
-    }
-
-    Err(PluginInstallError::new(
-        "TOO_MANY_REDIRECTS",
-        format!(
-            "GET {} exceeded redirect limit",
-            redact_source_location(initial_url)
-        ),
-    ))
+    fetch_bounded_https(
+        initial_url,
+        FetchOptions {
+            max_bytes: MAX_ARCHIVE_BYTES,
+            max_redirects: MAX_REDIRECTS,
+            request_timeout: HTTP_TIMEOUT,
+            user_agent: format!("hyp/{}", env!("CARGO_PKG_VERSION")),
+            display_url: redact_source_location,
+        },
+        |url| {
+            validate_plugin_download_url(url)
+                .map_err(|message| FetchError::new("UNSAFE_URL", message))
+        },
+        |current, location| {
+            let uri = resolve_redirect_url(current, location)
+                .map_err(|error| FetchError::new(error.code, error.message))?;
+            let source = uri.to_string();
+            Ok((uri, source))
+        },
+    )
+    .await
+    .map_err(|error| PluginInstallError::new(error.code, error.message))
 }
 
 /// Strips any URL query string (`?sig=...`, `?sv=...`) or fragment (`#...`) from HTTP(S)

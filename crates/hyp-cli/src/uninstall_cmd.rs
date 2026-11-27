@@ -5,19 +5,13 @@
 //! to download the latest `https://hyphae.to/uninstall.sh` over HTTPS, verify its script
 //! header and print its SHA-256 digest before executing it.
 
-#[cfg(unix)]
-use crate::config_file::build_http_client;
 use crate::ui::{CliError, EXIT_OK};
 use clap::Args;
 use http::Uri;
 #[cfg(unix)]
-use http::{Method, Request, header};
-#[cfg(unix)]
-use http_body_util::{BodyExt, Empty};
+use hyp_node::engine::http_fetch::{FetchError, FetchOptions, fetch_bounded_https};
 #[cfg(any(unix, test))]
 use hyp_proto::jcs::sha256_hex;
-#[cfg(unix)]
-use hyper::body::Bytes;
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
 #[cfg(unix)]
@@ -367,117 +361,31 @@ fn run_uninstall_unix(args: UninstallArgs) -> Result<ExitCode, CliError> {
 async fn fetch_latest_uninstall_script(
     initial_url: &str,
 ) -> Result<(String, String, String), (&'static str, String)> {
-    let mut current_url = initial_url.trim().to_string();
-    let mut current_uri =
-        validate_uninstall_script_url(&current_url).map_err(|e| ("UNSAFE_URL", e))?;
-    let client = build_http_client::<Empty<Bytes>>().map_err(|e| ("HTTP_INIT_ERROR", e))?;
-
-    for redirect_count in 0..=MAX_REDIRECTS {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(&current_uri)
-            .header(
-                header::USER_AGENT,
-                format!("hyp/{}", env!("CARGO_PKG_VERSION")),
-            )
-            .body(Empty::new())
-            .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
-
-        let resp = tokio::time::timeout(SCRIPT_FETCH_TIMEOUT, client.request(req))
-            .await
-            .map_err(|_| {
-                (
-                    "HTTP_TIMEOUT",
-                    format!(
-                        "GET {current_url} timed out after {}s",
-                        SCRIPT_FETCH_TIMEOUT.as_secs()
-                    ),
-                )
-            })?
-            .map_err(|e| ("HTTP_ERROR", format!("GET {current_url} failed: {e}")))?;
-
-        let status = resp.status();
-        if status.is_redirection() {
-            if redirect_count >= MAX_REDIRECTS {
-                return Err((
-                    "TOO_MANY_REDIRECTS",
-                    format!("GET {current_url} exceeded {MAX_REDIRECTS} redirects"),
-                ));
-            }
-            let location = resp
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    (
-                        "HTTP_ERROR",
-                        format!(
-                            "GET {current_url} returned redirect HTTP {} without Location header",
-                            status.as_u16()
-                        ),
-                    )
-                })?;
-            let next_url = if location.starts_with("http://") || location.starts_with("https://") {
-                location.to_string()
-            } else if location.starts_with('/') {
-                let scheme = current_uri.scheme_str().unwrap_or("https");
-                let authority = current_uri
-                    .authority()
-                    .map(|a| a.as_str())
-                    .unwrap_or_default();
-                format!("{scheme}://{authority}{location}")
-            } else {
-                return Err((
-                    "UNSAFE_REDIRECT",
-                    format!("Refusing unsupported redirect Location '{location}'"),
-                ));
-            };
-            let next_uri =
-                validate_uninstall_script_url(&next_url).map_err(|e| ("UNSAFE_REDIRECT", e))?;
-            if current_uri.scheme_str() == Some("https") && next_uri.scheme_str() != Some("https") {
-                return Err((
-                    "UNSAFE_REDIRECT",
-                    format!("Refusing HTTPS-to-HTTP downgrade redirect to '{next_url}'"),
-                ));
-            }
-            current_url = next_url;
-            current_uri = next_uri;
-            continue;
-        }
-
-        if !status.is_success() {
-            return Err((
-                "HTTP_STATUS",
-                format!("GET {current_url} returned HTTP {}", status.as_u16()),
-            ));
-        }
-
-        let mut body = resp.into_body();
-        let mut out = Vec::new();
-        while let Some(frame_res) = body.frame().await {
-            let frame = frame_res.map_err(|e| ("HTTP_ERROR", format!("body read error: {e}")))?;
-            if let Some(chunk) = frame.data_ref() {
-                if out.len().saturating_add(chunk.len()) > MAX_SCRIPT_BYTES {
-                    return Err((
-                        "RESPONSE_TOO_LARGE",
-                        format!(
-                            "Download from {current_url} exceeds {MAX_SCRIPT_BYTES} byte limit"
-                        ),
-                    ));
-                }
-                out.extend_from_slice(chunk);
-            }
-        }
-
-        let text = validate_uninstall_script_body(&out).map_err(|e| ("INVALID_SCRIPT", e))?;
-        let digest = sha256_hex(&out);
-        return Ok((text, digest, current_url));
-    }
-
-    Err((
-        "TOO_MANY_REDIRECTS",
-        format!("GET {initial_url} exceeded redirect limit"),
-    ))
+    let (out, source) = fetch_bounded_https(
+        initial_url,
+        FetchOptions {
+            max_bytes: MAX_SCRIPT_BYTES,
+            max_redirects: MAX_REDIRECTS,
+            request_timeout: SCRIPT_FETCH_TIMEOUT,
+            user_agent: format!("hyp/{}", env!("CARGO_PKG_VERSION")),
+            display_url: |url| url.to_string(),
+        },
+        |url| {
+            validate_uninstall_script_url(url)
+                .map_err(|message| FetchError::new("UNSAFE_URL", message))
+        },
+        |current, location| {
+            hyp_node::engine::http_fetch::resolve_redirect_url(current, location, false, |url| {
+                validate_uninstall_script_url(url)
+                    .map_err(|message| FetchError::new("UNSAFE_REDIRECT", message))
+            })
+        },
+    )
+    .await
+    .map_err(|error| (error.code, error.message))?;
+    let text = validate_uninstall_script_body(&out).map_err(|e| ("INVALID_SCRIPT", e))?;
+    let digest = sha256_hex(&out);
+    Ok((text, digest, source))
 }
 
 /// Returns the manual PowerShell uninstall guidance for Windows, matching `scripts/install.ps1`
