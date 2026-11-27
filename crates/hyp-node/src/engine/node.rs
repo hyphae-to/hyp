@@ -5720,6 +5720,62 @@ impl UnifiedNode {
         Ok(nodes.into_iter().collect())
     }
 
+    async fn build_room_epoch_bundle(
+        &self,
+        scope: EpochScope,
+        host_node: &str,
+        resource: &str,
+        previous_epoch: Option<u64>,
+        member_nodes: &[String],
+        link: Option<&Arc<PeerLink>>,
+    ) -> Result<(RoomEpochKey, SignedEpochKeyBundle), NodeError> {
+        let mut resolved = Vec::with_capacity(member_nodes.len());
+        for node_id in member_nodes {
+            let (_, enc_pk) = self.resolve_peer_keys(node_id, link).await?;
+            resolved.push((node_id.as_str(), enc_pk));
+        }
+        let members: Vec<EpochMember<'_>> = resolved
+            .iter()
+            .map(|(node_id, enc_pk)| EpochMember { node_id, enc_pk })
+            .collect();
+        let creator = self.config.node_id.as_str();
+        let signer = &self.identity.signing;
+        let bundle = match previous_epoch {
+            None => create_epoch_bundle(scope, host_node, resource, 1, creator, signer, &members)?,
+            Some(previous) => rotate_epoch_bundle(
+                scope, host_node, resource, previous, creator, signer, &members,
+            )?,
+        };
+        Ok(bundle)
+    }
+
+    async fn open_and_cache_room_epoch(
+        &self,
+        scope: EpochScope,
+        host_node: &str,
+        resource: &str,
+        creator_node_id: &str,
+        key_envelope_json: &str,
+        link: Option<&Arc<PeerLink>>,
+    ) -> Result<RoomEpochKey, NodeError> {
+        let bundle: SignedEpochKeyBundle = serde_json::from_str(key_envelope_json)?;
+        let (creator_sign_pk, _) = self.resolve_peer_keys(creator_node_id, link).await?;
+        let min_epoch = self.current_min_epoch(scope.as_str(), host_node, resource);
+        let (key, _) = open_epoch_bundle(
+            &bundle,
+            scope,
+            host_node,
+            resource,
+            &creator_sign_pk,
+            self.config.node_id.as_str(),
+            &self.identity.encryption,
+            min_epoch,
+        )?;
+        let copy = RoomEpochKey::from_raw(key.epoch(), *key.key_bytes());
+        self.cache_room_key(scope.as_str(), host_node, resource, key);
+        Ok(copy)
+    }
+
     async fn create_or_rotate_channel_epoch(
         &self,
         host_node: &str,
@@ -5728,39 +5784,16 @@ impl UnifiedNode {
         member_nodes: &[String],
         link: Option<&Arc<PeerLink>>,
     ) -> Result<u64, NodeError> {
-        let mut resolved: Vec<(String, X25519PublicKey)> = Vec::with_capacity(member_nodes.len());
-        for nid in member_nodes {
-            let (_, enc_pk) = self.resolve_peer_keys(nid, link).await?;
-            resolved.push((nid.clone(), enc_pk));
-        }
-        let epoch_members: Vec<EpochMember<'_>> = resolved
-            .iter()
-            .map(|(nid, pk)| EpochMember {
-                node_id: nid.as_str(),
-                enc_pk: pk,
-            })
-            .collect();
-
-        let (room_key, signed_bundle) = match prev_epoch {
-            None => create_epoch_bundle(
+        let (room_key, signed_bundle) = self
+            .build_room_epoch_bundle(
                 EpochScope::Channel,
                 host_node,
                 channel,
-                1,
-                self.config.node_id.as_str(),
-                &self.identity.signing,
-                &epoch_members,
-            )?,
-            Some(prev) => rotate_epoch_bundle(
-                EpochScope::Channel,
-                host_node,
-                channel,
-                prev,
-                self.config.node_id.as_str(),
-                &self.identity.signing,
-                &epoch_members,
-            )?,
-        };
+                prev_epoch,
+                member_nodes,
+                link,
+            )
+            .await?;
         let new_epoch = room_key.epoch();
 
         if let Some(l) = link {
@@ -5825,23 +5858,16 @@ impl UnifiedNode {
         stored: &ChannelEpoch,
         link: Option<&Arc<PeerLink>>,
     ) -> Result<RoomEpochKey, NodeError> {
-        let bundle: SignedEpochKeyBundle = serde_json::from_str(&stored.key_envelope_json)?;
-        let (creator_sign_pk, _) = self
-            .resolve_peer_keys(&stored.creator_node_id, link)
+        let copy = self
+            .open_and_cache_room_epoch(
+                EpochScope::Channel,
+                host_node,
+                channel,
+                &stored.creator_node_id,
+                &stored.key_envelope_json,
+                link,
+            )
             .await?;
-        let min_epoch = self.current_min_epoch("channel", host_node, channel);
-        let (rk, _payload) = open_epoch_bundle(
-            &bundle,
-            EpochScope::Channel,
-            host_node,
-            channel,
-            &creator_sign_pk,
-            self.config.node_id.as_str(),
-            &self.identity.encryption,
-            min_epoch,
-        )?;
-        let copy = RoomEpochKey::from_raw(rk.epoch(), *rk.key_bytes());
-        self.cache_room_key("channel", host_node, channel, rk);
         // Persist verified epoch locally as well.
         {
             let db = self.db();
@@ -6096,6 +6122,40 @@ impl UnifiedNode {
         self.notify_scheduler();
     }
 
+    fn verify_uploaded_epoch_bundle(
+        &self,
+        scope: EpochScope,
+        creator_node_id: &str,
+        resource: &str,
+        epoch: u64,
+        bundle: &SignedEpochKeyBundle,
+    ) -> Result<(), NodeError> {
+        let creator_pk = self
+            .lookup_peer_signing_key(creator_node_id)?
+            .ok_or_else(|| {
+                let label = match scope {
+                    EpochScope::Channel => "epoch",
+                    EpochScope::Kv => "kv epoch",
+                };
+                NodeError::Unauthorized(format!(
+                    "no pinned signing key for {label} creator '{creator_node_id}'"
+                ))
+            })?;
+        let payload: hyp_crypto::e2ee::EpochKeyBundlePayload =
+            creator_pk.verify_signed("epoch-key", bundle)?;
+        if payload.host_node != self.config.node_id.as_str()
+            || payload.resource != resource
+            || payload.epoch != epoch
+            || payload.created_by != creator_node_id
+        {
+            return Err(NodeError::BadRequest(format!(
+                "{} epoch bundle metadata mismatch",
+                scope.as_str(),
+            )));
+        }
+        Ok(())
+    }
+
     /// Server-side handler for `POST /v1/channel-epochs`: verifies writer policy (announcement
     /// rooms restrict epoch rotation to authorized writers), verifies creator Ed25519 signature,
     /// and stores monotonically in `channel_epochs`.
@@ -6112,26 +6172,13 @@ impl UnifiedNode {
         )?;
         self.enforce_channel_node_write_policy(&channel, &caller.peer_id)?;
 
-        let creator_pk = self
-            .lookup_peer_signing_key(&caller.peer_id)?
-            .ok_or_else(|| {
-                NodeError::Unauthorized(format!(
-                    "no pinned signing key for epoch creator '{}'",
-                    caller.peer_id
-                ))
-            })?;
-        let payload: hyp_crypto::e2ee::EpochKeyBundlePayload =
-            creator_pk.verify_signed("epoch-key", &req.bundle)?;
-        if payload.host_node != self.config.node_id.as_str()
-            || payload.resource != channel
-            || payload.epoch != req.epoch
-            || payload.created_by != caller.peer_id
-        {
-            return Err(NodeError::BadRequest(
-                "channel epoch bundle metadata mismatch".into(),
-            ));
-        }
-
+        self.verify_uploaded_epoch_bundle(
+            EpochScope::Channel,
+            &caller.peer_id,
+            &channel,
+            req.epoch,
+            &req.bundle,
+        )?;
         let saved = {
             let db = self.db();
             db.channels().put_epoch(
@@ -6348,39 +6395,16 @@ impl UnifiedNode {
         unique.insert(self.config.node_id.to_string());
         let all_members: Vec<String> = unique.into_iter().collect();
 
-        let mut resolved: Vec<(String, X25519PublicKey)> = Vec::with_capacity(all_members.len());
-        for nid in &all_members {
-            let (_, enc_pk) = self.resolve_peer_keys(nid, link).await?;
-            resolved.push((nid.clone(), enc_pk));
-        }
-        let epoch_members: Vec<EpochMember<'_>> = resolved
-            .iter()
-            .map(|(nid, pk)| EpochMember {
-                node_id: nid.as_str(),
-                enc_pk: pk,
-            })
-            .collect();
-
-        let (room_key, signed_bundle) = match prev_epoch {
-            None => create_epoch_bundle(
+        let (room_key, signed_bundle) = self
+            .build_room_epoch_bundle(
                 EpochScope::Kv,
                 host_node,
                 namespace,
-                1,
-                self.config.node_id.as_str(),
-                &self.identity.signing,
-                &epoch_members,
-            )?,
-            Some(prev) => rotate_epoch_bundle(
-                EpochScope::Kv,
-                host_node,
-                namespace,
-                prev,
-                self.config.node_id.as_str(),
-                &self.identity.signing,
-                &epoch_members,
-            )?,
-        };
+                prev_epoch,
+                &all_members,
+                link,
+            )
+            .await?;
         let new_epoch = room_key.epoch();
 
         if let Some(l) = link {
@@ -6442,23 +6466,16 @@ impl UnifiedNode {
         stored: &KvEpoch,
         link: Option<&Arc<PeerLink>>,
     ) -> Result<RoomEpochKey, NodeError> {
-        let bundle: SignedEpochKeyBundle = serde_json::from_str(&stored.key_envelope_json)?;
-        let (creator_sign_pk, _) = self
-            .resolve_peer_keys(&stored.creator_node_id, link)
+        let copy = self
+            .open_and_cache_room_epoch(
+                EpochScope::Kv,
+                host_node,
+                namespace,
+                &stored.creator_node_id,
+                &stored.key_envelope_json,
+                link,
+            )
             .await?;
-        let min_epoch = self.current_min_epoch("kv", host_node, namespace);
-        let (rk, _payload) = open_epoch_bundle(
-            &bundle,
-            EpochScope::Kv,
-            host_node,
-            namespace,
-            &creator_sign_pk,
-            self.config.node_id.as_str(),
-            &self.identity.encryption,
-            min_epoch,
-        )?;
-        let copy = RoomEpochKey::from_raw(rk.epoch(), *rk.key_bytes());
-        self.cache_room_key("kv", host_node, namespace, rk);
         {
             let db = self.db();
             let _ = db.kv().put_epoch(
@@ -6487,25 +6504,13 @@ impl UnifiedNode {
             caller.scopes.may_kv_write(&req.namespace, ""),
             &format!("kv:write={}/*", req.namespace),
         )?;
-        let creator_pk = self
-            .lookup_peer_signing_key(&caller.peer_id)?
-            .ok_or_else(|| {
-                NodeError::Unauthorized(format!(
-                    "no pinned signing key for kv epoch creator '{}'",
-                    caller.peer_id
-                ))
-            })?;
-        let payload: hyp_crypto::e2ee::EpochKeyBundlePayload =
-            creator_pk.verify_signed("epoch-key", &req.bundle)?;
-        if payload.host_node != self.config.node_id.as_str()
-            || payload.resource != req.namespace
-            || payload.epoch != req.epoch
-            || payload.created_by != caller.peer_id
-        {
-            return Err(NodeError::BadRequest(
-                "kv epoch bundle metadata mismatch".into(),
-            ));
-        }
+        self.verify_uploaded_epoch_bundle(
+            EpochScope::Kv,
+            &caller.peer_id,
+            &req.namespace,
+            req.epoch,
+            &req.bundle,
+        )?;
         let epoch = self.db().kv().put_epoch(
             &KvEpochInput {
                 host_node: self.config.node_id.to_string(),
