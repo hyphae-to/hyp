@@ -35,6 +35,91 @@ pub enum PushMode {
     Interrupt,
 }
 
+/// A wake transport failure reason serialized as the existing reason string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub struct PushReason(PushReasonKind);
+
+macro_rules! push_reasons {
+    ($($variant:ident => $wire:expr),+ $(,)?) => {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub(crate) enum PushReasonKind {
+            $($variant,)+
+            Other(String),
+        }
+
+        impl PushReasonKind {
+            fn known(value: &str) -> Option<Self> {
+                match value {
+                    $(candidate if candidate == $wire => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            fn as_str(&self) -> &str {
+                match self {
+                    $(Self::$variant => $wire,)+
+                    Self::Other(value) => value,
+                }
+            }
+        }
+    }
+}
+
+push_reasons! {
+    HerdrWorking => "herdr_working",
+    HerdrSendGuardRefused => "herdr_send_guard_refused",
+    HerdrAgentNotReady => "herdr_agent_not_ready",
+    T3ServerUnreachable => "t3_server_unreachable",
+    CodexQueueUnavailable => "codex_queue_unavailable",
+    OpenclawGatewayUnavailable => openclaw::REASON_OPENCLAW_GATEWAY_UNAVAILABLE,
+    OpenclawRateLimited => openclaw::REASON_OPENCLAW_RATE_LIMITED,
+    HerdrTargetUnavailable => "herdr_target_unavailable",
+    T3ThreadDeleted => "t3_thread_deleted",
+    T3ThreadArchived => "t3_thread_archived",
+    T3ThreadNotFound => "t3_thread_not_found",
+    T3AuthMissing => "t3_auth_missing",
+    T3AuthFailed => "t3_auth_failed",
+    T3InvalidServerUrl => "t3_invalid_server_url",
+    OpenclawAuthFailed => openclaw::REASON_OPENCLAW_AUTH_FAILED,
+    OpenclawHooksDisabled => openclaw::REASON_OPENCLAW_HOOKS_DISABLED,
+    OpenclawInvalidUrl => openclaw::REASON_OPENCLAW_INVALID_URL,
+    OpenclawInvalidSessionKey => openclaw::REASON_OPENCLAW_INVALID_SESSION_KEY,
+    OpenclawSessionMissing => openclaw::REASON_OPENCLAW_SESSION_MISSING,
+    OpenclawTokenMissing => openclaw::REASON_OPENCLAW_TOKEN_MISSING,
+}
+
+impl PushReason {
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub(crate) fn kind(&self) -> &PushReasonKind {
+        &self.0
+    }
+}
+
+impl From<String> for PushReason {
+    fn from(value: String) -> Self {
+        Self(PushReasonKind::known(&value).unwrap_or(PushReasonKind::Other(value)))
+    }
+}
+
+impl From<&str> for PushReason {
+    fn from(value: &str) -> Self {
+        Self(PushReasonKind::known(value).unwrap_or_else(|| PushReasonKind::Other(value.into())))
+    }
+}
+
+impl From<PushReason> for String {
+    fn from(value: PushReason) -> Self {
+        match value.0 {
+            PushReasonKind::Other(value) => value,
+            reason => reason.as_str().into(),
+        }
+    }
+}
+
 /// Deterministic outcome of a single external push transport delivery attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "lowercase")]
@@ -43,13 +128,13 @@ pub enum PushOutcome {
     Delivered,
     /// Target is busy, offline, or temporarily unavailable; keep unread in durable mailbox.
     Hold {
-        reason: String,
+        reason: PushReason,
         #[serde(default, skip_serializing_if = "is_false")]
         interrupted: bool,
     },
     /// Delivery attempt failed with uncertain or terminal error; keep unread in mailbox for hook fallback.
     Reject {
-        reason: String,
+        reason: PushReason,
         #[serde(default, skip_serializing_if = "is_false")]
         interrupted: bool,
     },
@@ -64,21 +149,21 @@ impl PushOutcome {
         Self::Delivered
     }
 
-    pub fn hold(reason: impl Into<String>) -> Self {
+    pub fn hold(reason: impl Into<PushReason>) -> Self {
         Self::Hold {
             reason: reason.into(),
             interrupted: false,
         }
     }
 
-    pub fn hold_interrupted(reason: impl Into<String>) -> Self {
+    pub fn hold_interrupted(reason: impl Into<PushReason>) -> Self {
         Self::Hold {
             reason: reason.into(),
             interrupted: true,
         }
     }
 
-    pub fn reject(reason: impl Into<String>) -> Self {
+    pub fn reject(reason: impl Into<PushReason>) -> Self {
         Self::Reject {
             reason: reason.into(),
             interrupted: false,
@@ -147,4 +232,33 @@ pub trait PushTransport: Send + Sync {
 #[cfg(test)]
 fn test_digest() -> InboxDigest {
     InboxDigest::count_only(1, hyp_node::delivery::DeliveryUrgency::Queue).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_outcome_reason_wire_format_is_compatible() {
+        for (reason, expected) in [
+            ("herdr_working", PushReasonKind::HerdrWorking),
+            (
+                "unrecognized_reason",
+                PushReasonKind::Other("unrecognized_reason".into()),
+            ),
+        ] {
+            assert_eq!(PushReason::from(reason).kind(), &expected);
+            assert_eq!(PushReason::from(reason.to_owned()).kind(), &expected);
+            let packet = serde_json::json!({"outcome": "hold", "reason": reason});
+            let outcome = serde_json::from_value::<PushOutcome>(packet.clone()).unwrap();
+            assert_eq!(
+                outcome,
+                PushOutcome::Hold {
+                    reason: PushReason(expected.clone()),
+                    interrupted: false,
+                }
+            );
+            assert_eq!(serde_json::to_value(outcome).unwrap(), packet);
+        }
+    }
 }
