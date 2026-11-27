@@ -289,27 +289,7 @@ fn generate_uuid_v4() -> String {
         let mixed = nanos ^ (pid << 64) ^ (seq.wrapping_mul(0x9e37_79b9_7f4a_7c15_u128));
         bytes = mixed.to_le_bytes();
     }
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-    )
+    hyp_proto::uuid::format_uuid_v4(bytes)
 }
 
 fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> Value {
