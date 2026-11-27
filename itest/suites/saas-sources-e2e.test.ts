@@ -1928,8 +1928,18 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
       404,
     );
 
+    // The SDK logs this from the listen callback, before the first signed POST.
+    const waitForWebhookListener = (plugin: string, url: string) => {
+      const log = path.join(sandbox.paths.hyphaeStateDir, "logs", `plugin-${plugin}.log`);
+      return waitUntil(
+        () => fs.existsSync(log) && fs.readFileSync(log, "utf8").includes(`${plugin} plugin webhook listening on ${url}`),
+        `${plugin} webhook listener at ${url}`,
+      );
+    };
+
     // 3. Verify Vercel HMAC-SHA1: 1-bit flip & wrong SHA-256 -> 401; valid SHA-1 -> 202!
     const vercelUrl = `http://127.0.0.1:${vercelPort}/vercel`;
+    await waitForWebhookListener("vercel", vercelUrl);
     const vercelPayload = {
       id: "evt_vrc_804",
       type: "deployment.error",
@@ -1953,6 +1963,7 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
 
     // 4. Verify Notion one-time `verification_token` handshake security (2nd hijack attempt -> 401!)
     const notionUrl = `http://127.0.0.1:${notionPort}/notion`;
+    await waitForWebhookListener("notion", notionUrl);
     const notionToken = "secret_NotionRealHandshakeToken_123456";
     sandbox.registerSecret("notion-verification-token", notionToken);
 
