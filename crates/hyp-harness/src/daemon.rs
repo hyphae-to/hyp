@@ -665,6 +665,11 @@ struct SessionRuntime {
     waiters: Vec<LiveWaiter>,
     channel: Option<LiveChannel>,
     attached_transport: Option<AttachedPushTransport>,
+    /// Cached target from persisted backend metadata. Reads do not touch SQLite.
+    openclaw_target: Option<(String, String)>,
+    /// A verified SessionStart exported the daemon wait token.
+    env_file_exported: bool,
+    flushing: bool,
 }
 
 impl SessionRuntime {
@@ -682,6 +687,9 @@ impl SessionRuntime {
             && self.waiters.is_empty()
             && self.channel.is_none()
             && self.attached_transport.is_none()
+            && self.openclaw_target.is_none()
+            && !self.env_file_exported
+            && !self.flushing
     }
 }
 
@@ -695,18 +703,10 @@ struct LocalDaemonInner {
     socket_path: PathBuf,
     /// Connected native OpenClaw Gateway plugin wake service (`openclaw.service.ready`).
     openclaw_service: Mutex<Option<LiveOpenClawService>>,
-    /// In-memory lock-free-of-DB index mapping `openclaw:*` `session_id -> (sessionKey, agentId)`,
-    /// hydrated from SQLite `sessions.backend_json` on startup and updated on every backend merge.
-    /// Ensures `active_transport_kind` / `daemon.status` / `ui/state.json` NEVER re-enter `node.db()`.
-    openclaw_targets: Mutex<HashMap<String, (String, String)>>,
     /// Deterministic 256-bit HMAC-SHA256 key loaded/persisted in `SecretStore` under
     /// [`DAEMON_SESSION_TOKEN_KEY_SECRET`] (`"daemon-session-token-key"`).
     /// NEVER serialized into `ui/state.json`, SQLite, or logs.
     session_token_key: [u8; 32],
-    /// Sessions that completed `SessionStart` with `envFileExported: true` (hydrated from SQLite
-    /// `sessions.backend_json` on startup) and therefore REQUIRE a valid `sessionToken` on
-    /// `wait.subscribe`.
-    env_file_exported_sessions: Mutex<HashSet<String>>,
     /// Specific `session_id`s that have registered a real `PreToolUse` `call.start` (`X6`).
     /// Never poisons an entire hookless harness (e.g. OpenClaw) globally from one forged call!
     hook_registered_sessions: Mutex<HashSet<String>>,
@@ -715,7 +715,6 @@ struct LocalDaemonInner {
     herdr_terminal_index: Mutex<HashMap<String, Vec<String>>>,
     /// Active background auto-detection probe watchers keyed by `session_id`.
     pending_probes: Mutex<HashMap<String, watch::Receiver<bool>>>,
-    flushing: Mutex<HashSet<String>>,
     /// Per-session classified metadata for `Pending` receipts (`receipt -> meta`).
     item_meta: Mutex<HashMap<String, HashMap<String, ClassifiedItemMeta>>>,
     /// Per-session subscription urgency & key mappings.
@@ -1801,8 +1800,7 @@ impl LocalDaemonInner {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let mut hydrated_herdr_index: HashMap<String, Vec<String>> = HashMap::new();
-        let mut hydrated_env_exported: HashSet<String> = HashSet::new();
-        let mut hydrated_openclaw_targets: HashMap<String, (String, String)> = HashMap::new();
+        let mut hydrated_runtime: HashMap<String, SessionRuntime> = HashMap::new();
         let mut hydrated_sub_meta: HashMap<String, Vec<SubscriptionRecordMeta>> = HashMap::new();
         {
             let db = node.db();
@@ -1818,10 +1816,13 @@ impl LocalDaemonInner {
                     }
                     if let Some(target) = extract_openclaw_target_from_parts(&s.id, &s.backend_json)
                     {
-                        hydrated_openclaw_targets.insert(s.id.clone(), target);
+                        hydrated_runtime
+                            .entry(s.id.clone())
+                            .or_default()
+                            .openclaw_target = Some(target);
                     }
                     if backend_json_flag_true(&s.backend_json, "envFileExported") {
-                        hydrated_env_exported.insert(s.id);
+                        hydrated_runtime.entry(s.id).or_default().env_file_exported = true;
                     }
                 }
             }
@@ -1857,13 +1858,10 @@ impl LocalDaemonInner {
             config,
             socket_path,
             openclaw_service: Mutex::new(None),
-            openclaw_targets: Mutex::new(hydrated_openclaw_targets),
             session_token_key,
-            env_file_exported_sessions: Mutex::new(hydrated_env_exported),
             hook_registered_sessions: Mutex::new(HashSet::new()),
             herdr_terminal_index: Mutex::new(hydrated_herdr_index),
             pending_probes: Mutex::new(HashMap::new()),
-            flushing: Mutex::new(HashSet::new()),
             item_meta: Mutex::new(HashMap::new()),
             sub_meta: Mutex::new(hydrated_sub_meta),
             dismissed_receipts: Mutex::new(HashSet::new()),
@@ -1872,7 +1870,7 @@ impl LocalDaemonInner {
             wake_hooks: Mutex::new(Vec::new()),
             wake_followup_gen: AtomicU64::new(0),
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
-            session_runtime: Mutex::new(HashMap::new()),
+            session_runtime: Mutex::new(hydrated_runtime),
             active_cold_spawns: Mutex::new(HashSet::new()),
             clock_offset_ms: AtomicI64::new(0),
             ui_rev: AtomicU64::new(1),
@@ -2004,10 +2002,10 @@ impl LocalDaemonInner {
             self.record_herdr_terminal(tid, session_id);
         }
         if let Some(target) = extract_openclaw_target_from_parts(session_id, &sess.backend_json) {
-            self.openclaw_targets
-                .lock()
-                .expect("openclaw_targets lock poisoned")
-                .insert(session_id.to_string(), target);
+            self.session_runtime()
+                .entry(session_id.to_owned())
+                .or_default()
+                .openclaw_target = Some(target);
         }
         Ok(sess)
     }
@@ -2604,15 +2602,6 @@ impl LocalDaemonInner {
             }
             {
                 let mut guard = self
-                    .env_file_exported_sessions
-                    .lock()
-                    .expect("env_file_exported_sessions lock poisoned");
-                for sid in &pruned {
-                    guard.remove(sid);
-                }
-            }
-            {
-                let mut guard = self
                     .hook_registered_sessions
                     .lock()
                     .expect("hook_registered_sessions lock poisoned");
@@ -2627,6 +2616,7 @@ impl LocalDaemonInner {
                         runtime.herdr_bare_shell_rejection = None;
                         runtime.lazy_hydrate_attempt_at = None;
                         runtime.quarantine_notices.clear();
+                        runtime.env_file_exported = false;
                         if runtime.is_empty() {
                             sessions.remove(session_id);
                         }
@@ -3079,11 +3069,9 @@ impl LocalDaemonInner {
             return None;
         }
         if let Some(cached) = self
-            .openclaw_targets
-            .lock()
-            .expect("openclaw_targets lock poisoned")
+            .session_runtime()
             .get(session_id)
-            .cloned()
+            .and_then(|runtime| runtime.openclaw_target.clone())
         {
             return Some(cached);
         }
@@ -4117,14 +4105,15 @@ impl LocalDaemonInner {
         format!("st_{}", URL_SAFE_NO_PAD.encode(tag.as_ref()))
     }
 
+    fn cache_env_file_exported(&self, session_id: &str) {
+        self.session_runtime()
+            .entry(session_id.to_owned())
+            .or_default()
+            .env_file_exported = true;
+    }
+
     fn mark_session_env_file_exported(&self, session_id: &str) {
-        {
-            let mut guard = self
-                .env_file_exported_sessions
-                .lock()
-                .expect("env_file_exported_sessions lock poisoned");
-            guard.insert(session_id.to_string());
-        }
+        self.cache_env_file_exported(session_id);
         let mut patch = Map::new();
         patch.insert("envFileExported".into(), json!(true));
         let _ = self.node.db().local().merge_session_backend(
@@ -4136,20 +4125,16 @@ impl LocalDaemonInner {
 
     fn session_requires_wait_token(&self, session_id: &str) -> bool {
         if self
-            .env_file_exported_sessions
-            .lock()
-            .expect("env_file_exported_sessions lock poisoned")
-            .contains(session_id)
+            .session_runtime()
+            .get(session_id)
+            .is_some_and(|runtime| runtime.env_file_exported)
         {
             return true;
         }
         let db = self.node.db();
         if let Ok(Some(sess)) = db.local().get_session(session_id) {
             if backend_json_flag_true(&sess.backend_json, "envFileExported") {
-                self.env_file_exported_sessions
-                    .lock()
-                    .expect("env_file_exported_sessions lock poisoned")
-                    .insert(session_id.to_string());
+                self.cache_env_file_exported(session_id);
                 return true;
             }
         }
@@ -4543,27 +4528,27 @@ impl LocalDaemonInner {
         bypass_activity_grace: bool,
     ) -> (Option<String>, bool) {
         {
-            let mut f = self.flushing.lock().expect("flushing lock poisoned");
-            if !f.insert(session_id.to_string()) {
+            let mut sessions = self.session_runtime();
+            let runtime = sessions.entry(session_id.to_owned()).or_default();
+            if runtime.flushing {
                 return (None, false);
             }
+            runtime.flushing = true;
         }
 
         struct FlushGuard<'a> {
-            flushing: &'a Mutex<HashSet<String>>,
-            session_id: String,
+            daemon: &'a LocalDaemonInner,
+            session_id: &'a str,
         }
         impl Drop for FlushGuard<'_> {
             fn drop(&mut self) {
-                self.flushing
-                    .lock()
-                    .expect("flushing lock poisoned")
-                    .remove(&self.session_id);
+                self.daemon
+                    .clear_runtime_field(self.session_id, |runtime| runtime.flushing = false);
             }
         }
         let _guard = FlushGuard {
-            flushing: &self.flushing,
-            session_id: session_id.to_string(),
+            daemon: self,
+            session_id,
         };
 
         let mut terminal_error: Option<String> = None;
@@ -8532,11 +8517,7 @@ async fn handle_session_start(
         return json!({ "ok": false, "error": e.to_string() });
     }
     if env_file_exported {
-        daemon
-            .env_file_exported_sessions
-            .lock()
-            .expect("env_file_exported_sessions lock poisoned")
-            .insert(session_id.to_string());
+        daemon.cache_env_file_exported(session_id);
     }
     daemon.clear_lazy_hydrate_cooldown(session_id);
     daemon.bump_ui_rev();
