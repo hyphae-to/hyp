@@ -1088,23 +1088,6 @@ impl LocalDaemon {
         self.inner.active_transport_kind(session_id)
     }
 
-    /// Derives the deterministic HMAC-SHA256 per-session authentication token (`sessionToken`)
-    /// for `session_id` and marks `session_id` as `envFileExported: true` so `wait.subscribe` /
-    /// `wait.subscribe` require the matching token even across daemon restarts.
-    pub fn mint_session_token(&self, session_id: &str) -> Result<String, String> {
-        if !is_valid_session_id(session_id) {
-            return Err("invalid_session".to_string());
-        }
-        self.inner.mark_session_env_file_exported(session_id);
-        Ok(self.inner.session_token_for(session_id))
-    }
-
-    /// Returns `true` iff `session_id` currently requires a per-session `sessionToken` on
-    /// `wait.subscribe` (`envFileExported: true`).
-    pub fn session_has_token(&self, session_id: &str) -> bool {
-        self.inner.session_requires_wait_token(session_id)
-    }
-
     /// Registers a pluggable outbound [`BridgePoster`] for `plugin` (case-insensitive slug).
     /// Also causes `mcp.caps` to advertise `hasPlugins: true` so `hyp_bridge` is surfaced in `tools/list`.
     pub fn register_bridge_poster(&self, plugin: impl Into<String>, poster: Arc<dyn BridgePoster>) {
@@ -4096,17 +4079,6 @@ impl LocalDaemonInner {
             .entry(session_id.to_owned())
             .or_default()
             .env_file_exported = true;
-    }
-
-    fn mark_session_env_file_exported(&self, session_id: &str) {
-        self.cache_env_file_exported(session_id);
-        let mut patch = Map::new();
-        patch.insert("envFileExported".into(), json!(true));
-        let _ = self.node.db().local().merge_session_backend(
-            session_id,
-            &Value::Object(patch),
-            self.current_time_ms(),
-        );
     }
 
     fn session_requires_wait_token(&self, session_id: &str) -> bool {

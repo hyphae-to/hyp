@@ -860,26 +860,6 @@ impl<'a> PeerStore<'a> {
         Ok(found.is_some())
     }
 
-    pub fn list_revocations(&self, peer_id: Option<&str>) -> StoreResult<Vec<RevocationRecord>> {
-        if let Some(pid) = peer_id {
-            query_vec(
-                self.db.conn(),
-                "SELECT grant_id, peer_id, signed_json, revoked_at FROM revocations
-                 WHERE peer_id = ?1 ORDER BY revoked_at ASC, grant_id ASC",
-                params![pid],
-                decode_revocation_row,
-            )
-        } else {
-            query_vec(
-                self.db.conn(),
-                "SELECT grant_id, peer_id, signed_json, revoked_at FROM revocations
-                 ORDER BY revoked_at ASC, grant_id ASC",
-                [],
-                decode_revocation_row,
-            )
-        }
-    }
-
     // ---- Peer Keys (RFC 7517 OKP JWKs + RFC 7638 kid) ----
 
     /// Pins a peer JWK in `peer_keys`.
@@ -1073,19 +1053,6 @@ impl<'a> PeerStore<'a> {
             .filter(|k| key_use.is_none_or(|u| k.key_use == u))
             .filter(|k| !active_only || k.status == KeyStatus::Active)
             .collect())
-    }
-
-    pub fn set_peer_key_status(
-        &self,
-        peer_id: &str,
-        kid: &str,
-        status: KeyStatus,
-    ) -> StoreResult<bool> {
-        let changed = self.db.conn().execute(
-            "UPDATE peer_keys SET status = ?1 WHERE peer_id = ?2 AND kid = ?3",
-            params![status.as_str(), peer_id, kid],
-        )?;
-        Ok(changed > 0)
     }
 
     // ---- Persisted Multi-Hub Peer Routes ----

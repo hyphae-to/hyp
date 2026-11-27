@@ -1105,15 +1105,6 @@ impl UnifiedNode {
         by_addr.into_values().map(|(_, entry)| entry).collect()
     }
 
-    pub fn drain_local_inbox(
-        &self,
-        session_id: &str,
-        limit: usize,
-    ) -> Result<Vec<MailboxEntry>, NodeError> {
-        let db = self.db();
-        Ok(db.local().drain_inbox(session_id, limit, now_ms())?)
-    }
-
     pub fn peek_local_inbox(
         &self,
         session_id: &str,
@@ -2752,30 +2743,6 @@ impl UnifiedNode {
         }
         self.require_scope(caller, false, "directory:read")?;
         unreachable!()
-    }
-
-    /// Registers an authorized key rotation for `caller_node` (`PUT /v1/keys`), loading
-    /// the caller's peer record and enforcing P1-2 fail-closed authorization.
-    pub fn register_peer_key_proof(
-        &self,
-        caller_node: &str,
-        req: &PutKeyRequest,
-    ) -> Result<(), NodeError> {
-        let caller = if caller_node == self.config.node_id.as_str() {
-            AuthenticatedPeer {
-                peer_id: self.config.node_id.to_string(),
-                scopes: ScopeSet::from_strings(&["*"]),
-                trust_tier: TrustTier::SelfNode,
-            }
-        } else {
-            let db = self.db();
-            load_active_authenticated_peer(&db, caller_node).map_err(|_| {
-                NodeError::Store(StoreError::Unauthorized(format!(
-                    "peer '{caller_node}' is not an active authorized peer for key rotation"
-                )))
-            })?
-        };
-        self.register_peer_key_proof_authorized(&caller, req, None)
     }
 
     /// Registers an authorized key rotation (`PUT /v1/keys`) fail-closed (P1-2).

@@ -25,11 +25,6 @@ pub fn to_jcs_string(value: &Value) -> Result<String, JcsError> {
     Ok(out)
 }
 
-/// Canonicalizes a `serde_json::Value` into RFC 8785 JCS UTF-8 bytes.
-pub fn to_jcs_bytes(value: &Value) -> Result<Vec<u8>, JcsError> {
-    Ok(to_jcs_string(value)?.into_bytes())
-}
-
 /// Serializes any `Serialize` type into RFC 8785 JCS UTF-8 text.
 pub fn serialize_jcs<T: Serialize>(value: &T) -> Result<String, JcsError> {
     let json = serde_json::to_value(value)?;

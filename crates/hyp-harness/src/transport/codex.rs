@@ -298,12 +298,6 @@ pub fn default_codex_home() -> PathBuf {
     PathBuf::from(".codex")
 }
 
-/// Returns `true` iff the configured `codex` binary exists as a file (if an explicit path) or
-/// resolves in the current process `PATH`.
-pub fn codex_binary_available(bin: &str) -> bool {
-    resolve_codex_binary_path(bin).is_some()
-}
-
 fn resolve_codex_binary_path(bin: &str) -> Option<PathBuf> {
     let trimmed = bin.trim();
     if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
