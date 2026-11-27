@@ -18,6 +18,7 @@ use crate::ui::{
 use crate::update::read_cached_update_status;
 use clap::Args;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
+use hyp_harness::executable::is_executable_file;
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::engine::{DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile};
 use hyp_node::gates::policy::{FilterAdapterConfig, LlmProvider, SecurityGateConfig};
@@ -2552,23 +2553,6 @@ pub(crate) fn build_tailscale_checks(
     }
 
     out
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path)
-            .map(|m| (m.permissions().mode() & 0o111) != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 fn find_executable_in_dir(dir: &Path, name: &Path) -> Option<PathBuf> {

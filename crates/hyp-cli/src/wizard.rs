@@ -3337,12 +3337,8 @@ pub fn find_executable_in_path_env(bin_name: &str, path_var: Option<&OsStr>) -> 
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             let candidate = dir.join(bin_name);
-            let is_exec = fs::metadata(&candidate)
-                .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
-                .unwrap_or(false);
-            if is_exec {
+            if hyp_harness::executable::is_executable_file(&candidate) {
                 return Some(candidate);
             }
         }
