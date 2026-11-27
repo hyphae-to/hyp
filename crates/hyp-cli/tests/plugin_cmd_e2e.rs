@@ -403,8 +403,9 @@ fn release_workflows_package_sign_and_checksum_plugins_tarball() {
             && nightly_wf.contains("nightly_version: ${{ needs.prepare.outputs.version }}"),
         "nightly must pass the resolved tag and version to the shared archive workflow"
     );
-    let shared_wf =
-        fs::read_to_string(root.join(".github/workflows/build-rust-archives.yml")).unwrap();
+    let shared_wf = fs::read_to_string(root.join(".github/workflows/build-rust-archives.yml"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let (_, build_job) = shared_wf
         .split_once("  build:\n")
         .expect("shared build job");
