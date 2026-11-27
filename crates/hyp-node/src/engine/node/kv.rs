@@ -32,6 +32,7 @@ pub struct KvWriteRequest {
     pub allowlist: Option<Vec<String>>,
     pub expected_version: Option<u64>,
     pub ttl_ms: Option<i64>,
+    pub clear_ttl: bool,
     /// Encrypt value with `kv.e2ee.v1` namespace epoch key before storing/sending.
     pub encrypt: bool,
     /// Optional explicit member nodes when auto-bootstrapping an E2EE KV namespace epoch.
@@ -478,6 +479,7 @@ impl UnifiedNode {
                 e2ee_epoch,
                 signature,
                 ttl_ms: req.ttl_ms,
+                clear_ttl: req.clear_ttl,
             };
             l.kv_set(&req.namespace, &req.key, &body, cas_expected)
                 .await?
@@ -499,6 +501,7 @@ impl UnifiedNode {
                         e2ee_epoch,
                         signature,
                         ttl_ms: req.ttl_ms,
+                        clear_ttl: req.clear_ttl,
                     },
                     now_ms(),
                 )?

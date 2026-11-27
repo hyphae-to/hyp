@@ -208,6 +208,7 @@ fn multi_thread_wal_concurrent_kv_cas_and_atomic_event_emission() {
                             e2ee_epoch: None,
                             signature: None,
                             ttl_ms: None,
+                            clear_ttl: false,
                         },
                         t0 + 1000 + (step as i64),
                     ) {

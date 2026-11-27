@@ -4107,6 +4107,17 @@ impl LocalDaemonInner {
                 };
                 let expected_version = args.get("expectedVersion").and_then(Value::as_u64);
                 let ttl_ms = args.get("ttlMs").and_then(Value::as_i64);
+                let clear_ttl = args
+                    .get("clearTtl")
+                    .map(|v| {
+                        v.as_bool()
+                            .ok_or_else(|| invalid_request("clearTtl must be a boolean"))
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                if clear_ttl && args.get("ttlMs").is_some_and(|v| !v.is_null()) {
+                    return Err(invalid_request("ttlMs and clearTtl are mutually exclusive"));
+                }
                 let encrypt = args
                     .get("encrypt")
                     .and_then(Value::as_bool)
@@ -4139,6 +4150,7 @@ impl LocalDaemonInner {
                         allowlist,
                         expected_version,
                         ttl_ms,
+                        clear_ttl,
                         encrypt,
                         e2ee_members,
                     })

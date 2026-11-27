@@ -101,6 +101,8 @@ hyp plugin remove <name|all> [--keep-config] [--json]       # cleans matching no
 
 For `hyp kv`, omitting `--node` or using `--node local` selects the configured node ID. The CLI uses the local daemon when it is reachable and opens SQLite when it is offline. Online writes wake subscribers to `local.kv` according to their coalescing settings.
 
+On `hyp kv set`, omit TTL options to keep a live entry's existing expiration or create an entry with no expiration. Pass `--ttl-seconds <seconds>` to set a new expiration measured from the write. Pass `--clear-ttl` to remove the expiration. The two options are mutually exclusive.
+
 ## Live Session Inspector, TUI, StatusLine & Waiters
 
 ```sh

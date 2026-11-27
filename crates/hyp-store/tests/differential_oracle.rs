@@ -287,7 +287,12 @@ impl MemoryOracle {
             .filter(|e| e.expires_at.is_none_or(|exp| exp > now_ms))
             .cloned();
         let value_json = serde_json::to_string(&input.value).unwrap();
-        let expires_at = input.ttl_ms.map(|ttl| now_ms + ttl);
+        let expires_at = match (input.ttl_ms, input.clear_ttl) {
+            (Some(ttl), false) => Some(now_ms + ttl),
+            (None, false) => live.as_ref().and_then(|entry| entry.expires_at),
+            (None, true) => None,
+            (Some(_), true) => return Err("invalid_input"),
+        };
 
         let entry = if let Some(prev) = live {
             match prev.write_model {
@@ -1111,14 +1116,20 @@ fn run_differential_seed(seed: u64, steps: usize) {
                     e2ee_epoch: None,
                     signature: None,
                     ttl_ms,
+                    clear_ttl: ttl_ms.is_none() && step % 5 == 0,
                 };
                 let real_res = db.kv().set(&input, now_ms);
                 let oracle_res = oracle.kv_set(&input, now_ms, &format!("oracle-kv-set-{step}"));
                 match (&real_res, &oracle_res) {
-                    (Ok(r), Ok(v)) => assert_eq!(
-                        r.entry.version, *v,
-                        "seed=0x{seed:016x} step={step}: KV set version mismatch"
-                    ),
+                    (Ok(r), Ok(v)) => {
+                        let expected = oracle.kv_get("local", "shared", key, now_ms).unwrap();
+                        assert_eq!(
+                            (r.entry.version, r.entry.expires_at),
+                            (*v, expected.expires_at),
+                            "seed=0x{seed:016x} step={step}: KV set version or expiration mismatch"
+                        );
+                    }
+
                     (Err(StoreError::VersionConflict { .. }), Err("version_conflict")) => {}
                     (Err(StoreError::Unauthorized(_)), Err("unauthorized")) => {}
                     _ => panic!(

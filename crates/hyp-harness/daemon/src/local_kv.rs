@@ -42,6 +42,8 @@ pub enum LocalKvAction {
         writer: Option<String>,
         expected_version: Option<u64>,
         ttl_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clear_ttl: bool,
     },
     Delete {
         key: String,
@@ -122,6 +124,7 @@ impl LocalKvRequest {
                 writer,
                 expected_version,
                 ttl_ms,
+                clear_ttl,
             } => {
                 let saved = kv.set(
                     &KvSetInput {
@@ -138,6 +141,7 @@ impl LocalKvRequest {
                         e2ee_epoch: None,
                         signature: None,
                         ttl_ms,
+                        clear_ttl,
                     },
                     now,
                 )?;

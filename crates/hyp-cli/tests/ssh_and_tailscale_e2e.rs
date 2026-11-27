@@ -279,6 +279,7 @@ async fn ssh_transport_full_stack_e2ee_dm_sse_kv_transfer_and_zero_pid_leak() {
             allowlist: None,
             expected_version: None,
             ttl_ms: None,
+            clear_ttl: false,
             encrypt: true,
             e2ee_members: Some(vec!["alice@macbook".to_string(), "solace".to_string()]),
         })

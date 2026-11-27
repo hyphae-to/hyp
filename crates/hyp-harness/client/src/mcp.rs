@@ -241,7 +241,8 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
                     "expectedVersion": {"type": "integer", "minimum": 0},
                     "writeModel": {"type": "string", "enum": ["owner", "shared", "allowlist"]},
                     "allowlist": {"type": "array", "items": s},
-                    "ttlMs": {"type": "integer", "minimum": 1},
+                    "ttlMs": {"type": "integer", "minimum": 1, "description": "Renew expiry from now. Omit to preserve an existing expiry."},
+                    "clearTtl": {"type": "boolean", "description": "Remove expiry. Mutually exclusive with ttlMs."},
                     "encrypt": {"type": "boolean"},
                     "e2eeMembers": {"type": "array", "items": s}
                 },

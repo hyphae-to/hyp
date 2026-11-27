@@ -90,5 +90,8 @@ Discover topics and manage CloudEvents v1.0 stream subscriptions (both local `lo
 | `prefix` | `string` | Key prefix filter (`list`) |
 | `expectedVersion` | `integer` | Optimistic CAS version (`If-Match`; returns `409 version_conflict` on race) |
 | `writeModel` | `"owner" \| "shared" \| "allowlist"` | Namespace write model |
-| `ttlMs` | `integer` | Optional entry TTL in milliseconds |
+| `ttlMs` | `integer` | Set a new expiration in milliseconds from the write. Omit to retain a live entry's expiration or create an entry with no expiration |
+| `clearTtl` | `boolean` | Remove the expiration on `set`. Mutually exclusive with `ttlMs` when true |
 | `encrypt` | `boolean` | Store end-to-end encrypted (`kv.e2ee.v1`) |
+
+The host storing the entry applies TTL changes. Hosts running Hyphae 0.8.0 or earlier clear the expiration when `ttlMs` is omitted.
