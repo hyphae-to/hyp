@@ -49,9 +49,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
@@ -803,8 +803,7 @@ impl LocalIngestServer {
         cleaned_up: Arc<AtomicBool>,
     ) -> Result<Self, NodeError> {
         prepare_unix_socket_path(&endpoint_path)?;
-        let listener = UnixListener::bind(&endpoint_path)?;
-        fs::set_permissions(&endpoint_path, fs::Permissions::from_mode(0o600))?;
+        let listener = crate::engine::private_socket::bind_private_unix_socket(&endpoint_path)?;
 
         let sem = Arc::new(Semaphore::new(LOCAL_INGEST_MAX_CONCURRENT_CONNS));
         let accept_state = Arc::clone(&state);

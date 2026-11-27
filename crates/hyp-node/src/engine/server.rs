@@ -247,47 +247,10 @@ impl UnifiedNode {
         let local_addr = listener.local_addr()?;
         self.set_bound_addr(local_addr);
 
-        let mut shutdown_rx = self.shutdown_receiver();
+        let shutdown_rx = self.shutdown_receiver();
         let node = Arc::clone(&self);
         let handle = tokio::spawn(async move {
-            loop {
-                let accept = tokio::select! {
-                    res = listener.accept() => res,
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let (stream, peer_addr) = match accept {
-                    Ok(pair) => pair,
-                    Err(_) => continue,
-                };
-                let conn_node = Arc::clone(&node);
-                let mut conn_shutdown = node.shutdown_receiver();
-                tokio::spawn(async move {
-                    if *conn_shutdown.borrow() {
-                        return;
-                    }
-                    let io = TokioIo::new(LingeringTcpStream::new(stream));
-                    let service = service_fn(move |req: Request<Incoming>| {
-                        let n = Arc::clone(&conn_node);
-                        async move { Ok::<_, Infallible>(handle_http_request(n, peer_addr, req).await) }
-                    });
-                    let builder = AutoServerBuilder::new(TokioExecutor::new());
-                    let conn = builder.serve_connection(io, service);
-                    tokio::pin!(conn);
-                    tokio::select! {
-                        _ = conn.as_mut() => {}
-                        _ = conn_shutdown.changed() => {
-                            if *conn_shutdown.borrow() {
-                                conn.as_mut().graceful_shutdown();
-                            }
-                        }
-                    }
-                });
-            }
+            serve_accept_loop(&listener, &node, shutdown_rx).await;
         });
 
         Ok((local_addr, handle))
@@ -340,59 +303,96 @@ impl UnifiedNode {
             std::fs::remove_file(&path)?;
         }
 
-        let listener = tokio::net::UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = crate::engine::private_socket::bind_private_unix_socket(&path)?;
         self.set_peer_socket_path(path.clone());
 
-        let mut shutdown_rx = self.shutdown_receiver();
+        let shutdown_rx = self.shutdown_receiver();
         let node = Arc::clone(&self);
         let cleanup_path = path.clone();
-        let loopback_peer = SocketAddr::from(([127, 0, 0, 1], 0));
         let handle = tokio::spawn(async move {
-            loop {
-                let accept = tokio::select! {
-                    res = listener.accept() => res,
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let (stream, _unix_addr) = match accept {
-                    Ok(pair) => pair,
-                    Err(_) => continue,
-                };
-                let conn_node = Arc::clone(&node);
-                let mut conn_shutdown = node.shutdown_receiver();
-                tokio::spawn(async move {
-                    if *conn_shutdown.borrow() {
-                        return;
-                    }
-                    let io = TokioIo::new(stream);
-                    let service = service_fn(move |req: Request<Incoming>| {
-                        let n = Arc::clone(&conn_node);
-                        async move {
-                            Ok::<_, Infallible>(handle_http_request(n, loopback_peer, req).await)
-                        }
-                    });
-                    let builder = AutoServerBuilder::new(TokioExecutor::new());
-                    let conn = builder.serve_connection(io, service);
-                    tokio::pin!(conn);
-                    tokio::select! {
-                        _ = conn.as_mut() => {}
-                        _ = conn_shutdown.changed() => {
-                            if *conn_shutdown.borrow() {
-                                conn.as_mut().graceful_shutdown();
-                            }
-                        }
-                    }
-                });
-            }
+            serve_accept_loop(&listener, &node, shutdown_rx).await;
             let _ = std::fs::remove_file(&cleanup_path);
         });
 
         Ok((path, handle))
+    }
+}
+
+// Transport policy remains explicit: TCP uses the lingering wrapper and its actual peer address;
+// Unix streams use the existing loopback attribution and stay unwrapped.
+trait PeerListener: Send + Sync {
+    type Stream: Send + 'static;
+    type Io: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+    fn accept(&self) -> impl Future<Output = io::Result<(Self::Stream, SocketAddr)>> + Send;
+    fn wrap_stream(stream: Self::Stream) -> Self::Io;
+}
+
+impl PeerListener for TcpListener {
+    type Stream = TcpStream;
+    type Io = LingeringTcpStream;
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        TcpListener::accept(self).await
+    }
+    fn wrap_stream(stream: TcpStream) -> LingeringTcpStream {
+        LingeringTcpStream::new(stream)
+    }
+}
+
+#[cfg(unix)]
+impl PeerListener for tokio::net::UnixListener {
+    type Stream = tokio::net::UnixStream;
+    type Io = tokio::net::UnixStream;
+    async fn accept(&self) -> io::Result<(Self::Stream, SocketAddr)> {
+        let (stream, _) = tokio::net::UnixListener::accept(self).await?;
+        Ok((stream, SocketAddr::from(([127, 0, 0, 1], 0))))
+    }
+    fn wrap_stream(stream: Self::Stream) -> Self::Io {
+        stream
+    }
+}
+
+async fn serve_accept_loop<L: PeerListener>(
+    listener: &L,
+    node: &Arc<UnifiedNode>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let accept = tokio::select! {
+            res = listener.accept() => res,
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let (stream, peer_addr) = match accept {
+            Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let conn_node = Arc::clone(node);
+        let mut conn_shutdown = node.shutdown_receiver();
+        tokio::spawn(async move {
+            if *conn_shutdown.borrow() {
+                return;
+            }
+            let io = TokioIo::new(L::wrap_stream(stream));
+            let service = service_fn(move |req: Request<Incoming>| {
+                let n = Arc::clone(&conn_node);
+                async move { Ok::<_, Infallible>(handle_http_request(n, peer_addr, req).await) }
+            });
+            let builder = AutoServerBuilder::new(TokioExecutor::new());
+            let conn = builder.serve_connection(io, service);
+            tokio::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => {}
+                _ = conn_shutdown.changed() => {
+                    if *conn_shutdown.borrow() {
+                        conn.as_mut().graceful_shutdown();
+                    }
+                }
+            }
+        });
     }
 }
 
