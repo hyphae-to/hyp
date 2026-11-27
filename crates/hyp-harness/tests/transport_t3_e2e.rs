@@ -620,6 +620,106 @@ async fn handle_mock_conn(
 // 1. Read-Only SQLite Thread & Caller Resolution E2E Tests
 // ============================================================================
 
+#[test]
+fn sqlite_resolves_only_exact_strong_active_native_thread_refs() {
+    let tmp = TempDir::new().unwrap();
+    let conn = create_t3_sqlite(tmp.path());
+    conn.execute_batch(
+        "ALTER TABLE orchestration_v2_projection_threads ADD COLUMN active_provider_thread_id TEXT;
+         ALTER TABLE orchestration_v2_projection_provider_threads ADD COLUMN payload_json TEXT;
+         INSERT INTO orchestration_v2_projection_threads
+             (thread_id, active_provider_thread_id) VALUES ('thread-a', 'namespaced-provider-a');
+         INSERT INTO orchestration_v2_projection_provider_threads
+             (provider_thread_id, thread_id, provider_session_id)
+             VALUES ('namespaced-provider-a', 'thread-a', 'internal-session-a');",
+    )
+    .unwrap();
+    let valid = json!({
+        "id": "namespaced-provider-a", "appThreadId": "thread-a", "driver": "claudeAgent",
+        "nativeThreadRef": {"driver": "claudeAgent", "nativeId": "native-session-a", "strength": "strong"}
+    });
+    let set_payload = |payload: &Value| {
+        conn.execute(
+            "UPDATE orchestration_v2_projection_provider_threads SET payload_json = ?1",
+            [payload.to_string()],
+        )
+        .unwrap();
+    };
+    for invalid in [None, Some("{broken-json")] {
+        conn.execute(
+            "UPDATE orchestration_v2_projection_provider_threads SET payload_json = ?1",
+            [invalid],
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_t3_thread_by_provider_session("native-session-a", tmp.path()),
+            Err(T3LookupError::CallerNotFound(_))
+        ));
+        assert_eq!(
+            resolve_t3_thread_by_provider_session("internal-session-a", tmp.path()),
+            Ok("thread-a".into())
+        );
+    }
+    set_payload(&valid);
+    assert_eq!(
+        resolve_t3_thread_by_provider_session("native-session-a", tmp.path()),
+        Ok("thread-a".into())
+    );
+    // Exact matching, never UUID suffix or substring attribution.
+    for id in ["session-a", "native-session", "native-session-a-extra"] {
+        assert!(matches!(
+            resolve_t3_thread_by_provider_session(id, tmp.path()),
+            Err(T3LookupError::CallerNotFound(_))
+        ));
+    }
+    for (path, value) in [
+        ("/nativeThreadRef/strength", json!("weak")),
+        ("/nativeThreadRef/driver", json!("codex")),
+        ("/nativeThreadRef/nativeId", json!("another-session")),
+        ("/appThreadId", json!("another-thread")),
+        ("/id", json!("another-provider")),
+    ] {
+        let mut mutated = valid.clone();
+        *mutated.pointer_mut(path).unwrap() = value;
+        set_payload(&mutated);
+        assert!(
+            matches!(
+                resolve_t3_thread_by_provider_session("native-session-a", tmp.path()),
+                Err(T3LookupError::CallerNotFound(_))
+            ),
+            "accepted mutation {path}"
+        );
+    }
+    set_payload(&valid);
+    for column in ["deleted_at", "archived_at", "active_provider_thread_id"] {
+        conn.execute(
+            &format!("UPDATE orchestration_v2_projection_threads SET {column} = 'different'"),
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_t3_thread_by_provider_session("native-session-a", tmp.path()),
+            Err(T3LookupError::CallerNotFound(_))
+        ));
+        conn.execute(
+            &format!("UPDATE orchestration_v2_projection_threads SET {column} = ?1"),
+            [if column == "active_provider_thread_id" {
+                Some("namespaced-provider-a")
+            } else {
+                None
+            }],
+        )
+        .unwrap();
+    }
+    // Two independently active owners remain ambiguous, including legacy exact matches.
+    conn.execute_batch("INSERT INTO orchestration_v2_projection_threads (thread_id) VALUES ('thread-b');
+        INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('native-session-a', 'thread-b');").unwrap();
+    assert!(matches!(
+        resolve_t3_thread_by_provider_session("native-session-a", tmp.path()),
+        Err(T3LookupError::CallerAmbiguous(_))
+    ));
+}
+
 #[tokio::test]
 async fn sqlite_resolves_v2_and_v1_schemas_ignores_deleted_archived_and_fails_closed_on_ambiguous()
 {
