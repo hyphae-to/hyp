@@ -439,7 +439,7 @@ pub fn build_initialize_instructions(
     }
     if options.channel {
         return format!(
-            "Join via hyp_mesh(action:'join', handle, include:['peers','topics']), hyp_send, hyp_stream (timers: local.schedule + OS cron -> hyp emit/ingest.sock). Claude Code can accept channel notices when selected at launch. Check join hasLiveTransport and use Monitor hyp watch or hyp wait when idle without a confirmed wake route. Never poll hyp_inbox. {H9_TRUST_NOTE}"
+            "Join via hyp_mesh(action:'join', handle). hyp_send, hyp_stream (local.schedule via hyp emit/ingest.sock). Claude channels are best effort when selected at launch. Use Monitor hyp watch or hyp wait when idle and hasLiveTransport=false. Never poll hyp_inbox. {H9_TRUST_NOTE}"
         );
     }
     if options.backend == Some(HarnessKind::Antigravity) {
@@ -1052,24 +1052,34 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_hint_is_latched_and_never_overrides_explicit_backend() {
-        for (explicit, first, second, expected) in [
+        for (explicit, first, second, expected, expected_channel) in [
             (
                 None,
                 "openclaw-bundle-mcp",
                 "claude-code",
                 HarnessKind::Openclaw,
+                false,
             ),
             (
                 None,
                 "claude-code",
                 "openclaw-bundle-mcp",
                 HarnessKind::Claude,
+                true,
             ),
             (
                 Some(HarnessKind::Openclaw),
                 "codex-mcp-client",
                 "claude-code",
                 HarnessKind::Openclaw,
+                false,
+            ),
+            (
+                Some(HarnessKind::Codex),
+                "claude-code",
+                "claude-code",
+                HarnessKind::Codex,
+                false,
             ),
         ] {
             let options = McpOptions {
@@ -1087,6 +1097,7 @@ mod tests {
             let expected = build_initialize_instructions(
                 &McpOptions {
                     backend: Some(expected),
+                    channel: expected_channel,
                     ..McpOptions::new(PathBuf::from("nonexistent.sock"))
                 },
                 detect_env_herdr_active(),
@@ -1097,6 +1108,11 @@ mod tests {
             for line in output.lines() {
                 let response: Value = serde_json::from_str(line).unwrap();
                 assert_eq!(response["result"]["instructions"], expected);
+                assert_eq!(
+                    response["result"]["capabilities"]["experimental"]["claude/channel"]
+                        .is_object(),
+                    expected_channel,
+                );
             }
         }
         for info in [

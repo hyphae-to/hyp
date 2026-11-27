@@ -549,7 +549,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             args: vec!["mcp", sock_str],
             envs: vec![],
             client_name: Some("claude-code"),
-            expected_substr: "Claude Code can accept channel notices when selected at launch",
+            expected_substr: "Claude channels are best effort when selected at launch",
             expect_monitor: true,
         },
         McpInstrCase {
@@ -557,7 +557,7 @@ fn live_mcp_subprocess_emits_transport_aware_initialize_instructions() {
             args: vec!["mcp", sock_str, "--claude-channel"],
             envs: vec![],
             client_name: None,
-            expected_substr: "Claude Code can accept channel notices when selected at launch",
+            expected_substr: "Claude channels are best effort when selected at launch",
             expect_monitor: true,
         },
         McpInstrCase {
