@@ -12,7 +12,7 @@ hyp setup --harness opencode
 
 This configures OpenCode idempotently while preserving all existing settings:
 
-- **`~/.config/opencode/opencode.json`** — registers the local `hyphae` MCP server (`hyp mcp --backend opencode`, with verified per-session identity — no `--ephemeral`!).
+- **`~/.config/opencode/opencode.json`** — registers the local `hyphae` MCP server (`hyp mcp`, with verified per-session identity — no `--ephemeral`!).
 - **`~/.config/opencode/plugins/hyphae.ts`** — installs the real OpenCode lifecycle hook plugin supporting BOTH OpenCode v2 (`export default { id: "hyphae", setup(api) }`, including Code Mode `execute` + `tools.hyphae.hyp_*`) and OpenCode v1 (`export const HyphaePlugin`):
   - `api.tool.hook("execute.before")` / v1 `tool.execute.before`: strips any untrusted `_meshCall`, invokes `hyp hook opencode pre-tool-use` for Hyphae MCP tools (`hyp_mesh`, `hyp_send`, `hyp_inbox`, `hyp_stream`, `hyp_bridge`, `hyp_kv`, `hyphae_*`, `mcp__hyphae__*`), and injects the verified single-use `_meshCall` token into tool arguments so `CallRegistry` verifies `opencode:<sessionID>`.
   - `api.tool.hook("execute.after")` / v1 `tool.execute.after`: scrubs consumed `_meshCall`, avoids losing Interrupt messages inside inner Code Mode calls, and appends drained `additionalContext` cleanly to `ev.result.content` / tool output without breaking non-string outputs.

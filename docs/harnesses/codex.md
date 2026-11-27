@@ -7,7 +7,7 @@ hyp setup --harness codex
 ```
 
 What this configures:
-- MCP entry in `~/.codex/config.toml` (`hyp mcp --backend codex`).
+- MCP entry in `~/.codex/config.toml` (`hyp mcp`).
 - Hooks (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`) in `~/.codex/hooks.json`.
 - Tailored skill in `~/.agents/skills/hyp-mesh/SKILL.md`.
 

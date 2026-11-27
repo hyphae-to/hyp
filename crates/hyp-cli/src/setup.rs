@@ -2050,7 +2050,8 @@ pub fn detect_harness_statuses(
                     (has_cfg, loc)
                 }
                 HarnessKind::Herdr => {
-                    let skill = spec.runtime_skill(home);
+                    let original = spec.runtime_skill(home);
+                    let skill = crate::skillshare::Skillshare::detect(home).and_then(|manager| manager.resolve_skill_path(&original).ok()).unwrap_or(original);
                     let legacy_skill = legacy_skill_path(&skill, "hyphae");
                     let mod_pane = home
                         .join(".config")
@@ -2259,7 +2260,7 @@ impl CodexMcpConfig {
                 args.get(1)?.as_str().filter(|arg| !arg.starts_with('-'))
             })
             .map(ToOwned::to_owned);
-        let args: Array = mcp_args(socket.as_deref(), &["--backend", "codex"])
+        let args: Array = mcp_args(socket.as_deref(), &[])
             .iter()
             .filter_map(Value::as_str)
             .collect();
@@ -2490,6 +2491,17 @@ fn install_harness_runtime_skills(
     let rendered = render_runtime_skill(&profile);
     let (primary, extras) = runtime_skill_paths(kind, home, claude_profiles);
     for path in std::iter::once(primary).chain(extras) {
+        if let Some(manager) = crate::skillshare::Skillshare::detect(home) {
+            let destination = manager.install_skill(&path, &rendered, ctx.force_skills, dry_run)?;
+            if !dry_run {
+                for legacy in legacy_runtime_skills(kind, home, &path) {
+                    retire_legacy_skill(&legacy, is_managed_legacy_runtime_skill)?;
+                }
+            }
+            files.push(destination.display().to_string());
+            notes.push("Runtime skill installed and synchronized by Skillshare (its naming and filters apply).".into());
+            continue;
+        }
         match apply_managed_skill(&path, &rendered, ctx.force_skills, dry_run)? {
             SkillWriteOutcome::Written | SkillWriteOutcome::Unchanged => {
                 if !dry_run {
@@ -3185,6 +3197,30 @@ impl HarnessSpec {
             skills,
             ..
         } = *request;
+        let manager = crate::skillshare::Skillshare::detect(home);
+        if let Some(manager) = &manager {
+            match self.kind {
+                HarnessKind::Antigravity => warnings.push("Skillshare's Antigravity MCP target writes a global config, while Hyphae uses its plugin config; the plugin remains directly managed. Skills use Skillshare.".into()),
+                HarnessKind::Openclaw | HarnessKind::Herdr | HarnessKind::T3 => warnings.push(format!("Skillshare has no native {} MCP target; its existing Hyphae integration remains directly managed. Skills use Skillshare.", self.kind.as_str())),
+                HarnessKind::Codex => warnings.push("Skillshare cannot preserve Codex-only optional CODEX_HOME/HYPHAE_SOCKET forwarding in one shared hyphae definition; Codex MCP remains directly managed. Skills use Skillshare.".into()),
+                HarnessKind::Claude => {
+                    if options.claude_profiles.iter().any(|p| !p.is_default_home) {
+                        return Err("Skillshare MCP account profiles need explicit target mapping; preserved existing Claude profile configurations".into());
+                    }
+                    for profile in options.claude_profiles { manager.configure_mcp(self.kind, &profile.mcp_file, bin, options.socket, options.dry_run)?; }
+                }
+                kind => {
+                    let path = match kind {
+                        HarnessKind::Cursor => spec(kind).config_location(home).join("mcp.json"),
+                        HarnessKind::Opencode => spec(kind).config_location(home).join("opencode.json"),
+                        HarnessKind::Gemini => spec(kind).config_location(home),
+                        _ => unreachable!(),
+                    };
+                    manager.configure_mcp(kind, &path, bin, options.socket, options.dry_run)?;
+                    warnings.push("Skillshare owns MCP server hyphae; native per-server settings and tool namespaces are preserved.".into());
+                }
+            }
+        }
         match self.kind {
             HarnessKind::Antigravity => setup_antigravity(home, bin, options, skills),
             HarnessKind::Claude => setup_claude(home, bin, options, skills, warnings, next),
@@ -3221,19 +3257,21 @@ fn setup_antigravity(
     )?;
 
     let mcp_json = plugin_dir.join("mcp_config.json");
-    maybe_write_json(
-        &mcp_json,
-        &json!({
-            "mcpServers": {
-                "hyphae": {
-                    "command": bin,
-                    "args": mcp_args(socket, &[])
+    {
+        maybe_write_json(
+            &mcp_json,
+            &json!({
+                "mcpServers": {
+                    "hyphae": {
+                        "command": bin,
+                        "args": mcp_args(socket, &[])
+                    }
                 }
-            }
-        }),
-        false,
-        dry_run,
-    )?;
+            }),
+            false,
+            dry_run,
+        )?;
+    }
 
     let hooks_json = plugin_dir.join("hooks.json");
     maybe_write_json(
@@ -3373,7 +3411,9 @@ fn setup_claude(
 
     for profile in opts.claude_profiles {
         // 1. Profile-local `.claude.json` (distinct per CLAUDE_CONFIG_DIR profile!).
-        if seen_mcp.insert(canonical_dedup_key(&profile.mcp_file)) {
+        if crate::skillshare::Skillshare::detect(home).is_none()
+            && seen_mcp.insert(canonical_dedup_key(&profile.mcp_file))
+        {
             let mut mcp_doc = read_json_object_or_empty(&profile.mcp_file)?;
             let mut servers = mcp_doc
                 .get("mcpServers")
@@ -3727,7 +3767,9 @@ fn setup_cursor(
         }),
     );
     mcp_doc.insert("mcpServers".to_string(), Value::Object(servers));
-    maybe_write_json(&mcp_file, &Value::Object(mcp_doc), false, dry_run)?;
+    if crate::skillshare::Skillshare::detect(home).is_none() {
+        maybe_write_json(&mcp_file, &Value::Object(mcp_doc), false, dry_run)?;
+    }
 
     let mut hooks_doc = read_json_object_or_empty(&hooks_file)?;
     let version = hooks_doc
@@ -3834,7 +3876,7 @@ fn setup_opencode(
         .cloned()
         .unwrap_or_default();
     let mut cmd_arr = vec![Value::String(bin.to_string())];
-    cmd_arr.extend(mcp_args(socket, &["--backend", "opencode"]));
+    cmd_arr.extend(mcp_args(socket, &[]));
     mcp.insert(
         "hyphae".to_string(),
         json!({
@@ -3843,7 +3885,9 @@ fn setup_opencode(
             "enabled": true
         }),
     );
-    cfg_doc.insert("mcp".to_string(), Value::Object(mcp));
+    if crate::skillshare::Skillshare::detect(home).is_none() {
+        cfg_doc.insert("mcp".to_string(), Value::Object(mcp));
+    }
     maybe_write_json(&config_file, &Value::Object(cfg_doc), false, dry_run)?;
 
     let bin_json = serde_json::to_string(bin).unwrap_or_else(|_| "\"hyp\"".to_string());
@@ -3930,7 +3974,9 @@ fn setup_gemini(
             "args": mcp_args(socket, &[])
         }),
     );
-    settings.insert("mcpServers".to_string(), Value::Object(servers));
+    if crate::skillshare::Skillshare::detect(home).is_none() {
+        settings.insert("mcpServers".to_string(), Value::Object(servers));
+    }
 
     let mut tools = settings
         .get("tools")
@@ -4136,7 +4182,7 @@ pub fn apply_openclaw_config(
         "hyphae".to_string(),
         json!({
             "command": bin,
-            "args": mcp_args(socket, &["--backend", "openclaw"])
+            "args": mcp_args(socket, &[])
         }),
     );
     mcp.insert("servers".to_string(), Value::Object(servers));

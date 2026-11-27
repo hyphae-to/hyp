@@ -322,8 +322,8 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     assert!(codex_toml_1.contains("[mcp_servers.hyphae]"));
     assert!(codex_toml_1.contains(fake_bin));
     assert!(
-        codex_toml_1.contains("\"--backend\", \"codex\""),
-        "X8: setup_codex must pass --backend codex in config.toml: {codex_toml_1}"
+        !codex_toml_1.contains("--backend"),
+        "setup_codex should infer the client backend without a generated flag: {codex_toml_1}"
     );
     assert_eq!(codex_toml_1.matches("[mcp_servers.hyphae]").count(), 1);
     assert!(home.join(".config/opencode/plugins/hyphae.ts").exists());
@@ -339,7 +339,7 @@ fn onboard_and_setup_all_nine_harnesses_in_isolated_home() {
     .unwrap();
     assert_eq!(
         opencode_cfg["mcp"]["hyphae"]["command"],
-        json!([fake_bin, "mcp", "--backend", "opencode"])
+        json!([fake_bin, "mcp"])
     );
 
     let agy_sidecar: Value = serde_json::from_str(

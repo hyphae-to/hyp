@@ -4,7 +4,7 @@ Zero-dependency native OpenClaw plugin (`~/.openclaw/extensions/hyphae/`) that c
 
 ## Installation & Configuration
 
-`hyp setup --harness openclaw` installs `openclaw.plugin.json` and `index.js` directly into `~/.openclaw/extensions/hyphae/` offline (zero npm install or build step) and merges `mcp.servers.hyphae` (`hyp mcp --backend openclaw`, without `--ephemeral`) and `plugins.entries.hyphae` non-destructively into `~/.openclaw/openclaw.json`.
+`hyp setup --harness openclaw` installs `openclaw.plugin.json` and `index.js` directly into `~/.openclaw/extensions/hyphae/` offline (zero npm install or build step) and merges `mcp.servers.hyphae` (`hyp mcp`, without `--ephemeral`) and `plugins.entries.hyphae` non-destructively into `~/.openclaw/openclaw.json`.
 
 ```sh
 # Default: Native plugin exact-session wake + conservative prompt injection OFF

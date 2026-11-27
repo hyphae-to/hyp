@@ -353,7 +353,7 @@ impl ManualGuideHarness {
         match self {
             Self::ClaudeDesktop => {
                 let path = claude_desktop_config_path(home);
-                let snippet = r#"{ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp", "--backend", "claude", "--ephemeral"] } } }"#;
+                let snippet = r#"{ "mcpServers": { "hyphae": { "command": "hyp", "args": ["mcp", "--ephemeral"] } } }"#;
                 Some((path, snippet.to_owned()))
             }
             Self::CodexDesktop => {
@@ -495,7 +495,7 @@ pub fn inspect_desktop_mcp_plan(
                 "{".to_string(),
                 "  \"mcpServers\": {".to_string(),
                 format!(
-                    "    \"hyphae\": {{ \"command\": {cmd_json}, \"args\": [\"mcp\", \"--backend\", \"claude\", \"--ephemeral\"] }}"
+                    "    \"hyphae\": {{ \"command\": {cmd_json}, \"args\": [\"mcp\", \"--ephemeral\"] }}"
                 ),
                 "  }".to_string(),
                 "}".to_string(),
@@ -545,6 +545,22 @@ pub fn apply_desktop_mcp_config(
         ManualGuideHarness::ClaudeDesktop => {
             let config_path = claude_desktop_config_path(home);
             let existed = config_path.exists();
+            if let Some(manager) = crate::skillshare::Skillshare::detect(home) {
+                let already_configured = inspect_desktop_mcp_plan(harness, home, cli_bin)
+                    .is_some_and(|plan| plan.already_configured);
+                manager.for_claude_desktop().configure_mcp(
+                    HarnessKind::Claude,
+                    &config_path,
+                    cli_bin,
+                    None,
+                    false,
+                )?;
+                return Ok(DesktopMcpApplyResult {
+                    config_path,
+                    created: !existed,
+                    already_configured,
+                });
+            }
             let mut doc: serde_json::Map<String, serde_json::Value> = if existed {
                 let raw = fs::read_to_string(&config_path)
                     .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
@@ -583,7 +599,7 @@ pub fn apply_desktop_mcp_config(
                 "hyphae".to_string(),
                 json!({
                     "command": cli_bin,
-                    "args": ["mcp", "--backend", "claude", "--ephemeral"]
+                    "args": ["mcp", "--ephemeral"]
                 }),
             );
             doc.insert("mcpServers".to_string(), serde_json::Value::Object(servers));
@@ -2152,19 +2168,23 @@ pub fn install_setup_skill_for_harnesses_with_claude(
         else {
             continue;
         };
-        if written_paths.insert(canonical_dedup_key(&primary)) {
-            write_setup_skill(home, &primary)?;
-        }
+        let installed_primary = if written_paths.insert(canonical_dedup_key(&primary)) {
+            write_setup_skill(home, &primary)?
+        } else {
+            resolved_setup_skill(home, &primary)?
+        };
         let mut written_extras = Vec::new();
         for extra in extras {
-            if written_paths.insert(canonical_dedup_key(&extra)) {
-                write_setup_skill(home, &extra)?;
-            }
-            written_extras.push(extra.display().to_string());
+            let installed_extra = if written_paths.insert(canonical_dedup_key(&extra)) {
+                write_setup_skill(home, &extra)?
+            } else {
+                resolved_setup_skill(home, &extra)?
+            };
+            written_extras.push(installed_extra.display().to_string());
         }
         entries.push(InstalledSkillEntry {
             harness: kind.as_str().to_string(),
-            path: primary.display().to_string(),
+            path: installed_primary.display().to_string(),
             extra_paths: written_extras,
         });
     }
@@ -2173,7 +2193,7 @@ pub fn install_setup_skill_for_harnesses_with_claude(
     // also populate `<home>/.agents/skills/hyp-setup/SKILL.md` for cross-tool discovery.
     let agents_skill = shared_setup_skill_path(home);
     if home.join(".agents").is_dir() && written_paths.insert(canonical_dedup_key(&agents_skill)) {
-        write_setup_skill(home, &agents_skill)?;
+        let agents_skill = write_setup_skill(home, &agents_skill)?;
         entries.push(InstalledSkillEntry {
             harness: "agents".to_string(),
             path: agents_skill.display().to_string(),
@@ -2193,6 +2213,7 @@ fn shared_setup_skill_path(home: &Path) -> PathBuf {
 fn is_stock_legacy_setup_skill(text: &str) -> bool {
     // The stock setup skill predates the managed runtime marker.
     const LEGACY_DIGESTS: &[&str] = &[
+        "6b2060da1c820016c22d3e6217dfe87d2866074c82b00a3c50f4552d57dd078e",
         "4a336e5b76253e513b4f57edae22cc9fbb2640080294c5cf0622912c1fb02186",
         "c86649c74bbca523f0cb5a2408fc5fd3080812f8aba1b28a921c0de8af16a547",
         "d34e2926a7f1d801b875efe526cc9e6044cd59201aad3b9bb3b3c4ff20ca7d48",
@@ -2221,12 +2242,26 @@ fn legacy_setup_skills(home: &Path, path: &Path) -> Vec<PathBuf> {
     }
 }
 
-fn write_setup_skill(home: &Path, path: &Path) -> Result<(), String> {
+fn resolved_setup_skill(home: &Path, path: &Path) -> Result<PathBuf, String> {
+    if let Some(manager) = crate::skillshare::Skillshare::detect(home) {
+        return manager.resolve_skill_path(path);
+    }
+    Ok(path.into())
+}
+
+fn write_setup_skill(home: &Path, path: &Path) -> Result<PathBuf, String> {
+    if let Some(manager) = crate::skillshare::Skillshare::detect(home) {
+        let installed = manager.install_skill(path, HYPHAE_SETUP_SKILL_MD, false, false)?;
+        for old in legacy_setup_skills(home, path) {
+            crate::skill_render::retire_legacy_skill(&old, is_stock_legacy_setup_skill)?;
+        }
+        return Ok(installed);
+    }
     crate::skill_render::write_managed_skill(path, HYPHAE_SETUP_SKILL_MD, true)?;
     for old in legacy_setup_skills(home, path) {
         crate::skill_render::retire_legacy_skill(&old, is_stock_legacy_setup_skill)?;
     }
-    Ok(())
+    Ok(path.into())
 }
 
 pub(crate) fn migrate_installed_setup_skills(
@@ -2846,7 +2881,11 @@ fn install_and_handoff_cli(
         }
     };
 
-    let primary_skill = chosen.primary_skill_path_for(home, explicit_home, claude_config_dir);
+    let primary_skill = resolved_setup_skill(
+        home,
+        &chosen.primary_skill_path_for(home, explicit_home, claude_config_dir),
+    )
+    .map_err(|e| CliError::error("SKILL_INSTALL_FAILED", e))?;
     if !as_json {
         print_installed_skills_banner(&installed);
         println!();
@@ -2891,14 +2930,18 @@ fn install_and_handoff_herdr(
     };
 
     let primary_skill = if let Some(lh) = inferred {
-        lh.primary_skill_path_for(home, explicit_home, claude_config_dir)
+        resolved_setup_skill(
+            home,
+            &lh.primary_skill_path_for(home, explicit_home, claude_config_dir),
+        )
+        .map_err(|e| CliError::error("SKILL_INSTALL_FAILED", e))?
     } else if let Some(first) = installed.first() {
         PathBuf::from(&first.path)
     } else {
         // Fallback cross-tool location when template name doesn't name a known harness and no
         // harness dirs exist under `home` yet.
         let fallback = shared_setup_skill_path(home);
-        write_setup_skill(home, &fallback)
+        let fallback = write_setup_skill(home, &fallback)
             .map_err(|e| CliError::error("SKILL_INSTALL_FAILED", e))?;
         installed.push(InstalledSkillEntry {
             harness: "agents".to_string(),
@@ -2952,9 +2995,11 @@ fn install_manual_guide_skills(
         }
     }
     for extra in harness.extra_skill_paths_for(home, explicit_home, claude_config_dir) {
-        if already_recorded.insert(canonical_dedup_key(&extra)) {
+        let resolved = resolved_setup_skill(home, &extra)?;
+        if already_recorded.insert(canonical_dedup_key(&resolved)) {
+            let extra = write_setup_skill(home, &extra)?;
+            already_recorded.insert(canonical_dedup_key(&extra));
             let extra_str = extra.display().to_string();
-            write_setup_skill(home, &extra)?;
             if let Some(first) = installed.first_mut() {
                 first.extra_paths.push(extra_str);
             } else {
@@ -2968,7 +3013,10 @@ fn install_manual_guide_skills(
     }
 
     Ok((
-        harness.primary_skill_path_for(home, explicit_home, claude_config_dir),
+        resolved_setup_skill(
+            home,
+            &harness.primary_skill_path_for(home, explicit_home, claude_config_dir),
+        )?,
         installed,
     ))
 }
@@ -7998,7 +8046,7 @@ mod tests {
         assert_eq!(updated["mcpServers"]["hyphae"]["command"], cli_bin);
         assert_eq!(
             updated["mcpServers"]["hyphae"]["args"],
-            json!(["mcp", "--backend", "claude", "--ephemeral"])
+            json!(["mcp", "--ephemeral"])
         );
 
         // 3. Second inspection detects `already_configured == true`.
@@ -8067,7 +8115,7 @@ mod tests {
         assert!(written.contains("# >>> hyphae >>>"));
         assert!(written.contains("[mcp_servers.hyphae]"));
         assert!(written.contains("command = \"/opt/homebrew/bin/hyp\""));
-        assert!(written.contains("args = [\"mcp\", \"--backend\", \"codex\"]"));
+        assert!(written.contains("args = [\"mcp\"]"));
         assert!(written.contains("env_vars = [\"CODEX_HOME\", \"HYPHAE_SOCKET\"]"));
         assert!(written.contains("# <<< hyphae <<<"));
 
@@ -8123,9 +8171,14 @@ command = "other"
         assert!(replaced.contains("[mcp_servers.other]"));
         assert!(replaced.contains("command = \"/opt/homebrew/bin/hyp\""));
         assert!(!replaced.contains("old-hyp"));
-        assert!(replaced.contains(
-            "args = [\"mcp\", \"/tmp/custom connector.sock\", \"--backend\", \"codex\"]"
-        ));
+        let parsed = replaced.parse::<toml_edit::DocumentMut>().unwrap();
+        let args: Vec<_> = parsed["mcp_servers"]["hyphae"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(args, ["mcp", "/tmp/custom connector.sock"]);
         assert!(replaced.contains("startup_timeout_sec = 25 # Keep this."));
         assert!(replaced.contains("env_vars = [\"CUSTOM\", \"CODEX_HOME\", \"HYPHAE_SOCKET\"]"));
         assert_eq!(
@@ -8225,7 +8278,7 @@ command = "other"
                 args.iter()
                     .map(|value| value.as_str().unwrap())
                     .collect::<Vec<_>>(),
-                ["mcp", socket, "--backend", "codex"]
+                ["mcp", socket]
             );
             assert!(
                 fs::read_to_string(path.with_file_name("hooks.json"))

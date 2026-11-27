@@ -3711,3 +3711,145 @@ esac
     daemon.stop().await;
     node.shutdown();
 }
+
+#[tokio::test]
+async fn initialize_backend_hints_match_explicit_transport_without_granting_identity() {
+    let dir = TempDir::new().unwrap();
+    let node = open_local_node("hint@box", dir.path());
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
+        .await
+        .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+    for (name, backend) in [
+        ("codex-mcp-client", HarnessKind::Codex),
+        ("opencode", HarnessKind::Opencode),
+        ("openclaw-bundle-mcp", HarnessKind::Openclaw),
+        ("claude-code", HarnessKind::Claude),
+        ("local-agent-mode-hyphae", HarnessKind::Claude),
+    ] {
+        let mut observed = Vec::new();
+        for explicit in [false, true] {
+            let mut options = McpOptions::new(sock.clone());
+            options.backend = explicit.then_some(backend);
+            // Metadata alone must not opt into scratch sessions.
+            let mut client = TestMcpClient::spawn(options);
+            let initialized = client.request("initialize", json!({"protocolVersion":"2025-06-18", "clientInfo":{"name": name, "version":"contract-fixture"}})).await;
+            assert!(initialized["result"]["capabilities"]["experimental"].is_null());
+            observed.push(initialized["result"]["instructions"].clone());
+            client
+                .send_json(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}))
+                .await;
+            for args in [
+                json!({"action":"status"}),
+                json!({"action":"status", "_meshCall":"forged-clientinfo-token"}),
+            ] {
+                let (text, is_error) = client.call_tool("hyp_mesh", args, None).await;
+                assert!(
+                    is_error,
+                    "clientInfo must not grant caller identity: {text}"
+                );
+            }
+            let (text, is_error) = client
+                .call_tool(
+                    "hyp_mesh",
+                    json!({"action":"status"}),
+                    Some(json!({"callId":"unregistered-clientinfo-call"})),
+                )
+                .await;
+            assert!(
+                is_error,
+                "unknown call ID must not fall back to scratch: {text}"
+            );
+            // A genuine Claude hook remains the caller even when metadata
+            // advertises another harness. Attribution comes from verification.
+            let raw = format!("verified-{name}-{explicit}");
+            let handle = format!("worker-{name}-{explicit}");
+            let (text, is_error) = client
+                .call_verified_claude(
+                    &sock,
+                    &raw,
+                    "hyp_mesh",
+                    json!({"action":"join", "handle":handle}),
+                )
+                .await;
+            assert!(!is_error, "verified caller was lost: {text}");
+            assert_eq!(
+                session_status(&sock, &format!("claude:{raw}")).await["handle"],
+                handle
+            );
+            client.close().await;
+            let mut scratch_options = McpOptions::new(sock.clone());
+            scratch_options.backend = explicit.then_some(backend);
+            scratch_options.ephemeral = true;
+            let mut scratch = TestMcpClient::spawn(scratch_options);
+            scratch
+                .request(
+                    "initialize",
+                    json!({"clientInfo":{"name":name, "version":"fixture"}}),
+                )
+                .await;
+            let (text, is_error) = scratch
+                .call_tool("hyp_mesh", json!({"action":"status"}), None)
+                .await;
+            assert!(!is_error, "explicit scratch opt-in stopped working: {text}");
+            let status: Value = serde_json::from_str(&text).unwrap();
+            assert!(status["handle"].is_null());
+            for (args, meta) in [
+                (
+                    json!({"action":"status"}),
+                    Some(json!({"callId":"unknown-scratch-call"})),
+                ),
+                (
+                    json!({"action":"status", "_meshCall":"forged-scratch-token"}),
+                    None,
+                ),
+            ] {
+                let (text, is_error) = scratch.call_tool("hyp_mesh", args, meta).await;
+                assert!(
+                    is_error,
+                    "explicit scratch mode bypassed caller verification: {text}"
+                );
+            }
+            scratch.close().await;
+        }
+        assert_eq!(
+            observed[0], observed[1],
+            "inferred and explicit transport guidance diverged"
+        );
+    }
+    // Unknown or malformed Desktop metadata must not weaken the existing
+    // explicit Claude scratch-mode proof checks.
+    for params in [
+        json!({}),
+        json!({"clientInfo":{"name":"unknown","version":"1"}}),
+        json!({"clientInfo":{"name":"codex-mcp-client","version":null}}),
+    ] {
+        let mut options = McpOptions::new(sock.clone());
+        options.ephemeral = true;
+        let mut client = TestMcpClient::spawn(options);
+        client.request("initialize", params).await;
+        let (text, error) = client
+            .call_tool("hyp_mesh", json!({"action":"status"}), None)
+            .await;
+        assert!(!error, "explicit scratch opt-in failed: {text}");
+        for (args, meta) in [
+            (
+                json!({"action":"status"}),
+                Some(json!({"callId":"unknown-desktop-call"})),
+            ),
+            (
+                json!({"action":"status","_meshCall":"forged-desktop-token"}),
+                None,
+            ),
+        ] {
+            let (text, error) = client.call_tool("hyp_mesh", args, meta).await;
+            assert!(
+                error,
+                "unknown metadata bypassed asserted caller proof: {text}"
+            );
+        }
+        client.close().await;
+    }
+    daemon.stop().await;
+    node.shutdown();
+}

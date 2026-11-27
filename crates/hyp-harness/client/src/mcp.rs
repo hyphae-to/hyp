@@ -296,7 +296,13 @@ fn build_mcp_hello(options: &McpOptions, ephemeral_client_id: Option<&str>) -> V
     let mut pkt = Map::new();
     let mut hints = TransportHintFields::default();
     pkt.insert("type".into(), json!("mcp.hello"));
-    if let Some(backend) = options.backend {
+    // Scratch mode already defaults to a Claude session in the daemon. Send that
+    // effective default explicitly so unknown/missing client metadata cannot
+    // weaken rejection of an asserted but unverifiable call ID.
+    if let Some(backend) = options
+        .backend
+        .or(options.ephemeral.then_some(HarnessKind::Claude))
+    {
         pkt.insert("backend".into(), json!(backend.as_str()));
     }
     if options.channel {
@@ -486,6 +492,22 @@ fn initialize_result(params: &Map<String, Value>, options: &McpOptions) -> Value
     })
 }
 
+/// MCP client metadata selects transport behavior only. It is self-reported and
+/// never substitutes for hook registration, a session token, or a call token.
+fn backend_hint_from_initialize(params: &Map<String, Value>) -> Option<HarnessKind> {
+    let info = params.get("clientInfo")?.as_object()?;
+    if info.get("version")?.as_str()?.is_empty() {
+        return None;
+    }
+    match info.get("name")?.as_str()? {
+        "codex-mcp-client" => Some(HarnessKind::Codex),
+        "opencode" => Some(HarnessKind::Opencode),
+        "openclaw-bundle-mcp" => Some(HarnessKind::Openclaw),
+        "claude-code" | "local-agent-mode-hyphae" => Some(HarnessKind::Claude),
+        _ => None,
+    }
+}
+
 enum PendingKind {
     ToolsList { jsonrpc_id: Value },
     ToolCall { jsonrpc_id: Value },
@@ -516,7 +538,11 @@ pub async fn run_mcp(options: McpOptions) -> io::Result<()> {
 }
 
 /// Runs the MCP JSON-RPC 2.0 server against arbitrary async reader/writer streams (testable).
-pub async fn run_mcp_io<R, W>(mut stdin: R, mut stdout: W, options: McpOptions) -> io::Result<()>
+pub async fn run_mcp_io<R, W>(
+    mut stdin: R,
+    mut stdout: W,
+    mut options: McpOptions,
+) -> io::Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -524,6 +550,7 @@ where
     let ephemeral_client_id = options.ephemeral.then(generate_uuid_v4);
     let mut conn: Option<DaemonConn> = None;
     let mut initialized = false;
+    let mut initialize_seen = false;
     let mut channel_ready_sent = false;
     let mut next_id: u64 = 0;
     let mut pending: HashMap<u64, PendingReq> = HashMap::new();
@@ -837,6 +864,12 @@ where
                                 continue;
                             }
                         };
+                        if !initialize_seen {
+                            initialize_seen = true;
+                            if options.backend.is_none() && conn.is_none() {
+                                options.backend = backend_hint_from_initialize(&params);
+                            }
+                        }
                         let res = initialize_result(&params, &options);
                         write_stdout_json(&mut stdout, &jsonrpc_result(jsonrpc_id, res)).await?;
                     }
@@ -1019,6 +1052,69 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn initialize_hint_is_latched_and_never_overrides_explicit_backend() {
+        for (explicit, first, second, expected) in [
+            (
+                None,
+                "openclaw-bundle-mcp",
+                "claude-code",
+                HarnessKind::Openclaw,
+            ),
+            (
+                None,
+                "claude-code",
+                "openclaw-bundle-mcp",
+                HarnessKind::Claude,
+            ),
+            (
+                Some(HarnessKind::Openclaw),
+                "codex-mcp-client",
+                "claude-code",
+                HarnessKind::Openclaw,
+            ),
+        ] {
+            let options = McpOptions {
+                backend: explicit,
+                ..McpOptions::new(PathBuf::from("nonexistent.sock"))
+            };
+            let mut input = String::new();
+            for (index, name) in [first, second].into_iter().enumerate() {
+                input.push_str(&format!("{}\n", json!({"jsonrpc":"2.0", "id":index+1, "method":"initialize", "params":{"clientInfo":{"name":name,"version":"fixture"}}})));
+            }
+            let mut output = Vec::new();
+            run_mcp_io(BufReader::new(input.as_bytes()), &mut output, options)
+                .await
+                .unwrap();
+            let expected = build_initialize_instructions(
+                &McpOptions {
+                    backend: Some(expected),
+                    ..McpOptions::new(PathBuf::from("nonexistent.sock"))
+                },
+                detect_env_herdr_active(),
+                detect_env_t3_active(&McpOptions::new(PathBuf::from("nonexistent.sock"))),
+            );
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.lines().count(), 2);
+            for line in output.lines() {
+                let response: Value = serde_json::from_str(line).unwrap();
+                assert_eq!(response["result"]["instructions"], expected);
+            }
+        }
+        for info in [
+            json!({"name":"unknown", "version":"1"}),
+            json!({"name":"Codex", "version":"1"}),
+            json!({"name":"codex-mcp-client"}),
+            json!({"name":"opencode", "version":""}),
+            json!(null),
+        ] {
+            assert!(
+                backend_hint_from_initialize(json!({"clientInfo":info}).as_object().unwrap())
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn catalog_is_four_core_tools_plus_conditional_bridge_and_kv() {
