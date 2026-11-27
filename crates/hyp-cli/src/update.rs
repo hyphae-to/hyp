@@ -1215,12 +1215,7 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                     })),
                     warnings,
                     next: Vec::new(),
-                    error: Some(CliError {
-                        exit: EXIT_ERROR,
-                        code: swap_err.code.to_string(),
-                        message: swap_err.message,
-                        fix: Some("Original binary remains intact; inspect the release artifact before retrying.".to_string()),
-                    }),
+                    error: Some(CliError::error(swap_err.code.to_string(), swap_err.message).with_fix("Original binary remains intact; inspect the release artifact before retrying.".to_string())),
                 };
                 print_json(&envelope);
             } else {
@@ -1317,13 +1312,10 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
             error: if ok {
                 None
             } else {
-                Some(CliError {
-                    exit: EXIT_ERROR,
-                    code: "FLEET_PARTIAL_FAILURE".to_string(),
-                    message: "Local node updated, but one or more remote peers failed to update"
-                        .to_string(),
-                    fix: None,
-                })
+                Some(CliError::error(
+                    "FLEET_PARTIAL_FAILURE".to_string(),
+                    "Local node updated, but one or more remote peers failed to update".to_string(),
+                ))
             },
         };
         print_json(&envelope);

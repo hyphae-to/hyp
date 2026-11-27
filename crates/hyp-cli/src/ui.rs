@@ -86,6 +86,12 @@ pub struct CliError {
     pub fix: Option<String>,
     #[serde(skip)]
     pub exit: u8,
+    #[serde(skip)]
+    command: Option<&'static str>,
+    #[serde(skip)]
+    data: Option<Box<Value>>,
+    #[serde(skip)]
+    plain: bool,
 }
 
 impl CliError {
@@ -95,6 +101,9 @@ impl CliError {
             message: message.into(),
             fix: None,
             exit,
+            command: None,
+            data: None,
+            plain: false,
         }
     }
 
@@ -104,6 +113,21 @@ impl CliError {
 
     pub fn usage(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::new(EXIT_USAGE, code, message)
+    }
+
+    pub fn with_command(mut self, command: &'static str) -> Self {
+        self.command = Some(command);
+        self
+    }
+
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(Box::new(data));
+        self
+    }
+
+    pub fn plain(mut self) -> Self {
+        self.plain = true;
+        self
     }
 
     pub fn with_fix(self, fix: impl Into<String>) -> Self {
@@ -197,19 +221,21 @@ pub fn emit_error(
     )
 }
 
-pub fn print_command_error(command: &str, as_json: bool, error: CliError) -> ExitCode {
+pub fn print_command_error(command: &str, as_json: bool, mut error: CliError) -> ExitCode {
     let exit = error.exit;
     if as_json {
         let envelope: JsonEnvelope<Value> = JsonEnvelope {
             ok: false,
-            command: command.to_string(),
+            command: error.command.unwrap_or(command).to_string(),
             summary: Some(error.message.clone()),
-            data: None,
+            data: error.data.take().map(|value| *value),
             warnings: Vec::new(),
             next: error.fix.iter().cloned().collect(),
             error: Some(error),
         };
         print_json(&envelope);
+    } else if error.plain {
+        eprintln!("error: {}", error.message);
     } else {
         eprintln!("FAIL [{}] {}", error.code, error.message);
         if let Some(fix) = error.fix {

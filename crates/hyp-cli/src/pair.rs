@@ -1924,15 +1924,16 @@ fn inspect_hp2p1(
 
     if as_json {
         let error = if expired {
-            Some(CliError {
-                exit: EXIT_ERROR,
-                code: "TOKEN_EXPIRED".to_string(),
-                message: format!(
-                    "P2P pairing offer '{}' expired at {}",
-                    offer.offer_id, offer.expires_at
-                ),
-                fix: next.first().cloned(),
-            })
+            Some(
+                CliError::error(
+                    "TOKEN_EXPIRED".to_string(),
+                    format!(
+                        "P2P pairing offer '{}' expired at {}",
+                        offer.offer_id, offer.expires_at
+                    ),
+                )
+                .with_optional_fix(next.first().cloned()),
+            )
         } else {
             None
         };
@@ -2127,12 +2128,13 @@ fn inspect_am2(
 
     if as_json {
         let error = if expired {
-            Some(CliError {
-                exit: EXIT_ERROR,
-                code: "TOKEN_EXPIRED".to_string(),
-                message: "Org Admin-CA invite bundle has expired".to_string(),
-                fix: next.first().cloned(),
-            })
+            Some(
+                CliError::error(
+                    "TOKEN_EXPIRED".to_string(),
+                    "Org Admin-CA invite bundle has expired".to_string(),
+                )
+                .with_optional_fix(next.first().cloned()),
+            )
         } else {
             None
         };

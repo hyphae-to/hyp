@@ -1021,18 +1021,19 @@ fn run_status_or_doctor(
         let error = if ok {
             None
         } else {
-            Some(CliError {
-                exit: EXIT_ERROR,
-                code: if gate_status.tampered {
-                    "GATE_POLICY_TAMPERED".to_string()
-                } else if schema_downgrade {
-                    "SCHEMA_TOO_NEW".to_string()
-                } else {
-                    "DOCTOR_FAILED".to_string()
-                },
-                message: summary.clone(),
-                fix: next.first().cloned(),
-            })
+            Some(
+                CliError::error(
+                    if gate_status.tampered {
+                        "GATE_POLICY_TAMPERED".to_string()
+                    } else if schema_downgrade {
+                        "SCHEMA_TOO_NEW".to_string()
+                    } else {
+                        "DOCTOR_FAILED".to_string()
+                    },
+                    summary.clone(),
+                )
+                .with_optional_fix(next.first().cloned()),
+            )
         };
         let envelope = JsonEnvelope {
             ok,

@@ -7,7 +7,7 @@
 
 #[cfg(unix)]
 use crate::config_file::build_http_client;
-use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, emit_error};
+use crate::ui::{CliError, EXIT_OK};
 use clap::Args;
 use http::Uri;
 #[cfg(unix)]
@@ -92,19 +92,16 @@ pub struct UninstallArgs {
 }
 
 /// Executes `hyp uninstall`.
-pub fn run_uninstall(args: UninstallArgs) -> ExitCode {
+pub fn run_uninstall(args: UninstallArgs) -> crate::ui::CommandResult {
+    crate::ui::CommandResult::new("uninstall", false, uninstall(args))
+}
+
+fn uninstall(args: UninstallArgs) -> Result<ExitCode, CliError> {
     if !args.latest && args.script_url.is_some() {
-        return emit_error(
-            "uninstall",
-            false,
-            EXIT_USAGE,
-            "INVALID_FLAGS",
-            "`--script-url` requires `--latest`",
-            Some(
+        return Err(CliError::usage("INVALID_FLAGS", "`--script-url` requires `--latest`").with_fix(
                 "Pass `--latest --script-url <url>` or omit `--script-url` to run the embedded uninstaller."
                     .to_string(),
-            ),
-        );
+            ));
     }
 
     #[cfg(unix)]
@@ -290,7 +287,7 @@ impl Drop for TempScriptGuard {
 }
 
 #[cfg(unix)]
-fn run_uninstall_unix(args: UninstallArgs) -> ExitCode {
+fn run_uninstall_unix(args: UninstallArgs) -> Result<ExitCode, CliError> {
     let script_content = if args.latest {
         let url = args
             .script_url
@@ -302,17 +299,10 @@ fn run_uninstall_unix(args: UninstallArgs) -> ExitCode {
         {
             Ok(rt) => rt,
             Err(e) => {
-                return emit_error(
-                    "uninstall",
-                    false,
-                    EXIT_ERROR,
-                    "RUNTIME_ERROR",
-                    format!("Failed to initialize async runtime: {e}"),
-                    Some(
+                return Err(CliError::error("RUNTIME_ERROR", format!("Failed to initialize async runtime: {e}")).with_fix(
                         "Re-run `hyp uninstall` without `--latest` to use the embedded script bundled with this binary."
                             .to_string(),
-                    ),
-                );
+                    ));
             }
         };
 
@@ -322,17 +312,10 @@ fn run_uninstall_unix(args: UninstallArgs) -> ExitCode {
                 text
             }
             Err((code, msg)) => {
-                return emit_error(
-                    "uninstall",
-                    false,
-                    EXIT_ERROR,
-                    code,
-                    msg,
-                    Some(
+                return Err(CliError::error(code, msg).with_fix(
                         "Re-run `hyp uninstall` without `--latest` to use the embedded script bundled with this binary."
                             .to_string(),
-                    ),
-                );
+                    ));
             }
         }
     } else {
@@ -342,7 +325,7 @@ fn run_uninstall_unix(args: UninstallArgs) -> ExitCode {
     let guard = match TempScriptGuard::write_private(&script_content) {
         Ok(g) => g,
         Err(e) => {
-            return emit_error("uninstall", false, EXIT_ERROR, "TEMP_SCRIPT_ERROR", e, None);
+            return Err(CliError::error("TEMP_SCRIPT_ERROR", e));
         }
     };
 
@@ -364,23 +347,19 @@ fn run_uninstall_unix(args: UninstallArgs) -> ExitCode {
     let status = match cmd.status() {
         Ok(s) => s,
         Err(e) => {
-            return emit_error(
-                "uninstall",
-                false,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "EXEC_ERROR",
                 format!("Failed to run uninstall.sh via bash: {e}"),
-                None,
-            );
+            ));
         }
     };
 
     drop(guard);
 
     match status.code() {
-        Some(0) => ExitCode::from(EXIT_OK),
-        Some(code) if code > 0 && code <= 255 => ExitCode::from(code as u8),
-        _ => ExitCode::from(EXIT_ERROR),
+        Some(0) => Ok(ExitCode::from(EXIT_OK)),
+        Some(code) if code > 0 && code <= 255 => Ok(ExitCode::from(code as u8)),
+        _ => Ok(ExitCode::from(crate::ui::EXIT_ERROR)),
     }
 }
 
@@ -518,7 +497,7 @@ pub fn windows_uninstall_guidance() -> &'static str {
 }
 
 #[cfg(not(unix))]
-fn run_uninstall_windows(args: UninstallArgs) -> ExitCode {
+fn run_uninstall_windows(args: UninstallArgs) -> Result<ExitCode, CliError> {
     let _ = (
         args.latest,
         &args.script_url,
@@ -531,16 +510,12 @@ fn run_uninstall_windows(args: UninstallArgs) -> ExitCode {
     );
     println!("{}", windows_uninstall_guidance());
     if args.dry_run {
-        ExitCode::from(EXIT_OK)
+        Ok(ExitCode::from(EXIT_OK))
     } else {
-        emit_error(
-            "uninstall",
-            false,
-            EXIT_ERROR,
+        Err(CliError::error(
             "WINDOWS_MANUAL_UNINSTALL",
             "Automated bash uninstaller is Unix-only; follow the PowerShell steps printed above.",
-            None,
-        )
+        ))
     }
 }
 
