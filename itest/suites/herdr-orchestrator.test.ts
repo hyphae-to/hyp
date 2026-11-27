@@ -23,6 +23,7 @@
  *     both shipped (`main.json`) and symlinked custom layouts!
  */
 
+import { waitForCondition } from "../lib/util.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
@@ -40,19 +41,6 @@ import {
   pauseMidStream,
 } from "../lib/llm-shim/index.ts";
 import { REPO_ROOT, withSandbox } from "../lib/sandbox.ts";
-
-async function waitForCondition(
-  predicate: () => Promise<boolean> | boolean,
-  timeoutMs = 20_000,
-  label = "condition",
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await predicate()) return;
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}`);
-}
 
 test("Real Herdr (hc) + Claude: identity pinning, bare-shell fail-closed, mid-stream queue-hold vs hc interrupt, and PID-recycle guard", async (t) => {
   const hcBin = resolveHcBin();

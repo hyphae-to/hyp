@@ -13,6 +13,7 @@
  *  - Daemon restart loss or duplicate delivery
  */
 
+import { extractSessionsFromInspect, waitForCondition } from "../lib/util.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
@@ -24,27 +25,6 @@ import {
   emitText,
 } from "../lib/llm-shim/index.ts";
 import { withSandbox } from "../lib/sandbox.ts";
-
-async function waitForCondition(
-  predicate: () => Promise<boolean> | boolean,
-  timeoutMs = 15_000,
-  label = "condition",
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await predicate()) return;
-    await new Promise((r) => setTimeout(r, 150));
-  }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${label}`);
-}
-
-function extractSessionsFromInspect(inspectJson: any): any[] {
-  const data = inspectJson?.data ?? inspectJson ?? {};
-  if (Array.isArray(data.sessions)) return data.sessions;
-  if (Array.isArray(data.items)) return data.items;
-  if (data.session) return [data.session];
-  return [];
-}
 
 test("Real OpenClaw Gateway: plugin load, dual-session exact enrollment, live hyphae-wake DM, zero cron/ghost/bleed, missing-session reject, and daemon restart survival", async (t) => {
   const openclawBin = resolveOpenClawBin();
@@ -123,7 +103,7 @@ test("Real OpenClaw Gateway: plugin load, dual-session exact enrollment, live hy
     await waitForCondition(async () => {
       const st = await hyp.daemonRpc({ type: "daemon.status" });
       return Boolean(st?.ok && (st.result?.openclawPluginConnected || st.result?.openclawWakeConnected || true));
-    }, 3_000, "daemon status");
+    }, 3_000, "daemon status", 150);
 
     // 3. Script FakeBrain for our 2 concurrent sessions (`agent:main:alpha` and `agent:main:beta`).
     shim.script("openclaw", [
@@ -356,7 +336,7 @@ test("Real OpenClaw Gateway: plugin load, dual-session exact enrollment, live hy
       const ins = await hyp.inspect({ handle: "oc-beta", allowFailure: true });
       const list = extractSessionsFromInspect(ins.json);
       return list.some((s) => s.handle === "oc-beta" && s.transportKind === "openclaw_plugin" && s.hasLiveTransport);
-    }, 10_000, "hyphae-wake service reconnect after daemon restart");
+    }, 10_000, "hyphae-wake service reconnect after daemon restart", 150);
 
     const turnsBeforeRestartDm = shim.getTurns("openclaw").length;
     await hyp.send("external-tester", "oc-beta", dmPayloadAfterRestart);

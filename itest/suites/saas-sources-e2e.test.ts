@@ -9,6 +9,7 @@
  *    `./plugins` or `HYPHAE_ITEST_SAAS_PLUGINS_DIR`.
  */
 
+import { writeNodeJson } from "../lib/util.ts";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -91,10 +92,6 @@ async function installOfficialPlugin(
   const pluginRec = (res.json?.data?.plugins ?? []).find((p: any) => p.name === name);
   assert.ok(pluginRec?.scriptPath, `missing scriptPath for '${name}'`);
   return { nodePath, scriptPath: pluginRec.scriptPath };
-}
-
-function writeNodeJson(hyp: HypCli, config: Record<string, unknown>): void {
-  fs.writeFileSync(hyp.nodeConfigPath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
 }
 
 function coreToolSearchRule(includeBridge = false) {
@@ -234,7 +231,7 @@ test("Sources E2E — github-public: 200->304->429->200 ETag polling, strict mul
       initialEvents: [],
     });
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "ghpub-itest@local",
       profile: "local",
@@ -453,7 +450,7 @@ test("Sources E2E — github-webhook: valid HMAC -> Claude, 1-bit flip 401, non-
     await hyp.secretSet("gh-wh-secret", whSecret);
 
     const bindPort = await getFreePort();
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "ghwh-itest@local",
       profile: "p2p",
@@ -645,7 +642,7 @@ test("Sources E2E — Prometheus plugin: signed delivery, bearer or basic auth, 
 
     const nodePromPort = await getFreePort();
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "prom-itest@local",
       profile: "p2p",
@@ -902,7 +899,7 @@ test("Sources E2E — webhook plugin: signed source events, expiry and body caps
     const sourcePort = await getFreePort();
     const nodeWhPort = await getFreePort();
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "whdiff-itest@local",
       profile: "p2p",
@@ -1156,7 +1153,7 @@ test("Sources E2E — localIngest (ingest.sock / hyp emit): real Claude wake, >6
     ]);
     assert.equal(authInit.exitCode, 0, `hyp auth init failed: ${authInit.stderr}`);
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "ingest-itest@local",
       profile: "local",
@@ -1768,7 +1765,7 @@ test("SaaS Sources Full Black-Box E2E (B1, B3 AgentMail WS+REST race, Notion han
       fs.cpSync(path.join(saasDir, name), path.join(stagedPluginsDir, name), { recursive: true });
     }
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "saas-itest@local",
       profile: "local",

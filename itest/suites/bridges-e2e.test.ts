@@ -10,6 +10,7 @@
  *    `metadata-only-wake`, `duplicate-delivery`, `mcp-schema-footprint`).
  */
 
+import { writeNodeJson } from "../lib/util.ts";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -52,10 +53,6 @@ async function installOfficialPlugin(
   assert.equal(pluginRec.verified, true, `installed plugin '${name}' must be verified`);
   assert.ok(fs.existsSync(pluginRec.scriptPath), `installed script missing on disk: ${pluginRec.scriptPath}`);
   return { nodePath, scriptPath: pluginRec.scriptPath };
-}
-
-function writeNodeJson(hyp: HypCli, config: Record<string, unknown>): void {
-  fs.writeFileSync(hyp.nodeConfigPath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
 }
 
 function bridgeToolSearchRule(name = "load-bridge-tools") {
@@ -104,7 +101,7 @@ test("Bridges E2E — Telegram: full inbound->Claude->outbound+reaction loop, 42
     const bindPort = await getFreePort();
     const offsetFile = path.join(sandbox.paths.hyphaeStateDir, "telegram-offset.json");
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "tg-itest@local",
       profile: "p2p",
@@ -363,7 +360,7 @@ test("Bridges E2E — Slack Socket Mode: auth.test, apps.connections.open, envel
     const slackMock = await SlackSocketMockServer.start({ appToken, botToken });
     sandbox.onTeardown(() => slackMock.close());
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "slack-itest@local",
       profile: "local",
@@ -574,7 +571,7 @@ test("Bridges E2E — WhatsApp Cloud API: GET verify challenge (403/200), 1-bit 
     const waHealthUrl = `http://127.0.0.1:${waPort}/health`;
     const phoneNumberId = "100200300400";
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "wa-itest@local",
       profile: "local",
@@ -804,7 +801,7 @@ test("Bridges E2E — Blind Spot B2: real Node plugin crash -> CrashLoopBackOff 
       { mode: 0o700 },
     );
 
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "b2-itest@local",
       profile: "local",

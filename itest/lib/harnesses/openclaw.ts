@@ -5,10 +5,10 @@
  * and wired to the compiled `hyp` binary strictly via `hyp onboard` + `hyp setup --harness openclaw`.
  */
 
+import { pickFreePort } from "../util.ts";
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { resolveToolBinary } from "../../scripts/provision.mjs";
 import type { HypCli } from "../hyp-cli.ts";
@@ -31,18 +31,6 @@ export interface OpenClawExecResult {
 export function resolveOpenClawBin(): string | null {
   const info = resolveToolBinary("openclaw", { useHostBins: true, probeVersion: false });
   return info.path;
-}
-
-function pickFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.once("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const addr = srv.address();
-      const port = addr && typeof addr === "object" ? addr.port : 0;
-      srv.close(() => resolve(port));
-    });
-  });
 }
 
 function parseTrailingJson(stdout: string): any {

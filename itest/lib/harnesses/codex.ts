@@ -9,6 +9,7 @@
  *  - Live interactive `codex` inside a real POSIX PTY (`spawnInPty`) for live `codex queue --thread <uuid>` wakeups!
  */
 
+import { parseJsonLines } from "../util.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveToolBinary } from "../../scripts/provision.mjs";
@@ -28,27 +29,15 @@ export function resolveCodexBin(): string | null {
   return info.path;
 }
 
+type CodexExecEvent = { type?: string; thread_id?: string; item?: { type?: string; text?: unknown } };
+
 export interface CodexExecResult {
   exitCode: number | null;
   threadId: string | null;
   stdout: string;
   stderr: string;
-  events: any[];
+  events: CodexExecEvent[];
   finalText: string;
-}
-
-function parseJsonLines(stdout: string): any[] {
-  const events: any[] = [];
-  for (const raw of stdout.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || !line.startsWith("{")) continue;
-    try {
-      events.push(JSON.parse(line));
-    } catch {
-      // ignore non-JSON lines
-    }
-  }
-  return events;
 }
 
 /** Recursively locates rollout JSONL files under `$CODEX_HOME/sessions/`. */
@@ -246,7 +235,7 @@ export class CodexHarness {
         );
       }
 
-      const events = parseJsonLines(proc.stdout);
+      const events = parseJsonLines<CodexExecEvent>(proc.stdout);
       const started = events.find((e) => e?.type === "thread.started");
       const threadId =
         typeof started?.thread_id === "string"

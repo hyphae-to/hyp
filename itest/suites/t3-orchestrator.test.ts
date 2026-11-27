@@ -21,6 +21,7 @@
  *     verified via schema-pinned `T3ContractMockServer` against the compiled `hyp` binary.
  */
 
+import { writeNodeJson } from "../lib/util.ts";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -35,10 +36,6 @@ import {
 import { HypCli, HypMcpClient } from "../lib/hyp-cli.ts";
 import { waitUntil } from "../lib/mocks/helpers.ts";
 import { withSandbox } from "../lib/sandbox.ts";
-
-function writeNodeJson(hyp: HypCli, doc: Record<string, unknown>): void {
-  fs.writeFileSync(hyp.nodeConfigPath, JSON.stringify(doc, null, 2) + "\n", { mode: 0o600 });
-}
 
 async function runClaudePreToolHook(
   hyp: HypCli,
@@ -124,7 +121,7 @@ test("T3 Orchestrator — real t3 serve: setup, statev2.sqlite auto-attach, /api
       baseDir: t3.baseDir,
       tokenSecret: "t3-session-token",
     };
-    writeNodeJson(hyp, setupCfg);
+    writeNodeJson(hyp.nodeConfigPath, setupCfg);
 
     // Store real T3 bearer token in isolated file SecretStore via stdin (`t3-session-token`).
     await hyp.secretSet("t3-session-token", t3.bearerToken);
@@ -226,7 +223,7 @@ test("T3 Orchestrator — unverified MCP spoof rejected, primary t3-auth-token s
     await hyp.secretSet("unrelated-api-key", "SUPER_SECRET_UNRELATED_KEY_DO_NOT_EXFIL");
 
     // 2a. Arbitrary `tokenSecret` in `node.json` MUST fail closed (never read `unrelated-api-key`!).
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "t3-standalone@local",
       stateDir: sandbox.paths.hyphaeStateDir,
@@ -280,7 +277,7 @@ test("T3 Orchestrator — unverified MCP spoof rejected, primary t3-auth-token s
     await exfilMcp.close();
 
     // 2b. Switch `node.json` back to default primary `t3-auth-token` (omitting `tokenSecret`) -> attaches live!
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "t3-standalone@local",
       stateDir: sandbox.paths.hyphaeStateDir,
@@ -339,7 +336,7 @@ test("T3 Orchestrator — mutated negative security: bad auth token 401 detaches
 
     const hyp = new HypCli(sandbox);
     await hyp.onboard({ nodeId: "t3-neg@local", noSkills: true, noCommands: true });
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "t3-neg@local",
       stateDir: sandbox.paths.hyphaeStateDir,
@@ -552,7 +549,7 @@ test("T3 Orchestrator — contract fallback & active-run dispatchMode selection 
     const hyp = new HypCli(sandbox);
     await hyp.onboard({ nodeId: "t3-contract@local", noSkills: true, noCommands: true });
     await hyp.secretSet("t3-auth-token", t3.bearerToken);
-    writeNodeJson(hyp, {
+    writeNodeJson(hyp.nodeConfigPath, {
       v: 2,
       nodeId: "t3-contract@local",
       stateDir: sandbox.paths.hyphaeStateDir,

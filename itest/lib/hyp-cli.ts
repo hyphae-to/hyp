@@ -5,6 +5,7 @@
  * stdio MCP JSON-RPC 2.0 (`hyp mcp`), or local daemon `connector.sock` NDJSON.
  */
 
+import { tryParseJson } from "./util.ts";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
@@ -57,24 +58,6 @@ export function resolveHypBin(): string {
   throw new Error(
     `Compiled 'hyp' binary not found. Build with 'cargo build --bin hyp' or set HYP_BIN=/path/to/hyp.`,
   );
-}
-
-function tryParseJson(stdout: string): any {
-  const trimmed = stdout.trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const idx = trimmed.indexOf("{");
-    if (idx !== -1) {
-      try {
-        return JSON.parse(trimmed.slice(idx));
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
 }
 
 /**
@@ -214,7 +197,7 @@ export class HypMcpClient {
     const text = (res.result.content || []).map((c: any) => c?.text || "").join("");
     return {
       text,
-      json: tryParseJson(text),
+      json: tryParseJson(text, true),
       isError: Boolean(res.result.isError),
       raw: res.result,
     };
@@ -282,7 +265,7 @@ export class HypCli {
             exitCode,
             stdout: stdout || "",
             stderr: stderr || "",
-            json: tryParseJson(stdout || ""),
+            json: tryParseJson(stdout || "", true),
           };
           if (err && !options.allowFailure) {
             reject(

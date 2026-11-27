@@ -10,6 +10,7 @@
  *    remaining spawned children if `hc server stop` fails.
  */
 
+import { tryParseJson } from "../util.ts";
 import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -39,16 +40,6 @@ export interface HcExecResult {
   stdout: string;
   stderr: string;
   json: any;
-}
-
-function tryParseJson(raw: string): any {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    return null;
-  }
 }
 
 export class HerdrOrchestrator {
