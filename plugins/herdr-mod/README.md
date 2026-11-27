@@ -7,8 +7,10 @@ Native GPUI pane header status pills and expandable thread inspector for [Herdr]
 | Mod | Role | Placement |
 |---|---|---|
 | `mods/hyphae-pane/` | Drop-in replacement for Herdr's shipped `mods/pane` header with a right-aligned Hyphae live status pill (`pill.js`). Hidden on plain shells. | `pane.header.content.mod = "hyphae-pane"` |
-| `mods/hyphae-panel/` | Expandable **Hyphae Thread Inspector** (`Subs`, `Queue`, `Rules`, `Mesh`, Focus Mode & Mute All toggles, metadata-only quarantine alert). | Right `panel-body` dock, floating window (`cmd-shift-h`), or split/tab pane |
+| `mods/hyphae-panel/` | Expandable **Hyphae Thread Inspector** (`Subs`, `Queue`, `Rules`, `Mesh`, `KV`, Focus Mode & Mute All toggles, metadata-only quarantine alert). | Right `panel-body` dock, floating window (`cmd-shift-h`), or split/tab pane |
 | `keys.json` | Global shortcut `"cmd-shift-h": "mod.open:hyphae-panel"` (merged only if unbound). | `~/.config/herdr-app/keys.json` |
+
+Press `5` in the inspector to browse KV namespaces and keys. Select a key to request its preview, then select **Copy** to copy the displayed text.
 
 ## Zero-Polling Architecture
 
@@ -36,11 +38,12 @@ sh plugins/herdr-mod/scripts/install.sh --clone-layout herdr-hyphae
 
 ## Composing `pill.js` Into a Custom Pane Header
 
-Because Herdr (`gpui-shell`) sandboxes JavaScript module imports to each mod's own directory (`../` imports are rejected by `herdr-app check`), custom pane headers can compose the Hyphae pill cleanly by copying three files from `mods/hyphae-pane/` into their own mod folder:
+Because Herdr (`gpui-shell`) sandboxes JavaScript module imports to each mod's own directory (`../` imports are rejected by `herdr-app check`), custom pane headers can compose the Hyphae pill cleanly by copying four files from `mods/hyphae-pane/` into their own mod folder:
 
 ```sh
 cp ~/.config/herdr-app/mods/hyphae-pane/pill.js ~/.config/herdr-app/mods/my-pane/
 cp ~/.config/herdr-app/mods/hyphae-pane/shared-client.js ~/.config/herdr-app/mods/my-pane/
+cp ~/.config/herdr-app/mods/hyphae-pane/kv-view.js ~/.config/herdr-app/mods/my-pane/
 cp ~/.config/herdr-app/mods/hyphae-pane/hyphae.svg ~/.config/herdr-app/mods/my-pane/
 ```
 

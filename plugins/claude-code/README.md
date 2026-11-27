@@ -90,9 +90,9 @@ On Claude Code **v2.1.287+**, `hyp setup --harness claude` automatically install
 
 - **Quiet inline indicator (auto-hidden in Herdr)**: renders a single dim clickable line above the prompt outside Herdr (e.g. `@integration-tests · telegram:personal · 1 sub` — zero bright warning yellow, zero clutter when unenrolled). Automatically hides itself inside Herdr when the native Herdr mod (`hyphae-pane` / `hyphae-panel`) is active. Override anytime with `/hyp-panel status off|on` or `HYPHAE_PANEL_STATUS=off|on`.
   - *Tip — pick one status bar:* If you use the native `hyp-panel` plugin on Claude Code v2.1.287+, you don't need `--statusline` (shell `statusLine` chaining is mainly for Antigravity CLI `agy` or older Claude Code versions). If you previously ran `--statusline`, run `hyp setup --harness claude --restore-statusline` to avoid showing two bars.
-- **Interactive side panel (`/hyp-panel`)**: run `/hyp-panel` (or `/hyp-panel subs|queue|rules|mesh|close`) to open the docked live inspector (`Esc` closes it, `1`–`4` switch tabs, `f` toggles Focus Mode, `r` refreshes):
+- **Interactive side panel (`/hyp-panel`)**: run `/hyp-panel` (or `/hyp-panel subs|queue|rules|mesh|kv|close`) to open the docked live inspector (`Esc` closes it, `1`–`5` switch tabs, `f` toggles Focus Mode, `r` refreshes):
   - **Header**: active `@handle`, daemon online indicator, `nodeId`, peer count, linked bridge target, `FOCUS` / `MUTED*` badges, and a prominent red `⚠ N quarantined` alert pointing to `hyp gate review`.
-  - **Tabs**: **Subs** (linked external bridges like `telegram:personal [primary]` + `hyp_stream` subscriptions with `× unsub`), **Queue** (metadata-only `kind`, `source`, `urgency`, relative age), **Rules** (active mutes + `× unmute`, per-source urgency rules), and **Mesh** (`#channels` + `× leave`).
+  - **Tabs**: **Subs** (linked external bridges like `telegram:personal [primary]` + `hyp_stream` subscriptions with `× unsub`), **Queue** (metadata-only `kind`, `source`, `urgency`, relative age), **Rules** (active mutes + `× unmute`, per-source urgency rules), **Mesh** (`#channels` + `× leave`), and **KV** (namespaces and keys). Select a key in **KV** to request its preview.
 - **Emergency quarantine alert**: surfaces a 1-line red `⚠ N quarantined` banner whenever Security Gate items are held (`quarantined > 0`), even inside Herdr.
 - **State projection**: reads Hyphae's atomic metadata-only snapshot at `~/.config/hyphae/ui/state.json` (respecting `HYPHAE_STATE_DIR` and `node.json`'s `stateDir` override) and degrades cleanly when the daemon is offline.
 
@@ -102,7 +102,7 @@ On `SessionStart`, `hyp hook claude session-start` validates the Claude session 
 
 | Command | Action |
 |---|---|
-| `/hyp-panel [subs\|queue\|rules\|mesh\|close]` | Open or control the native live Claude Code side panel (Claude Code v2.1.287+) |
+| `/hyp-panel [subs\|queue\|rules\|mesh\|kv\|close]` | Open or control the native live Claude Code side panel (Claude Code v2.1.287+) |
 | `!hyp ui` | Launch the zero-token live interactive TUI inspector (Subscriptions, Queue, Rules & Mutes, Channels) |
 | `hyp inspect [--json]` | Print a read-only metadata snapshot for this session |
 | `/hyp` *(or `/hyphae:hyp`)* | Render a concise summary table of handle, Focus Mode, subscriptions, queued metadata, rules, and quarantine alerts |

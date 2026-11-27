@@ -83,13 +83,13 @@ fn build_rs_pinned_digests_and_tree_hashes_match_sha2_crate_and_crlf_invariance(
         ("google-calendar", PluginKind::Bridge, 2),
         ("vercel", PluginKind::Bridge, 2),
         ("notion", PluginKind::Bridge, 2),
-        ("claude-panel", PluginKind::Harness, 2),
-        ("claude-code", PluginKind::Harness, 12),
-        ("herdr-mod", PluginKind::Harness, 9),
+        ("claude-panel", PluginKind::Harness, 3),
+        ("claude-code", PluginKind::Harness, 13),
+        ("herdr-mod", PluginKind::Harness, 11),
     ];
 
     assert_eq!(PINNED_PLUGINS.len(), expected_plugins.len());
-    assert_eq!(PINNED_PLUGIN_FILES.len(), 42);
+    assert_eq!(PINNED_PLUGIN_FILES.len(), 45);
     let plugins_dir = repo_root().join("plugins");
 
     for (spec, (exp_id, exp_kind, exp_count)) in PINNED_PLUGINS.iter().zip(expected_plugins.iter())
@@ -640,14 +640,49 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
         r#"{"modules":["./register.tsx"]}"#,
     )
     .unwrap();
-    for file in ["register.tsx", "state.ts"] {
-        let current = fs::read_to_string(plugins_dir.join("claude-code/hooks").join(file)).unwrap();
-        let legacy = current.replace("/hyp-panel", "/hyphae-panel").replace(
-            "COMMAND_NAME = 'hyp-panel'",
-            "COMMAND_NAME = 'hyphae-panel'",
-        );
-        fs::write(legacy_panel.join("hooks").join(file), legacy).unwrap();
-    }
+    let legacy_files = [
+        (
+            "claude-code/hooks/register.tsx",
+            "// legacy panel register fixture",
+        ),
+        (
+            "claude-code/hooks/state.ts",
+            "// legacy panel state fixture",
+        ),
+    ];
+    let legacy_digests: Vec<_> = legacy_files
+        .iter()
+        .map(|(rel, text)| {
+            fs::write(
+                legacy_panel.join(rel.strip_prefix("claude-code/").unwrap()),
+                text,
+            )
+            .unwrap();
+            (*rel, sha256_file_hex(text.as_bytes(), false))
+        })
+        .collect();
+    let legacy_pairs: Vec<_> = legacy_digests
+        .iter()
+        .map(|(rel, hash)| (*rel, hash.as_str()))
+        .collect();
+    let receipts_path = state_dir.join("plugins/installed.json");
+    fs::create_dir_all(receipts_path.parent().unwrap()).unwrap();
+    fs::write(
+        &receipts_path,
+        json!({
+            "schemaVersion": 1,
+            "installed": {
+                "claude-panel": {
+                    "kind": "harness",
+                    "treeSha256": compute_tree_sha256(&legacy_pairs),
+                    "installedAt": 1,
+                    "targetPaths": [legacy_panel],
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
     fs::write(legacy_panel.join("notes.txt"), "my notes").unwrap();
 
     // 2. Install telegram, claude-panel, and herdr-mod via --from-dir.
@@ -736,7 +771,6 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     fs::write(&tg_path, old_tg).unwrap();
     let old_sha = sha256_file_hex(old_tg, false);
     let old_tree = compute_tree_sha256(&[("telegram/index.mjs", &old_sha)]);
-    let receipts_path = state_dir.join("plugins/installed.json");
     let mut receipts_doc: Value =
         serde_json::from_str(&fs::read_to_string(&receipts_path).unwrap()).unwrap();
     receipts_doc["installed"]["telegram"]["treeSha256"] = Value::String(old_tree);

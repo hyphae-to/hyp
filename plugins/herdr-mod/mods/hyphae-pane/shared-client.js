@@ -5,6 +5,8 @@
 // remote SSH machines via `exec(..., { on: machine })`). Never renders or retains
 // message bodies, CloudEvent `data`, wakeup `note`s, quarantined text, or secrets.
 
+import { parseKvInspection } from "./kv-view.js";
+
 const REMOTE_REFRESH_MS = 10_000;
 const REMOTE_MAX_BACKOFF_MS = 60_000;
 const REMOTE_CACHE_KEY = "hyphae.remoteCache";
@@ -226,6 +228,7 @@ export function parseSnapshotJson(rawText) {
     daemon: root.daemon && typeof root.daemon === "object" ? stripMetadataOnly(root.daemon) : null,
     sessions,
     byHerdrTerminal,
+    kv: parseKvInspection(root.kv),
   };
 }
 
@@ -372,6 +375,7 @@ export function formatPillMetrics(entry, daemonOrSnapshot = null) {
 
   const queued = Math.max(0, Number(counts.queued) || 0);
   const unnotified = Math.max(0, Number(counts.unnotified) || 0);
+  const kvUnread = Math.max(0, Number(entry.unreadBreakdown?.kv) || 0);
   const quarantined = getEffectiveQuarantinedCount(entry, daemonOrSnapshot);
   const mutedRules = Math.max(0, Number(counts.mutedRules) || 0);
   const channels = Math.max(0, Number(counts.channels) || 0);
@@ -437,6 +441,7 @@ export function formatPillMetrics(entry, daemonOrSnapshot = null) {
   if (mutedAll) medParts.push("muted");
   if (subs > 0 || (!bridgeSummary && queued === 0)) medParts.push(`${subs}s`);
   if (queued > 0) medParts.push(`${queued}q`);
+  if (kvUnread > 0) medParts.push(String(kvUnread) + " KV");
   const mediumLabel = medParts.join(" · ");
 
   const wideParts = [];
@@ -448,6 +453,7 @@ export function formatPillMetrics(entry, daemonOrSnapshot = null) {
     wideParts.push(subs === 1 ? "1 sub" : `${subs} subs`);
   }
   if (queued > 0) wideParts.push(`${queued} queued`);
+  if (kvUnread > 0) wideParts.push(String(kvUnread) + " KV");
   const wideLabel = wideParts.join(" · ");
 
   return {
@@ -618,7 +624,8 @@ export function createHyphaeClient(host) {
       if (!activeWatchDir && dirs.length > 0) {
         activeWatchDir = dirs[0];
       }
-      return localSnapshot;
+      localSnapshot = null;
+      return null;
     } finally {
       localLoadInFlight = false;
     }

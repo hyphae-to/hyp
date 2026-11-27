@@ -421,7 +421,7 @@ fn wire_active_layout(
                 layout_path.display()
             ));
             notes.push(format!(
-                "Keep `{custom_mod}` intact via `pill.js`: copy `mods/hyphae-pane/{{pill.js,shared-client.js,hyphae.svg}}` into `mods/{custom_mod}/`, add `import {{ renderHyphaePill }} from \"./pill.js\"` + `renderHyphaePill(...)`, and add `{{ \"id\": \"hyphae\", \"type\": \"block\", \"content\": {{ \"mod\": \"hyphae-panel\" }} }}` to `panel-body.children`."
+                "Keep `{custom_mod}` intact via `pill.js`: copy `mods/hyphae-pane/{{pill.js,shared-client.js,kv-view.js,hyphae.svg}}` into `mods/{custom_mod}/`, add `import {{ renderHyphaePill }} from \"./pill.js\"` + `renderHyphaePill(...)`, and add `{{ \"id\": \"hyphae\", \"type\": \"block\", \"content\": {{ \"mod\": \"hyphae-panel\" }} }}` to `panel-body.children`."
             ));
             next.push(format!(
                 "Compose pill.js inside mods/{custom_mod}/ and add hyphae-panel to panel-body.children in your custom UI repo (or press {DEFAULT_SHORTCUT_KEY} for the floating inspector)."
@@ -436,7 +436,7 @@ fn wire_active_layout(
                     .to_string(),
             );
             notes.push(
-                "Custom pane header composition: copy `mods/hyphae-pane/{pill.js,shared-client.js,hyphae.svg}` into your pane mod folder and use `import { renderHyphaePill } from \"./pill.js\"` (Herdr sandboxes JS module imports per mod folder)."
+                "Custom pane header composition: copy `mods/hyphae-pane/{pill.js,shared-client.js,kv-view.js,hyphae.svg}` into your pane mod folder and use `import { renderHyphaePill } from \"./pill.js\"` (Herdr sandboxes JS module imports per mod folder)."
                     .to_string(),
             );
             next.push(
@@ -459,7 +459,7 @@ fn wire_active_layout(
                 layout_path.display()
             ));
             notes.push(format!(
-                "Compose Hyphae inside `mods/{custom_mod}/`: copy `mods/hyphae-pane/{{pill.js,shared-client.js,hyphae.svg}}` into `mods/{custom_mod}/` and call `renderHyphaePill(...)` via `import {{ renderHyphaePill }} from \"./pill.js\"`."
+                "Compose Hyphae inside `mods/{custom_mod}/`: copy `mods/hyphae-pane/{{pill.js,shared-client.js,kv-view.js,hyphae.svg}}` into `mods/{custom_mod}/` and call `renderHyphaePill(...)` via `import {{ renderHyphaePill }} from \"./pill.js\"`."
             ));
             next.push(
                 "Re-run with `--force-layout` to replace the custom pane header with `hyphae-pane`."
@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn dry_run_does_not_mutate_disk_and_pinned_herdr_assets_are_present() {
         let spec = crate::plugin_cmd::pinned_spec_for("herdr-mod").expect("herdr-mod pinned spec");
-        assert_eq!(spec.files.len(), 9);
+        assert_eq!(spec.files.len(), 11);
         assert_eq!(spec.tree_sha256.len(), 64);
 
         let tmp = TempDir::new().unwrap();

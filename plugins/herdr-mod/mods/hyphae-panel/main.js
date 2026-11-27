@@ -41,11 +41,14 @@ import {
   withAlpha,
 } from "./shared-client.js";
 
+import { KvBrowser, combineKvInspection, readKvCommandData } from "./kv-view.js";
+
 const TABS = [
   { id: "subs", label: "Subs" },
   { id: "queue", label: "Queue" },
   { id: "rules", label: "Rules" },
   { id: "mesh", label: "Mesh" },
+  { id: "kv", label: "KV" },
 ];
 
 const URGENCY_CYCLE = ["interrupt", "queue", "notify", "mute"];
@@ -72,6 +75,11 @@ function urgencyColor(t, urgency) {
 export default class HyphaePanel extends View {
   init(initialProps, cx) {
     this.tab = "subs";
+    this.kv = new KvBrowser();
+    this.kvMachine = null;
+    this.kvOnline = false;
+    this.kvRevision = null;
+    this.kvCursor = 0;
     this.overrideTerminal = initialProps?.terminal ?? null;
     this.overrideSessionId = null;
     this.lastFocusedTerminal = checking() ? null : focused()?.terminal ?? null;
@@ -150,6 +158,7 @@ export default class HyphaePanel extends View {
   }
 
   async close(_cx) {
+    this.kv.reset();
     if (this.client) {
       this.client.dispose();
     }
@@ -262,6 +271,12 @@ export default class HyphaePanel extends View {
     if (checking()) return;
     const target = this.resolveTarget();
     this.statusError = null;
+    if (this.tab === "kv") {
+      this.runKv(target, cx, async (runKv) => {
+        await this.kv.inspect(runKv);
+        await this.kv.refreshPage(runKv);
+      });
+    }
     cx.spawn(async (spawnCx) => {
       await this.client.refreshNow(target.machine, spawnCx);
       spawnCx.notify();
@@ -603,7 +618,7 @@ export default class HyphaePanel extends View {
       );
   }
 
-  renderTabBar(t, entry) {
+  renderTabBar(t, entry, target) {
     const counts = entry?.counts ?? {};
     const rulesCount = (entry?.details?.mutes?.length ?? counts.mutedRules ?? 0) + (entry?.details?.rules?.length ?? 0);
     const badgeFor = (id) => {
@@ -650,8 +665,7 @@ export default class HyphaePanel extends View {
             .hover((s) => s.bg(t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, mCx) => mCx.stop_propagation())
             .on_click((_e, clickCx) => {
-              this.tab = tab.id;
-              clickCx.notify();
+              this.selectTab(tab.id, target, clickCx);
             })
             .child(div().truncate().child(text));
         })
@@ -1319,6 +1333,151 @@ export default class HyphaePanel extends View {
     return rows;
   }
 
+  selectTab(tab, target, cx) {
+    if (this.tab !== tab && (this.tab === "kv" || tab === "kv")) {
+      this.kv.reset();
+      this.kvCursor = 0;
+    }
+    this.tab = tab;
+    if (tab === "kv") this.runKv(target, cx, (runKv) => this.kv.inspect(runKv));
+    cx.notify();
+  }
+
+  kvTargetOnline(target) {
+    return Boolean(target.snapshot?.daemon?.online)
+      && !(target.machine && this.client.getRemoteStatus(target.machine)?.error);
+  }
+
+  runKv(target, cx, action) {
+    if (checking() || this.kv.busy || !this.kvTargetOnline(target)) return;
+    const runKv = async (args) => {
+      const opts = { timeout: 7_000 };
+      if (target.machine) opts.on = target.machine;
+      const result = await exec("hyp", args, opts);
+      return readKvCommandData(result.stdout, result.code);
+    };
+    cx.spawn(async (spawnCx) => {
+      await action(runKv);
+      spawnCx.notify();
+    });
+    cx.notify();
+  }
+
+  kvReport(target) {
+    return combineKvInspection(target.snapshot?.kv, this.kv.inspection, target.snapshot?.daemon?.nodeId);
+  }
+
+  kvRows(target) {
+    return this.kv.namespace ? this.kv.page?.entries ?? [] : this.kvReport(target)?.namespaces ?? [];
+  }
+
+  openKvRow(row, target, cx) {
+    if (!row) return;
+    this.runKv(target, cx, async (runKv) => {
+      if (this.kv.namespace) {
+        await this.kv.show(row.key, runKv, sanitizeUiText);
+      } else {
+        await this.kv.open(row, runKv);
+        this.kvCursor = 0;
+      }
+    });
+  }
+
+  kvButton(t, id, label, action) {
+    return div()
+      .id(id)
+      .px(7)
+      .py(3)
+      .rounded(4)
+      .text_size(11)
+      .text_color(t.accent || t.foreground)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => action(cx))
+      .child(label);
+  }
+
+  renderKvTab(t, target) {
+    const rows = [];
+    const back = () => this.kvButton(t, "kv-back", "Back", (cx) => {
+      this.kv.back();
+      this.kvCursor = 0;
+      cx.notify();
+    });
+    if (this.kv.error || this.kv.busy) {
+      rows.push(div().text_size(11).text_color(t.muted).child(this.kv.error || "Loading KV…"));
+    }
+    if (this.kv.preview) {
+      const preview = this.kv.preview;
+      rows.push(h_flex().gap(6).children([
+        back(),
+        this.kvButton(t, "kv-copy", "Copy", (cx) => {
+          const active = this.resolveTarget();
+          if (this.kv.preview !== preview || active.machine !== target.machine || !this.kvTargetOnline(active)) return;
+          cx.write_to_clipboard(preview.text);
+          this.statusNote = "Copied KV preview.";
+          cx.notify();
+        }),
+      ]));
+      rows.push(div().text_size(11).text_color(t.muted).child(
+        `${sanitizeUiText(preview.key, 80)} · v${preview.version}${preview.truncated ? " · truncated" : ""}`,
+      ));
+      rows.push(v_flex().gap(1).children(preview.text.split("\n").map((line) => (
+        div().text_size(11).child(line || " ")
+      ))));
+      return rows;
+    }
+
+    if (this.kv.namespace) {
+      const pageActions = [back()];
+      if (this.kv.cursorHistory.length > 1) pageActions.push(this.kvButton(t, "kv-prev", "Previous", (cx) => {
+        this.runKv(target, cx, async (runKv) => {
+          await this.kv.turnPage(false, runKv);
+          this.kvCursor = 0;
+        });
+      }));
+      if (this.kv.page?.nextAfter) pageActions.push(this.kvButton(t, "kv-next", "Next", (cx) => {
+        this.runKv(target, cx, async (runKv) => {
+          await this.kv.turnPage(true, runKv);
+          this.kvCursor = 0;
+        });
+      }));
+      rows.push(h_flex().gap(4).children(pageActions));
+      rows.push(div().font_medium().child(`${this.kv.namespace.originNode}/${this.kv.namespace.name}`));
+    } else if (this.kvReport(target)?.namespacesTruncated) {
+      rows.push(div().text_size(11).text_color(t.muted).child("Namespace list truncated."));
+    }
+
+    const entries = this.kvRows(target);
+    const now = Date.now();
+    rows.push(...entries.map((entry, index) => {
+      const keyView = this.kv.namespace !== null;
+      const title = keyView ? sanitizeUiText(entry.key, 96) : `${entry.originNode}/${entry.name}`;
+      const detail = keyView
+        ? `v${entry.version} · ${sanitizeUiText(entry.updatedBy, 36)} · ${formatRelativeAge(entry.updatedAt, now)} ago · ${entry.expiresAt === null ? "no expiry" : `TTL ${formatRelativeAge(now, entry.expiresAt)}`} · ${entry.sizeBytes} B`
+        : `${entry.entryCount} keys · ${entry.watchCount} watches${entry.epoch === null ? "" : ` · E2EE e${entry.epoch} · ${entry.memberCount} members`}`;
+      return v_flex()
+        .id(`kv-row-${index}`)
+        .p(6)
+        .gap(1)
+        .rounded(5)
+        .bg(index === this.kvCursor ? t.selected : t.background)
+        .cursor_pointer()
+        .hover((style) => style.bg(t.hover))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => this.openKvRow(entry, target, cx))
+        .child(div().font_medium().truncate().child(title))
+        .child(div().text_size(11).text_color(t.muted).child(detail));
+    }));
+    if (entries.length === 0 && !this.kv.busy) {
+      rows.push(div().p(8).text_size(11).text_color(t.muted).child(
+        this.kv.namespace ? "No visible keys." : "No visible KV namespaces.",
+      ));
+    }
+    return rows;
+  }
+
   renderEmptyState(t, target) {
     const remoteStatus = target.machine ? this.client.getRemoteStatus(target.machine) : null;
     const msg = remoteStatus?.error
@@ -1358,12 +1517,30 @@ export default class HyphaePanel extends View {
       this.client.ensureRemoteFresh(target.machine, cx, false);
     }
 
+    const kvOnline = this.kvTargetOnline(target);
+    if (target.machine !== this.kvMachine || kvOnline !== this.kvOnline) {
+      this.kv.reset();
+      this.kvMachine = target.machine;
+      this.kvOnline = kvOnline;
+      this.kvRevision = null;
+      this.kvCursor = 0;
+      if (this.tab === "kv" && kvOnline) this.runKv(target, cx, (runKv) => this.kv.inspect(runKv));
+    }
+    if (kvOnline) {
+      this.kv.reconcileSnapshot(target.snapshot.kv, target.snapshot.daemon.nodeId);
+      if (this.tab === "kv" && target.snapshot.rev !== this.kvRevision && !this.kv.busy) {
+        this.kvRevision = target.snapshot.rev;
+        if (this.kv.namespace) this.runKv(target, cx, (runKv) => this.kv.refreshPage(runKv));
+      }
+    }
     const entry = target.entry;
     const showMuteInput = Boolean(entry) && this.tab === "rules";
     const canSubmitMute = Boolean(this.muteText.trim()) && !this.busy;
 
     let bodyRows;
-    if (!entry && this.tab !== "mesh") {
+    if (this.tab === "kv") {
+      bodyRows = kvOnline ? this.renderKvTab(t, target) : this.renderEmptyState(t, target);
+    } else if (!entry && this.tab !== "mesh") {
       bodyRows = this.renderEmptyState(t, target);
     } else if (this.tab === "subs") {
       bodyRows = this.renderSubsTab(t, entry);
@@ -1403,15 +1580,35 @@ export default class HyphaePanel extends View {
           return;
         }
         if (this.typing) return;
-        if (e.key === "1") { this.tab = "subs"; keyCx.notify(); }
-        else if (e.key === "2") { this.tab = "queue"; keyCx.notify(); }
-        else if (e.key === "3") { this.tab = "rules"; keyCx.notify(); }
-        else if (e.key === "4") { this.tab = "mesh"; keyCx.notify(); }
-        else if (e.key === "r") { this.refresh(keyCx); }
+        const tab = TABS[Number(e.key) - 1];
+        if (tab) {
+          this.selectTab(tab.id, target, keyCx);
+        } else if (e.key === "r") {
+          this.refresh(keyCx);
+        } else if (this.tab === "kv") {
+          const rows = this.kvRows(target);
+          if (e.key === "up" || e.key === "down") {
+            this.kvCursor = Math.max(0, Math.min(rows.length - 1, this.kvCursor + (e.key === "up" ? -1 : 1)));
+          } else if (e.key === "enter" && !this.kv.preview) {
+            this.openKvRow(rows[this.kvCursor], target, keyCx);
+          } else if (e.key === "n" || e.key === "p") {
+            this.runKv(target, keyCx, async (runKv) => {
+              await this.kv.turnPage(e.key === "n", runKv);
+              this.kvCursor = 0;
+            });
+          } else if (e.key === "b") {
+            this.kv.back();
+            this.kvCursor = 0;
+          } else {
+            return;
+          }
+          keyCx.stop_propagation();
+          keyCx.notify();
+        }
       })
       .child(this.renderHeader(t, target, cx))
       .child(this.renderQuickControls(t, target))
-      .child(this.renderTabBar(t, entry))
+      .child(this.renderTabBar(t, entry, target))
       .child(
         v_flex()
           .id("hyphae-scroll-body")

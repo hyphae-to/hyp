@@ -123,6 +123,7 @@ const PLUGIN_SPECS: &[BuildPluginSpec] = &[
         files: &[
             ("claude-code/hooks/register.tsx", false),
             ("claude-code/hooks/state.ts", false),
+            ("claude-code/hooks/kv-view.mjs", false),
         ],
     },
     BuildPluginSpec {
@@ -135,6 +136,7 @@ const PLUGIN_SPECS: &[BuildPluginSpec] = &[
             ("claude-code/hooks/hooks.json", false),
             ("claude-code/hooks/register.tsx", false),
             ("claude-code/hooks/state.ts", false),
+            ("claude-code/hooks/kv-view.mjs", false),
             ("claude-code/commands/hyp.md", false),
             ("claude-code/commands/hyp-focus.md", false),
             ("claude-code/commands/hyp-mute.md", false),
@@ -151,10 +153,12 @@ const PLUGIN_SPECS: &[BuildPluginSpec] = &[
             ("herdr-mod/mods/hyphae-pane/main.js", false),
             ("herdr-mod/mods/hyphae-pane/pill.js", false),
             ("herdr-mod/mods/hyphae-pane/shared-client.js", false),
+            ("herdr-mod/mods/hyphae-pane/kv-view.js", false),
             ("herdr-mod/mods/hyphae-pane/hyphae.svg", false),
             ("herdr-mod/mods/hyphae-panel/mod.json", false),
             ("herdr-mod/mods/hyphae-panel/main.js", false),
             ("herdr-mod/mods/hyphae-panel/shared-client.js", false),
+            ("herdr-mod/mods/hyphae-panel/kv-view.js", false),
             ("herdr-mod/mods/hyphae-panel/hyphae.svg", false),
         ],
     },

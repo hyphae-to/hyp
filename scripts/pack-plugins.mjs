@@ -121,6 +121,7 @@ export const PLUGIN_SPECS = [
     files: [
       { relPath: "claude-code/hooks/register.tsx", isBinary: false },
       { relPath: "claude-code/hooks/state.ts", isBinary: false },
+      { relPath: "claude-code/hooks/kv-view.mjs", isBinary: false },
     ],
   },
   {
@@ -133,6 +134,7 @@ export const PLUGIN_SPECS = [
       { relPath: "claude-code/hooks/hooks.json", isBinary: false },
       { relPath: "claude-code/hooks/register.tsx", isBinary: false },
       { relPath: "claude-code/hooks/state.ts", isBinary: false },
+      { relPath: "claude-code/hooks/kv-view.mjs", isBinary: false },
       { relPath: "claude-code/commands/hyp.md", isBinary: false },
       { relPath: "claude-code/commands/hyp-focus.md", isBinary: false },
       { relPath: "claude-code/commands/hyp-mute.md", isBinary: false },
@@ -149,10 +151,12 @@ export const PLUGIN_SPECS = [
       { relPath: "herdr-mod/mods/hyphae-pane/main.js", isBinary: false },
       { relPath: "herdr-mod/mods/hyphae-pane/pill.js", isBinary: false },
       { relPath: "herdr-mod/mods/hyphae-pane/shared-client.js", isBinary: false },
+      { relPath: "herdr-mod/mods/hyphae-pane/kv-view.js", isBinary: false },
       { relPath: "herdr-mod/mods/hyphae-pane/hyphae.svg", isBinary: false },
       { relPath: "herdr-mod/mods/hyphae-panel/mod.json", isBinary: false },
       { relPath: "herdr-mod/mods/hyphae-panel/main.js", isBinary: false },
       { relPath: "herdr-mod/mods/hyphae-panel/shared-client.js", isBinary: false },
+      { relPath: "herdr-mod/mods/hyphae-panel/kv-view.js", isBinary: false },
       { relPath: "herdr-mod/mods/hyphae-panel/hyphae.svg", isBinary: false },
     ],
   },

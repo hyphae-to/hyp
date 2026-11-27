@@ -229,7 +229,7 @@ if (stat.isSymbolicLink() && !patchLayout) {
   console.log("      Snippet to add to your layout JSON:");
   console.log('        1) pane.header.content.mod = "hyphae-pane"');
   console.log('        2) panel-body.children += { "id": "hyphae", "type": "block", "content": { "mod": "hyphae-panel" } }');
-  console.log("      Or copy mods/hyphae-pane/{pill.js,shared-client.js,hyphae.svg} into your custom pane mod");
+  console.log("      Or copy mods/hyphae-pane/{pill.js,shared-client.js,kv-view.js,hyphae.svg} into your custom pane mod");
   console.log('      and import { renderHyphaePill } from "./pill.js" (or re-run with --patch-layout).');
   process.exit(0);
 }
@@ -238,7 +238,7 @@ const tree = JSON.parse(fs.readFileSync(activePath, "utf8"));
 const res = patchTree(tree);
 if (res.status === "skipped_custom_header") {
   console.log("WARN  active layout uses custom pane header mod '" + res.currentMod + "' — skipped clobbering.");
-  console.log("      Copy mods/hyphae-pane/{pill.js,shared-client.js,hyphae.svg} into mods/" + res.currentMod + "/");
+  console.log("      Copy mods/hyphae-pane/{pill.js,shared-client.js,kv-view.js,hyphae.svg} into mods/" + res.currentMod + "/");
   console.log('      and call renderHyphaePill(...) from "./pill.js" (or re-run with --force).');
   process.exit(0);
 }
@@ -375,7 +375,7 @@ if os.path.islink(active_path) and not patch_layout:
     print("      Snippet to add to your layout JSON:")
     print('        1) pane.header.content.mod = "hyphae-pane"')
     print('        2) panel-body.children += { "id": "hyphae", "type": "block", "content": { "mod": "hyphae-panel" } }')
-    print("      Or copy mods/hyphae-pane/{pill.js,shared-client.js,hyphae.svg} into your custom pane mod")
+    print("      Or copy mods/hyphae-pane/{pill.js,shared-client.js,kv-view.js,hyphae.svg} into your custom pane mod")
     print('      and import { renderHyphaePill } from "./pill.js" (or re-run with --patch-layout).')
     sys.exit(0)
 
@@ -384,7 +384,7 @@ with open(active_path, "r", encoding="utf-8") as f:
 status, current_mod = patch_tree(tree)
 if status == "skipped_custom_header":
     print(f"WARN  active layout uses custom pane header mod '{current_mod}' — skipped clobbering.")
-    print(f"      Copy mods/hyphae-pane/{{pill.js,shared-client.js,hyphae.svg}} into mods/{current_mod}/")
+    print(f"      Copy mods/hyphae-pane/{{pill.js,shared-client.js,kv-view.js,hyphae.svg}} into mods/{current_mod}/")
     print('      and call renderHyphaePill(...) from "./pill.js" (or re-run with --force).')
     sys.exit(0)
 

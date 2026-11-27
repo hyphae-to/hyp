@@ -911,3 +911,63 @@ describe('hyphae native Claude Code side-panel mod', () => {
     await alertMount.unmount();
   });
 });
+
+test('KV tab browses without a session and fetches value text only after selecting a key', async ($, on) => {
+  const key = '-draft/alpha\u202e';
+  const entry = {
+    key, version: 2, updatedBy: 'alice', updatedAt: 1_700_000_000_000,
+    expiresAt: null, sizeBytes: 64, value: 'DISCARD_SNAPSHOT_VALUE',
+  };
+  const kv = {
+    namespaces: [{ name: 'shared', originNode: 'laptop', epoch: 2, memberCount: 1, entryCount: 1, watchCount: 1, entries: [entry] }],
+  };
+  const root = JSON.parse(makeRichSnapshotJson()) as Record<string, unknown>;
+  const stateJson = JSON.stringify({ ...root, sessions: [], kv });
+  const calls: (readonly string[])[] = [];
+  mock.clock(on, { now: 1_700_000_000_000 });
+  mock.env(on, { HOME: '/fake-home' });
+  on('session.id', () => ({ value: 'unbound' }));
+  on('ui.invalidate', () => ({ value: undefined }));
+  on('ui.status', () => ({ value: undefined }));
+  on('fs.read', (_$, event) => {
+    if (event.path.endsWith('/ui/state.json')) return { value: stateJson };
+    return { deny: 'ENOENT' };
+  });
+  on('process.run', (_$, event) => {
+    calls.push(event.argv);
+    const data = event.argv[1] === 'inspect' ? { kv }
+      : event.argv[2] === 'keys' ? { entries: [entry], nextAfter: null }
+      : { text: '\u001b[31mvisible-preview\u202e', version: 2, truncated: true };
+    return { value: {
+      exitCode: 0, stdout: JSON.stringify({ ok: true, data }), stderr: '',
+      isStdoutTruncated: false, isStderrTruncated: false,
+    }};
+  });
+  const mounted = await $.ui.mount({
+    plugin: 'hyphae', surface: 'terminal', component: 'Pane', requestId: 'hyphae-panel',
+    props: PANE_PROPS, viewport: VIEWPORT,
+  });
+  await mounted.press({ key: 'hyphae-tab-kv' });
+  await mounted.redraw(PANE_PROPS);
+  expect(collectStrings(await mounted.drawn()).join('\n')).toContain('laptop/shared');
+  await mounted.press({ key: 'hyphae-kv-namespace-0' });
+  await mounted.redraw(PANE_PROPS);
+  const metadata = collectStrings(await mounted.drawn()).join('\n');
+  expect(metadata).toContain('draft/alpha');
+  expect(metadata).not.toContain('DISCARD_SNAPSHOT_VALUE');
+  expect(metadata).not.toContain('visible-preview');
+  expect(calls.every((args) => !args.includes('preview'))).toBe(true);
+
+  await mounted.press({ key: 'hyphae-kv-key-0' });
+  await mounted.redraw(PANE_PROPS);
+  const preview = collectStrings(await mounted.drawn()).join('\n');
+  expect(preview).toContain('visible-preview');
+  expect(preview).toContain('truncated');
+  expect(preview).not.toContain('\u001b');
+  expect(preview).not.toContain('\u202e');
+  expect(calls.at(-1)).toEqual(['hyp', 'kv', 'preview', '--node=laptop', '--ns=shared', '--json', '--key=' + key]);
+  await mounted.press({ key: 'hyphae-kv-back' });
+  await mounted.redraw(PANE_PROPS);
+  expect(collectStrings(await mounted.drawn()).join('\n')).not.toContain('visible-preview');
+  await mounted.unmount();
+});
