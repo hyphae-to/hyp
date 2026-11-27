@@ -1010,8 +1010,14 @@ fn legacy_claude_code_tree_matches(
             entry.rel_path.to_owned()
         };
         let path = rel_path_to_disk_path(spec.id, root, &rel);
-        let (_, _, actual, _) = inspect_plugin_file(root, &path, entry.sha256, entry.is_binary);
-        let Some(actual) = actual else { return false };
+        let (present, _, actual, _) =
+            inspect_plugin_file(root, &path, entry.sha256, entry.is_binary);
+        let Some(actual) = actual else {
+            if !present {
+                continue;
+            }
+            return false;
+        };
         entries.push((rel, actual));
     }
     let pairs: Vec<_> = entries
@@ -1121,7 +1127,12 @@ fn retire_legacy_claude_panel(
     }
     let mut entries = Vec::with_capacity(spec.files.len());
     let mut paths = Vec::with_capacity(spec.files.len());
-    for entry in spec.files {
+    for entry in spec.files.iter().filter(|entry| {
+        matches!(
+            entry.rel_path,
+            "claude-code/hooks/register.tsx" | "claude-code/hooks/state.ts"
+        )
+    }) {
         let path = rel_path_to_disk_path(spec.id, &old, entry.rel_path);
         let (_, _, actual, _) = inspect_plugin_file(&old, &path, entry.sha256, entry.is_binary);
         let Some(actual) = actual else { return Ok(()) };
@@ -1348,6 +1359,22 @@ fn inspect_plugin(
             if first_detail.is_none() {
                 first_detail = Some("outdated (legacy command or skill paths)".into());
             }
+            PluginStatus::Outdated
+        } else if !symlink_or_io_error
+            && missing_in_root > 0
+            && (spec.id != CLAUDE_PANEL_ID || check_claude_panel_wrappers(root).is_none())
+            && receipt_tree.as_deref().is_some_and(|receipt_tree| {
+                let pairs: Vec<_> = tree_entries
+                    .iter()
+                    .map(|(rel, sha)| (*rel, sha.as_str()))
+                    .collect();
+                compute_tree_sha256(&pairs) == receipt_tree
+            })
+        {
+            if first_detail.is_none() {
+                first_detail = Some("outdated (new files in the pinned plugin)".into());
+            }
+            representative_disk_tree.clone_from(&receipt_tree);
             PluginStatus::Outdated
         } else if symlink_or_io_error || missing_in_root > 0 {
             if first_detail.is_none() {
