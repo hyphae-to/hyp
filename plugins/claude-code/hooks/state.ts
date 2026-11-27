@@ -10,6 +10,8 @@
 //     inserting `--` before any positional argument starting with `-`.
 
 import { parseKvInspection, type KvInspection } from './kv-view.mjs';
+import { parseSnapshotMetadata, sanitizeControlValue, sanitizeUiText } from './ui-snapshot.mjs';
+export { resolveUiStateCandidates, sanitizeControlValue, sanitizeUiText, stripMetadataOnly } from './ui-snapshot.mjs';
 
 export type PanelTab = 'subs' | 'queue' | 'rules' | 'mesh' | 'kv';
 
@@ -152,57 +154,6 @@ export interface SessionControlTarget {
   handle?: string | null;
 }
 
-const FORBIDDEN_BODY_KEYS = new Set([
-  'body',
-  'text',
-  'note',
-  'payload',
-  'data',
-  'content',
-  'message',
-  'raw',
-  'ciphertext',
-  'plaintext',
-  'secret',
-  'token',
-  'quarantinedText',
-  'quarantinedItems',
-]);
-
-/**
- * Strips ANSI escape sequences (OSC, CSI, DCS/APC/PM/SOS, ESC), C0/C1 control
- * characters, zero-width joiners/marks, and Unicode BiDi override/isolate
- * characters WITHOUT truncating length — safe for CLI action identifiers/patterns.
- */
-export function sanitizeControlValue(raw: unknown): string {
-  if (raw === null || raw === undefined) return '';
-  return String(raw)
-    // OSC sequences: ESC ] ... (BEL | ST)
-    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
-    // DCS / SOS / PM / APC strings: ESC [PX^_] ... ST
-    .replace(/\u001b[PX^_][^\u001b]*(?:\u001b\\)?/g, '')
-    // CSI sequences: ESC [ params intermediates final
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
-    // Remaining 2-byte ESC sequences
-    .replace(/\u001b[@-Z\\-_]/g, '')
-    // C0 / DEL / C1 control characters (includes remaining bare ESC)
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
-    // Unicode BiDi overrides/isolates/marks + zero-width / BOM characters
-    .replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
-    .trim();
-}
-
-/**
- * Strips ANSI escape sequences (OSC, CSI, DCS/APC/PM/SOS, ESC), C0/C1 control
- * characters, zero-width joiners/marks, and Unicode BiDi override/isolate
- * characters from untrusted external strings before rendering, bounded to `maxLen`.
- */
-export function sanitizeUiText(raw: unknown, maxLen = 120): string {
-  const cleaned = sanitizeControlValue(raw);
-  if (cleaned.length <= maxLen) return cleaned;
-  return `${cleaned.slice(0, Math.max(0, maxLen - 1))}…`;
-}
-
 /**
  * Qualifies a channel target as `<hostNode>/<channel>` so `hyp session leave`
  * targets the exact host node and never resolves bare `#channel` to a default Hub.
@@ -217,25 +168,6 @@ export function qualifyChannelTarget(
   if (cleanChannel.includes('/')) return cleanChannel;
   const cleanHost = sanitizeControlValue(hostNode) || sanitizeControlValue(fallbackNodeId) || 'local';
   return `${cleanHost}/${cleanChannel}`;
-}
-
-/**
- * Recursively removes any forbidden body, CloudEvent `data`, wakeup `note`, or
- * secret/token fields as defense-in-depth before any UI code inspects the data.
- */
-export function stripMetadataOnly(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(stripMetadataOnly);
-  }
-  if (!value || typeof value !== 'object') {
-    return value;
-  }
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (FORBIDDEN_BODY_KEYS.has(k)) continue;
-    out[k] = stripMetadataOnly(v);
-  }
-  return out;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -255,74 +187,6 @@ function asCount(value: unknown): number {
 
 function asStr(value: unknown): string {
   return typeof value === 'string' ? value : '';
-}
-
-function expandStateDir(rawDir: string, baseHome: string, cfgDir: string): string {
-  const sd = rawDir.trim();
-  if (!sd) return '';
-  if (sd === '~') return baseHome;
-  if (sd.startsWith('~/') || sd.startsWith('~\\')) {
-    return `${baseHome}/${sd.slice(2)}`;
-  }
-  if (sd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(sd)) {
-    return sd;
-  }
-  return `${cfgDir}/${sd}`;
-}
-
-/**
- * Resolves ordered candidate `<state_dir>/ui` directories and `state.json` paths,
- * matching `crates/hyp-cli/src/config_file.rs` and `plugins/herdr-mod/mods/hyphae-pane/shared-client.js`.
- *
- * Precedence:
- *   1. `HYPHAE_STATE_DIR` environment variable (`<HYPHAE_STATE_DIR>/ui/state.json`)
- *   2. `stateDir` in `~/.config/hyphae/node.json` (or legacy `connector.json`)
- *   3. `~/.config/hyphae/ui/state.json`
- *   4. `~/.config/hyphae/state/ui/state.json`
- */
-export function resolveUiStateCandidates(
-  homeDir: string,
-  envStateDir?: string | null,
-  nodeJsonText?: string | null,
-): { dirs: string[]; files: string[] } {
-  const baseHome = homeDir.replace(/[\\/]+$/, '');
-  const cfgDir = baseHome ? `${baseHome}/.config/hyphae` : '.config/hyphae';
-  const dirs: string[] = [];
-
-  const pushDir = (dir: string): void => {
-    const normalized = dir.replace(/[\\/]+$/, '');
-    if (normalized && !dirs.includes(normalized)) {
-      dirs.push(normalized);
-    }
-  };
-
-  if (typeof envStateDir === 'string' && envStateDir.trim()) {
-    const resolved = expandStateDir(envStateDir, baseHome, cfgDir);
-    if (resolved) pushDir(`${resolved.replace(/[\\/]+$/, '')}/ui`);
-  }
-
-  if (typeof nodeJsonText === 'string' && nodeJsonText.trim()) {
-    try {
-      const parsed = asRecord(JSON.parse(nodeJsonText));
-      const sd = parsed && typeof parsed.stateDir === 'string' ? parsed.stateDir.trim() : '';
-      if (sd) {
-        const resolved = expandStateDir(sd, baseHome, cfgDir);
-        if (resolved) pushDir(`${resolved.replace(/[\\/]+$/, '')}/ui`);
-      }
-    } catch {
-      // Ignore malformed config and fall back to default paths.
-    }
-  }
-
-  if (baseHome) {
-    pushDir(`${cfgDir}/ui`);
-    pushDir(`${cfgDir}/state/ui`);
-  }
-
-  return {
-    dirs,
-    files: dirs.map((d) => `${d}/state.json`),
-  };
 }
 
 function parseSessionSummary(raw: unknown): SessionSummary | null {
@@ -511,27 +375,7 @@ function parseSessionSummary(raw: unknown): SessionSummary | null {
  * CLI envelope into a strictly sanitized, metadata-only `HyphaeSnapshot`.
  */
 export function parseSnapshotJson(rawText: string): HyphaeSnapshot | null {
-  if (!rawText || !rawText.trim()) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    return null;
-  }
-
-  const parsedObj = asRecord(parsed);
-  if (!parsedObj) return null;
-
-  // Unwrap `{ ok: true, data: ... }` / `{ ok: true, result: ... }` BEFORE stripping
-  // forbidden nested payload keys (`data`, `body`, `text`, ...) so CLI envelopes work!
-  let unwrapped: Record<string, unknown> = parsedObj;
-  if ('ok' in parsedObj) {
-    if (parsedObj.ok === false) return null;
-    const envelopeData = asRecord(parsedObj.data) ?? asRecord(parsedObj.result);
-    if (envelopeData) unwrapped = envelopeData;
-  }
-
-  const root = asRecord(stripMetadataOnly(unwrapped));
+  const root = parseSnapshotMetadata(rawText);
   if (!root) return null;
 
   const daemonObj = asRecord(root.daemon);

@@ -748,3 +748,42 @@ test("KV snapshots and cursor navigation keep values behind an explicit preview"
   await pending;
   assert.equal(browser.preview, null);
 });
+
+test("snapshot clients agree on metadata, envelope failures, and path precedence", async () => {
+  const claude = await import("../../claude-code/hooks/state.ts");
+  const opencode = await import("../../opencode/tui.mjs");
+  const record = {
+    rev: 5,
+    daemon: { nodeId: "laptop", online: true, body: "private daemon text" },
+    sessions: [
+      {
+        sessionId: "claude:test",
+        enrolled: true,
+        handle: "alice",
+        details: {
+          queuedItems: [{ kind: "event", source: "topic", data: "private event data" }],
+        },
+      },
+    ],
+  };
+  const projection = (snapshot) => ({
+    rev: snapshot.rev,
+    nodeId: snapshot.daemon.nodeId,
+    sessions: snapshot.sessions.map(({ sessionId, handle }) => [sessionId, handle]),
+  });
+  const expected = { rev: 5, nodeId: "laptop", sessions: [["claude:test", "alice"]] };
+  for (const parse of [parseSnapshotJson, claude.parseSnapshotJson, opencode.parseSnapshotJson]) {
+    for (const shape of [record, { ok: true, data: record }, { ok: true, result: record }]) {
+      const snapshot = parse(JSON.stringify(shape));
+      assert.deepEqual(projection(snapshot), expected);
+      assert.doesNotMatch(JSON.stringify(snapshot), /private (?:daemon|event)/);
+    }
+    assert.equal(parse('{"ok":false}'), null);
+    assert.equal(parse("[]"), null);
+  }
+  const config = '{"stateDir":"./custom"}';
+  const home = "/Users/alice";
+  const paths = resolveUiStateCandidates(home, config);
+  assert.deepEqual(claude.resolveUiStateCandidates(home, null, config), paths);
+  assert.deepEqual(opencode.resolveUiStateCandidates(home, null, config), paths);
+});

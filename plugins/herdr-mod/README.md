@@ -38,12 +38,13 @@ sh plugins/herdr-mod/scripts/install.sh --clone-layout herdr-hyphae
 
 ## Composing `pill.js` Into a Custom Pane Header
 
-Because Herdr (`gpui-shell`) sandboxes JavaScript module imports to each mod's own directory (`../` imports are rejected by `herdr-app check`), custom pane headers can compose the Hyphae pill cleanly by copying four files from `mods/hyphae-pane/` into their own mod folder:
+Because Herdr (`gpui-shell`) sandboxes JavaScript module imports to each mod's own directory (`../` imports are rejected by `herdr-app check`), custom pane headers can compose the Hyphae pill cleanly by copying five files from `mods/hyphae-pane/` into their own mod folder:
 
 ```sh
 cp ~/.config/herdr-app/mods/hyphae-pane/pill.js ~/.config/herdr-app/mods/my-pane/
 cp ~/.config/herdr-app/mods/hyphae-pane/shared-client.js ~/.config/herdr-app/mods/my-pane/
 cp ~/.config/herdr-app/mods/hyphae-pane/kv-view.js ~/.config/herdr-app/mods/my-pane/
+cp ~/.config/herdr-app/mods/hyphae-pane/ui-snapshot.js ~/.config/herdr-app/mods/my-pane/
 cp ~/.config/herdr-app/mods/hyphae-pane/hyphae.svg ~/.config/herdr-app/mods/my-pane/
 ```
 

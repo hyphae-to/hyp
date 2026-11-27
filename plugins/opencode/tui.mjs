@@ -14,73 +14,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { parseSnapshotMetadata, resolveUiStateCandidates, sanitizeUiText } from "./ui-snapshot.mjs";
+export { resolveUiStateCandidates, sanitizeUiText, stripMetadataOnly } from "./ui-snapshot.mjs";
 
-const FORBIDDEN_BODY_KEYS = new Set([
-  "body",
-  "text",
-  "note",
-  "payload",
-  "data",
-  "content",
-  "message",
-  "raw",
-  "ciphertext",
-  "plaintext",
-  "secret",
-  "token",
-  "quarantinedText",
-  "quarantinedItems",
-]);
-
-const UNSAFE_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const WATCH_DEBOUNCE_MS = 50;
 const MAX_SNAPSHOT_BYTES = 1024 * 1024;
-
-/**
- * Strips ANSI escape sequences (OSC, CSI, DCS/APC/PM/SOS, ESC), C0/C1 control
- * characters, zero-width joiners/marks, and Unicode BiDi override/isolate
- * characters from untrusted external strings before rendering.
- */
-export function sanitizeUiText(raw, maxLen = 120) {
-  if (raw === null || raw === undefined) return "";
-  const cleaned = String(raw)
-    // OSC sequences: ESC ] ... (BEL | ST)
-    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
-    // DCS / SOS / PM / APC strings: ESC [PX^_] ... ST
-    .replace(/\u001b[PX^_][^\u001b]*(?:\u001b\\)?/g, "")
-    // CSI sequences: ESC [ params intermediates final
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
-    // Remaining 2-byte ESC sequences
-    .replace(/\u001b[@-Z\\-_]/g, "")
-    // C0 / DEL / C1 control characters (includes remaining bare ESC)
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
-    // Unicode BiDi overrides/isolates/marks + zero-width / BOM characters
-    .replace(/[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
-    .trim();
-
-  if (cleaned.length <= maxLen) return cleaned;
-  return `${cleaned.slice(0, Math.max(0, maxLen - 1))}…`;
-}
-
-/**
- * Recursively removes any forbidden body, CloudEvent `data`, wakeup `note`, or
- * secret/token fields as defense-in-depth before any UI code inspects the data.
- */
-export function stripMetadataOnly(value, depth = 0) {
-  if (depth > 32) return null;
-  if (Array.isArray(value)) {
-    return value.map((item) => stripMetadataOnly(item, depth + 1));
-  }
-  if (!value || typeof value !== "object") {
-    return value;
-  }
-  const out = {};
-  for (const [key, val] of Object.entries(value)) {
-    if (FORBIDDEN_BODY_KEYS.has(key) || UNSAFE_OBJECT_KEYS.has(key)) continue;
-    out[key] = stripMetadataOnly(val, depth + 1);
-  }
-  return out;
-}
 
 function asRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -95,79 +33,6 @@ function asNum(value, fallback = 0) {
 
 function asCount(value) {
   return Math.max(0, Math.floor(asNum(value, 0)));
-}
-
-function expandStateDir(rawDir, baseHome, cfgDir) {
-  const sd = rawDir.trim();
-  if (!sd) return "";
-  if (sd === "~") return baseHome;
-  if (sd.startsWith("~/") || sd.startsWith("~\\")) {
-    return `${baseHome}/${sd.slice(2).replace(/^[\\/]+/, "")}`;
-  }
-  if (sd.startsWith("/") || /^[A-Za-z]:[\\/]/.test(sd)) {
-    return sd;
-  }
-  const rel = sd.replace(/^(?:\.[\\/])+/, "");
-  return rel ? `${cfgDir}/${rel}` : cfgDir;
-}
-
-/**
- * Resolves ordered candidate `<state_dir>/ui` directories and `state.json` paths,
- * matching `crates/hyp-cli/src/config_file.rs` and `plugins/claude-code/hooks/state.ts`.
- *
- * Precedence:
- *   1. `HYPHAE_STATE_DIR` environment variable (`<HYPHAE_STATE_DIR>/ui/state.json`)
- *   2. `stateDir` in `~/.config/hyphae/node.json` (or legacy `connector.json`)
- *   3. `~/.config/hyphae/ui/state.json`
- *   4. `~/.config/hyphae/state/ui/state.json`
- */
-export function resolveUiStateCandidates(
-  homeDir,
-  envStateDir = null,
-  nodeJsonText = null,
-) {
-  const baseHome =
-    typeof homeDir === "string" ? homeDir.replace(/[\\/]+$/, "") : "";
-  const cfgDir = baseHome ? `${baseHome}/.config/hyphae` : ".config/hyphae";
-  const dirs = [];
-
-  const pushDir = (dir) => {
-    const normalized = String(dir).replace(/[\\/]+$/, "");
-    if (normalized && !dirs.includes(normalized)) {
-      dirs.push(normalized);
-    }
-  };
-
-  if (typeof envStateDir === "string" && envStateDir.trim()) {
-    const resolved = expandStateDir(envStateDir, baseHome, cfgDir);
-    if (resolved) pushDir(`${resolved.replace(/[\\/]+$/, "")}/ui`);
-  }
-
-  if (typeof nodeJsonText === "string" && nodeJsonText.trim()) {
-    try {
-      const parsed = asRecord(JSON.parse(nodeJsonText));
-      const sd =
-        parsed && typeof parsed.stateDir === "string"
-          ? parsed.stateDir.trim()
-          : "";
-      if (sd) {
-        const resolved = expandStateDir(sd, baseHome, cfgDir);
-        if (resolved) pushDir(`${resolved.replace(/[\\/]+$/, "")}/ui`);
-      }
-    } catch {
-      // Ignore malformed config and fall back to default paths.
-    }
-  }
-
-  if (baseHome) {
-    pushDir(`${cfgDir}/ui`);
-    pushDir(`${cfgDir}/state/ui`);
-  }
-
-  return {
-    dirs,
-    files: dirs.map((d) => `${d}/state.json`),
-  };
 }
 
 function parseSessionSummary(raw) {
@@ -391,33 +256,9 @@ function parseSessionSummary(raw) {
  * CLI envelope into a strictly sanitized, metadata-only snapshot.
  */
 export function parseSnapshotJson(rawText) {
-  if (typeof rawText !== "string" || !rawText.trim()) return null;
-  if (rawText.length > MAX_SNAPSHOT_BYTES) return null;
-
-  let parsed;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    return null;
-  }
-
-  const stripped = asRecord(stripMetadataOnly(parsed));
-  if (!stripped) return null;
-
-  let root = stripped;
-  if ("ok" in stripped) {
-    if (stripped.ok === false) return null;
-    // Note: `data` is in FORBIDDEN_BODY_KEYS for nested payloads, so support
-    // envelope unwrap via original parsed top-level `data`/`result` ONLY after
-    // applying `stripMetadataOnly` directly to that sub-object.
-    const rawEnvelope = asRecord(parsed);
-    const envelopeInner =
-      asRecord(rawEnvelope?.data) ?? asRecord(rawEnvelope?.result);
-    if (envelopeInner) {
-      const sanitizedInner = asRecord(stripMetadataOnly(envelopeInner));
-      if (sanitizedInner) root = sanitizedInner;
-    }
-  }
+  if (typeof rawText !== "string" || rawText.length > MAX_SNAPSHOT_BYTES) return null;
+  const root = parseSnapshotMetadata(rawText);
+  if (!root) return null;
 
   const daemonObj = asRecord(root.daemon);
   const daemon = daemonObj

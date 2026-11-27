@@ -25,7 +25,7 @@ This configures OpenCode idempotently while preserving all existing settings:
 
 `plugins/opencode/tui.mjs` is a dependency-free, zero-polling (`fs.watch` only — never `setInterval`), metadata-only TUI plugin compatible with both OpenCode v2 (`setup(api)`) and OpenCode v1 (`tui(api)`).
 
-To enable it, add `file:///path/to/plugins/opencode/tui.mjs` to `~/.config/opencode/tui.json` (preserving any existing plugins):
+To enable it, add `file:///path/to/plugins/opencode/tui.mjs` to `~/.config/opencode/tui.json` (preserving any existing plugins). Keep the adjacent `ui-snapshot.mjs` file with `tui.mjs` when copying it out of the checkout.
 
 ```json
 {

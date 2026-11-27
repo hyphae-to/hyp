@@ -30,8 +30,8 @@ Live per-pane Hyphae mesh status pills in every Herdr terminal header paired wit
 
 ## Built from
 
-- `mods/hyphae-pane/`: `mod.json`, `main.js`, `pill.js`, `shared-client.js`, `kv-view.js`, `hyphae.svg`.
-- `mods/hyphae-panel/`: `mod.json`, `main.js`, `shared-client.js`, `kv-view.js`, `hyphae.svg`.
+- `mods/hyphae-pane/`: `mod.json`, `main.js`, `pill.js`, `shared-client.js`, `kv-view.js`, `ui-snapshot.js`, `hyphae.svg`.
+- `mods/hyphae-panel/`: `mod.json`, `main.js`, `shared-client.js`, `kv-view.js`, `ui-snapshot.js`, `hyphae.svg`.
 - `keys.json`: `{ "global": { "cmd-shift-h": "mod.open:hyphae-panel" } }`.
 - Herdr APIs: `panes`, `focused`, `terminals`, `layout`, `props`, `run`, `theme`, `home`, `readTextFile`, `watchFolder`, `exec`, `openOverlay`, `closeOverlay`, `shared`, `setShared`, `checking`, `nextCommand`.
 - External CLI invoked on user quick-control clicks (and remote machine refresh): `hyp inspect --all --json` and `hyp session focus|mute|unmute|rule|unsubscribe|leave --herdr-terminal <tid> --json`.
@@ -40,7 +40,7 @@ Live per-pane Hyphae mesh status pills in every Herdr terminal header paired wit
 
 Herdr sandboxes JS module imports to each mod's own folder (`../` imports fail `herdr-app check`). To embed the Hyphae status pill alongside your own widgets in a custom pane header mod (`mods/my-pane/`):
 
-1. Copy `pill.js`, `shared-client.js`, `kv-view.js`, and `hyphae.svg` from `mods/hyphae-pane/` into `mods/my-pane/`.
+1. Copy `pill.js`, `shared-client.js`, `kv-view.js`, `ui-snapshot.js`, and `hyphae.svg` from `mods/hyphae-pane/` into `mods/my-pane/`.
 2. Import and render the pill in `mods/my-pane/main.js`:
 
 ```js
