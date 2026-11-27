@@ -52,7 +52,7 @@ use hyp_proto::address::Channel;
 use hyp_proto::problem::ProblemDetails;
 use hyp_store::{KvDeleteInput, KvSetInput, StoreError, now_ms};
 
-use crate::adapters::{AdapterError, WebhookIngestOutcome};
+use crate::adapters::{AdapterError, GitHubWebhookAdapter, WebhookIngestOutcome};
 use crate::engine::config::{NodeError, ip_matches_trusted_proxies, normalize_ip_addr};
 use crate::engine::drop_relay::{
     CreateDropRequest, DROP_CAP_HEADER, DROP_SSE_KEEPALIVE_SECONDS, DropCapRole, DropRelay,
@@ -567,29 +567,9 @@ async fn route_request(
         return Ok(json_response(StatusCode::OK, &reply));
     }
 
-    if method == Method::POST && path == "/v1/webhooks/github" {
-        let Some(adapter) = node.github_webhook_adapter(None) else {
-            return Err(NodeError::NotFound(
-                "github webhook endpoint is disabled on this node".into(),
-            ));
-        };
+    if let Some(adapter) = resolve_github_webhook_target(&node, &method, &path)? {
         let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
         return webhook_outcome_response(outcome);
-    }
-
-    if method == Method::POST {
-        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/github/") {
-            if !raw_id.is_empty() && !raw_id.contains('/') {
-                let id = percent_decode(raw_id);
-                let Some(adapter) = node.github_webhook_adapter(Some(&id)) else {
-                    return Err(NodeError::NotFound(format!(
-                        "github webhook '{id}' is not configured on this node"
-                    )));
-                };
-                let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
-                return webhook_outcome_response(outcome);
-            }
-        }
     }
 
     if method == Method::POST {
@@ -1269,6 +1249,35 @@ fn check_content_length(headers: &HeaderMap, max_bytes: usize) -> Result<(), Nod
     Ok(())
 }
 
+fn resolve_github_webhook_target(
+    node: &UnifiedNode,
+    method: &Method,
+    path: &str,
+) -> Result<Option<Arc<GitHubWebhookAdapter>>, NodeError> {
+    if method != Method::POST {
+        return Ok(None);
+    }
+    if path == "/v1/webhooks/github" {
+        return node.github_webhook_adapter(None).map(Some).ok_or_else(|| {
+            NodeError::NotFound("github webhook endpoint is disabled on this node".into())
+        });
+    }
+    let Some(raw_id) = path
+        .strip_prefix("/v1/webhooks/github/")
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+    else {
+        return Ok(None);
+    };
+    let id = percent_decode(raw_id);
+    node.github_webhook_adapter(Some(&id))
+        .map(Some)
+        .ok_or_else(|| {
+            NodeError::NotFound(format!(
+                "github webhook '{id}' is not configured on this node"
+            ))
+        })
+}
+
 fn resolve_pre_read_body_limit(
     node: &UnifiedNode,
     method: &Method,
@@ -1304,27 +1313,8 @@ fn resolve_pre_read_body_limit(
         return Ok(MAX_UNAUTH_CONTROL_BODY_BYTES);
     }
 
-    if method == Method::POST && path == "/v1/webhooks/github" {
-        let Some(adapter) = node.github_webhook_adapter(None) else {
-            return Err(NodeError::NotFound(
-                "github webhook endpoint is disabled on this node".into(),
-            ));
-        };
+    if let Some(adapter) = resolve_github_webhook_target(node, method, path)? {
         return Ok(adapter.config().max_body_bytes);
-    }
-
-    if method == Method::POST {
-        if let Some(raw_id) = path.strip_prefix("/v1/webhooks/github/") {
-            if !raw_id.is_empty() && !raw_id.contains('/') {
-                let id = percent_decode(raw_id);
-                let Some(adapter) = node.github_webhook_adapter(Some(&id)) else {
-                    return Err(NodeError::NotFound(format!(
-                        "github webhook '{id}' is not configured on this node"
-                    )));
-                };
-                return Ok(adapter.config().max_body_bytes);
-            }
-        }
     }
 
     if method == Method::PUT && path.starts_with("/v1/transfers/") {
