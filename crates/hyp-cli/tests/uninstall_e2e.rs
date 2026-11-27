@@ -1,5 +1,4 @@
-//! End-to-end tests for `scripts/uninstall.sh`, its byte-identical mirrors
-//! (`uninstall.sh`, `site/uninstall.sh`), and the backwards-compatible
+//! End-to-end tests for `scripts/uninstall.sh` and the backwards-compatible
 //! `scripts/reset-local.sh` wrapper.
 //!
 //! Strict isolation invariant: every test executes inside an ephemeral
@@ -24,23 +23,16 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn uninstall_script_mirrors_are_byte_identical_and_non_empty() {
+fn uninstall_script_and_raw_mirror_are_byte_identical_and_non_empty() {
     let root = repo_root();
     let canonical = fs::read(root.join("scripts/uninstall.sh")).expect("read scripts/uninstall.sh");
-    let top_mirror = fs::read(root.join("uninstall.sh")).expect("read uninstall.sh");
-    let site_mirror = fs::read(root.join("site/uninstall.sh")).expect("read site/uninstall.sh");
 
+    let raw_mirror = fs::read(root.join("uninstall.sh")).expect("read uninstall.sh");
+
+    assert_eq!(canonical, raw_mirror, "root uninstall.sh must match");
     assert!(
         !canonical.is_empty(),
         "scripts/uninstall.sh must not be empty"
-    );
-    assert_eq!(
-        canonical, top_mirror,
-        "uninstall.sh must be byte-identical to scripts/uninstall.sh"
-    );
-    assert_eq!(
-        canonical, site_mirror,
-        "site/uninstall.sh must be byte-identical to scripts/uninstall.sh"
     );
     assert!(
         canonical.starts_with(b"#!/usr/bin/env bash\n")
@@ -535,7 +527,6 @@ fast_mode = true
         for rel in [
             "scripts/uninstall.sh",
             "uninstall.sh",
-            "site/uninstall.sh",
             "scripts/reset-local.sh",
         ] {
             let path = root.join(rel);
@@ -974,7 +965,7 @@ fast_mode = true
         let fx = build_populated_home();
         let h = fx.home.path();
         let script_bytes =
-            fs::read(repo_root().join("site/uninstall.sh")).expect("read site/uninstall.sh");
+            fs::read(repo_root().join("scripts/uninstall.sh")).expect("read scripts/uninstall.sh");
 
         let mut child = Command::new("/bin/sh")
             .args(["-s", "--", "--yes"])
@@ -996,7 +987,7 @@ fast_mode = true
             .take()
             .unwrap()
             .write_all(&script_bytes)
-            .expect("pipe site/uninstall.sh to /bin/sh");
+            .expect("pipe scripts/uninstall.sh to /bin/sh");
         let out = child.wait_with_output().expect("wait /bin/sh");
         assert_eq!(
             out.status.code(),

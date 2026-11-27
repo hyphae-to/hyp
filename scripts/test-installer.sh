@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end verification suite for scripts/install.sh & site/install.* mirrors.
+# End-to-end verification suite for scripts/install.sh and the Pages artifact.
 # Builds the real Rust release binary, serves a real .tar.gz + SHA256SUMS.txt over
 # an ephemeral localhost HTTP server, and verifies:
 #   1. Happy-path install + `hyp version --json` (`ok: true`)
 #   2. Fail-closed 1-byte tampered archive mutation test (non-zero exit, zero binary written)
-#   3. `--dry-run`, POSIX syntax (`sh -n`), and byte-identical `scripts/` <-> `site/` mirrors
+#   3. `--dry-run`, POSIX syntax (`sh -n`), and Pages artifact contents
 
 set -euo pipefail
 
@@ -243,9 +243,9 @@ fi
 echo "    PASS: tampered archive rejected fail-closed (exit=${TAMPER_RC}, zero files written)"
 
 # ---------------------------------------------------------------------------
-# Test 3: --dry-run, POSIX syntax check, and scripts/ <-> site/ mirror parity
+# Test 3: --dry-run, POSIX syntax check, and Pages artifact contents
 # ---------------------------------------------------------------------------
-echo "==> [Test 3/3] --dry-run, POSIX sh -n syntax, and mirror parity..."
+echo "==> [Test 3/3] --dry-run, POSIX sh -n syntax, and Pages artifact contents..."
 TMP_BIN_DRY="${TMP_ROOT}/bin-dry"
 DRY_OUT="$(sh "${REPO_ROOT}/scripts/install.sh" \
   --version "$VERSION" \
@@ -262,34 +262,23 @@ if ! printf '%s' "$DRY_OUT" | grep -q "$ARCHIVE_NAME"; then
 fi
 
 sh -n "${REPO_ROOT}/scripts/install.sh"
-sh -n "${REPO_ROOT}/site/install.sh"
 
-if ! cmp -s "${REPO_ROOT}/scripts/install.sh" "${REPO_ROOT}/site/install.sh"; then
-  echo "FAIL [Test 3]: scripts/install.sh and site/install.sh differ!" >&2
-  exit 1
-fi
-if ! cmp -s "${REPO_ROOT}/scripts/install.sh" "${REPO_ROOT}/install.sh"; then
-  echo "FAIL [Test 3]: scripts/install.sh and root install.sh differ!" >&2
-  exit 1
-fi
-if ! cmp -s "${REPO_ROOT}/scripts/install.ps1" "${REPO_ROOT}/site/install.ps1"; then
-  echo "FAIL [Test 3]: scripts/install.ps1 and site/install.ps1 differ!" >&2
-  exit 1
-fi
-if [ ! -f "${REPO_ROOT}/scripts/uninstall.ps1" ] || [ ! -f "${REPO_ROOT}/site/uninstall.ps1" ]; then
-  echo "FAIL [Test 3]: scripts/uninstall.ps1 or site/uninstall.ps1 is missing!" >&2
-  exit 1
-fi
-if ! cmp -s "${REPO_ROOT}/scripts/uninstall.ps1" "${REPO_ROOT}/site/uninstall.ps1"; then
-  echo "FAIL [Test 3]: scripts/uninstall.ps1 and site/uninstall.ps1 differ!" >&2
-  exit 1
-fi
+PAGES_DIR="${TMP_ROOT}/pages"
+sh "${REPO_ROOT}/scripts/stage-pages.sh" "$PAGES_DIR"
+for script in install.sh uninstall.sh install.ps1 uninstall.ps1; do
+  cmp "${REPO_ROOT}/scripts/$script" "$PAGES_DIR/$script"
+done
+for asset in CNAME index.html drop/index.html; do
+  cmp "${REPO_ROOT}/site/$asset" "$PAGES_DIR/$asset"
+done
+cmp "${REPO_ROOT}/scripts/install.sh" "${REPO_ROOT}/install.sh"
+cmp "${REPO_ROOT}/scripts/uninstall.sh" "${REPO_ROOT}/uninstall.sh"
 if command -v pwsh >/dev/null 2>&1; then
   (
     cd "$REPO_ROOT"
     pwsh -NoProfile -Command '
       $ErrorActionPreference = "Stop"
-      foreach ($path in @("scripts/install.ps1", "site/install.ps1", "scripts/uninstall.ps1", "site/uninstall.ps1")) {
+      foreach ($path in @("scripts/install.ps1", "scripts/uninstall.ps1")) {
         $tokens = $null
         $errors = $null
         $resolved = (Resolve-Path $path).Path
@@ -305,6 +294,6 @@ fi
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -s sh "${REPO_ROOT}/scripts/install.sh"
 fi
-echo "    PASS: --dry-run clean, POSIX sh -n valid, scripts/ <-> site/ byte-identical"
+echo "    PASS: --dry-run clean, POSIX sh -n valid, Pages artifact files verified"
 
 echo "ALL 3 INSTALLER TESTS PASSED!"
