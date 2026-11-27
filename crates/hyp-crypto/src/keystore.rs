@@ -500,10 +500,11 @@ fn check_private_owner_and_mode(path: &Path, expect_dir: bool) -> Result<u64, Cr
 #[cfg(unix)]
 fn open_private_directory(dir: &Path) -> Result<fs::File, CryptoError> {
     use std::os::unix::fs::OpenOptionsExt;
+    let normalized: PathBuf = dir.components().collect();
     Ok(OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(dir)?)
+        .open(normalized)?)
 }
 
 #[cfg(unix)]
@@ -517,9 +518,21 @@ fn tighten_private_directory(directory: &fs::File, path: &Path) -> Result<(), Cr
         )));
     }
     directory.set_permissions(fs::Permissions::from_mode(0o700))?;
-    if directory.metadata()?.mode() & 0o077 != 0 {
+    let metadata = directory.metadata()?;
+    if metadata.mode() & 0o077 != 0 {
         return Err(CryptoError::Keystore(format!(
             "{} has overly broad permissions after chmod",
+            path.display()
+        )));
+    }
+    let normalized: PathBuf = path.components().collect();
+    let visible = fs::symlink_metadata(&normalized)?;
+    if visible.file_type().is_symlink()
+        || visible.dev() != metadata.dev()
+        || visible.ino() != metadata.ino()
+    {
+        return Err(CryptoError::Keystore(format!(
+            "{} was replaced while setting directory permissions",
             path.display()
         )));
     }
@@ -528,6 +541,9 @@ fn tighten_private_directory(directory: &fs::File, path: &Path) -> Result<(), Cr
 
 /// Creates or tightens a user-owned real directory to mode 0700, rejecting links before chmod.
 pub fn ensure_private_dir(dir: &Path) -> Result<(), CryptoError> {
+    // A trailing separator or `/.` must not turn a leaf symlink into a followed directory.
+    let normalized: PathBuf = dir.components().collect();
+    let dir = normalized.as_path();
     if !dir.exists() {
         fs::create_dir_all(dir)?;
     }
@@ -2632,8 +2648,13 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         let link = temp.path().join("link");
         symlink(&target, &link).unwrap();
-        let error = ensure_private_dir(&link).unwrap_err();
-        assert!(matches!(error, CryptoError::Keystore(ref reason) if reason.contains("symlink")));
+        for spelling in [&link, &link.join(""), &link.join(".")] {
+            let error = ensure_private_dir(spelling).unwrap_err();
+            assert!(
+                matches!(error, CryptoError::Keystore(ref reason) if reason.contains("symlink"))
+            );
+            assert!(open_private_directory(spelling).is_err());
+        }
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o755
@@ -2667,7 +2688,8 @@ mod tests {
         fs::rename(&path, &moved).unwrap();
         symlink(&target, &path).unwrap();
         assert!(open_private_directory(&path).is_err());
-        tighten_private_directory(&opened, &path).unwrap();
+        let error = tighten_private_directory(&opened, &path).unwrap_err();
+        assert!(matches!(error, CryptoError::Keystore(ref reason) if reason.contains("replaced")));
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o755
