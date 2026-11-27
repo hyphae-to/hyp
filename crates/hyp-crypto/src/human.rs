@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::armor::{armor, dearmor};
 use crate::e2ee::{pad_bucket, unpad_bucket};
 use crate::error::CryptoError;
 use crate::hpke::{self, hkdf_sha256};
@@ -857,23 +858,13 @@ where
 /// Encodes a validated `HumanDropEnvelopeV1` into an armored `hdrop1_<base64url(JCS)>` token.
 pub fn encode_hdrop1(envelope: &HumanDropEnvelopeV1) -> Result<String, CryptoError> {
     let _ = validate_envelope_structure(envelope)?;
-    let canon = to_canonical_json(envelope)?;
-    Ok(format!(
-        "{HDROP1_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(canon.as_bytes())
-    ))
+    armor(HDROP1_PREFIX, envelope)
 }
 
 /// Decodes and structurally validates an armored `hdrop1_<base64url(JCS)>` token.
 pub fn decode_hdrop1(armored: &str) -> Result<HumanDropEnvelopeV1, CryptoError> {
-    let trimmed = armored.trim();
-    let encoded = trimmed
-        .strip_prefix(HDROP1_PREFIX)
-        .ok_or_else(|| CryptoError::InvalidEnvelope("expected 'hdrop1_' prefix".into()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid hdrop1_ base64url: {e}")))?;
-    let envelope: HumanDropEnvelopeV1 = serde_json::from_slice(&bytes)?;
+    let envelope: HumanDropEnvelopeV1 =
+        dearmor(HDROP1_PREFIX, armored, CryptoError::InvalidEnvelope)?;
     let _ = validate_envelope_structure(&envelope)?;
     Ok(envelope)
 }
@@ -994,23 +985,12 @@ pub fn encode_hcert1(cert: &SignedNodeCertV1) -> Result<String, CryptoError> {
             "SignedNodeCertV1 payload and sig must be non-empty".into(),
         ));
     }
-    let canon = to_canonical_json(cert)?;
-    Ok(format!(
-        "{HCERT1_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(canon.as_bytes())
-    ))
+    armor(HCERT1_PREFIX, cert)
 }
 
 /// Decodes an armored `hcert1_<base64url(JCS)>` string into a `SignedNodeCertV1`.
 pub fn decode_hcert1(armored: &str) -> Result<SignedNodeCertV1, CryptoError> {
-    let trimmed = armored.trim();
-    let encoded = trimmed
-        .strip_prefix(HCERT1_PREFIX)
-        .ok_or_else(|| CryptoError::InvalidEnvelope("expected 'hcert1_' prefix".into()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid hcert1_ base64url: {e}")))?;
-    let cert: SignedNodeCertV1 = serde_json::from_slice(&bytes)?;
+    let cert: SignedNodeCertV1 = dearmor(HCERT1_PREFIX, armored, CryptoError::InvalidEnvelope)?;
     if cert.payload.is_empty() || cert.sig.is_empty() {
         return Err(CryptoError::InvalidEnvelope(
             "decoded hcert1_ has empty payload or sig".into(),
@@ -1552,23 +1532,13 @@ pub fn encode_hjoin1(signed: &SignedHumanInviteV1) -> Result<String, CryptoError
         ));
     }
     let _ = signed.admin_jwk.to_ed25519()?;
-    let canon = to_canonical_json(signed)?;
-    Ok(format!(
-        "{HJOIN1_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(canon.as_bytes())
-    ))
+    armor(HJOIN1_PREFIX, signed)
 }
 
 /// Decodes an armored `hjoin1_<base64url_nopad(JCS)>` string into a `SignedHumanInviteV1`.
 pub fn decode_hjoin1(armored: &str) -> Result<SignedHumanInviteV1, CryptoError> {
-    let trimmed = armored.trim();
-    let encoded = trimmed
-        .strip_prefix(HJOIN1_PREFIX)
-        .ok_or_else(|| CryptoError::InvalidEnvelope("expected 'hjoin1_' prefix".into()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid hjoin1_ base64url: {e}")))?;
-    let signed: SignedHumanInviteV1 = serde_json::from_slice(&bytes)?;
+    let signed: SignedHumanInviteV1 =
+        dearmor(HJOIN1_PREFIX, armored, CryptoError::InvalidEnvelope)?;
     if signed.payload.is_empty() || signed.sig.is_empty() {
         return Err(CryptoError::InvalidEnvelope(
             "decoded hjoin1_ has empty payload or sig".into(),
@@ -1604,23 +1574,12 @@ fn validate_human_pub_card(
 /// Encodes a validated `HumanPubCardV1` into a compact copyable `hpub1_<base64url_nopad(JCS)>` string.
 pub fn encode_hpub1(card: &HumanPubCardV1) -> Result<String, CryptoError> {
     let _ = validate_human_pub_card(card)?;
-    let canon = to_canonical_json(card)?;
-    Ok(format!(
-        "{HPUB1_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(canon.as_bytes())
-    ))
+    armor(HPUB1_PREFIX, card)
 }
 
 /// Decodes and validates a compact `hpub1_<base64url_nopad(JCS)>` identity card fail-closed.
 pub fn decode_hpub1(armored: &str) -> Result<HumanPubCardV1, CryptoError> {
-    let trimmed = armored.trim();
-    let encoded = trimmed
-        .strip_prefix(HPUB1_PREFIX)
-        .ok_or_else(|| CryptoError::InvalidEnvelope("expected 'hpub1_' prefix".into()))?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|e| CryptoError::InvalidEnvelope(format!("invalid hpub1_ base64url: {e}")))?;
-    let card: HumanPubCardV1 = serde_json::from_slice(&bytes)?;
+    let card: HumanPubCardV1 = dearmor(HPUB1_PREFIX, armored, CryptoError::InvalidEnvelope)?;
     let _ = validate_human_pub_card(&card)?;
     Ok(card)
 }
