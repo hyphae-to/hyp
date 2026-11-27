@@ -27,6 +27,7 @@ All notable changes to Hyphae (`hyp`) are documented in this file.
 - **`HYPHAE_STATE_DIR` for plugins**: The node now passes its state directory to every `plugins[]` subprocess so polling cursors survive restarts without per-plugin path config (an explicit `plugins[].env` value wins).
 
 ### Security & Hardening
+- **Private directories**: Reject symlink directories before tightening permissions, leaving their targets unchanged. Node staging directories now use the same owner and permission checks as the keystore.
 - **Plugins that crash after connecting now stop**: `plugins/sdk/client.mjs` logs one line (message only) and hard-stops the process on an uncaught error or unhandled rejection. Previously the open channel kept a crashed Node bridge (Telegram, Slack, WhatsApp, webhook, Prometheus or a custom plugin) alive, so the node reported it as running and the restart backoff and `CrashLoopBackOff` breaker never engaged.
 
 ## [0.7.0] - 2026-11-25
