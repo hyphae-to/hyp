@@ -24,10 +24,9 @@ use bytes::Bytes;
 use http::{Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full, Limited};
 use hyp_crypto::SecretStore;
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -261,24 +260,10 @@ impl FilterOutcome {
 /// and local HTTP (`127.0.0.1`) endpoints without requiring global rustls CryptoProvider state.
 pub(crate) fn build_gate_http_client()
 -> Result<Client<HttpsConnector<HttpConnector>, Full<Bytes>>, GateError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let tls_config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| GateError::InvalidConfig(format!("failed to configure TLS: {e}")))?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
+    crate::engine::http_util::build_ring_http_client(
+        crate::engine::http_util::HttpProtocols::Http1And2,
+    )
+    .map_err(|e| GateError::InvalidConfig(format!("failed to configure TLS: {e}")))
 }
 
 /// Isolated Stage 2 LLM Policy Guard backed by `hyper 1` + `hyper-rustls` and a bounded semaphore.

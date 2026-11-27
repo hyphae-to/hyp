@@ -563,7 +563,6 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
- "webpki-roots",
  "zeroize",
 ]
 

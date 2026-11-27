@@ -16,9 +16,6 @@ use hyp_node::engine::{DropRelayConfig, normalize_drop_portal_url};
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{NodeManifestPayload, SignedNodeManifest};
 use hyp_proto::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
@@ -2592,14 +2589,8 @@ async fn probe_manifest_url(
     // Ensure rustls has a default ring crypto provider installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let connector = HttpsConnectorBuilder::new()
-        .with_webpki_roots()
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    let client: Client<_, Empty<hyper::body::Bytes>> =
-        Client::builder(TokioExecutor::new()).build(connector);
+    let client =
+        hyp_node::engine::http_util::build_default_http_client::<Empty<hyper::body::Bytes>>();
 
     let req = match http::Request::builder()
         .method(http::Method::GET)

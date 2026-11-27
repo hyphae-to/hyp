@@ -28,7 +28,6 @@ use hyp_proto::filter::{DiagnosticCode, DiagnosticSeverity, Filter, Subscription
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, watch};
@@ -702,24 +701,8 @@ struct RawHttpResponse {
 }
 
 fn build_http_client() -> Result<HttpClient, AdapterError> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| AdapterError::Http(format!("TLS protocol setup failed: {e}")))?
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
-
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_or_http()
-        .enable_http1()
-        .build();
-
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
+    crate::engine::http_util::build_ring_http_client(crate::engine::http_util::HttpProtocols::Http1)
+        .map_err(|e| AdapterError::Http(format!("TLS protocol setup failed: {e}")))
 }
 
 async fn github_get(
