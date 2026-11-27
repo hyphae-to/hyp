@@ -2103,7 +2103,14 @@ async fn test7_unified_hook_state_machine_interrupt_queue_notify_and_activity_le
         .await
         .unwrap();
     assert!(nudge_xport.take().is_empty());
-    tokio::time::sleep(Duration::from_millis(240)).await;
+    // Wait for the background flush to deliver and commit its notification watermark.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while node.db().local().unnotified_count(sid).unwrap() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Activity lease expiry must commit the Queue fallback notification");
     let q_nudges = nudge_xport.take();
     assert_eq!(
         q_nudges.len(),
