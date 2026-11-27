@@ -110,9 +110,7 @@ fn generate_uuid_v4() -> Result<String, CryptoError> {
     let mut b = [0u8; 16];
     rng.fill(&mut b)
         .map_err(|_| CryptoError::Hpke("OS CSPRNG failure".into()))?;
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    Ok(uuid_from_bytes(&b))
+    Ok(hyp_proto::uuid::format_uuid_v4(b))
 }
 
 fn uuid_to_bytes(id: &str) -> Result<[u8; 16], CryptoError> {

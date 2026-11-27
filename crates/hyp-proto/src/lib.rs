@@ -13,6 +13,7 @@ pub mod problem;
 pub mod rfc3339;
 pub mod rpc;
 pub mod scopes;
+pub mod uuid;
 
 /// Current Hyphae wire protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
