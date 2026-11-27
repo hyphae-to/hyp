@@ -24,6 +24,9 @@ use crate::gate_cmd::{
     ConfirmError, require_controlling_tty_confirmation, require_interactive_tty_confirmation,
     sanitize_tty_display,
 };
+pub(crate) use crate::oneshot_loopback::{
+    random_b64url, should_skip_browser_open, try_open_browser,
+};
 use crate::ui::{
     CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
@@ -63,19 +66,13 @@ use hyp_store::{
     HumanDelegationPolicyInput, HumanNodeCertInput, KeyUse, NodeDb, now_ms, uuid_v4,
 };
 use hyper::body::{Bytes, Incoming};
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::convert::Infallible;
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 const MAX_JWK_STDIN_BYTES: u64 = 16 * 1024;
@@ -1013,14 +1010,6 @@ fn sanitize_human_id(raw: &str) -> String {
         .chars()
         .take(64)
         .collect()
-}
-
-pub(crate) fn random_b64url(len: usize) -> Result<String, String> {
-    let mut buf = vec![0u8; len];
-    SystemRandom::new()
-        .fill(&mut buf)
-        .map_err(|_| "OS CSPRNG failure".to_string())?;
-    Ok(URL_SAFE_NO_PAD.encode(&buf))
 }
 
 fn parse_optional_enc_jwk(val: Option<&Value>) -> Result<Option<(String, String)>, String> {
@@ -3670,37 +3659,6 @@ pub(crate) fn extract_portal_origin(portal_url: &str) -> Result<String, String> 
     Ok(format!("{scheme}://{authority}"))
 }
 
-pub(crate) fn should_skip_browser_open(no_open: bool, store: &SecretStore) -> bool {
-    if no_open {
-        return true;
-    }
-    if std::env::var_os("HYPHAE_NO_OPEN").is_some() || std::env::var_os("CI").is_some() {
-        return true;
-    }
-    let tmp = std::env::temp_dir();
-    let canon_tmp = std::fs::canonicalize(&tmp).unwrap_or(tmp);
-    let dir = store.config_dir();
-    let canon_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    canon_dir.starts_with(&canon_tmp)
-        || dir.starts_with("/tmp")
-        || dir.starts_with("/private/tmp")
-        || dir.starts_with("/var/folders")
-        || dir.starts_with("/private/var/folders")
-}
-
-pub(crate) fn try_open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let _ = url;
-}
-
 pub(crate) fn apply_enroll_cors(
     origin: Option<&str>,
     allowed_origin: &str,
@@ -3757,7 +3715,7 @@ async fn enroll_passkey_via_web(
     let prf_salt = random_b64url(16)?;
     let csrf_token = random_b64url(24)?;
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
+    let listener = crate::oneshot_loopback::bind(port)
         .await
         .map_err(|e| format!("failed to bind 127.0.0.1:{port}: {e}"))?;
     let local_addr = listener
@@ -3783,7 +3741,7 @@ async fn enroll_passkey_via_web(
         URL_SAFE_NO_PAD.encode(canon.as_bytes())
     );
 
-    let (done_tx, mut done_rx) = oneshot::channel::<Result<WebEnrolledAuthority, String>>();
+    let (done_tx, done_rx) = oneshot::channel::<Result<WebEnrolledAuthority, String>>();
     let state = Arc::new(WebEnrollState {
         allowed_origin,
         default_human_id: human_id.to_string(),
@@ -3804,36 +3762,23 @@ async fn enroll_passkey_via_web(
         try_open_browser(&enroll_url);
     }
 
-    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs.max(1)));
-    tokio::pin!(timeout);
-
-    loop {
-        tokio::select! {
-            res = &mut done_rx => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                return res.map_err(|_| "enrollment callback channel closed unexpectedly".to_string())?;
-            }
-            _ = &mut timeout => {
-                return Err(format!("timed out after {timeout_secs}s waiting for Passkey enrollment callback"));
-            }
-            accept = listener.accept() => {
-                let Ok((stream, _)) = accept else {
-                    continue;
-                };
-                let st = Arc::clone(&state);
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let st = Arc::clone(&st);
-                        async move { Ok::<_, Infallible>(handle_enroll_callback(st, req).await) }
-                    });
-                    let _ = AutoServerBuilder::new(TokioExecutor::new())
-                        .serve_connection(io, svc)
-                        .await;
-                });
-            }
+    crate::oneshot_loopback::serve(
+        listener,
+        state,
+        done_rx,
+        Duration::from_secs(timeout_secs.max(1)),
+        Duration::from_millis(50),
+        handle_enroll_callback,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::oneshot_loopback::WaitError::ChannelClosed => {
+            "enrollment callback channel closed unexpectedly".to_string()
         }
-    }
+        crate::oneshot_loopback::WaitError::TimedOut => {
+            format!("timed out after {timeout_secs}s waiting for Passkey enrollment callback")
+        }
+    })?
 }
 
 async fn handle_enroll_callback(

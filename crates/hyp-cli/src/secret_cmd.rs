@@ -10,9 +10,8 @@
 use crate::config_file::{
     ct_eq, open_secret_store, resolve_config_path_for_read, resolve_state_dir,
 };
+use crate::oneshot_loopback::{random_b64url, should_skip_browser_open, try_open_browser};
 use crate::ui::{CliError, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Subcommand;
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::Full;
@@ -20,19 +19,13 @@ use hyp_crypto::keystore::{SecretMetadata, SecretStore, validate_secret_name};
 use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::node_file::NodeFile;
 use hyper::body::{Bytes, Incoming};
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::convert::Infallible;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 const MAX_SECRET_INPUT_BYTES: u64 = 64 * 1024;
@@ -545,14 +538,6 @@ struct WebSaved {
     location: String,
 }
 
-fn random_b64url(len: usize) -> Result<String, String> {
-    let rng = SystemRandom::new();
-    let mut buf = vec![0u8; len];
-    rng.fill(&mut buf)
-        .map_err(|_| "OS CSPRNG failure".to_string())?;
-    Ok(URL_SAFE_NO_PAD.encode(&buf))
-}
-
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1025,38 +1010,6 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>
         .expect("valid text response")
 }
 
-fn should_skip_browser_open(no_open: bool, store: &SecretStore) -> bool {
-    if no_open {
-        return true;
-    }
-    if std::env::var_os("HYPHAE_NO_OPEN").is_some() || std::env::var_os("CI").is_some() {
-        return true;
-    }
-    // Never pop up a real browser window when running against ephemeral temp dirs (tests!).
-    let tmp = std::env::temp_dir();
-    let canon_tmp = std::fs::canonicalize(&tmp).unwrap_or(tmp);
-    let dir = store.config_dir();
-    let canon_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    canon_dir.starts_with(&canon_tmp)
-        || dir.starts_with("/tmp")
-        || dir.starts_with("/private/tmp")
-        || dir.starts_with("/var/folders")
-        || dir.starts_with("/private/var/folders")
-}
-
-fn try_open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let _ = url;
-}
-
 struct WebCaptureState {
     name: String,
     expected_path: String,
@@ -1084,7 +1037,7 @@ async fn capture_secret_via_web(
         &csrf_nonce,
     );
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
+    let listener = crate::oneshot_loopback::bind(port)
         .await
         .map_err(|e| format!("failed to bind 127.0.0.1:{port}: {e}"))?;
     let local_addr = listener
@@ -1092,7 +1045,7 @@ async fn capture_secret_via_web(
         .map_err(|e| format!("failed to query local address: {e}"))?;
     let url = format!("http://127.0.0.1:{}{expected_path}", local_addr.port());
 
-    let (done_tx, mut done_rx) = oneshot::channel::<Result<WebSaved, String>>();
+    let (done_tx, done_rx) = oneshot::channel::<Result<WebSaved, String>>();
     let state = Arc::new(WebCaptureState {
         name: name.to_string(),
         expected_path,
@@ -1111,37 +1064,23 @@ async fn capture_secret_via_web(
         try_open_browser(&url);
     }
 
-    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs.max(1)));
-    tokio::pin!(timeout);
-
-    loop {
-        tokio::select! {
-            res = &mut done_rx => {
-                // Allow a brief moment for the HTTP 200 response frame to flush before exiting.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                return res.map_err(|_| "secret capture channel closed unexpectedly".to_string())?;
-            }
-            _ = &mut timeout => {
-                return Err(format!("timed out after {timeout_secs}s waiting for secret '{name}' submission"));
-            }
-            accept = listener.accept() => {
-                let Ok((stream, _)) = accept else {
-                    continue;
-                };
-                let st = Arc::clone(&state);
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let st = Arc::clone(&st);
-                        async move { Ok::<_, Infallible>(handle_web_capture_request(st, req).await) }
-                    });
-                    let _ = AutoServerBuilder::new(TokioExecutor::new())
-                        .serve_connection(io, svc)
-                        .await;
-                });
-            }
+    crate::oneshot_loopback::serve(
+        listener,
+        state,
+        done_rx,
+        Duration::from_secs(timeout_secs.max(1)),
+        Duration::from_millis(50),
+        handle_web_capture_request,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::oneshot_loopback::WaitError::ChannelClosed => {
+            "secret capture channel closed unexpectedly".to_string()
         }
-    }
+        crate::oneshot_loopback::WaitError::TimedOut => {
+            format!("timed out after {timeout_secs}s waiting for secret '{name}' submission")
+        }
+    })?
 }
 
 async fn handle_web_capture_request(
