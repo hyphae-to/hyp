@@ -46,7 +46,7 @@ Read and acknowledge filtered cursor-paginated inbox items (call when a `<hyphae
 | `limit` | `integer` (`1..=50`) | Page size (default `20`) |
 | `summary` | `boolean` | Return compact metadata summaries |
 | `ack` | `boolean` | Mark returned unread items as delivered (defaults to `true` for `unread` queries; pass `false` to peek) |
-| `ids` | `string[]` | Fetch specific receipt IDs |
+| `ids` | `string[]` | Select items by the returned `receipt` field. Use with `ack: true` to acknowledge only those items |
 | `mode` | `"queue" \| "notify"` | Set session delivery mode (`"notify"` = Focus Mode) |
 | `rules` | `Array<{ target, delivery }>` | Per-source overrides (`delivery`: `"interrupt" \| "queue" \| "notify" \| "mute"`) |
 | `mute` / `unmute` | `string` | Mute or unmute a source pattern |

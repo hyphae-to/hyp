@@ -698,53 +698,76 @@ async fn rfc0004_decision3_hyp_inbox_acks_by_default_peek_provenance_and_focus_v
         .await;
     assert!(!peek_err, "peek failed: {peek_txt}");
     let peek_val: Value = serde_json::from_str(&peek_txt).unwrap();
-    assert_eq!(peek_val["items"].as_array().unwrap().len(), 2);
+    let peek_items = peek_val["items"].as_array().unwrap();
+    assert_eq!(peek_items.len(), 2);
+    assert!(peek_items.iter().all(|item| item.get("itemId").is_none()));
+    let peer_receipt = peek_items
+        .iter()
+        .find(|item| item["trustTier"] == "peer")
+        .unwrap()["receipt"]
+        .as_str()
+        .unwrap();
+    let human_receipt = peek_items
+        .iter()
+        .find(|item| item["trustTier"] == "human-verified")
+        .unwrap()["receipt"]
+        .as_str()
+        .unwrap();
+    assert_ne!(peer_receipt, human_receipt);
     assert_eq!(
         peek_val["unread"], 2,
         "ack: false must preserve unread count"
     );
     assert_eq!(session_status(&sock, "claude:d3-sess").await["pending"], 2);
 
-    // 2. Default read (`hyp_inbox({})`, NO `ack` arg!) returns both items with explicit trustTier
-    //    & provenance AND acknowledges them as delivered!
+    // Selective acknowledgement uses the returned receipt and leaves the other item unread.
+    let (selected_txt, selected_err) = mcp
+        .call_verified_claude(
+            &sock,
+            "d3-sess",
+            "hyp_inbox",
+            json!({ "ids": [peer_receipt], "ack": true }),
+        )
+        .await;
+    assert!(!selected_err, "{selected_txt}");
+    let selected: Value = serde_json::from_str(&selected_txt).unwrap();
+    let selected_items = selected["items"].as_array().unwrap();
+    assert_eq!(selected_items.len(), 1);
+    let peer_item = &selected_items[0];
+    assert_eq!(peer_item["receipt"], peer_receipt);
+    assert_eq!(peer_item["text"], "UNTRUSTED_PEER_BODY_D3");
+    assert_eq!(peer_item["trustTier"], "peer");
+    assert_eq!(peer_item["untrusted"], true);
+    assert!(peer_item.get("itemId").is_none());
+    assert!(peer_item.get("provenance").is_none());
+    assert_eq!(selected["acked"], 1);
+    assert_eq!(selected["unread"], 1);
+
+    // A default read returns and acknowledges the remaining item.
     let (read_txt, read_err) = mcp
         .call_verified_claude(&sock, "d3-sess", "hyp_inbox", json!({}))
         .await;
     assert!(!read_err, "default read failed: {read_txt}");
     let read_val: Value = serde_json::from_str(&read_txt).unwrap();
     let items = read_val["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
-    assert_eq!(
-        read_val["unread"], 0,
-        "default hyp_inbox must ack returned unread items"
-    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(read_val["acked"], 1);
+    assert_eq!(read_val["unread"], 0);
     assert_eq!(session_status(&sock, "claude:d3-sess").await["pending"], 0);
 
-    let human_item = items
-        .iter()
-        .find(|i| {
-            i["text"]
-                .as_str()
-                .unwrap_or("")
-                .contains("HUMAN_VERIFIED_DEPLOY_OK")
-        })
-        .expect("human verified item");
+    let human_item = &items[0];
+    assert_eq!(human_item["receipt"], human_receipt);
+    assert!(
+        human_item["text"]
+            .as_str()
+            .unwrap()
+            .contains("HUMAN_VERIFIED_DEPLOY_OK")
+    );
     assert_eq!(human_item["humanVerified"], true);
     assert_eq!(human_item["trustTier"], "human-verified");
     assert!(human_item.get("untrusted").is_none());
-
-    let peer_item = items
-        .iter()
-        .find(|i| {
-            i["text"]
-                .as_str()
-                .unwrap_or("")
-                .contains("UNTRUSTED_PEER_BODY_D3")
-        })
-        .expect("peer item");
-    assert_eq!(peer_item["trustTier"], "peer");
-    assert_eq!(peer_item["untrusted"], true);
-    assert!(items.iter().all(|item| item.get("provenance").is_none()));
+    assert!(human_item.get("itemId").is_none());
+    assert!(human_item.get("provenance").is_none());
 
     // 3. Focus Mode VIP isolation (#32) with default `ack: true`:
     //    Enable Focus Mode with VIP interrupt rule; send buffered non-VIP + VIP; unfiltered
@@ -1506,6 +1529,7 @@ async fn digest_and_inbox_require_stored_daemon_notice_provenance() {
     );
     assert!(!digest.contains(" body"), "{digest}");
 
+    let stored = node.db().local().peek_inbox(sid, 10).unwrap();
     let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
     mcp.initialize().await;
     let (response, is_error) = mcp
@@ -1522,7 +1546,16 @@ async fn digest_and_inbox_require_stored_daemon_notice_provenance() {
         ("legacy-wake", "peer"),
         ("bridge-item", "bridge"),
     ] {
-        let item = items.iter().find(|item| item["itemId"] == item_id).unwrap();
+        let receipt = &stored
+            .iter()
+            .find(|entry| entry.item_id == item_id)
+            .unwrap()
+            .receipt;
+        let item = items
+            .iter()
+            .find(|item| item["receipt"] == *receipt)
+            .unwrap();
+        assert!(item.get("itemId").is_none(), "{item}");
         assert_eq!(item["trustTier"], tier, "{item}");
         assert!(item.get("provenance").is_none(), "{item}");
         if tier == "self" {

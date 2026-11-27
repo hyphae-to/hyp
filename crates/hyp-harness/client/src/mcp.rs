@@ -138,7 +138,7 @@ pub fn select_tools_for_caps(caps: McpToolCaps) -> Vec<Value> {
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                     "summary": {"type": "boolean"},
                     "ack": {"type": "boolean"},
-                    "ids": {"type": "array", "items": s},
+                    "ids": {"type": "array", "items": s, "description": "Receipts from returned items. Use with ack:true to acknowledge only those items."},
                     "mode": {"type": "string", "enum": ["queue", "notify"]},
                     "rules": {
                         "type": "array",
