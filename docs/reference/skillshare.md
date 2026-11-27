@@ -9,9 +9,11 @@ reports an error and does not switch to a direct installation.
 An uninitialized manager is initialized noninteractively without importing other
 skills or adding unrelated targets. Hyphae installs local generated skills into
 stable per-destination collections, then synchronizes them. Existing target
-naming, filters, and sync modes remain in force. Consequently, the exposed folder
+naming, filters, and merge/copy modes remain in force. Full-directory symlink
+mode cannot isolate harness-specific variants, so setup preserves it and reports
+that merge or copy mode is required. Consequently, the exposed folder
 can be `hyphae-<id>__hyp-mesh` under flat naming, while standard naming keeps
-`hyp-mesh`. Onboarding reports the actual exposed path. Customized skills marked
+`hyp-mesh`. Onboarding reports the actual exposed path. Copy-mode updates retain Skillshare's normal ownership policy. Customized skills marked
 `<!-- hyphae:unmanaged -->` are preserved, including edits through manager links.
 
 Supported MCP registrations retain the `hyphae` name. Recognized existing direct

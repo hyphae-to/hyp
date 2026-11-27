@@ -18,6 +18,12 @@ pub(crate) struct Skillshare {
 }
 
 impl Skillshare {
+    fn policy(&self) -> Result<serde_yaml_ng::Value, String> {
+        let bytes = fs::read(self.config_path())
+            .map_err(|_| "Could not read Skillshare policy before adding a target")?;
+        serde_yaml_ng::from_slice(&bytes)
+            .map_err(|_| "Invalid Skillshare policy; inspect it before adding a target".into())
+    }
     fn current_home_matches(&self) -> bool {
         #[cfg(windows)]
         let current = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
@@ -476,43 +482,115 @@ impl Skillshare {
                 .to_string_lossy()
                 .as_bytes(),
         )[..12];
+        let policy = self.policy()?;
+        let status = self.run(&["status", "-g", "--json"])?;
+        let source = status["source"]["path"]
+            .as_str()
+            .ok_or("Skillshare did not report its source path; upgrade Skillshare")?;
+        if crate::setup::canonical_dedup_key(target_dir)
+            == crate::setup::canonical_dedup_key(Path::new(source))
+        {
+            return Err("The receiving skills folder points at Skillshare's entire source; configure an independent merge/copy target first".into());
+        }
         let inventory = self.run(&["target", "list", "-g", "--json"])?;
         let targets = inventory["targets"]
             .as_array()
             .ok_or("Skillshare returned no target inventory; upgrade Skillshare")?;
-        let target = targets.iter().find(|target| {
-            target["path"].as_str().is_some_and(|p| {
-                crate::setup::canonical_dedup_key(Path::new(p))
-                    == crate::setup::canonical_dedup_key(target_dir)
+        let mut target = targets
+            .iter()
+            .find(|target| {
+                target["path"].as_str().is_some_and(|p| {
+                    crate::setup::canonical_dedup_key(Path::new(p))
+                        == crate::setup::canonical_dedup_key(target_dir)
+                })
             })
-        });
-        let target_name;
-        let naming;
-        if let Some(target) = target {
-            if target["skillsEnabled"] == false {
-                return Err(format!(
-                    "Skillshare skills are disabled for {}; enable them in Skillshare first",
-                    target_dir.display()
-                ));
+            .cloned();
+        let created = target.is_none();
+        if created {
+            // Querying/creating a target can realize an inherited folder link.
+            // Read the actual YAML policy first so an unsupported global mode
+            // never exposes all source skills to a newly selected harness.
+            let mode = skill_mode(&policy, None)?;
+            if mode == "symlink" {
+                return Err("Skillshare global full-directory symlink mode cannot isolate harness-tailored skills; add a merge/copy target explicitly first".into());
             }
-            target_name = target["name"]
-                .as_str()
-                .ok_or("Skillshare target has no name")?
-                .to_owned();
-            naming = target["targetNaming"].as_str().unwrap_or("flat").to_owned();
-        } else {
-            target_name = format!("hyphae-{id}");
-            fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
+            let added_name = format!("hyphae-{id}");
+            // Keep the new target disabled until its inherited policy is known.
+            // In particular, adding under global symlink mode must not expose
+            // every other harness's generated instructions through this folder.
             self.run(&[
                 "target",
                 "add",
-                &target_name,
+                &added_name,
                 &target_dir.to_string_lossy(),
+                "--no-skills",
                 "-g",
             ])?;
-            naming = "flat".into();
+            let inventory = self.run(&["target", "list", "-g", "--json"])?;
+            target = inventory["targets"]
+                .as_array()
+                .and_then(|targets| targets.iter().find(|target| target["name"] == added_name))
+                .cloned();
+        }
+        let target = target.ok_or("Skillshare did not create the receiving target")?;
+        let target_name = target["name"]
+            .as_str()
+            .ok_or("Skillshare target has no name")?
+            .to_owned();
+        let policy = if created { self.policy()? } else { policy };
+        if skill_mode(&policy, Some(&target_name))? == "symlink" {
+            return Err(format!(
+                "Skillshare full-directory symlink mode cannot isolate harness-tailored skills for {}; choose merge/copy mode and enable the target in Skillshare first",
+                target_dir.display()
+            ));
+        }
+        if !created && target["skillsEnabled"] == false {
+            return Err(format!(
+                "Skillshare skills are disabled for {}; enable them in Skillshare first",
+                target_dir.display()
+            ));
+        }
+        let naming = target["targetNaming"].as_str().unwrap_or("flat").to_owned();
+        if created {
+            fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
+            self.run(&["target", &target_name, "--skills=true", "-g"])?;
         }
         let collection = format!("hyphae-{id}");
+        let destination = if naming == "flat" {
+            target_dir.join(format!("{collection}__{name}/SKILL.md"))
+        } else {
+            target_dir.join(name).join("SKILL.md")
+        };
+        if !force
+            && fs::read_to_string(&destination)
+                .is_ok_and(|text| text.contains(crate::skill_render::UNMANAGED_MARKER))
+        {
+            return Err(format!(
+                "Preserved unmanaged Skillshare skill at {}; pass --force-skills to overwrite",
+                destination.display()
+            ));
+        }
+        let manifest = target_dir.join(".skillshare-manifest.json");
+        let manager_owned = match fs::read(&manifest) {
+            Ok(bytes) => {
+                let record: Value = serde_json::from_slice(&bytes).map_err(
+                    |_| "Invalid Skillshare target manifest; inspect it before migration",
+                )?;
+                let output_name = destination
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|s| s.to_str())
+                    .ok_or("Invalid exposed skill path")?;
+                record["managed"]
+                    .as_object()
+                    .ok_or(
+                        "Invalid Skillshare managed-skill inventory; inspect it before migration",
+                    )?
+                    .contains_key(output_name)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(format!("Could not read Skillshare target manifest: {e}")),
+        };
         let staged = self
             .home
             .join(".config/hyphae/skillshare")
@@ -535,14 +613,10 @@ impl Skillshare {
             "-g",
             "--json",
         ])?;
-        let destination = if naming == "flat" {
-            target_dir.join(format!("{collection}__{name}/SKILL.md"))
-        } else {
-            target_dir.join(name).join("SKILL.md")
-        };
         let backup = staged.parent().unwrap().with_extension("direct-backup");
         let move_direct = old.is_some()
             && destination == path
+            && !manager_owned
             && fs::symlink_metadata(skill_dir).is_ok_and(|m| !m.file_type().is_symlink());
         if move_direct {
             if fs::read_dir(skill_dir).map_err(|e| e.to_string())?.count() != 1 {
@@ -620,5 +694,53 @@ fn verify_command(command: &str, bin: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("The existing hyphae entry runs a different command; preserved it instead of claiming ownership".into())
+    }
+}
+
+fn skill_mode<'a>(
+    policy: &'a serde_yaml_ng::Value,
+    target: Option<&str>,
+) -> Result<&'a str, String> {
+    let local = target.and_then(|name| policy.get("targets")?.get(name));
+    for mode in [
+        local.and_then(|target| target.get("skills")?.get("mode")),
+        local.and_then(|target| target.get("mode")),
+        policy.get("mode"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mode = mode.as_str().ok_or("Skillshare mode must be a string")?;
+        if !mode.is_empty() {
+            return Ok(mode);
+        }
+    }
+    Ok("merge")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_modes_inherit_empty_overrides_and_preserve_explicit_policy() {
+        for (text, expected) in [
+            (
+                "mode: symlink\ntargets:\n  cursor:\n    mode: ''\n",
+                "symlink",
+            ),
+            (
+                "mode: symlink\ntargets:\n  cursor:\n    skills:\n      mode: ''\n",
+                "symlink",
+            ),
+            (
+                "mode: symlink\ntargets:\n  cursor:\n    skills:\n      mode: copy\n",
+                "copy",
+            ),
+            ("mode: ''\ntargets: {}\n", "merge"),
+        ] {
+            let policy = serde_yaml_ng::from_str(text).unwrap();
+            assert_eq!(skill_mode(&policy, Some("cursor")).unwrap(), expected);
+        }
     }
 }

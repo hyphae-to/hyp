@@ -59,6 +59,20 @@ impl Fixture {
     fn json(&self, path: &str) -> Value {
         serde_json::from_slice(&fs::read(self.home.join(path)).unwrap()).unwrap()
     }
+    fn source_has_skills(&self) -> bool {
+        fn visit(path: &Path) -> bool {
+            fs::read_dir(path).unwrap().any(|entry| {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    visit(&entry.path())
+                } else {
+                    kind.is_file() && entry.file_name() == "SKILL.md"
+                }
+            })
+        }
+        visit(&self.home.join(".config/skillshare/skills"))
+    }
     fn write(&self, path: &str, contents: &str) {
         let path = self.home.join(path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -383,4 +397,127 @@ fn missing_receipt_cannot_change_other_clients_launch_arguments() {
     assert!(!ok, "{result:#}");
     assert_eq!(f.json(".claude.json"), claude);
     assert_eq!(f.json(".cursor/mcp.json"), cursor);
+}
+
+#[test]
+#[ignore = "requires real Skillshare v0.33+ on PATH"]
+fn opt_out_survives_user_changing_manager_naming_policy() {
+    let f = Fixture::new(true);
+    let source = f.home.join(".config/skillshare/skills");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(f.home.join(".cursor/skills")).unwrap();
+    f.write(".config/skillshare/config.yaml", &json!({"source":source,"mode":"merge","target_naming":"standard","targets":{"cursor":{"path":f.home.join(".cursor/skills")}}}).to_string());
+    assert!(f.run("setup", "cursor", &["--no-commands"]).0);
+    for args in [
+        vec!["target", "cursor", "--target-naming", "flat", "-g"],
+        vec!["sync", "-g", "--json"],
+    ] {
+        let out = Command::new(manager())
+            .env_clear()
+            .env("HOME", &f.home)
+            .env("PATH", &f.tools)
+            .env("SKILLSHARE_AUTO_UPDATE_CHECK", "false")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    let skill = fs::read_dir(f.home.join(".cursor/skills"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("hyp-mesh")
+        })
+        .unwrap()
+        .join("SKILL.md");
+    let edited = format!(
+        "{}\n<!-- hyphae:unmanaged -->\nKeep after naming change\n",
+        fs::read_to_string(&skill).unwrap()
+    );
+    fs::write(&skill, &edited).unwrap();
+    let (ok, result) = f.run("setup", "cursor", &["--no-commands"]);
+    assert!(!ok, "{result:#}");
+    assert_eq!(fs::read_to_string(&skill).unwrap(), edited);
+}
+
+#[test]
+#[ignore = "requires real Skillshare v0.33+ on PATH"]
+fn copy_mode_unchanged_source_preserves_local_edits() {
+    let f = Fixture::new(true);
+    let source = f.home.join(".config/skillshare/skills");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(f.home.join(".cursor/skills")).unwrap();
+    f.write(".config/skillshare/config.yaml", &json!({"source":source,"mode":"copy","target_naming":"standard","targets":{"cursor":{"path":f.home.join(".cursor/skills")}}}).to_string());
+    assert!(f.run("setup", "cursor", &["--no-commands"]).0);
+    let skill = f.home.join(".cursor/skills/hyp-mesh/SKILL.md");
+    assert!(
+        !fs::symlink_metadata(skill.parent().unwrap())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let edited = format!(
+        "{}\nUser copy customization\n",
+        fs::read_to_string(&skill).unwrap()
+    );
+    fs::write(&skill, &edited).unwrap();
+    let (ok, result) = f.run("setup", "cursor", &["--no-commands"]);
+    assert!(ok, "{result:#}");
+    assert_eq!(fs::read_to_string(&skill).unwrap(), edited);
+}
+
+#[test]
+#[ignore = "requires real Skillshare v0.33+ on PATH"]
+fn full_directory_symlink_mode_is_rejected_without_changing_user_policy() {
+    let f = Fixture::new(true);
+    let source = f.home.join(".config/skillshare/skills");
+    fs::create_dir_all(&source).unwrap();
+    let skills = f.home.join(".cursor/skills");
+    fs::create_dir_all(skills.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&source, &skills).unwrap();
+    f.write(
+        ".config/skillshare/config.yaml",
+        &json!({"source":source,"mode":"symlink","targets":{"cursor":{"path":skills}}}).to_string(),
+    );
+    let (ok, result) = f.run("setup", "cursor", &["--no-commands"]);
+    assert!(!ok, "{result:#}");
+    assert_eq!(fs::read_link(&skills).unwrap(), source);
+    assert!(!f.source_has_skills());
+    assert!(
+        fs::read_to_string(f.home.join(".config/skillshare/config.yaml"))
+            .unwrap()
+            .contains("symlink")
+    );
+}
+
+#[test]
+#[ignore = "requires real Skillshare v0.33+ on PATH"]
+fn newly_added_target_uses_global_naming_and_rejects_global_symlink_mode() {
+    for mode in ["merge", "symlink"] {
+        let f = Fixture::new(true);
+        let source = f.home.join(".config/skillshare/skills");
+        fs::create_dir_all(&source).unwrap();
+        f.write(
+            ".config/skillshare/config.yaml",
+            &json!({"source":source,"mode":mode,"target_naming":"standard","targets":{}})
+                .to_string(),
+        );
+        let (ok, result) = f.run("setup", "cursor", &["--no-commands"]);
+        let skills = f.home.join(".cursor/skills");
+        if mode == "merge" {
+            assert!(ok, "{result:#}");
+            assert!(skills.join("hyp-mesh/SKILL.md").is_file());
+        } else {
+            assert!(!ok, "{result:#}");
+            assert!(!fs::symlink_metadata(&skills).is_ok_and(|m| m.file_type().is_symlink()));
+            assert!(!f.source_has_skills());
+        }
+    }
 }
