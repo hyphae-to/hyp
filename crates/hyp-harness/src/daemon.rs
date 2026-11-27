@@ -2467,7 +2467,7 @@ impl LocalDaemonInner {
     ) -> bool {
         let herdr_tid = transport.herdr_terminal_id().map(ToString::to_string);
         let target_meta = transport.target_metadata();
-        {
+        let replaced = {
             let mut sessions = self.session_runtime();
             let runtime = sessions.entry(session_id.to_owned()).or_default();
             if runtime
@@ -2477,11 +2477,13 @@ impl LocalDaemonInner {
             {
                 return false;
             }
-            runtime.attached_transport = Some(AttachedPushTransport {
+            runtime.attached_transport.replace(AttachedPushTransport {
                 transport,
                 priority,
-            });
-        }
+            })
+        };
+        // A transport's destructor may query the daemon.
+        drop(replaced);
         if let Some(ref tid) = herdr_tid {
             self.record_herdr_terminal(tid, session_id);
         }
@@ -2509,12 +2511,19 @@ impl LocalDaemonInner {
             .unwrap_or(0)
     }
 
+    fn attached_push_transport(&self, session_id: &str) -> Option<Arc<dyn PushTransport>> {
+        self.session_runtime()
+            .get(session_id)
+            .and_then(|runtime| runtime.attached_transport.as_ref())
+            .map(|attached| Arc::clone(&attached.transport))
+    }
+
     fn unregister_session_transport(&self, session_id: &str) -> bool {
-        let removed = self
-            .update_runtime(session_id, |runtime| {
-                runtime.attached_transport.take().is_some()
-            })
-            .unwrap_or(false);
+        let previous = self
+            .update_runtime(session_id, |runtime| runtime.attached_transport.take())
+            .flatten();
+        let removed = previous.is_some();
+        drop(previous);
         if removed {
             self.cancel_hold_retry(session_id);
             self.bump_ui_rev();
@@ -3134,12 +3143,8 @@ impl LocalDaemonInner {
         if self.openclaw_plugin_wake_available_for(session_id) {
             return Some("openclaw_plugin");
         }
-        if let Some(attached) = self
-            .session_runtime()
-            .get(session_id)
-            .and_then(|runtime| runtime.attached_transport.as_ref())
-        {
-            return Some(attached.transport.kind());
+        if let Some(transport) = self.attached_push_transport(session_id) {
+            return Some(transport.kind());
         }
         let sessions = self.session_runtime();
         if let Some(list) = sessions.get(session_id).map(|runtime| &runtime.waiters) {
@@ -4723,11 +4728,7 @@ impl LocalDaemonInner {
             {
                 self.maybe_lazy_hydrate_transport(session_id).await;
             }
-            let push_transport = self
-                .session_runtime()
-                .get(session_id)
-                .and_then(|runtime| runtime.attached_transport.as_ref())
-                .map(|a| Arc::clone(&a.transport));
+            let push_transport = self.attached_push_transport(session_id);
             if let Some(transport) = push_transport {
                 // Notify-only FYI batches NEVER wake an idle agent via an external L2 push
                 // transport (no wasted LLM turn for Focus Mode / burst-demoted chatter).
@@ -10899,15 +10900,8 @@ type HerdrCandidateRank = (bool, i64, bool, bool);
 impl LocalDaemonInner {
     fn session_herdr_terminal_id(&self, sess: &hyp_store::Session) -> Option<String> {
         let from_transport = self
-            .session_runtime()
-            .get(&sess.id)
-            .and_then(|runtime| runtime.attached_transport.as_ref())
-            .and_then(|attached| {
-                attached
-                    .transport
-                    .herdr_terminal_id()
-                    .map(ToString::to_string)
-            });
+            .attached_push_transport(&sess.id)
+            .and_then(|transport| transport.herdr_terminal_id().map(ToString::to_string));
         from_transport.or_else(|| {
             extract_backend_str(&sess.backend_json, "herdrTerminalId")
                 .filter(|tid| is_valid_terminal_id(tid))
@@ -10916,10 +10910,8 @@ impl LocalDaemonInner {
 
     fn session_herdr_created_ms(&self, sess: &hyp_store::Session) -> Option<i64> {
         let from_transport = self
-            .session_runtime()
-            .get(&sess.id)
-            .and_then(|runtime| runtime.attached_transport.as_ref())
-            .and_then(|attached| attached.transport.herdr_created_ms());
+            .attached_push_transport(&sess.id)
+            .and_then(|transport| transport.herdr_created_ms());
         from_transport.or_else(|| extract_backend_i64(&sess.backend_json, "herdrCreatedMs"))
     }
 
@@ -10961,17 +10953,22 @@ impl LocalDaemonInner {
                 .get(terminal_id)
                 .cloned()
                 .unwrap_or_default();
-            let transport_ids: Vec<String> = self
+            let transports: Vec<_> = self
                 .session_runtime()
                 .iter()
-                .filter(|(_, runtime)| {
-                    runtime.attached_transport.as_ref().is_some_and(|attached| {
-                        attached.transport.herdr_terminal_id() == Some(terminal_id)
-                    })
+                .filter_map(|(session_id, runtime)| {
+                    runtime
+                        .attached_transport
+                        .as_ref()
+                        .map(|attached| (session_id.clone(), Arc::clone(&attached.transport)))
                 })
-                .map(|(sid, _)| sid.clone())
                 .collect();
-            for sid in indexed_ids.into_iter().chain(transport_ids.into_iter()) {
+            let transport_ids = transports
+                .into_iter()
+                .filter_map(|(session_id, transport)| {
+                    (transport.herdr_terminal_id() == Some(terminal_id)).then_some(session_id)
+                });
+            for sid in indexed_ids.into_iter().chain(transport_ids) {
                 if !candidate_map.contains_key(&sid) {
                     if let Ok(Some(sess)) = db.local().get_session(&sid) {
                         candidate_map.insert(sess.id.clone(), sess);
