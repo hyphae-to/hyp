@@ -1377,7 +1377,13 @@ async fn node_start_repo_tokens_warnings_plaintext_fail_closed_and_gate_auth_hea
             .args(["-TERM", &pid.to_string()])
             .status();
         let exit_status = running_child.wait().expect("wait for exit");
-        assert_eq!(exit_status.code(), Some(0));
+        assert_eq!(
+            exit_status.code(),
+            Some(0),
+            "SIGTERM immediately after startup must shut down cleanly: {exit_status}"
+        );
+        assert!(!state_dir.join("node.pid").exists());
+        assert!(!state_dir.join("node.status.json").exists());
     }
     #[cfg(not(unix))]
     {

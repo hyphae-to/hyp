@@ -970,6 +970,9 @@ fn node_start(args: NodeStartArgs) -> Result<ExitCode, CliError> {
             .as_ref()
             .map(|p| p.display().to_string());
 
+        // Install shutdown listeners before publishing the node's readiness.
+        let shutdown_signal = prepare_shutdown_signal();
+
         write_atomic_file(&pid_path, format!("{pid}\n").as_bytes(), true)?;
         let status_doc = json!({
             "pid": pid,
@@ -1101,7 +1104,7 @@ fn node_start(args: NodeStartArgs) -> Result<ExitCode, CliError> {
             let _ = std::io::stdout().flush();
         }
 
-        wait_for_shutdown_signal().await;
+        shutdown_signal.await;
 
         if let Some(tx) = headless_wake_shutdown {
             let _ = tx.send(true);
@@ -1246,12 +1249,13 @@ fn reload_gate_pipeline_from_disk(
     Ok(Some(Arc::new(pipeline)))
 }
 
-async fn wait_for_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = signal(SignalKind::terminate()).ok();
-        let mut sigint = signal(SignalKind::interrupt()).ok();
+#[cfg(unix)]
+fn prepare_shutdown_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate()).ok();
+    let mut sigint = signal(SignalKind::interrupt()).ok();
+    async move {
         match (sigterm.as_mut(), sigint.as_mut()) {
             (Some(t), Some(i)) => {
                 tokio::select! {
@@ -1262,14 +1266,23 @@ async fn wait_for_shutdown_signal() {
             (Some(t), None) => {
                 let _ = t.recv().await;
             }
-            _ => {
+            (None, Some(i)) => {
+                let _ = i.recv().await;
+            }
+            (None, None) => {
                 let _ = tokio::signal::ctrl_c().await;
             }
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(windows)]
+fn prepare_shutdown_signal() -> impl std::future::Future<Output = ()> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c().ok();
+    async move {
+        if let Some(listener) = ctrl_c.as_mut() {
+            let _ = listener.recv().await;
+        }
     }
 }
 
