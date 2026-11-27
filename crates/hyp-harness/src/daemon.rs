@@ -7645,8 +7645,7 @@ async fn handle_connection<R, W>(
                     .and_then(Value::as_str)
                     .unwrap_or_default();
 
-                match pkt_type {
-                    // ---- Single-shot hook / CLI RPCs ----
+                let response = match pkt_type {
                     "call.start" => {
                         let resp = handle_call_start(&daemon, &packet);
                         if resp.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -7659,56 +7658,66 @@ async fn handle_connection<R, W>(
                                 maybe_spawn_transport_probe(&daemon, sid, hints);
                             }
                         }
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
+                        Some(resp)
                     }
-                    "session.start" => {
-                        let resp = handle_session_start(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "session.hint" => {
-                        let resp = handle_session_hint(&daemon, &packet);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
+                    "session.start" => Some(handle_session_start(&daemon, &packet).await),
+                    "session.hint" => Some(handle_session_hint(&daemon, &packet)),
                     "call.end" => {
                         let cid = packet.get("callId").and_then(Value::as_str);
                         let tok = packet.get("callToken").and_then(Value::as_str);
                         daemon.calls.finish_call(cid, tok);
-                        let _ = write_ndjson_line_async(
-                            &mut write_half,
-                            &json!({ "ok": true, "result": {} }),
-                        )
-                        .await;
-                        break;
+                        Some(json!({ "ok": true, "result": {} }))
                     }
-                    "mailbox.drain" => {
-                        let resp = handle_mailbox_drain(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
+                    "mailbox.drain" => Some(handle_mailbox_drain(&daemon, &packet).await),
+                    "session.status" => Some(handle_session_status(&daemon, &packet).await),
+                    "session.idle" => Some(handle_session_idle(&daemon, &packet).await),
+                    "session.summary" => Some(handle_session_summary(&daemon, &packet)),
+                    "sessions.summary" => Some(handle_sessions_summary(
+                        &daemon,
+                        &packet,
+                        tcp_endpoint.is_none(),
+                    )),
+                    "session.focus" => Some(handle_session_focus(&daemon, &packet).await),
+                    "session.mute" => Some(handle_session_mute(&daemon, &packet)),
+                    "session.unmute" => Some(handle_session_unmute(&daemon, &packet)),
+                    "session.rule" => Some(handle_session_rule(&daemon, &packet)),
+                    "session.unsubscribe" => Some(handle_session_unsubscribe(&daemon, &packet)),
+                    "session.leave_channel" => {
+                        Some(handle_session_leave_channel(&daemon, &packet).await)
                     }
-                    "session.status" => {
-                        let resp = handle_session_status(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "session.idle" => {
-                        let resp = handle_session_idle(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "session.summary" => {
-                        let resp = handle_session_summary(&daemon, &packet);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "sessions.summary" => {
-                        let resp =
-                            handle_sessions_summary(&daemon, &packet, tcp_endpoint.is_none());
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
+                    "kv.local.challenge" => Some(match tcp_endpoint {
+                        Some(endpoint) => {
+                            authenticate_tcp_kv(
+                                &daemon,
+                                &packet,
+                                endpoint,
+                                &mut reader,
+                                &mut write_half,
+                            )
+                            .await
+                        }
+                        None => kv_auth_required(),
+                    }),
+                    "kv.local" => Some(if tcp_endpoint.is_none() {
+                        handle_local_kv(&daemon, packet.get("request")).await
+                    } else {
+                        kv_auth_required()
+                    }),
+                    "daemon.status" => Some(handle_daemon_status(&daemon).await),
+                    "peers.reload" => Some(handle_peers_reload(&daemon).await),
+                    "drop.ingest" => Some(handle_drop_ingest_rpc(&daemon, &packet).await),
+                    "gate.reload" => Some(handle_gate_reload_rpc(&daemon)),
+                    "inbox.wake" => Some(handle_inbox_wake_rpc(&daemon, &packet).await),
+                    "system.wake" => Some(handle_system_wake_rpc(&daemon, &packet).await),
+
+                    _ => None,
+                };
+                if let Some(response) = response {
+                    let _ = write_ndjson_line_async(&mut write_half, &response).await;
+                    break;
+                }
+
+                match pkt_type {
                     "inspect.watch" => {
                         run_inspect_watch(
                             &daemon,
@@ -7721,93 +7730,6 @@ async fn handle_connection<R, W>(
                         .await;
                         break;
                     }
-                    "session.focus" => {
-                        let resp = handle_session_focus(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "session.mute" => {
-                        let resp = handle_session_mute(&daemon, &packet);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "session.unmute" => {
-                        let resp = handle_session_unmute(&daemon, &packet);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "session.rule" => {
-                        let resp = handle_session_rule(&daemon, &packet);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "session.unsubscribe" => {
-                        let resp = handle_session_unsubscribe(&daemon, &packet);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "session.leave_channel" => {
-                        let resp = handle_session_leave_channel(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "kv.local.challenge" => {
-                        let resp = match tcp_endpoint {
-                            Some(endpoint) => {
-                                authenticate_tcp_kv(
-                                    &daemon,
-                                    &packet,
-                                    endpoint,
-                                    &mut reader,
-                                    &mut write_half,
-                                )
-                                .await
-                            }
-                            None => kv_auth_required(),
-                        };
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "kv.local" => {
-                        let resp = if tcp_endpoint.is_none() {
-                            handle_local_kv(&daemon, packet.get("request")).await
-                        } else {
-                            kv_auth_required()
-                        };
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "daemon.status" => {
-                        let resp = handle_daemon_status(&daemon).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "peers.reload" => {
-                        let resp = handle_peers_reload(&daemon).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "drop.ingest" => {
-                        let resp = handle_drop_ingest_rpc(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "gate.reload" => {
-                        let resp = handle_gate_reload_rpc(&daemon);
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "inbox.wake" => {
-                        let resp = handle_inbox_wake_rpc(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-                    "system.wake" => {
-                        let resp = handle_system_wake_rpc(&daemon, &packet).await;
-                        let _ = write_ndjson_line_async(&mut write_half, &resp).await;
-                        break;
-                    }
-
                     // ---- Blocking waiter / streaming watcher ----
                     "wait.subscribe" => {
                         let mode = match packet.get("mode").and_then(Value::as_str) {
