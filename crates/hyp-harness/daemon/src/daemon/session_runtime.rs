@@ -26,6 +26,11 @@ struct ActivityGraceTimer {
     bypass_grace: bool,
 }
 
+struct InterruptWakeCooldown {
+    generation: u64,
+    deferred: bool,
+}
+
 #[derive(Clone, Copy)]
 struct HoldRetry {
     attempt: u32,
@@ -44,6 +49,7 @@ struct GateHoldRetry {
 pub(super) struct SessionTimers {
     activity: Option<SessionActivity>,
     activity_grace: Option<ActivityGraceTimer>,
+    interrupt_wake: Option<InterruptWakeCooldown>,
     transport_retry: Option<HoldRetry>,
     gate_retry: Option<GateHoldRetry>,
 }
@@ -251,6 +257,86 @@ impl LocalDaemonInner {
                 return;
             }
             let _ = daemon.flush_session_inner(&sid, bypass_grace).await;
+        });
+    }
+
+    pub(super) fn flush_lock_for(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut sessions = self.session_runtime();
+        let runtime = sessions.entry(session_id.to_owned()).or_default();
+        Arc::clone(
+            runtime
+                .flush_lock
+                .get_or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
+    }
+
+    /// Defers repeated interrupt-capable pushes without consuming any mailbox receipts.
+    pub(super) fn defer_interrupt_wake(&self, session_id: &str) -> bool {
+        let mut sessions = self.session_runtime();
+        if let Some(cooldown) = sessions
+            .get_mut(session_id)
+            .and_then(|runtime| runtime.timers.interrupt_wake.as_mut())
+        {
+            cooldown.deferred = true;
+            return true;
+        }
+        false
+    }
+
+    /// A hook or inbox read can consume some or all deferred receipts during the window.
+    /// Keep this timer independent of activity grace so the follow-up uses a fresh snapshot.
+    pub(super) fn start_interrupt_wake_cooldown(self: &Arc<Self>, session_id: &str) {
+        let delay = self.config.interrupt_wake_cooldown;
+        if delay.is_zero() {
+            return;
+        }
+        let generation = self.next_seq();
+        self.session_runtime()
+            .entry(session_id.to_owned())
+            .or_default()
+            .timers
+            .interrupt_wake = Some(InterruptWakeCooldown {
+            generation,
+            deferred: false,
+        });
+
+        let daemon = Arc::clone(self);
+        let sid = session_id.to_owned();
+        let deadline = tokio::time::Instant::now() + delay;
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = shutdown_rx.changed() => return,
+            }
+            // Serialize with any in-flight flush to avoid dropping the final wake on contention.
+            let Some(lock) = daemon
+                .session_runtime()
+                .get(&sid)
+                .and_then(|runtime| runtime.flush_lock.clone())
+            else {
+                return;
+            };
+            let guard = lock.lock().await;
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            let deferred = daemon.update_runtime(&sid, |runtime| {
+                let timer = &mut runtime.timers.interrupt_wake;
+                if timer
+                    .as_ref()
+                    .is_some_and(|timer| timer.generation == generation)
+                {
+                    return timer.take().is_some_and(|timer| timer.deferred);
+                }
+                false
+            });
+            if deferred == Some(true) {
+                let _ = daemon.flush_session_locked(&sid, false).await;
+            }
+            drop(guard);
+            drop(lock);
+            daemon.update_runtime(&sid, |_| ());
         });
     }
 
@@ -541,6 +627,7 @@ impl LocalDaemonInner {
                 interrupted_active.push(session_id.clone());
             }
             runtime.timers.activity_grace = None;
+            runtime.timers.interrupt_wake = None;
             if runtime.timers.transport_retry.take().is_some() {
                 cleared_hold_retries += 1;
             }
@@ -568,6 +655,7 @@ impl SessionRuntime {
     pub(super) fn is_empty(&self) -> bool {
         self.timers.activity.is_none()
             && self.timers.activity_grace.is_none()
+            && self.timers.interrupt_wake.is_none()
             && self.last_midturn_digest_at_ms.is_none()
             && self.lazy_hydrate_attempt_at.is_none()
             && self.timers.transport_retry.is_none()
@@ -581,6 +669,9 @@ impl SessionRuntime {
             && self.attached_transport.is_none()
             && self.openclaw_target.is_none()
             && !self.env_file_exported
-            && !self.flushing
+            && self
+                .flush_lock
+                .as_ref()
+                .is_none_or(|lock| Arc::strong_count(lock) == 1)
     }
 }

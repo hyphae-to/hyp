@@ -550,9 +550,16 @@ async fn test3_local_ingest_socket_wakes_hyp_stream_subscriber_end_to_end() {
         .expect("start default LocalIngestServer");
     let ingest_endpoint = ingest_server.endpoint_path().to_path_buf();
 
-    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
-        .await
-        .expect("start LocalDaemon");
+    let daemon = LocalDaemon::start(
+        Arc::clone(&node),
+        None,
+        LocalDaemonConfig {
+            interrupt_wake_cooldown: Duration::from_millis(150),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start LocalDaemon");
     let sock = daemon.socket_path().to_path_buf();
 
     let mut client_opts = McpOptions::new(sock.clone());

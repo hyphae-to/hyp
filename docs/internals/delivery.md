@@ -24,6 +24,7 @@ All four tiers emit the exact same compact `<hyphae-inbox>` XML count digest (ne
 - **Focus Mode & Per-Source Overrides:** `hyp_inbox({ mode: "notify", rules: [...] })` demotes `* -> notify` while evaluating specificity-ranked overrides (`@handle`, `<node>/<handle>`, `<node>/*`, `#channel`, `<node>.<topic>`, `topic:<topic>`, `<plugin>:<target>`, `*`). VIP `Interrupt` items bypass Focus Mode without leaking or acknowledging Focus-buffered items.
 - **Stage 1 Trust-Tier Ceiling:** `Guest` and `ExternalWebhook` default to `cap_to_queue` (steps `interrupt` down to `queue`, allowing source plugins to wake idle threads safely via metadata-only digests while never interrupting mid-turn).
 - **Adaptive Burst Protection ("Noisy Mode"):** Exceeding `10` arrivals inside a `60s` rolling window per source engages a `300s` cooldown (`min_delivery_interval: 30s`), automatically stepping `interrupt`/`queue` floods down to `notify` (`mute` stays `mute`).
+- **Session Interrupt Cooldown:** An active hook-capable session gets the usual two-second grace for `PostToolUse` before the first external interrupt. After an interrupt-capable push succeeds or confirms it cancelled the turn, further interrupt pushes to that session wait five seconds. Hook digests and inbox reads continue during this window. At expiry the daemon rechecks deferred receipts and can wake the session for arrivals outside an earlier inbox snapshot, even without new traffic.
 
 ---
 
@@ -53,3 +54,5 @@ Both hooks (`PreInvocation`/`UserPromptSubmit`, `PostToolUse`, `Stop`, etc.) and
 1. **Tier 1 / 2 (Native Push & Blocking Waiters):** Live push via Herdr (`hc send`/`hc interrupt`), `codex queue`, T3 WebSocket RPC, OpenClaw Gateway (`hyphae-wake` / `/hooks/wake`), OpenCode `session.idle` SDK prompt, `--claude-channel`, hooks (`PostToolUse`/`Stop`/`PreInvocation`), or blocking `hyp wait` / `hyp watch`.
 2. **Tier 3 (Busy `Hold` Backoff & Durable Mailbox):** Busy turns enter bounded retry backoff (`5s -> 15s -> 30s -> 60s`), cancelled immediately when a hook drains first, and coalesce cleanly in SQLite with TTL.
 3. **Tier 4 (Strictly Opt-In Cold Revival):** Offline sessions are never spawned unless explicitly opted in via `node.json` (`codexResume` or allowlisted `herdrSpawnAllowlist`), passing only the `<hyphae-inbox>` digest.
+
+When Herdr interrupts Claude Code during a tool call, Claude Code can display the cancelled tool as a user rejection. A retry of `hyp_inbox` can retrieve any messages still unread after the cancellation.

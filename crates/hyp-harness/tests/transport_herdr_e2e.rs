@@ -317,6 +317,224 @@ esac
         }
     }
 
+    #[tokio::test]
+    async fn interrupt_burst_preserves_inbox_read_and_wakes_for_late_arrival() {
+        use std::sync::Arc;
+
+        use common::{TestMcpClient, run_hook};
+        use hyp_crypto::SecretBackend;
+        use hyp_harness::daemon::{InboundItem, LocalDaemon, LocalDaemonConfig};
+        use hyp_harness::hooks::HookEvent;
+        use hyp_harness::mcp::McpOptions;
+        use hyp_harness::protocol::HarnessKind;
+        use hyp_node::delivery::{DeliveryRule, DeliveryUrgency};
+        use hyp_node::engine::{NodeConfig, UnifiedNode};
+        use hyp_node::gates::TrustTier as GateTrustTier;
+        use hyp_proto::address::NodeId;
+        use hyp_store::MailboxKind;
+
+        const RAW_SESSION: &str = "burst";
+        const SESSION: &str = "claude:burst";
+        const HOOK_GRACE: Duration = Duration::from_millis(60);
+        const COOLDOWN: Duration = Duration::from_millis(800);
+
+        hyp_harness::enable_test_env_isolation();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::local(NodeId::new("burst@local").unwrap(), dir.path());
+        config.secret_backend = Some(SecretBackend::File);
+        let node = UnifiedNode::open(config).unwrap();
+        node.register_session(SESSION, r#"{"kind":"claude"}"#)
+            .unwrap();
+        let daemon = LocalDaemon::start(
+            Arc::clone(&node),
+            None,
+            LocalDaemonConfig {
+                interrupt_hook_grace: HOOK_GRACE,
+                interrupt_wake_cooldown: COOLDOWN,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Distinct sources keep per-source burst demotion out of the scenario.
+        {
+            let db = node.db();
+            let mut policy = daemon.delivery().policy(&db, SESSION).unwrap();
+            for source in ["first", "second", "third", "late", "isolated"] {
+                policy.upsert_rule(DeliveryRule::new(
+                    format!("peer@net/{source}"),
+                    DeliveryUrgency::Interrupt,
+                ));
+            }
+            daemon.delivery().set_policy(&db, SESSION, policy).unwrap();
+        }
+
+        let hc = FakeHc::new();
+        let state = |state: &str| {
+            json!({
+                "address": "burst-terminal",
+                "pid": 3210,
+                "state": "live",
+                "status": { "app": "claude-code", "state": state }
+            })
+            .to_string()
+        };
+        hc.set_get_default(0, &state("working"));
+        for recheck in [2, 4, 6] {
+            hc.set_get_seq(recheck, 0, &state("idle"));
+        }
+        hc.set_interrupt(0, r#"{"outcome":"stopped"}"#);
+        hc.set_send(0, r#"{"outcome":"sent"}"#);
+        daemon.register_session_transport(
+            SESSION,
+            Arc::new(HerdrTransport::new(
+                HerdrTarget::new("burst-terminal").with_bin(hc.bin()),
+            )),
+        );
+
+        let sock = daemon.socket_path();
+        let mut opts = McpOptions::new(sock.to_owned());
+        opts.backend = Some(HarnessKind::Claude);
+        let mut mcp = TestMcpClient::spawn(opts);
+        mcp.initialize().await;
+
+        let ingest = |source: &'static str| {
+            let daemon = &daemon;
+            async move {
+                assert_eq!(
+                    daemon
+                        .ingest_inbound(InboundItem {
+                            session_id: SESSION.into(),
+                            origin_node: "peer@net".into(),
+                            item_id: source.into(),
+                            source: format!("peer@net/{source}"),
+                            text: format!("body-{source}"),
+                            kind: MailboxKind::Message,
+                            trust_tier: GateTrustTier::Peer,
+                        })
+                        .await
+                        .unwrap(),
+                    Some(DeliveryUrgency::Interrupt)
+                );
+            }
+        };
+        let wait_until_notified = || {
+            let node = &node;
+            async move {
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    while node.db().local().unnotified_count(SESSION).unwrap() != 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("pending receipt should get a push wake");
+            }
+        };
+        let count_interrupts = || {
+            hc.recorded_calls()
+                .iter()
+                .filter(|args| args[0] == "interrupt")
+                .count()
+        };
+
+        run_hook(
+            sock,
+            HarnessKind::Claude,
+            HookEvent::PreInvocation,
+            json!({
+                "session_id": RAW_SESSION
+            }),
+        )
+        .await;
+        ingest("first").await;
+        tokio::time::timeout(COOLDOWN, wait_until_notified())
+            .await
+            .expect("the first interrupt should only wait for hook grace");
+        assert_eq!(count_interrupts(), 1);
+
+        // Start the real Claude tool lifecycle, then deliver the burst before the MCP read.
+        // Hold at this boundary past hook grace, while the first wake's cooldown is active.
+        let arguments = json!({ "state": "unread", "ack": true });
+        assert_eq!(
+            run_hook(
+                sock,
+                HarnessKind::Claude,
+                HookEvent::PreToolUse,
+                json!({
+                    "session_id": RAW_SESSION,
+                    "tool_use_id": "toolu_burst_read",
+                    "tool_name": "mcp__hyphae__hyp_inbox",
+                    "tool_input": arguments
+                })
+            )
+            .await,
+            json!({})
+        );
+        ingest("second").await;
+        ingest("third").await;
+        tokio::time::sleep(HOOK_GRACE * 3).await;
+        assert_eq!(
+            count_interrupts(),
+            1,
+            "repeat wake could cancel the inbox tool"
+        );
+        let (snapshot, is_error) = mcp
+            .call_tool(
+                "hyp_inbox",
+                arguments,
+                Some(json!({ "claudecode/toolUseId": "toolu_burst_read" })),
+            )
+            .await;
+        assert!(!is_error, "{snapshot}");
+        for source in ["first", "second", "third"] {
+            assert!(snapshot.contains(&format!("body-{source}")), "{snapshot}");
+        }
+        assert_eq!(node.db().local().pending_count(SESSION).unwrap(), 0);
+
+        assert_eq!(
+            run_hook(
+                sock,
+                HarnessKind::Claude,
+                HookEvent::PostToolUse,
+                json!({
+                    "session_id": RAW_SESSION,
+                    "tool_use_id": "toolu_burst_read",
+                    "tool_name": "mcp__hyphae__hyp_inbox",
+                })
+            )
+            .await,
+            json!({})
+        );
+        ingest("late").await;
+        assert_eq!(node.db().local().unnotified_count(SESSION).unwrap(), 1);
+        assert_eq!(count_interrupts(), 1);
+        wait_until_notified().await;
+        assert_eq!(
+            count_interrupts(),
+            2,
+            "late receipt needs a wake without new traffic"
+        );
+        let (late, is_error) = mcp
+            .call_verified_claude(
+                sock,
+                RAW_SESSION,
+                "hyp_inbox",
+                json!({ "state": "unread", "ack": true }),
+            )
+            .await;
+        assert!(!is_error && late.contains("body-late"), "{late}");
+
+        tokio::time::sleep(COOLDOWN).await;
+        ingest("isolated").await;
+        tokio::time::timeout(COOLDOWN, wait_until_notified())
+            .await
+            .expect("the next isolated interrupt should only wait for hook grace");
+        assert_eq!(count_interrupts(), 3);
+        mcp.close().await;
+        daemon.shutdown();
+    }
+
     fn remove_dir_contents(dir: &Path) {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
