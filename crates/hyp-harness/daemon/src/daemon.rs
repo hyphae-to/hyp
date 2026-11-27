@@ -4106,7 +4106,15 @@ impl LocalDaemonInner {
                     _ => WriteModel::Owner,
                 };
                 let expected_version = args.get("expectedVersion").and_then(Value::as_u64);
-                let ttl_ms = args.get("ttlMs").and_then(Value::as_i64);
+                let ttl_ms = args
+                    .get("ttlMs")
+                    .map(|value| {
+                        value
+                            .as_i64()
+                            .filter(|&ttl| ttl > 0)
+                            .ok_or_else(|| invalid_request("ttlMs must be a positive integer"))
+                    })
+                    .transpose()?;
                 let clear_ttl = args
                     .get("clearTtl")
                     .map(|v| {
@@ -4115,7 +4123,7 @@ impl LocalDaemonInner {
                     })
                     .transpose()?
                     .unwrap_or(false);
-                if clear_ttl && args.get("ttlMs").is_some_and(|v| !v.is_null()) {
+                if clear_ttl && ttl_ms.is_some() {
                     return Err(invalid_request("ttlMs and clearTtl are mutually exclusive"));
                 }
                 let encrypt = args

@@ -1033,6 +1033,44 @@ fn kv_cli_and_mcp_preserve_and_clear_ttl_across_daemon_and_offline_writes() {
         mcp_set(&mut mcp, json!({}))["expires_at"],
         initial["expiresAt"]
     );
+    for invalid_ttl in [
+        json!("60"),
+        json!(1.5),
+        json!(u64::MAX),
+        json!(null),
+        json!(0),
+    ] {
+        let (text, is_error) = mcp.call_verified_claude(
+            home,
+            socket,
+            "kv-ttl",
+            "hyp_kv",
+            json!({"action":"set","node":"local","namespace":"shared","key":"lease","value":999,"ttlMs":invalid_ttl}),
+            RPC_TIMEOUT,
+        );
+        assert!(is_error, "{text}");
+        assert!(text.contains("ttlMs must be a positive integer"), "{text}");
+    }
+    let output = isolated_cmd(home)
+        .args([
+            "kv",
+            "get",
+            "--ns",
+            "shared",
+            "--key",
+            "lease",
+            "--state-dir",
+            state,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let unchanged = common::parse_json_stdout(&output);
+    assert_eq!(unchanged["data"]["version"], 2);
+    assert_eq!(unchanged["data"]["value"], 2);
+    assert_eq!(unchanged["data"]["expiresAt"], initial["expiresAt"]);
+
     let renewed = mcp_set(&mut mcp, json!({"ttlMs": 60_000}));
     assert_eq!(
         renewed["expires_at"].as_i64().unwrap() - renewed["updated_at"].as_i64().unwrap(),
