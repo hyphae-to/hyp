@@ -11,26 +11,23 @@
 //!   with automatic backup rollback via `hyp.prev` on Unix / `hyp.old.exe` on Windows).
 
 use crate::config_file::{
-    build_http_client, ct_eq, default_node_id, ensure_v2_node_json_defaults,
-    load_node_or_legacy_config, resolve_config_path_for_read, resolve_config_path_for_write,
-    resolve_state_dir,
+    ct_eq, default_node_id, ensure_v2_node_json_defaults, load_node_or_legacy_config,
+    resolve_config_path_for_read, resolve_config_path_for_write, resolve_state_dir,
 };
 use crate::ui::{
     CliError, CommandResult, EXIT_ERROR, EXIT_OK, JsonEnvelope, print_json, print_next_steps,
     print_warnings,
 };
 use clap::{Args, Subcommand, ValueEnum};
-use http::{Method, Request, header};
-use http_body_util::{BodyExt, Empty};
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keys::Ed25519PublicKey;
 use hyp_crypto::pairing::validate_http_endpoint_origin;
 use hyp_crypto::rfc3339::parse_rfc3339_millis;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
 use hyp_node::engine::NodeProfile;
+use hyp_node::engine::http_fetch::{FetchError, FetchOptions, fetch_bounded_https};
 use hyp_node::node_file::NodeFile;
 use hyp_store::{NodeDb, PeerRecord, now_ms};
-use hyper::body::Bytes;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1596,134 +1593,51 @@ fn resolve_redirect_url(
     current_uri: &http::Uri,
     location: &str,
 ) -> Result<http::Uri, (&'static str, String)> {
-    let trimmed = location.trim();
-    let next_url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else if trimmed.starts_with('/') {
-        let scheme = current_uri.scheme_str().unwrap_or("https");
-        let authority = current_uri
-            .authority()
-            .map(|a| a.as_str())
-            .unwrap_or_default();
-        format!("{scheme}://{authority}{trimmed}")
-    } else {
-        return Err((
-            "UNSAFE_REDIRECT",
-            format!("Refusing unsupported redirect Location '{trimmed}'"),
-        ));
-    };
-
-    validate_http_endpoint_origin(&next_url).map_err(|e| {
-        (
-            "UNSAFE_REDIRECT",
-            format!("Refusing unsafe redirect '{next_url}': {e}"),
-        )
-    })?;
-    let next_uri: http::Uri = next_url.parse().map_err(|e| {
-        (
-            "UNSAFE_REDIRECT",
-            format!("Invalid redirect URL '{next_url}': {e}"),
-        )
-    })?;
-    if current_uri.scheme_str() == Some("https") && next_uri.scheme_str() != Some("https") {
-        return Err((
-            "UNSAFE_REDIRECT",
-            format!("Refusing HTTPS-to-HTTP downgrade redirect to '{next_url}'"),
-        ));
-    }
-    Ok(next_uri)
+    hyp_node::engine::http_fetch::resolve_redirect_url(current_uri, location, true, |url| {
+        validate_http_endpoint_origin(url).map_err(|e| {
+            FetchError::new(
+                "UNSAFE_REDIRECT",
+                format!("Refusing unsafe redirect '{url}': {e}"),
+            )
+        })?;
+        url.parse().map_err(|e| {
+            FetchError::new(
+                "UNSAFE_REDIRECT",
+                format!("Invalid redirect URL '{url}': {e}"),
+            )
+        })
+    })
+    .map(|(uri, _)| uri)
+    .map_err(|error| (error.code, error.message))
 }
 
 async fn download_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, (&'static str, String)> {
-    let mut current_url = url.trim().to_string();
-    validate_http_endpoint_origin(&current_url).map_err(|e| {
-        (
-            "UNSAFE_URL",
-            format!("Refusing unsafe URL '{current_url}': {e}"),
-        )
-    })?;
-    let mut current_uri: http::Uri = current_url
-        .parse()
-        .map_err(|e| ("INVALID_URL", format!("Invalid URL '{current_url}': {e}")))?;
-    let client = build_http_client::<Empty<Bytes>>().map_err(|e| ("HTTP_INIT_ERROR", e))?;
-
-    for redirect_count in 0..=MAX_REDIRECTS {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(&current_uri)
-            .header(
-                header::USER_AGENT,
-                format!("hyp/{}", env!("HYPHAE_BUILD_VERSION")),
-            )
-            .body(Empty::new())
-            .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
-
-        let resp =
-            tokio::time::timeout(Duration::from_secs(HTTP_TIMEOUT_SECS), client.request(req))
-                .await
-                .map_err(|_| {
-                    (
-                        "HTTP_TIMEOUT",
-                        format!("GET {current_url} timed out after {HTTP_TIMEOUT_SECS}s"),
-                    )
-                })?
-                .map_err(|e| ("HTTP_ERROR", format!("GET {current_url} failed: {e}")))?;
-
-        let status = resp.status();
-        if status.is_redirection() {
-            if redirect_count >= MAX_REDIRECTS {
-                return Err((
-                    "TOO_MANY_REDIRECTS",
-                    format!("GET {current_url} exceeded {MAX_REDIRECTS} redirects"),
-                ));
-            }
-            let location = resp
-                .headers()
-                .get(header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    (
-                        "HTTP_ERROR",
-                        format!(
-                            "GET {current_url} returned redirect HTTP {} without Location header",
-                            status.as_u16()
-                        ),
-                    )
-                })?;
-            let next_uri = resolve_redirect_url(&current_uri, location)?;
-            current_url = next_uri.to_string();
-            current_uri = next_uri;
-            continue;
-        }
-
-        if !status.is_success() {
-            return Err((
-                "HTTP_STATUS",
-                format!("GET {current_url} returned HTTP {}", status.as_u16()),
-            ));
-        }
-
-        let mut body = resp.into_body();
-        let mut out = Vec::new();
-        while let Some(frame_res) = body.frame().await {
-            let frame = frame_res.map_err(|e| ("HTTP_ERROR", format!("body read error: {e}")))?;
-            if let Some(chunk) = frame.data_ref() {
-                if out.len().saturating_add(chunk.len()) > max_bytes {
-                    return Err((
-                        "RESPONSE_TOO_LARGE",
-                        format!("Download from {current_url} exceeds {max_bytes} byte limit"),
-                    ));
-                }
-                out.extend_from_slice(chunk);
-            }
-        }
-        return Ok(out);
-    }
-
-    Err((
-        "TOO_MANY_REDIRECTS",
-        format!("GET {current_url} exceeded {MAX_REDIRECTS} redirects"),
-    ))
+    fetch_bounded_https(
+        url,
+        FetchOptions {
+            max_bytes,
+            max_redirects: MAX_REDIRECTS,
+            request_timeout: Duration::from_secs(HTTP_TIMEOUT_SECS),
+            user_agent: format!("hyp/{}", env!("HYPHAE_BUILD_VERSION")),
+            display_url: |url| url.to_string(),
+        },
+        |url| {
+            validate_http_endpoint_origin(url).map_err(|e| {
+                FetchError::new("UNSAFE_URL", format!("Refusing unsafe URL '{url}': {e}"))
+            })?;
+            url.parse()
+                .map_err(|e| FetchError::new("INVALID_URL", format!("Invalid URL '{url}': {e}")))
+        },
+        |current, location| {
+            let uri = resolve_redirect_url(current, location)
+                .map_err(|(code, message)| FetchError::new(code, message))?;
+            let source = uri.to_string();
+            Ok((uri, source))
+        },
+    )
+    .await
+    .map(|(bytes, _)| bytes)
+    .map_err(|error| (error.code, error.message))
 }
 
 struct SwapSuccess {

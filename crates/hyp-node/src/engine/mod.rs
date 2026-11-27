@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod drop_relay;
+pub mod http_fetch;
 pub mod http_util;
 pub mod local_ingest;
 pub mod node;
