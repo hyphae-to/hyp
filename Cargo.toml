@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/hyp-mycelium",
   "crates/hyp-proto",
   "crates/hyp-crypto",
   "crates/hyp-store",
@@ -23,6 +24,7 @@ repository = "https://github.com/hyphae-to/hyp"
 homepage = "https://hyphae.to"
 
 [workspace.dependencies]
+hyp-mycelium = { path = "crates/hyp-mycelium" }
 hyp-proto = { path = "crates/hyp-proto" }
 hyp-crypto = { path = "crates/hyp-crypto" }
 hyp-store = { path = "crates/hyp-store" }

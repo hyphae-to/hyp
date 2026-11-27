@@ -6,7 +6,7 @@ This document defines the engineering conventions and testing philosophy for all
 
 - **Binary / CLI**: `hyp` (single static Rust binary from `crates/hyp-cli`) · **MCP tools**: 4 compact core tools (`hyp_send`, `hyp_inbox`, `hyp_mesh`, `hyp_stream`) + conditional `hyp_bridge` / `hyp_kv`.
 - **Repository**: `https://github.com/hyphae-to/hyp` · **Site**: `https://hyphae.to`
-- **Runtime**: Pure-Rust 6-crate workspace (`hyp-proto`, `hyp-crypto`, `hyp-store`, `hyp-node`, `hyp-harness`, `hyp-cli`), Rust 1.87+ (`edition = "2024"`), bundled SQLite (`rusqlite`, WAL mode), zero Node.js/Python runtime requirement for the core binary. Self-contained external chat bridges live under `plugins/` and communicate over JSON-RPC 2.0 / fd-3 NDJSON.
+- **Runtime**: Pure-Rust workspace (see [Cargo.toml](./Cargo.toml) for member crates), Rust 1.87+ (`edition = "2024"`), bundled SQLite (`rusqlite`, WAL mode), zero Node.js/Python runtime requirement for the core binary. Self-contained external chat bridges live under `plugins/` and communicate over JSON-RPC 2.0 / fd-3 NDJSON.
 - **Security**:
   - Prefer OS Keychain (macOS `security`, service `hyphae`) and Linux Secret Service (`secret-tool`) for secrets (written over stdin), with a private user-only `0600` file fallback in `~/.config/hyphae/secrets/` on headless servers (`HYPHAE_SECRET_BACKEND=keychain|secret-service|file`).
   - Fail closed on auth, caller verification, Ed25519/HMAC signatures, scope checks (`*` never grants `bridge:post` or `forward:via`), E2EE policy, `gate_policy_sig` tamper checks, and user-only permissions (`0700`/`0600`) on Unix sockets, tokens, state directories, and fallback files.

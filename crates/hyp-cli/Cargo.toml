@@ -11,6 +11,7 @@ name = "hyp"
 path = "src/main.rs"
 
 [dependencies]
+hyp-mycelium.workspace = true
 hyp-proto.workspace = true
 hyp-crypto.workspace = true
 hyp-store.workspace = true
