@@ -844,12 +844,15 @@ fn issue81_auth_add_and_revoke_refuse_to_reseal_tampered_gate() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    add_child
+    // Tamper rejection may close stdin before the parent writes the fixture key.
+    if let Err(error) = add_child
         .stdin
         .take()
         .unwrap()
         .write_all(second_jwk.as_bytes())
-        .unwrap();
+    {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
     let add_out = add_child.wait_with_output().unwrap();
     assert_eq!(add_out.status.code(), Some(1));
     let add_json = parse_json_stdout(&add_out);
