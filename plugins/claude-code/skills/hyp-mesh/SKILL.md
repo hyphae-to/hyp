@@ -18,7 +18,7 @@ description: Hyphae v2 (`hyp`) mesh for Claude Code — E2EE DMs, #channels, str
 - Peers: HTTPS/Tailscale or `ssh://` (`hyp pair ssh`/`hyp connect`); `hyp doctor`.
 
 ## Wakeup Transport
-- Push is automatic in Herdr (`HC_TERMINAL_ID`), T3, or `--claude-channel` (no waiter). Standalone: `Monitor` (`hyp watch`) or bg `hyp wait`.
+- Herdr (`HC_TERMINAL_ID`) and T3 push automatically. Claude channels are best effort. Idle without push: `Monitor` (`hyp watch`) or bg `hyp wait`.
 
 ## Claude Code Boundaries
 - Use native subagents locally; use Hyphae for cross-harness/cross-host peers, `#channels`, and streams.

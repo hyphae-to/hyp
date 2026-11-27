@@ -17,7 +17,8 @@ For additional profiles, pass `--claude-config-dir ~/.claude-work`. For Claude D
 ## Caller Identity & Wakeups
 
 - **Identity:** `PreToolUse` registers `(session_id, tool_name, tool_use_id)` in `CallRegistry`; `tools/call` must match `_meta["claudecode/toolUseId"]`.
-- **Wakeups:** Queued items drain automatically on `PostToolUse` and `Stop`. For immediate mid-idle push, opt in to `--claude-channel` (`notifications/claude/channel`), `hyp watch` (Monitor), or `hyp wait`.
+- **Wakeups:** Queued items drain automatically on `PostToolUse` and `Stop`. Herdr, T3, or an armed `hyp watch` (Monitor) or `hyp wait` takes precedence when available.
+- **Channels:** Plain `hyp mcp` advertises channel capability to Claude Code. For Claude to accept notices, select the Hyphae MCP server when launching Claude Code. A channel notice carries unread counts and sources. Open the inbox with `hyp_inbox` to read and acknowledge the receipts. Hooks and waiters can still surface the same receipts if Claude ignores the notice or reads it slowly. [Claude Code channels](https://code.claude.com/docs/en/channels)
 
 ## Status UI
 

@@ -230,7 +230,7 @@ Compiled directly into `hyp` (`crates/hyp-node/src/engine/local_ingest.rs`) and 
 - **Signature verification & Security Gate**: Whenever an inbound event carries the `hyphaesig` CloudEvents extension (`ed25519:<kid>:<b64url>`), it is **always** verified fail-closed against active `human_authorities` and upgrades the event to `TrustTier::HumanVerified` (writing an immutable `gate_audit` row). Routes with `requireSignature: true` reject unsigned events fail-closed. With `gate: true`, all matching events pass through `SecurityGatePipeline` before publishing onto `local.<topic>`.
 - **Rate limiting (`onLimit`)**: `"drop"` rejects excess bursts (`rate_limited`); `"coalesce"` collapses saturated bursts under a shared mailbox coalesce key.
 - **Inherited Tier 1–3 delivery ladder (+ opt-in Tier 4 revival)**:
-  1. **Tier 1 / 2 (Native push)**: Delivers immediately to live sessions via `hc send`/`hc interrupt`, T3 RPC, `codex queue`, OpenClaw Gateway hooks, OpenCode lifecycle hooks, `--claude-channel`, or `hyp wait`.
+  1. **Tier 1 / 2 (Native push)**: Delivers immediately to live sessions via `hc send`/`hc interrupt`, T3 RPC, `codex queue`, OpenClaw Gateway hooks, OpenCode lifecycle hooks, Claude Code channel notices, or `hyp wait`.
   2. **Tier 3 (Busy `Hold` backoff & durable mailbox)**: Busy turns enter bounded retry backoff (`5s -> 15s -> 30s -> 60s`), cancelled immediately if a hook drains first, and coalesce cleanly in the durable local mailbox with TTL.
   3. **Tier 4 (Strictly opt-in cold revival)**: Offline sessions are never spawned unexpectedly unless explicitly opted in via `node.json` (`codexResume` or allowlisted `herdrSpawnAllowlist`).
 

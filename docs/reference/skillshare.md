@@ -38,10 +38,11 @@ portable environment references shared by every receiving client; it rejects
 literal values would change working configurations, so setup reports this
 ownership limitation explicitly.
 
-Channel mode remains an explicit `--claude-channel` choice. Skillshare also cannot
-represent differing per-client command arguments under one `hyphae` definition.
-If an existing channel, socket, or Desktop ephemeral launch conflicts with the
-shared source, setup reports the conflict and preserves existing registrations.
+Claude Code receives channel capability over a plain `hyp mcp` launch and controls
+channel selection itself. Skillshare uses one shared `hyphae` command. If existing
+arguments such as a legacy `--claude-channel` flag, a socket override, or Desktop
+`--ephemeral` conflict with the shared source, setup preserves the registrations
+and reports the conflict.
 Customized portable MCP fields require explicit migration rather than silently
 propagating one client's environment or credentials to every other client.
 

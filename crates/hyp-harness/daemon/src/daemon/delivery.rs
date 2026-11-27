@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hyp_delivery_digest::selection::needs_midturn_reminder_timestamp;
 use hyp_delivery_digest::{
-    BuiltDigestBatch, DigestCandidate, DigestPolicy, DrainScope, build_digest,
+    BuiltDigestBatch, DigestCandidate, DigestPolicy, DrainScope, InboxDigest, build_digest,
 };
 use hyp_harness_transport::transport::herdr::is_valid_herdr_template;
 use hyp_harness_transport::transport::openclaw::{
@@ -29,10 +29,11 @@ use serde_json::json;
 use tokio::sync::oneshot;
 
 use super::{
-    ChannelDeliverCommand, ClassifiedItemMeta, DaemonStateLock, LocalDaemonInner, OpenClawWakeAck,
-    OpenClawWakeCommand, SubscriptionRecordMeta, TransportHints, WaiterKind,
-    cap_trust_tier_to_external_webhook, extract_backend_str, maybe_spawn_transport_probe,
-    parse_gate_trust_tier, parse_human_auth_meta, raw_has_external_webhook_origin,
+    ChannelDeliverCommand, ClassifiedItemMeta, ClaudeChannelWake, DaemonStateLock,
+    LocalDaemonInner, OpenClawWakeAck, OpenClawWakeCommand, SessionFlushMode,
+    SubscriptionRecordMeta, TransportHints, WaiterKind, cap_trust_tier_to_external_webhook,
+    extract_backend_str, maybe_spawn_transport_probe, parse_gate_trust_tier, parse_human_auth_meta,
+    raw_has_external_webhook_origin,
 };
 
 impl LocalDaemonInner {
@@ -423,6 +424,7 @@ impl LocalDaemonInner {
                 channel: classification.parsed.channel,
                 is_announcement,
                 notified: entry.notified,
+                claude_channel_wake: ClaudeChannelWake::Fresh,
                 is_wake_notice,
             },
         );
@@ -965,7 +967,7 @@ impl LocalDaemonInner {
         self.bump_ui_rev();
     }
 
-    /// Flushes eligible batches to live transports (`claude-channel` > `PushTransport` > `watch` stream > `wait` once).
+    /// Flushes eligible batches to live transports (native push, then `watch`/`wait`, then a best-effort Claude notice).
     ///
     /// On transient `PushTransport` `Hold` outcomes (`herdr_working`, `herdr_send_guard_refused`,
     /// `herdr_agent_not_ready`, `t3_server_unreachable`, `codex_queue_unavailable`), schedules
@@ -982,23 +984,30 @@ impl LocalDaemonInner {
         self: &Arc<Self>,
         session_id: &str,
     ) -> (Option<String>, bool) {
-        self.flush_session_inner(session_id, false).await
+        self.flush_session_inner(session_id, SessionFlushMode::Normal)
+            .await
     }
 
     pub(super) async fn flush_session_inner(
         self: &Arc<Self>,
         session_id: &str,
-        bypass_activity_grace: bool,
+        flush_mode: SessionFlushMode,
     ) -> (Option<String>, bool) {
         let lock = self.flush_lock_for(session_id);
-        let Ok(guard) = lock.try_lock() else {
+        let guard = if flush_mode == SessionFlushMode::ClaudeIdleWake {
+            lock.lock().await
+        } else if let Ok(guard) = lock.try_lock() {
+            guard
+        } else {
             // An arrival can race the final snapshot of the in-flight flush.
             self.defer_interrupt_wake(session_id);
             return (None, false);
         };
-        let result = self
-            .flush_session_locked(session_id, bypass_activity_grace)
-            .await;
+        let result = if *self.shutdown_rx.borrow() {
+            (None, false)
+        } else {
+            self.flush_session_locked(session_id, flush_mode).await
+        };
         drop(guard);
         drop(lock);
         self.update_runtime(session_id, |_| ());
@@ -1008,10 +1017,12 @@ impl LocalDaemonInner {
     pub(super) async fn flush_session_locked(
         self: &Arc<Self>,
         session_id: &str,
-        bypass_activity_grace: bool,
+        flush_mode: SessionFlushMode,
     ) -> (Option<String>, bool) {
         let mut terminal_error: Option<String> = None;
         let mut delivered_any = false;
+        let claude_idle_wake = flush_mode == SessionFlushMode::ClaudeIdleWake;
+        let normal_grace = flush_mode == SessionFlushMode::Normal;
 
         loop {
             let Some(batch) = self.build_batch_for_session(session_id).await else {
@@ -1019,51 +1030,17 @@ impl LocalDaemonInner {
                 break;
             };
 
-            // Priority 1: Live Claude native channel (`--claude-channel`)
-            let channel_entry = self
-                .session_runtime()
-                .get(session_id)
-                .and_then(|runtime| runtime.channel.as_ref())
-                .map(|c| (c.conn_id, c.tx.clone()));
-            if let Some((channel_conn_id, tx)) = channel_entry {
-                let delivery_id = self.next_seq();
-                let (ack_tx, ack_rx) = oneshot::channel();
-                if tx
-                    .send(ChannelDeliverCommand {
-                        delivery_id,
-                        text: batch.rendered.as_str().to_owned(),
-                        ack_tx,
-                    })
-                    .is_ok()
-                {
-                    let submitted =
-                        tokio::time::timeout(self.config.channel_deliver_timeout, ack_rx)
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .unwrap_or(false);
-                    if submitted {
-                        self.commit_delivered_batch(session_id, &batch);
-                        delivered_any = true;
-                        // Stop loop if notify-only (already marked notified so next iteration would break).
-                        continue;
-                    }
+            if claude_idle_wake {
+                if !self.has_pending_claude_idle_wake(session_id, &batch) {
+                    break;
                 }
-                // If the same channel connection is still attached (explicit nack or timeout),
-                // keep the batch preserved as unread for hook/`hyp_inbox` fallback instead of
-                // spinning on the stalled channel. If the channel disconnected, fall through to
-                // any live `watch`/`wait` transport!
-                let still_attached = self
-                    .session_runtime()
-                    .get(session_id)
-                    .and_then(|runtime| runtime.channel.as_ref())
-                    .is_some_and(|c| c.conn_id == channel_conn_id);
-                if still_attached {
+                if let Some((_, remaining)) = self.active_session_lease(session_id) {
+                    self.schedule_activity_grace_flush(session_id, remaining, flush_mode);
                     break;
                 }
             }
 
-            // Priority 1.5: Native OpenClaw Gateway plugin wake service (`openclaw.service.ready`).
+            // Priority 1: Native OpenClaw Gateway plugin wake service (`openclaw.service.ready`).
             // Targets the EXACT existing `(agentId, sessionKey)` with `createIfMissing: false` —
             // zero webhook token required, zero isolated cron spawns, strictly metadata-only nudge!
             if !batch.notify_only && self.openclaw_plugin_wake_available_for(session_id) {
@@ -1076,7 +1053,7 @@ impl LocalDaemonInner {
                     oc_service_entry,
                     self.resolve_openclaw_session_target(session_id),
                 ) {
-                    if !bypass_activity_grace {
+                    if normal_grace {
                         if let Some((act_harness, remaining)) =
                             self.active_session_lease(session_id)
                         {
@@ -1085,14 +1062,22 @@ impl LocalDaemonInner {
                                     && !self.config.interrupt_hook_grace.is_zero()
                                 {
                                     let delay = self.config.interrupt_hook_grace.min(remaining);
-                                    self.schedule_activity_grace_flush(session_id, delay, true);
+                                    self.schedule_activity_grace_flush(
+                                        session_id,
+                                        delay,
+                                        SessionFlushMode::InterruptGraceExpired,
+                                    );
                                     break;
                                 }
                             } else if batch.max_urgency == DeliveryUrgency::Queue
                                 && Self::can_drain_turn_end(act_harness)
                                 && !self.config.queue_activity_lease.is_zero()
                             {
-                                self.schedule_activity_grace_flush(session_id, remaining, false);
+                                self.schedule_activity_grace_flush(
+                                    session_id,
+                                    remaining,
+                                    SessionFlushMode::Normal,
+                                );
                                 break;
                             }
                         }
@@ -1164,6 +1149,7 @@ impl LocalDaemonInner {
             // by LAZY_HYDRATE_COOLDOWN so dead targets never enter a probe loop).
             let mut deferred_transient_hold = false;
             if !batch.notify_only
+                && !claude_idle_wake
                 && self.config.auto_detect_transports
                 && self.current_transport_priority(session_id) == 0
                 && terminal_error.is_none()
@@ -1175,9 +1161,10 @@ impl LocalDaemonInner {
                 // Notify-only FYI batches NEVER wake an idle agent via an external L2 push
                 // transport (no wasted LLM turn for Focus Mode / burst-demoted chatter).
                 // They remain cleanly unread for TurnStart (`pre_turn`) digests and passive UIs,
-                // while L3 streams (`--claude-channel`, `watch`, `wait`) still receive them below.
+                // while `watch` and `wait` still receive them below.
                 if !batch.notify_only {
-                    let push_mode = if batch.max_urgency == DeliveryUrgency::Interrupt
+                    let push_mode = if !claude_idle_wake
+                        && batch.max_urgency == DeliveryUrgency::Interrupt
                         && transport.supports_interrupt()
                     {
                         PushMode::Interrupt
@@ -1195,7 +1182,7 @@ impl LocalDaemonInner {
                     //     to drain mid-turn; if no tool hook drains in time, falls back to L2!
                     //   - `Queue`: wait for TurnEnd (`Stop` / `agent_end`) or `queue_activity_lease`
                     //     expiry with no more tool calls before firing L2 wake nudge!
-                    if !bypass_activity_grace {
+                    if normal_grace {
                         if let Some((act_harness, remaining)) =
                             self.active_session_lease(session_id)
                         {
@@ -1204,14 +1191,22 @@ impl LocalDaemonInner {
                                     && !self.config.interrupt_hook_grace.is_zero()
                                 {
                                     let delay = self.config.interrupt_hook_grace.min(remaining);
-                                    self.schedule_activity_grace_flush(session_id, delay, true);
+                                    self.schedule_activity_grace_flush(
+                                        session_id,
+                                        delay,
+                                        SessionFlushMode::InterruptGraceExpired,
+                                    );
                                     break;
                                 }
                             } else if batch.max_urgency == DeliveryUrgency::Queue
                                 && Self::can_drain_turn_end(act_harness)
                                 && !self.config.queue_activity_lease.is_zero()
                             {
-                                self.schedule_activity_grace_flush(session_id, remaining, false);
+                                self.schedule_activity_grace_flush(
+                                    session_id,
+                                    remaining,
+                                    SessionFlushMode::Normal,
+                                );
                                 break;
                             }
                         }
@@ -1248,7 +1243,9 @@ impl LocalDaemonInner {
                         {
                             // Target is actively working or has an in-progress user draft;
                             // preserve unread in durable SQLite and schedule bounded Tier 3 retry.
-                            self.schedule_hold_retry(session_id);
+                            if !claude_idle_wake {
+                                self.schedule_hold_retry(session_id);
+                            }
                             break;
                         }
                         PushOutcome::Hold { ref reason, .. }
@@ -1338,7 +1335,8 @@ impl LocalDaemonInner {
             // - NEVER runs for Notify-only / Focus-buffered / muted batches (`batch.notify_only == true`).
             // - NEVER runs solely for a daemon-generated host sleep/wake notice (Issue #29).
             // - NEVER runs when a live push transport or waiter exists, or a live transport is only
-            //   transiently holding (`deferred_transient_hold`).
+            //   transiently holding (`deferred_transient_hold`). An authenticated Claude
+            //   channel connection also means a session process is already running.
             // - NEVER runs when `herdr_spawn_allowlist` is empty or does not match the session's
             //   persisted `herdrTemplate` verbatim.
             // - Strictly enforces `maxConcurrentSpawns: 1` (`active_cold_spawns`) and uses a
@@ -1354,8 +1352,13 @@ impl LocalDaemonInner {
             if !batch.notify_only
                 && has_non_wake_deliverable
                 && !deferred_transient_hold
+                && !claude_idle_wake
                 && !self.config.delivery_retry.herdr_spawn_allowlist.is_empty()
                 && !self.has_live_transport(session_id)
+                && self
+                    .session_runtime()
+                    .get(session_id)
+                    .is_none_or(|runtime| runtime.channel.is_none())
             {
                 let herdr_template = {
                     let db = self.node.db();
@@ -1392,13 +1395,114 @@ impl LocalDaemonInner {
                 }
             }
 
-            if deferred_transient_hold {
+            if deferred_transient_hold && !claude_idle_wake {
                 self.schedule_hold_retry(session_id);
+            } else if !batch.notify_only {
+                self.try_claude_channel_notice(session_id, &batch, flush_mode);
             }
             break;
         }
 
         (terminal_error, delivered_any)
+    }
+
+    fn has_pending_claude_idle_wake(&self, session_id: &str, batch: &PackedDeliveryBatch) -> bool {
+        let guard = self.item_meta.lock_state("item_meta lock poisoned");
+        guard.get(session_id).is_some_and(|meta_by_receipt| {
+            batch.receipt_ids.iter().any(|receipt| {
+                meta_by_receipt.get(receipt).is_some_and(|meta| {
+                    meta.claude_channel_wake == ClaudeChannelWake::WaitingForIdle
+                        && meta.eligible_for_claude_channel_wake()
+                })
+            })
+        })
+    }
+
+    /// Claude may discard a channel notice. Keep receipts eligible for a confirmed wake.
+    fn try_claude_channel_notice(
+        self: &Arc<Self>,
+        session_id: &str,
+        batch: &PackedDeliveryBatch,
+        flush_mode: SessionFlushMode,
+    ) {
+        let tx = self
+            .session_runtime()
+            .get(session_id)
+            .and_then(|runtime| runtime.channel.as_ref())
+            .map(|channel| channel.tx.clone());
+        let Some(tx) = tx else {
+            return;
+        };
+        let active_lease = self
+            .active_session_lease(session_id)
+            .map(|(_, remaining)| remaining);
+        let (notify, await_idle) = {
+            let mut guard = self.item_meta.lock_state("item_meta lock poisoned");
+            let Some(meta_by_receipt) = guard.get_mut(session_id) else {
+                return;
+            };
+            let mut notify = false;
+            let mut await_idle = false;
+            for receipt in &batch.receipt_ids {
+                let Some(meta) = meta_by_receipt.get_mut(receipt) else {
+                    continue;
+                };
+                if !meta.eligible_for_claude_channel_wake()
+                    || meta.claude_channel_wake == ClaudeChannelWake::Attempted
+                {
+                    continue;
+                }
+                if active_lease.is_some() {
+                    notify |= flush_mode != SessionFlushMode::ClaudeIdleWake
+                        && meta.claude_channel_wake == ClaudeChannelWake::Fresh
+                        && meta.urgency == DeliveryUrgency::Interrupt;
+                    meta.claude_channel_wake = ClaudeChannelWake::WaitingForIdle;
+                    await_idle = true;
+                } else {
+                    meta.claude_channel_wake = ClaudeChannelWake::Attempted;
+                    notify = true;
+                }
+            }
+            (notify, await_idle)
+        };
+        if await_idle {
+            if let Some(remaining) = active_lease {
+                self.schedule_activity_grace_flush(
+                    session_id,
+                    remaining,
+                    SessionFlushMode::ClaudeIdleWake,
+                );
+            }
+        }
+        if notify {
+            let idle_digest = if flush_mode == SessionFlushMode::ClaudeIdleWake
+                && batch.max_urgency == DeliveryUrgency::Interrupt
+            {
+                InboxDigest::count_only(batch.receipt_ids.len(), DeliveryUrgency::Queue)
+            } else {
+                None
+            };
+            // Keep at most one queued notice while a reader is slow or its pipe stops draining.
+            let _ = tx.try_send(ChannelDeliverCommand {
+                session_id: session_id.to_owned(),
+                text: idle_digest
+                    .as_ref()
+                    .unwrap_or(&batch.rendered)
+                    .as_str()
+                    .to_owned(),
+            });
+        }
+    }
+}
+
+impl ClassifiedItemMeta {
+    fn eligible_for_claude_channel_wake(&self) -> bool {
+        !self.notified
+            && !self.burst_demoted
+            && matches!(
+                self.urgency,
+                DeliveryUrgency::Interrupt | DeliveryUrgency::Queue
+            )
     }
 }
 

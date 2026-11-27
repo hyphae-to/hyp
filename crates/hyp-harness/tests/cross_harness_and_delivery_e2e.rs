@@ -7,7 +7,7 @@
 //!    cancellation, and `tools/call` racing 20ms ahead of `PreToolUse`).
 //! 3. Live §2.5 Delivery Policy, Hybrid Batch Packer, Giant Truncation, Strict Focus Mode,
 //!    Filtered/Paginated `hyp_inbox` (with quarantined receipt isolation) & E2EE file drops.
-//! 4. `--claude-channel` Failure, Nack (`submitted: false`), Disconnect & Timeout Fallback Matrix.
+//! 4. Flag-free Claude channel listeners, hook fallback, and waiter priority.
 //! 5. Bridge Identity Ownership (`all read · 1 primary writer + live handoff + fail-closed
 //!    `not_target_holder` + Stage 1 Outbound DLP).
 //! 6. Cross-OS `LocalDaemon::start_tcp` (`connector.addr`) Differential Parity vs Unix sockets.
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use common::{
     TestMcpClient, loopback_zero, run_hook, session_status, wait_for_live_transport,
-    wait_for_no_live_transport, wait_for_pending_count,
+    wait_for_pending_count,
 };
 use hyp_crypto::{Ed25519KeyPair, SecretBackend};
 use hyp_harness::daemon::{BoxFuture, BridgePoster, InboundItem, LocalDaemon, LocalDaemonConfig};
@@ -1631,277 +1631,437 @@ async fn suite_3b_live_e2ee_file_drop_via_mcp() {
 }
 
 // ============================================================================
-// Suite 4: `--claude-channel` Failure, Nack & Timeout Fallback Matrix
+// Suite 4: Claude channel listeners and independent fallback
 // ============================================================================
 
 #[tokio::test]
-async fn suite_4_claude_channel_failure_nack_disconnect_and_timeout_fallback_matrix() {
+async fn suite_4_flag_free_claude_channel_preserves_hooks_and_armed_waiters() {
     let dir = TempDir::new().unwrap();
     let node = open_local_node("chan@box", dir.path());
-    let cfg = LocalDaemonConfig {
-        channel_deliver_timeout: Duration::from_millis(150),
-        ..Default::default()
-    };
-    let daemon = LocalDaemon::start(Arc::clone(&node), None, cfg)
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, LocalDaemonConfig::default())
         .await
         .unwrap();
     let sock = daemon.socket_path().to_path_buf();
 
-    // ---- Case 4.1: Explicit `channel.ack(submitted: false)` preserves message for PostToolUse ----
-    {
-        let (r, mut w) = connect_daemon_async(&sock).await.unwrap();
-        let mut reader = BufReader::new(r);
-        write_ndjson_line_async(
-            &mut w,
-            &json!({
-                "type": "mcp.hello",
-                "backend": "claude",
-                "channel": true,
-                "clientId": "nack-sess"
-            }),
-        )
-        .await
-        .unwrap();
-        write_ndjson_line_async(&mut w, &json!({ "type": "channel.ready" }))
-            .await
-            .unwrap();
-        wait_for_live_transport(&sock, "claude:nack-sess").await;
-
-        let push_task = tokio::spawn(async move {
-            let line = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
-                .await
-                .unwrap()
-                .unwrap();
-            let pkt: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(pkt["type"], "channel.deliver");
-            let delivery_id = pkt["delivery"].as_u64().unwrap();
-            write_ndjson_line_async(
-                &mut w,
-                &json!({ "type": "channel.ack", "delivery": delivery_id, "submitted": false }),
-            )
-            .await
-            .unwrap();
-            (reader, w)
-        });
-
-        daemon
-            .ingest_inbound(InboundItem {
-                session_id: "claude:nack-sess".into(),
-                origin_node: "peer@net".into(),
-                item_id: "nack-item-1".into(),
-                source: "peer@net/bot".into(),
-                text: "NACK_PRESERVED_PAYLOAD".into(),
-                kind: MailboxKind::Message,
-                trust_tier: GateTrustTier::Peer,
-            })
-            .await
-            .unwrap();
-
-        let (_r_keep, _w_keep) = tokio::time::timeout(Duration::from_secs(3), push_task)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Message MUST NOT be lost/acked; TurnStart (`UserPromptSubmit`) hook emits metadata-only
-        // XML digest while full payload remains preserved in mailbox!
-        let drain = run_hook(
-            &sock,
-            HarnessKind::Claude,
-            HookEvent::PreInvocation,
-            json!({ "session_id": "nack-sess" }),
-        )
-        .await;
-        let ctx = drain["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .expect("nacked channel message must emit XML digest via TurnStart hook");
-        assert!(ctx.starts_with("<hyphae-inbox unread=\"1\" urgency=\"queue\">"));
-        assert!(ctx.contains("<dm from=\"peer@net/bot\" count=\"1\"/>"));
-        assert!(!ctx.contains("NACK_PRESERVED_PAYLOAD"));
-        assert!(
-            node.db()
-                .local()
-                .peek_inbox("claude:nack-sess", 10)
-                .unwrap()
-                .iter()
-                .any(|m| m.text.contains("NACK_PRESERVED_PAYLOAD"))
-        );
-    }
-
-    // ---- Case 4.2: Channel disconnects mid-delivery -> preserved & delivered via `hyp wait` ----
-    {
-        let (r, mut w) = connect_daemon_async(&sock).await.unwrap();
-        let mut reader = BufReader::new(r);
-        write_ndjson_line_async(
-            &mut w,
-            &json!({
-                "type": "mcp.hello",
-                "backend": "claude",
-                "channel": true,
-                "clientId": "drop-sess"
-            }),
-        )
-        .await
-        .unwrap();
-        write_ndjson_line_async(&mut w, &json!({ "type": "channel.ready" }))
-            .await
-            .unwrap();
-        wait_for_live_transport(&sock, "claude:drop-sess").await;
-
-        let drop_task = tokio::spawn(async move {
-            let line = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
-                .await
-                .unwrap()
-                .unwrap();
-            let pkt: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(pkt["type"], "channel.deliver");
-            // Drop socket abruptly mid-delivery without sending `channel.ack`!
-            drop(reader);
-            drop(w);
-        });
-
-        daemon
-            .ingest_inbound(InboundItem {
-                session_id: "claude:drop-sess".into(),
-                origin_node: "peer@net".into(),
-                item_id: "drop-item-1".into(),
-                source: "peer@net/bot".into(),
-                text: "DISCONNECT_FALLBACK_WAIT_PAYLOAD".into(),
-                kind: MailboxKind::Message,
-                trust_tier: GateTrustTier::Peer,
-            })
-            .await
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(3), drop_task)
-            .await
-            .unwrap()
-            .unwrap();
-        wait_for_no_live_transport(&sock, "claude:drop-sess").await;
-
-        // `hyp wait` immediately receives the preserved message!
-        let mut buf = Vec::new();
-        let code = tokio::time::timeout(
-            Duration::from_secs(3),
-            run_wait_to_writer(
-                WaitOptions {
-                    socket_path: sock.clone(),
-                    mode: WaitMode::Once,
-                    session_id: Some("claude:drop-sess".into()),
-                    handle: None,
-                    timeout_seconds: Some(2.0),
-                    json: false,
-                },
-                &mut buf,
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(code, 0);
-        let wait_text = String::from_utf8(buf).unwrap();
-        assert!(
-            wait_text.contains("<hyphae-inbox") && wait_text.contains("peer@net/bot"),
-            "expected preserved message XML digest via hyp wait, got: {wait_text:?}"
-        );
-        assert!(
-            !wait_text.contains("DISCONNECT_FALLBACK_WAIT_PAYLOAD"),
-            "RFC 0004: hyp wait must NEVER include raw DM body: {wait_text:?}"
-        );
-        assert!(
-            node.db()
-                .local()
-                .peek_inbox("claude:drop-sess", 10)
-                .unwrap()
-                .iter()
-                .any(|m| m.text.contains("DISCONNECT_FALLBACK_WAIT_PAYLOAD"))
-        );
-    }
-
-    // ---- Case 4.3: Channel never acks (150ms timeout fires) -> preserved & drained via `hyp_inbox` ----
-    {
-        let (r, mut w) = connect_daemon_async(&sock).await.unwrap();
-        let mut reader = BufReader::new(r);
-        write_ndjson_line_async(
-            &mut w,
-            &json!({
-                "type": "mcp.hello",
-                "backend": "claude",
-                "channel": true,
-                "clientId": "timeout-sess"
-            }),
-        )
-        .await
-        .unwrap();
-        write_ndjson_line_async(&mut w, &json!({ "type": "channel.ready" }))
-            .await
-            .unwrap();
-        wait_for_live_transport(&sock, "claude:timeout-sess").await;
-
-        let silent_task = tokio::spawn(async move {
-            let line = read_bounded_line_async(&mut reader, MAX_SOCKET_LINE_BYTES)
-                .await
-                .unwrap()
-                .unwrap();
-            let pkt: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(pkt["type"], "channel.deliver");
-            // Intentionally stay connected and NEVER send `channel.ack`!
-            (reader, w)
-        });
-
-        let start = tokio::time::Instant::now();
-        daemon
-            .ingest_inbound(InboundItem {
-                session_id: "claude:timeout-sess".into(),
-                origin_node: "peer@net".into(),
-                item_id: "timeout-item-1".into(),
-                source: "peer@net/bot".into(),
-                text: "TIMEOUT_PRESERVED_INBOX_PAYLOAD".into(),
-                kind: MailboxKind::Message,
-                trust_tier: GateTrustTier::Peer,
-            })
-            .await
-            .unwrap();
-        // `ingest_inbound` awaited `flush_session`, which waited the 150ms `channel_deliver_timeout`!
-        assert!(
-            start.elapsed() >= Duration::from_millis(120),
-            "expected channel_deliver_timeout (~150ms) to elapse, got {:?}",
-            start.elapsed()
-        );
-
-        let (_r_keep, _w_keep) = tokio::time::timeout(Duration::from_secs(2), silent_task)
-            .await
-            .unwrap()
-            .unwrap();
-
-        // Drain via verified MCP `hyp_inbox`!
+    for fixture in ["listening", "ignoring", "slow", "armed", "native"] {
         let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
-        mcp.initialize().await;
-        let (inbox_txt, inbox_err) = mcp
-            .call_verified_claude(
-                &sock,
-                "timeout-sess",
-                "hyp_inbox",
-                json!({ "state": "unread", "ack": true }),
+        let init = mcp
+            .request(
+                "initialize",
+                json!({"clientInfo": {"name": "claude-code", "version": "fixture"}}),
             )
             .await;
-        assert!(
-            !inbox_err,
-            "hyp_inbox after channel timeout failed: {inbox_txt}"
+        assert!(init["result"]["capabilities"]["experimental"]["claude/channel"].is_object());
+        mcp.send_json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        let (join, error) = mcp
+            .call_verified_claude(
+                &sock,
+                fixture,
+                "hyp_mesh",
+                json!({"action": "join", "handle": fixture}),
+            )
+            .await;
+        assert!(!error, "{join}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&join).unwrap()["hasLiveTransport"],
+            false
         );
-        let inbox_val: Value = serde_json::from_str(&inbox_txt).unwrap();
-        let items = inbox_val["items"].as_array().unwrap();
-        assert_eq!(items.len(), 1);
+        let session_id = format!("claude:{fixture}");
+
+        let waiter = if fixture == "armed" {
+            let options = WaitOptions {
+                socket_path: sock.clone(),
+                mode: WaitMode::Once,
+                session_id: Some(session_id.clone()),
+                handle: None,
+                timeout_seconds: Some(5.0),
+                json: false,
+            };
+            let waiter = tokio::spawn(async move {
+                let mut buf = Vec::new();
+                assert_eq!(run_wait_to_writer(options, &mut buf).await.unwrap(), 0);
+                String::from_utf8(buf).unwrap()
+            });
+            wait_for_live_transport(&sock, &session_id).await;
+            Some(waiter)
+        } else {
+            None
+        };
+
+        run_hook(
+            &sock,
+            HarnessKind::Claude,
+            HookEvent::Stop,
+            json!({"session_id": fixture}),
+        )
+        .await;
+        let native = (fixture == "native").then(|| {
+            let transport = Arc::new(RecordingPushTransport::new("native_fixture", true));
+            daemon.register_session_transport(&session_id, transport.clone());
+            transport
+        });
+
+        daemon
+            .ingest_inbound(InboundItem {
+                session_id: session_id.clone(),
+                origin_node: "peer@net".into(),
+                item_id: format!("item-{fixture}"),
+                source: "peer@net/bot".into(),
+                text: "PRIVATE_CHANNEL_FIXTURE_BODY".into(),
+                kind: MailboxKind::Message,
+                trust_tier: GateTrustTier::Peer,
+            })
+            .await
+            .unwrap();
+
+        let proven = fixture == "armed" || fixture == "native";
+        let entries = node.db().local().peek_inbox(&session_id, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        let receipt = entries[0].receipt.clone();
+        assert_eq!(entries[0].notified, proven);
+        assert_eq!(entries[0].gate_state, GateState::Pending);
+
+        let stop_hook = || {
+            run_hook(
+                &sock,
+                HarnessKind::Claude,
+                HookEvent::Stop,
+                json!({"session_id": fixture}),
+            )
+        };
+        let early_stop = if fixture == "slow" {
+            // Claude reaches a natural boundary before its listener handles the queued notice.
+            Some(stop_hook().await)
+        } else {
+            None
+        };
+        let digest = if let Some(waiter) = waiter {
+            waiter.await.unwrap()
+        } else if let Some(native) = native {
+            let deliveries = native.take_delivered();
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].0, PushMode::Queue);
+            deliveries.into_iter().next().unwrap().1
+        } else {
+            let notice = mcp.next_message().await;
+            assert_eq!(notice["method"], "notifications/claude/channel");
+            notice["params"]["content"].as_str().unwrap().to_owned()
+        };
         assert!(
-            items[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("TIMEOUT_PRESERVED_INBOX_PAYLOAD")
+            digest.contains("<dm from=\"peer@net/bot\" count=\"1\"/>"),
+            "{fixture}: {digest}"
         );
+        assert!(!digest.contains("PRIVATE_CHANNEL_FIXTURE_BODY"));
+
+        // Repeat reconciliation while the channel is attached and the same receipt is pending.
+        for _ in 0..3 {
+            daemon.flush_pending_sessions().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), mcp.next_message())
+                .await
+                .is_err(),
+            "{fixture}: unexpected second notice or notice alongside a proven wake"
+        );
+
+        let read = async |mcp: &mut TestMcpClient| {
+            let args = json!({"ids": [receipt], "ack": true});
+            let sock = sock.clone();
+            let (text, error) = mcp
+                .call_verified_claude(&sock, fixture, "hyp_inbox", args)
+                .await;
+            assert!(!error, "{text}");
+            let inbox: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(inbox["acked"], 1);
+            assert_eq!(inbox["items"][0]["text"], "PRIVATE_CHANNEL_FIXTURE_BODY");
+        };
+
+        if fixture == "listening" {
+            read(&mut mcp).await;
+        }
+        let stop = match early_stop {
+            Some(stop) => stop,
+            None => stop_hook().await,
+        };
+        let surfaced = stop.to_string().contains("peer@net/bot");
+        assert_eq!(
+            surfaced,
+            matches!(fixture, "slow" | "ignoring"),
+            "{fixture}: {stop}"
+        );
+
+        if fixture == "slow" || proven {
+            read(&mut mcp).await;
+        }
+        let entry = node
+            .db()
+            .local()
+            .get_mailbox_entry(&receipt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.gate_state,
+            if fixture == "ignoring" {
+                GateState::Pending
+            } else {
+                GateState::Delivered
+            }
+        );
+        mcp.close().await;
+    }
+
+    let (r, mut w) = connect_daemon_async(&sock).await.unwrap();
+    let mut reader = BufReader::new(r);
+    for packet in [
+        json!({"type": "mcp.hello", "backend": "claude", "channel": true, "clientId": "legacy"}),
+        json!({"type": "channel.ready"}),
+        json!({"type": "tool.call", "id": 1, "name": "hyp_mesh",
+            "args": {"action": "join", "handle": "legacy"}}),
+    ] {
+        write_ndjson_line_async(&mut w, &packet).await.unwrap();
+    }
+    let result = next_channel_fixture_packet(&mut reader).await;
+    assert_eq!(result["result"]["hasLiveTransport"], false);
+    daemon
+        .ingest_inbound(InboundItem {
+            session_id: "claude:legacy".into(),
+            origin_node: "peer@net".into(),
+            item_id: "legacy-item".into(),
+            source: "peer@net/bot".into(),
+            text: "LEGACY_CHANNEL_FIXTURE_BODY".into(),
+            kind: MailboxKind::Message,
+            trust_tier: GateTrustTier::Peer,
+        })
+        .await
+        .unwrap();
+    let notice = next_channel_fixture_packet(&mut reader).await;
+    assert_eq!(notice["type"], "channel.deliver");
+    assert!(notice["delivery"].is_u64());
+    for packet in [
+        json!({"type": "channel.ack", "delivery": notice["delivery"], "submitted": true}),
+        json!({"type": "mcp.caps", "id": 2}),
+    ] {
+        write_ndjson_line_async(&mut w, &packet).await.unwrap();
+    }
+    assert_eq!(next_channel_fixture_packet(&mut reader).await["id"], 2);
+    let entries = node.db().local().peek_inbox("claude:legacy", 10).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(!entries[0].notified);
+    assert_eq!(entries[0].gate_state, GateState::Pending);
+
+    daemon.stop().await;
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn claude_idle_fallback_rechecks_sliding_lease_and_outstanding_receipts() {
+    const LEASE: Duration = Duration::from_millis(600);
+    let dir = TempDir::new().unwrap();
+    let node = open_local_node("idle@box", dir.path());
+    let config = LocalDaemonConfig {
+        queue_activity_lease: LEASE,
+        interrupt_hook_grace: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, config)
+        .await
+        .unwrap();
+    let sock = daemon.socket_path().to_path_buf();
+
+    for fixture in [
+        "queue-expiry",
+        "interrupt-native-expiry",
+        "interrupt-channel-expiry",
+        "renew-and-read",
+        "stop-first",
+    ] {
+        let mut mcp = TestMcpClient::spawn(McpOptions::new(sock.clone()));
+        mcp.request(
+            "initialize",
+            json!({"clientInfo": {"name": "claude-code", "version": "fixture"}}),
+        )
+        .await;
+        mcp.send_json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        let (join, err) = mcp
+            .call_verified_claude(
+                &sock,
+                fixture,
+                "hyp_mesh",
+                json!({"action": "join", "handle": fixture}),
+            )
+            .await;
+        assert!(!err, "{join}");
+        let is_interrupt = fixture.starts_with("interrupt-");
+        if is_interrupt {
+            let (rule, err) = mcp
+                .call_verified_claude(
+                    &sock,
+                    fixture,
+                    "hyp_inbox",
+                    json!({"rules": [{"target": "peer@net/bot", "delivery": "interrupt"}]}),
+                )
+                .await;
+            assert!(!err, "{rule}");
+        }
+        let session_id = format!("claude:{fixture}");
+        let tool_boundary = json!({
+            "session_id": fixture, "tool_name": "Bash",
+        });
+        let started = tokio::time::Instant::now();
+        run_hook(
+            &sock,
+            HarnessKind::Claude,
+            HookEvent::PostToolUse,
+            tool_boundary.clone(),
+        )
+        .await;
+        let urgency = daemon
+            .ingest_inbound(InboundItem {
+                session_id: session_id.clone(),
+                origin_node: "peer@net".into(),
+                item_id: format!("item-{fixture}"),
+                source: "peer@net/bot".into(),
+                text: "IDLE_FIXTURE_BODY".into(),
+                kind: MailboxKind::Message,
+                trust_tier: GateTrustTier::Peer,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        if is_interrupt {
+            assert_eq!(urgency.as_str(), "interrupt");
+            let notice = mcp.next_message().await;
+            assert_eq!(notice["method"], "notifications/claude/channel");
+            assert!(
+                notice["params"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("urgency=\"interrupt\"")
+            );
+            if fixture == "interrupt-channel-expiry" {
+                let wake = mcp.next_message().await;
+                assert_eq!(wake["method"], "notifications/claude/channel");
+                assert_eq!(
+                    wake["params"]["content"],
+                    "<hyphae-inbox unread=\"1\" urgency=\"queue\"/>"
+                );
+                assert!(!node.db().local().peek_inbox(&session_id, 10).unwrap()[0].notified);
+                daemon.flush_pending_sessions().await;
+                assert!(
+                    tokio::time::timeout(LEASE / 3, mcp.next_message())
+                        .await
+                        .is_err(),
+                    "lease expiry can trigger only one normal wake for a receipt",
+                );
+            } else {
+                // The native transport becomes available after the channel notice. It must not
+                // interrupt, even though the pending receipt was classified as Interrupt.
+                let transport = Arc::new(RecordingPushTransport::new("idle_fixture", true));
+                daemon.register_session_transport(&session_id, transport.clone());
+                tokio::time::sleep_until(started + LEASE / 2).await;
+                assert!(transport.take_delivered().is_empty());
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let deliveries = transport.take_delivered();
+                        if let [(mode, _)] = deliveries.as_slice() {
+                            assert_eq!(*mode, PushMode::Queue);
+                            break;
+                        }
+                        assert!(deliveries.is_empty());
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("lease expiry must wake through the newly available native route");
+                assert!(node.db().local().peek_inbox(&session_id, 10).unwrap()[0].notified);
+            }
+        } else {
+            assert_eq!(urgency.as_str(), "queue");
+            assert!(
+                tokio::time::timeout_at(started + LEASE / 2, mcp.next_message())
+                    .await
+                    .is_err(),
+                "Queue delivery should wait while a tool may be running"
+            );
+            match fixture {
+                "queue-expiry" => {
+                    let wake = mcp.next_message().await;
+                    assert_eq!(wake["method"], "notifications/claude/channel");
+                    assert!(
+                        wake["params"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("urgency=\"queue\"")
+                    );
+                    let entry = &node.db().local().peek_inbox(&session_id, 10).unwrap()[0];
+                    assert!(!entry.notified);
+                    assert_eq!(entry.gate_state, GateState::Pending);
+                }
+                "renew-and-read" => {
+                    run_hook(
+                        &sock,
+                        HarnessKind::Claude,
+                        HookEvent::PostToolUse,
+                        tool_boundary,
+                    )
+                    .await;
+                    assert!(
+                        tokio::time::timeout_at(started + LEASE + LEASE / 8, mcp.next_message())
+                            .await
+                            .is_err(),
+                        "a newer tool boundary must defer the old idle deadline"
+                    );
+                    let (text, error) = mcp
+                        .call_verified_claude(&sock, fixture, "hyp_inbox", json!({}))
+                        .await;
+                    assert!(!error, "{text}");
+                    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["acked"], 1);
+                    assert!(
+                        tokio::time::timeout(LEASE + LEASE / 4, mcp.next_message())
+                            .await
+                            .is_err(),
+                        "a receipt read before idle must not trigger a later notice"
+                    );
+                }
+                "stop-first" => {
+                    let stop = run_hook(
+                        &sock,
+                        HarnessKind::Claude,
+                        HookEvent::Stop,
+                        json!({"session_id": fixture}),
+                    )
+                    .await;
+                    assert!(stop.to_string().contains("peer@net/bot"), "{stop}");
+                    assert!(
+                        tokio::time::timeout(LEASE + LEASE / 4, mcp.next_message())
+                            .await
+                            .is_err(),
+                        "a Stop digest must satisfy the idle wake"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
         mcp.close().await;
     }
 
     daemon.stop().await;
     node.shutdown();
+}
+
+async fn next_channel_fixture_packet(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> Value {
+    let line = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_bounded_line_async(reader, MAX_SOCKET_LINE_BYTES),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    serde_json::from_str(&line).unwrap()
 }
 
 // ============================================================================
@@ -3734,7 +3894,10 @@ async fn initialize_backend_hints_match_explicit_transport_without_granting_iden
             // Metadata alone must not opt into scratch sessions.
             let mut client = TestMcpClient::spawn(options);
             let initialized = client.request("initialize", json!({"protocolVersion":"2025-06-18", "clientInfo":{"name": name, "version":"contract-fixture"}})).await;
-            assert!(initialized["result"]["capabilities"]["experimental"].is_null());
+            assert_eq!(
+                initialized["result"]["capabilities"]["experimental"]["claude/channel"].is_object(),
+                name == "claude-code",
+            );
             observed.push(initialized["result"]["instructions"].clone());
             client
                 .send_json(&json!({"jsonrpc":"2.0", "method":"notifications/initialized"}))

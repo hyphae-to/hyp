@@ -130,8 +130,10 @@ hyp uninstall [--dry-run] [--yes] [--keep-binary] [--keep-state]
 
 ```sh
 hyp hook <harness> <event> [--socket <path>]                # ~2.7 ms zero-Tokio fast path
-hyp mcp [<socket>] [--backend <h>] [--claude-channel] [--thread <uuid>] [--resume] [--remote <addr>] [--ephemeral]
+hyp mcp [<socket>] [--backend <h>] [--thread <uuid>] [--resume] [--remote <addr>] [--ephemeral]
 ```
+
+Claude Code channel capability is inferred from MCP initialization. Existing launches may still pass `--claude-channel` as a legacy override. Claude Code controls channel selection at launch.
 
 ## Live Daemon Hot-Reload IPC RPCs (`connector.sock` / `connector.addr`)
 

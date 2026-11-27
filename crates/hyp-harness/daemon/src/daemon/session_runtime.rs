@@ -23,7 +23,14 @@ struct SessionActivity {
 struct ActivityGraceTimer {
     generation: u64,
     fire_at: Instant,
-    bypass_grace: bool,
+    mode: SessionFlushMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionFlushMode {
+    Normal,
+    InterruptGraceExpired,
+    ClaudeIdleWake,
 }
 
 struct InterruptWakeCooldown {
@@ -87,7 +94,15 @@ impl LocalDaemonInner {
     }
 
     pub(super) fn cancel_activity_grace(&self, session_id: &str) {
-        self.clear_runtime_field(session_id, |runtime| runtime.timers.activity_grace = None);
+        self.clear_runtime_field(session_id, |runtime| {
+            if !runtime
+                .timers
+                .activity_grace
+                .is_some_and(|timer| timer.mode == SessionFlushMode::ClaudeIdleWake)
+            {
+                runtime.timers.activity_grace = None;
+            }
+        });
     }
 
     pub(super) fn infer_session_harness(
@@ -156,12 +171,21 @@ impl LocalDaemonInner {
     }
 
     /// Immediately transitions `session_id` to `Idle` and cancels any pending activity grace timer.
-    pub(super) fn mark_session_idle(&self, session_id: &str) {
-        self.clear_runtime_field(session_id, |runtime| {
+    pub(super) fn mark_session_idle(&self, session_id: &str) -> SessionFlushMode {
+        let awaiting_claude_idle_wake = self.update_runtime(session_id, |runtime| {
             runtime.timers.activity = None;
-            runtime.timers.activity_grace = None;
             runtime.last_midturn_digest_at_ms = None;
+            runtime
+                .timers
+                .activity_grace
+                .take()
+                .is_some_and(|timer| timer.mode == SessionFlushMode::ClaudeIdleWake)
         });
+        if awaiting_claude_idle_wake == Some(true) {
+            SessionFlushMode::ClaudeIdleWake
+        } else {
+            SessionFlushMode::Normal
+        }
     }
 
     /// Returns the active hook activity lease for `session_id`, pruning it if already expired.
@@ -183,19 +207,13 @@ impl LocalDaemonInner {
         None
     }
 
-    /// Schedules a single one-shot fallback flush timer when an L2 `PushTransport` nudge is
-    /// deferred because a hooked session is currently `Active`.
-    ///
-    /// - An earlier timer (e.g., 2s `Interrupt` grace) is NEVER starved by a later timer (15s `Queue` lease).
-    /// - `bypass_grace == true` (`Interrupt` fallback) forces L2 delivery even if the activity lease was
-    ///   still live when the short tool-boundary grace expired.
-    /// - `bypass_grace == false` (`Queue` lease expiry) re-checks the lease on wake: if new tool calls
-    ///   extended `active_until`, it slides cleanly until `Stop` fires or the agent actually goes quiet.
+    /// Schedules one fallback flush after tool-boundary grace or idle lease expiry.
+    /// A pending Claude idle wake retains queue semantics if another transport attaches.
     pub(super) fn schedule_activity_grace_flush(
         self: &Arc<Self>,
         session_id: &str,
         delay: Duration,
-        bypass_grace: bool,
+        mode: SessionFlushMode,
     ) {
         let delay = delay.max(Duration::from_millis(1));
         let now = Instant::now();
@@ -205,8 +223,16 @@ impl LocalDaemonInner {
             let mut sessions = self.session_runtime();
             let runtime = sessions.entry(session_id.to_owned()).or_default();
             if let Some(existing) = runtime.timers.activity_grace {
-                if existing.fire_at > now
-                    && (existing.fire_at <= fire_at || (existing.bypass_grace && !bypass_grace))
+                let waiting_for_idle = existing.mode == SessionFlushMode::ClaudeIdleWake;
+                if waiting_for_idle {
+                    if mode != SessionFlushMode::ClaudeIdleWake || existing.fire_at > now {
+                        return;
+                    }
+                } else if mode != SessionFlushMode::ClaudeIdleWake
+                    && existing.fire_at > now
+                    && (existing.fire_at <= fire_at
+                        || (existing.mode == SessionFlushMode::InterruptGraceExpired
+                            && mode == SessionFlushMode::Normal))
                 {
                     return;
                 }
@@ -215,7 +241,7 @@ impl LocalDaemonInner {
             runtime.timers.activity_grace = Some(ActivityGraceTimer {
                 generation,
                 fire_at,
-                bypass_grace,
+                mode,
             });
             generation
         };
@@ -256,7 +282,7 @@ impl LocalDaemonInner {
             if !still_current {
                 return;
             }
-            let _ = daemon.flush_session_inner(&sid, bypass_grace).await;
+            let _ = daemon.flush_session_inner(&sid, mode).await;
         });
     }
 
@@ -332,7 +358,9 @@ impl LocalDaemonInner {
                 false
             });
             if deferred == Some(true) {
-                let _ = daemon.flush_session_locked(&sid, false).await;
+                let _ = daemon
+                    .flush_session_locked(&sid, SessionFlushMode::Normal)
+                    .await;
             }
             drop(guard);
             drop(lock);

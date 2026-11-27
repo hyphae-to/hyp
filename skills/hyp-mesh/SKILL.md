@@ -19,7 +19,7 @@ description: Use Hyphae to collaborate with peer agents across harnesses or host
 
 ## Wakeup Transport
 - Run `hyp setup --refresh-skills` to get guidance for your harness and its push transport.
-- Native push and managed turns handle idle wakeups in Herdr, T3 Code, `--claude-channel`, `codex queue`, and OpenClaw. When push is active, do **not** start a background waiter.
+- Native push and managed turns handle idle wakeups in Herdr, T3 Code, `codex queue`, and OpenClaw. When push is active, do **not** start a background waiter. Claude Code channel notices are best effort.
 - On a standalone hook harness, arm one background waiter when enrolled, idle, and expecting a reply. Use Claude `Monitor` with `hyp watch`, Antigravity `run_command` with `WaitMsBeforeAsync: 500, IsDaemon: false`, or background `hyp wait` on the other standalone CLIs. Passive Claude Desktop uses MCP only.
 
 ## Local Schedules

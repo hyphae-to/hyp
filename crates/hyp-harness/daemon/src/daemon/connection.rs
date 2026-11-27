@@ -41,6 +41,33 @@ struct McpSocketContext {
     hints: TransportHints,
 }
 
+impl McpSocketContext {
+    fn set_channel_session(
+        &mut self,
+        daemon: &Arc<LocalDaemonInner>,
+        conn_id: u64,
+        chan_tx: &mpsc::Sender<ChannelDeliverCommand>,
+        session_id: &str,
+        harness: HarnessKind,
+    ) {
+        if !self.channel {
+            return;
+        }
+        let next = (harness == HarnessKind::Claude).then_some(session_id);
+        if self.channel_session_id.as_deref() != next {
+            if let Some(previous) = self.channel_session_id.take() {
+                unbind_channel(daemon, conn_id, &previous);
+            }
+            self.channel_session_id = next.map(str::to_owned);
+        }
+        if self.channel_ready {
+            if let Some(sid) = next {
+                bind_channel(daemon, conn_id, sid, chan_tx);
+            }
+        }
+    }
+}
+
 pub(super) async fn handle_connection<R, W>(
     daemon: Arc<LocalDaemonInner>,
     read_half: R,
@@ -54,13 +81,12 @@ pub(super) async fn handle_connection<R, W>(
     let conn_id = daemon.next_seq();
     let mut reader = BufReader::new(read_half);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
-    let (chan_tx, mut chan_rx) = mpsc::unbounded_channel::<ChannelDeliverCommand>();
+    let (chan_tx, mut chan_rx) = mpsc::channel::<ChannelDeliverCommand>(1);
     let (oc_wake_tx, mut oc_wake_rx) = mpsc::unbounded_channel::<OpenClawWakeCommand>();
 
     let mut mcp_ctx: Option<McpSocketContext> = None;
     let mut attached_waiter: Option<(String, u64)> = None;
     let mut is_openclaw_service = false;
-    let mut pending_channel_acks: HashMap<u64, oneshot::Sender<bool>> = HashMap::new();
     let mut pending_oc_wake_acks: HashMap<u64, oneshot::Sender<OpenClawWakeAck>> = HashMap::new();
 
     // Writer loop merged into select! so both request replies and async pushes serialize cleanly.
@@ -110,15 +136,21 @@ pub(super) async fn handle_connection<R, W>(
             }
             Ev::Push(None) => break,
             Ev::ChannelCmd(Some(cmd)) => {
-                let pkt = json!({
-                    "type": "channel.deliver",
-                    "delivery": cmd.delivery_id,
-                    "text": cmd.text,
-                });
-                if write_ndjson_line_async(&mut write_half, &pkt).await.is_ok() {
-                    pending_channel_acks.insert(cmd.delivery_id, cmd.ack_tx);
-                } else {
-                    let _ = cmd.ack_tx.send(false);
+                let is_current = mcp_ctx.as_ref().is_some_and(|ctx| {
+                    ctx.channel_session_id.as_deref() == Some(cmd.session_id.as_str())
+                }) && daemon
+                    .session_runtime()
+                    .get(&cmd.session_id)
+                    .and_then(|runtime| runtime.channel.as_ref())
+                    .is_some_and(|channel| channel.conn_id == conn_id);
+                if is_current
+                    && write_ndjson_line_async(
+                        &mut write_half,
+                        &json!({ "type": "channel.deliver", "delivery": daemon.next_seq(), "text": cmd.text }),
+                    )
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -326,7 +358,7 @@ pub(super) async fn handle_connection<R, W>(
                                 });
                         }
                         attached_waiter = Some((session_id.clone(), waiter_id));
-                        daemon.mark_session_idle(&session_id);
+                        let flush_mode = daemon.mark_session_idle(&session_id);
                         let _ = daemon
                             .node
                             .db()
@@ -352,7 +384,9 @@ pub(super) async fn handle_connection<R, W>(
                         let flush_daemon = Arc::clone(&daemon);
                         let flush_sid = session_id;
                         tokio::spawn(async move {
-                            flush_daemon.flush_session(&flush_sid).await;
+                            flush_daemon
+                                .flush_session_inner(&flush_sid, flush_mode)
+                                .await;
                         });
                     }
 
@@ -422,7 +456,15 @@ pub(super) async fn handle_connection<R, W>(
                             .get("backend")
                             .and_then(Value::as_str)
                             .and_then(|s| s.parse::<HarnessKind>().ok());
-                        let channel = packet.get("channel").and_then(Value::as_bool) == Some(true);
+                        let channel = packet.get("channel").is_some_and(|mode| {
+                            mode.as_str() == Some("best-effort") || mode.as_bool() == Some(true)
+                        });
+                        if let Some(sid) = mcp_ctx
+                            .as_ref()
+                            .and_then(|ctx| ctx.channel_session_id.as_deref())
+                        {
+                            unbind_channel(&daemon, conn_id, sid);
+                        }
                         let ephemeral_client_id = packet
                             .get("clientId")
                             .and_then(Value::as_str)
@@ -449,33 +491,14 @@ pub(super) async fn handle_connection<R, W>(
                         if let Some(ref mut ctx) = mcp_ctx {
                             if ctx.channel {
                                 ctx.channel_ready = true;
-                                if let Some(ref sid) = ctx.channel_session_id.clone() {
+                                if let Some(sid) = ctx.channel_session_id.as_deref() {
                                     bind_channel(&daemon, conn_id, sid, &chan_tx);
-                                } else if let Some(ref cid) = ctx.ephemeral_client_id.clone() {
-                                    let sid = format!("claude:{cid}");
-                                    let mut patch =
-                                        ctx.hints.backend_patch(Some(HarnessKind::Claude));
-                                    patch.insert("channel".into(), json!(true));
-                                    let _ = daemon.merge_session_backend_and_index(
-                                        &sid,
-                                        &patch,
-                                        daemon.current_time_ms(),
-                                    );
-                                    ctx.channel_session_id = Some(sid.clone());
-                                    bind_channel(&daemon, conn_id, &sid, &chan_tx);
                                 }
                             }
                         }
                     }
-                    "channel.ack" => {
-                        if let Some(delivery_id) = packet.get("delivery").and_then(Value::as_u64) {
-                            let submitted =
-                                packet.get("submitted").and_then(Value::as_bool) == Some(true);
-                            if let Some(tx) = pending_channel_acks.remove(&delivery_id) {
-                                let _ = tx.send(submitted);
-                            }
-                        }
-                    }
+                    // Older shims acknowledge their stdout write. That gives no host acceptance signal.
+                    "channel.ack" => {}
                     "mcp.caps" => {
                         if let Some(req_id) = packet.get("id").and_then(Value::as_u64) {
                             let resp = json!({
@@ -573,23 +596,11 @@ pub(super) async fn handle_connection<R, W>(
             })
             .unwrap_or(false);
     }
-    if let Some(ref ctx) = mcp_ctx {
-        if let Some(ref sid) = ctx.channel_session_id {
-            transport_changed |= daemon
-                .update_runtime(sid, |runtime| {
-                    if runtime
-                        .channel
-                        .as_ref()
-                        .is_some_and(|channel| channel.conn_id == conn_id)
-                    {
-                        runtime.channel = None;
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false);
-        }
+    if let Some(sid) = mcp_ctx
+        .as_ref()
+        .and_then(|ctx| ctx.channel_session_id.as_deref())
+    {
+        unbind_channel(&daemon, conn_id, sid);
     }
     if is_openclaw_service {
         let mut guard = daemon
@@ -603,9 +614,6 @@ pub(super) async fn handle_connection<R, W>(
     if transport_changed {
         daemon.bump_ui_rev();
     }
-    for (_, tx) in pending_channel_acks.drain() {
-        let _ = tx.send(false);
-    }
     for (_, tx) in pending_oc_wake_acks.drain() {
         let _ = tx.send(OpenClawWakeAck {
             ok: false,
@@ -614,20 +622,47 @@ pub(super) async fn handle_connection<R, W>(
     }
 }
 
+fn unbind_channel(daemon: &LocalDaemonInner, conn_id: u64, session_id: &str) {
+    let removed = daemon
+        .update_runtime(session_id, |runtime| {
+            if runtime
+                .channel
+                .as_ref()
+                .is_some_and(|channel| channel.conn_id == conn_id)
+            {
+                runtime.channel = None;
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false);
+    if removed {
+        daemon.bump_ui_rev();
+    }
+}
+
 fn bind_channel(
     daemon: &Arc<LocalDaemonInner>,
     conn_id: u64,
     session_id: &str,
-    chan_tx: &mpsc::UnboundedSender<ChannelDeliverCommand>,
+    chan_tx: &mpsc::Sender<ChannelDeliverCommand>,
 ) {
-    daemon
-        .session_runtime()
-        .entry(session_id.to_owned())
-        .or_default()
-        .channel = Some(LiveChannel {
-        conn_id,
-        tx: chan_tx.clone(),
-    });
+    {
+        let mut sessions = daemon.session_runtime();
+        let runtime = sessions.entry(session_id.to_owned()).or_default();
+        if runtime
+            .channel
+            .as_ref()
+            .is_some_and(|channel| channel.conn_id == conn_id)
+        {
+            return;
+        }
+        runtime.channel = Some(LiveChannel {
+            conn_id,
+            tx: chan_tx.clone(),
+        });
+    }
     daemon.bump_ui_rev();
     let flush_daemon = Arc::clone(daemon);
     let sid = session_id.to_string();
@@ -640,7 +675,7 @@ async fn resolve_tool_caller(
     daemon: &Arc<LocalDaemonInner>,
     mut mcp_ctx: Option<&mut McpSocketContext>,
     conn_id: u64,
-    chan_tx: &mpsc::UnboundedSender<ChannelDeliverCommand>,
+    chan_tx: &mpsc::Sender<ChannelDeliverCommand>,
     tool_name: &str,
     call_id: Option<&str>,
     call_token: Option<&str>,
@@ -677,12 +712,7 @@ async fn resolve_tool_caller(
                 );
                 daemon.bump_ui_rev();
                 if let Some(ctx) = mcp_ctx.as_deref_mut() {
-                    if ctx.channel && harness == HarnessKind::Claude {
-                        ctx.channel_session_id = Some(session_id.clone());
-                        if ctx.channel_ready {
-                            bind_channel(daemon, conn_id, &session_id, chan_tx);
-                        }
-                    }
+                    ctx.set_channel_session(daemon, conn_id, chan_tx, &session_id, harness);
                     let mut hints = ctx.hints.clone();
                     // Sparse MCP calls must keep T3 hints previously supplied by hooks.
                     // Another probe may start after the hook's own probe has completed.
@@ -747,12 +777,7 @@ async fn resolve_tool_caller(
                 daemon.current_time_ms(),
             );
             daemon.bump_ui_rev();
-            if ctx.channel && harness == HarnessKind::Claude {
-                ctx.channel_session_id = Some(session_id.clone());
-                if ctx.channel_ready {
-                    bind_channel(daemon, conn_id, &session_id, chan_tx);
-                }
-            }
+            ctx.set_channel_session(daemon, conn_id, chan_tx, &session_id, harness);
             let mut hints = ctx.hints.clone();
             if hints.harness.is_none() {
                 hints.harness = Some(harness);
