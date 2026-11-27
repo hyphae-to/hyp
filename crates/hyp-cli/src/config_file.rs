@@ -38,17 +38,7 @@ pub fn resolve_home_dir(home_override: Option<&Path>) -> Option<PathBuf> {
     if let Some(home) = home_override {
         return Some(home.to_path_buf());
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            return Some(PathBuf::from(home));
-        }
-    }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        if !profile.trim().is_empty() {
-            return Some(PathBuf::from(profile));
-        }
-    }
-    None
+    hyp_harness::paths::home_dir_from_env(|key| std::env::var(key).ok())
 }
 
 /// Resolves the effective state directory holding `node.sqlite`, `secrets/`, and `node.pid`.

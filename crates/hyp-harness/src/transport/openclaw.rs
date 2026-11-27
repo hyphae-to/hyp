@@ -24,6 +24,7 @@
 //!   - `401`/`403` -> [`PushOutcome::Reject`] (`"openclaw_auth_failed"`, terminal — daemon detaches)
 //!   - `404` -> [`PushOutcome::Reject`] (`"openclaw_hooks_disabled"`, terminal — daemon detaches)
 
+use crate::paths::transport_config_dir as default_hyphae_config_dir;
 use std::fmt;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
@@ -605,43 +606,6 @@ fn sanitize_idempotency_suffix(raw: &str) -> String {
     } else {
         cleaned
     }
-}
-
-fn home_dir() -> PathBuf {
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.trim().is_empty() {
-            return PathBuf::from(h);
-        }
-    }
-    if let Ok(h) = std::env::var("USERPROFILE") {
-        if !h.trim().is_empty() {
-            return PathBuf::from(h);
-        }
-    }
-    PathBuf::from(".")
-}
-
-fn default_hyphae_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HYPHAE_CONFIG_DIR") {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("hyphae");
-        }
-    }
-    #[cfg(windows)]
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let trimmed = appdata.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("hyphae");
-        }
-    }
-    home_dir().join(".config").join("hyphae")
 }
 
 fn is_valid_header_token(tok: &str) -> bool {

@@ -11,6 +11,9 @@
 //!   (over loopback TCP `ws://` and `rustls` TLS `wss://`) speaking T3's orchestration protocol v2
 //!   Effect RPC (`orchestration.getThreadProjection` + `orchestration.dispatchCommand`).
 
+use crate::paths::{
+    transport_config_dir as default_hyphae_config_dir, transport_home_dir as home_dir,
+};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::net::Ipv6Addr;
@@ -220,7 +223,7 @@ pub struct T3DeliveryDetail {
 
 /// Resolves the default T3 Code base directory (`$T3CODE_HOME` if non-empty, else `~/.t3`).
 pub fn default_t3_base_dir() -> PathBuf {
-    if let Ok(env_home) = std::env::var("T3CODE_HOME") {
+    if let Some(env_home) = crate::ambient_env_var("T3CODE_HOME") {
         let trimmed = env_home.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);
@@ -232,43 +235,6 @@ pub fn default_t3_base_dir() -> PathBuf {
 /// Returns `<base_dir>/userdata/statev2.sqlite`.
 pub fn t3_state_db_path(base_dir: &Path) -> PathBuf {
     base_dir.join("userdata").join("statev2.sqlite")
-}
-
-fn home_dir() -> PathBuf {
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.trim().is_empty() {
-            return PathBuf::from(h);
-        }
-    }
-    if let Ok(h) = std::env::var("USERPROFILE") {
-        if !h.trim().is_empty() {
-            return PathBuf::from(h);
-        }
-    }
-    PathBuf::from(".")
-}
-
-fn default_hyphae_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HYPHAE_CONFIG_DIR") {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("hyphae");
-        }
-    }
-    #[cfg(windows)]
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let trimmed = appdata.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("hyphae");
-        }
-    }
-    home_dir().join(".config").join("hyphae")
 }
 
 const INVALID_URL_ERR: &str = "T3 Code server URL must be a loopback origin (e.g. http://127.0.0.1:3773) or an explicit HTTPS origin when remote access is enabled";
