@@ -632,16 +632,9 @@ pub fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
     fn nearest_cube(v: u8) -> usize {
-        let mut best_idx = 0usize;
-        let mut best_dist = i32::MAX;
-        for (idx, &lvl) in CUBE_LEVELS.iter().enumerate() {
-            let d = (v as i32 - lvl as i32).abs();
-            if d < best_dist {
-                best_dist = d;
-                best_idx = idx;
-            }
-        }
-        best_idx
+        // At the midpoint of adjacent cube levels, use the lower index.
+        const LOWER_LEVEL_UPPER_BOUNDS: [u8; 5] = [47, 115, 155, 195, 235];
+        LOWER_LEVEL_UPPER_BOUNDS.partition_point(|&upper_bound| upper_bound < v)
     }
 
     let ri = nearest_cube(r);
