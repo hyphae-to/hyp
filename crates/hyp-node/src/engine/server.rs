@@ -425,6 +425,47 @@ async fn handle_http_request(
     }
 }
 
+#[derive(Clone, Copy)]
+enum PublicControlRoute<'a> {
+    Health,
+    Manifest,
+    AgentCard,
+    Pair,
+    GuestPair,
+    AuthClaim,
+    DelegatedPair,
+    P2pPair(&'a str),
+}
+
+impl<'a> PublicControlRoute<'a> {
+    fn classify(method: &Method, path: &'a str) -> Option<Self> {
+        let route = match (method, path) {
+            (&Method::GET, "/v1/health") => Self::Health,
+            (&Method::GET, "/v1/manifest") => Self::Manifest,
+            (&Method::GET, "/.well-known/agent.json") => Self::AgentCard,
+            (&Method::POST, "/v1/pair") => Self::Pair,
+            (&Method::POST, "/v1/guest/pair") => Self::GuestPair,
+            (&Method::POST, "/v1/auth/claim") => Self::AuthClaim,
+            (&Method::POST, "/v1/pair/delegated") => Self::DelegatedPair,
+            (&Method::POST, _) => Self::P2pPair(path.strip_prefix("/v1/p2p/pair/")?),
+            _ => return None,
+        };
+        Some(route)
+    }
+
+    fn check_enabled(self, node: &UnifiedNode) -> Result<(), NodeError> {
+        match self {
+            Self::AgentCard if !node.config().expose_a2a_card => Err(NodeError::NotFound(
+                "A2A agent card projection is disabled on this node".into(),
+            )),
+            Self::GuestPair if !node.config().guest_pairing.enabled => Err(NodeError::NotFound(
+                "guest pairing is disabled on this node".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
 async fn route_request(
     node: Arc<UnifiedNode>,
     peer_addr: SocketAddr,
@@ -475,7 +516,8 @@ async fn route_request(
 
     // Pre-auth route-appropriate body size guard: check route limits & `Content-Length` BEFORE
     // buffering request body bytes (preventing pre-auth memory amplification).
-    let max_body = resolve_pre_read_body_limit(&node, &method, &path, &headers)?;
+    let public_control = PublicControlRoute::classify(&method, &path);
+    let max_body = resolve_pre_read_body_limit(&node, &method, &path, &headers, public_control)?;
     check_content_length(&headers, max_body)?;
 
     let body_bytes = read_body_bytes(req.into_body(), max_body).await?;
@@ -483,102 +525,92 @@ async fn route_request(
 
     // ---- Unauthenticated or Optionally Authenticated Endpoints ----
 
-    if method == Method::GET && path == "/v1/health" {
-        let gh_summary = match node.github_public_adapter() {
-            Some(adapter) => {
-                let stats = adapter.stats().await;
-                json!({
-                    "enabled": true,
-                    "activePollers": stats.active_pollers,
-                    "pollsTotal": stats.polls_total,
-                    "polls200": stats.polls_200,
-                    "polls304": stats.polls_304,
-                })
+    if let Some(route) = public_control {
+        route.check_enabled(&node)?;
+        return match route {
+            PublicControlRoute::Health => {
+                let gh_summary = match node.github_public_adapter() {
+                    Some(adapter) => {
+                        let stats = adapter.stats().await;
+                        json!({
+                            "enabled": true,
+                            "activePollers": stats.active_pollers,
+                            "pollsTotal": stats.polls_total,
+                            "polls200": stats.polls_200,
+                            "polls304": stats.polls_304,
+                        })
+                    }
+                    None => json!({
+                        "enabled": false,
+                        "activePollers": 0,
+                        "pollsTotal": 0,
+                        "polls200": 0,
+                        "polls304": 0,
+                    }),
+                };
+                Ok(json_response(
+                    StatusCode::OK,
+                    &json!({
+                        "ok": true,
+                        "nodeId": node.node_id().as_str(),
+                        "profile": node.config().profile,
+                        "guestPairingEnabled": node.config().guest_pairing.enabled,
+                        "githubPublic": gh_summary,
+                        "dropRelay": node.drop_relay().health(now_ms()),
+                    }),
+                ))
             }
-            None => json!({
-                "enabled": false,
-                "activePollers": 0,
-                "pollsTotal": 0,
-                "polls200": 0,
-                "polls304": 0,
-            }),
+            PublicControlRoute::Manifest => {
+                let caller =
+                    node.authenticate_request(&headers, "GET", &path_and_query, &body_sha)?;
+                let (signed, _payload, etag) = node.build_signed_manifest(caller.as_ref())?;
+                if etag_matches_if_none_match(&headers, &etag) {
+                    return Ok(not_modified_response(&etag));
+                }
+                Ok(json_response_with_etag(StatusCode::OK, &signed, &etag))
+            }
+            PublicControlRoute::AgentCard => {
+                let caller =
+                    node.authenticate_request(&headers, "GET", &path_and_query, &body_sha)?;
+                let (_signed, payload, _etag) = node.build_signed_manifest(caller.as_ref())?;
+                let card = payload.to_a2a_agent_card(&node.endpoint_url());
+                Ok(json_response(StatusCode::OK, &card))
+            }
+            PublicControlRoute::Pair => {
+                let pair_env: AdminPairRequestEnvelope = serde_json::from_slice(&body_bytes)?;
+                let reply = node.handle_admin_pair_request_with_grant(
+                    &pair_env.base,
+                    pair_env.signed_grant.as_ref(),
+                )?;
+                Ok(json_response(StatusCode::OK, &reply))
+            }
+            PublicControlRoute::GuestPair => {
+                let guest_req: GuestPairRequest = serde_json::from_slice(&body_bytes)?;
+                let reply = node.handle_guest_pair_request(&guest_req)?;
+                Ok(json_response(StatusCode::OK, &reply))
+            }
+            PublicControlRoute::AuthClaim => {
+                let claim_req: AuthClaimRequest = serde_json::from_slice(&body_bytes)?;
+                let reply = node.handle_auth_claim_request(&claim_req)?;
+                Ok(json_response(StatusCode::OK, &reply))
+            }
+            PublicControlRoute::DelegatedPair => {
+                let pair_req: DelegatedPairRequest = serde_json::from_slice(&body_bytes)?;
+                let reply = node.handle_delegated_pair_request(&pair_req)?;
+                Ok(json_response(StatusCode::OK, &reply))
+            }
+            PublicControlRoute::P2pPair(offer_id) => {
+                let offer_id = percent_decode(offer_id);
+                let pair_resp: P2pPairResponse = serde_json::from_slice(&body_bytes)?;
+                let reply = node.handle_p2p_pair_request(&offer_id, &pair_resp)?;
+                Ok(json_response(StatusCode::OK, &reply))
+            }
         };
-        return Ok(json_response(
-            StatusCode::OK,
-            &json!({
-                "ok": true,
-                "nodeId": node.node_id().as_str(),
-                "profile": node.config().profile,
-                "guestPairingEnabled": node.config().guest_pairing.enabled,
-                "githubPublic": gh_summary,
-                "dropRelay": node.drop_relay().health(now_ms()),
-            }),
-        ));
-    }
-
-    if method == Method::GET && path == "/v1/manifest" {
-        let caller = node.authenticate_request(&headers, "GET", &path_and_query, &body_sha)?;
-        let (signed, _payload, etag) = node.build_signed_manifest(caller.as_ref())?;
-        if etag_matches_if_none_match(&headers, &etag) {
-            return Ok(not_modified_response(&etag));
-        }
-        return Ok(json_response_with_etag(StatusCode::OK, &signed, &etag));
-    }
-
-    if method == Method::GET && path == "/.well-known/agent.json" {
-        if !node.config().expose_a2a_card {
-            return Err(NodeError::NotFound(
-                "A2A agent card projection is disabled on this node".into(),
-            ));
-        }
-        let caller = node.authenticate_request(&headers, "GET", &path_and_query, &body_sha)?;
-        let (_signed, payload, _etag) = node.build_signed_manifest(caller.as_ref())?;
-        let card = payload.to_a2a_agent_card(&node.endpoint_url());
-        return Ok(json_response(StatusCode::OK, &card));
-    }
-
-    if method == Method::POST && path == "/v1/pair" {
-        let pair_env: AdminPairRequestEnvelope = serde_json::from_slice(&body_bytes)?;
-        let reply = node
-            .handle_admin_pair_request_with_grant(&pair_env.base, pair_env.signed_grant.as_ref())?;
-        return Ok(json_response(StatusCode::OK, &reply));
-    }
-
-    if method == Method::POST && path == "/v1/guest/pair" {
-        if !node.config().guest_pairing.enabled {
-            return Err(NodeError::NotFound(
-                "guest pairing is disabled on this node".into(),
-            ));
-        }
-        let guest_req: GuestPairRequest = serde_json::from_slice(&body_bytes)?;
-        let reply = node.handle_guest_pair_request(&guest_req)?;
-        return Ok(json_response(StatusCode::OK, &reply));
-    }
-
-    if method == Method::POST && path == "/v1/auth/claim" {
-        let claim_req: AuthClaimRequest = serde_json::from_slice(&body_bytes)?;
-        let reply = node.handle_auth_claim_request(&claim_req)?;
-        return Ok(json_response(StatusCode::OK, &reply));
-    }
-
-    if method == Method::POST && path == "/v1/pair/delegated" {
-        let pair_req: DelegatedPairRequest = serde_json::from_slice(&body_bytes)?;
-        let reply = node.handle_delegated_pair_request(&pair_req)?;
-        return Ok(json_response(StatusCode::OK, &reply));
     }
 
     if let Some(adapter) = resolve_github_webhook_target(&node, &method, &path)? {
         let outcome = adapter.ingest_webhook(&headers, &body_bytes).await;
         return webhook_outcome_response(outcome);
-    }
-
-    if method == Method::POST {
-        if let Some(offer_id) = path.strip_prefix("/v1/p2p/pair/") {
-            let offer_id = percent_decode(offer_id);
-            let pair_resp: P2pPairResponse = serde_json::from_slice(&body_bytes)?;
-            let reply = node.handle_p2p_pair_request(&offer_id, &pair_resp)?;
-            return Ok(json_response(StatusCode::OK, &reply));
-        }
     }
 
     // ---- Strictly Authenticated Peer Endpoints ----
@@ -1283,33 +1315,10 @@ fn resolve_pre_read_body_limit(
     method: &Method,
     path: &str,
     headers: &HeaderMap,
+    public_control: Option<PublicControlRoute<'_>>,
 ) -> Result<usize, NodeError> {
-    if method == Method::GET
-        && matches!(
-            path,
-            "/v1/health" | "/v1/manifest" | "/.well-known/agent.json"
-        )
-    {
-        if path == "/.well-known/agent.json" && !node.config().expose_a2a_card {
-            return Err(NodeError::NotFound(
-                "A2A agent card projection is disabled on this node".into(),
-            ));
-        }
-        return Ok(MAX_UNAUTH_CONTROL_BODY_BYTES);
-    }
-
-    if method == Method::POST
-        && (path == "/v1/pair"
-            || path == "/v1/guest/pair"
-            || path == "/v1/auth/claim"
-            || path == "/v1/pair/delegated"
-            || path.starts_with("/v1/p2p/pair/"))
-    {
-        if path == "/v1/guest/pair" && !node.config().guest_pairing.enabled {
-            return Err(NodeError::NotFound(
-                "guest pairing is disabled on this node".into(),
-            ));
-        }
+    if let Some(route) = public_control {
+        route.check_enabled(node)?;
         return Ok(MAX_UNAUTH_CONTROL_BODY_BYTES);
     }
 
