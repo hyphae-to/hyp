@@ -238,7 +238,8 @@ jobs:
           tool: cargo-nextest@0.9.152
 
       - name: Workspace Tests (unit, golden interop, chaos & CLI E2E)
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        # The dedicated Linux live plugin step captures output to detect skips.
+        run: cargo nextest run --workspace --locked --no-fail-fast ${{ runner.os == 'Linux' && '-E "not binary(=real_plugins_e2e)"' || '' }}
 
       - name: Workspace doctests
         run: cargo test --workspace --locked --doc
@@ -250,7 +251,7 @@ jobs:
           set -euo pipefail
           node --version
           python3 --version
-          out="$(cargo nextest run --locked -p hyp-node --test real_plugins_e2e --no-capture 2>&1)" || { printf '%s\n' "$out"; exit 1; }
+          out="$(cargo nextest run --locked -p hyp-node --test real_plugins_e2e --no-capture --no-fail-fast 2>&1)" || { printf '%s\n' "$out"; exit 1; }
           printf '%s\n' "$out"
           if [[ "$out" == *'SKIP '* ]]; then
             echo "ERROR: real_plugins_e2e skipped one or more live plugin tests!" >&2
