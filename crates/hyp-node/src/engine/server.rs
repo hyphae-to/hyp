@@ -1003,6 +1003,30 @@ async fn route_request(
         };
     }
 
+    if method == Method::GET && path == "/v1/kv-metadata" {
+        return match (query.get("namespace"), query.get("key")) {
+            (None, None) => Ok(json_response(
+                StatusCode::OK,
+                &node.inspect_hosted_kv_for_peer(&caller, now_ms())?,
+            )),
+            (Some(namespace), None) => Ok(json_response(
+                StatusCode::OK,
+                &node.inspect_hosted_kv_keys_for_peer(
+                    &caller,
+                    namespace,
+                    query.get("after").map(String::as_str),
+                )?,
+            )),
+            (Some(namespace), Some(key)) => Ok(json_response(
+                StatusCode::OK,
+                &node.read_hosted_kv_for_peer(&caller, namespace, key)?,
+            )),
+            _ => Err(NodeError::BadRequest(
+                "KV preview requires a namespace and key".into(),
+            )),
+        };
+    }
+
     // /v1/kv/<namespace>[/<key...>]
     if let Some(rest) = path.strip_prefix("/v1/kv/") {
         if let Some((ns_raw, key_raw)) = rest.split_once('/') {

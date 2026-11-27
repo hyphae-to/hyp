@@ -1140,6 +1140,11 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
         mode: KvMode::E2ee,
         write_model: KvWriteModel::Shared,
     });
+    hub_cfg.kv_namespaces.push(KvNamespaceConfig {
+        name: "limited".into(),
+        mode: KvMode::Plaintext,
+        write_model: KvWriteModel::Owner,
+    });
     let hub = UnifiedNode::open(hub_cfg).unwrap();
     let (_hub_addr, _hub_srv) = Arc::clone(&hub).serve(loopback_zero()).await.unwrap();
 
@@ -1165,6 +1170,7 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
         "dm:receive",
         "kv:read=shared/*",
         "kv:write=shared/*",
+        "kv:read=limited/visible/*",
     ];
     let guest_scopes_owned = ScopePreset::GuestRo.expand();
     let guest_scopes: Vec<&str> = guest_scopes_owned.iter().map(String::as_str).collect();
@@ -1222,6 +1228,98 @@ async fn kv_e2ee_auto_wraps_for_authorized_hub_members_excludes_blind_router_and
         .await
         .unwrap();
     assert_eq!(written_v1.e2ee_epoch, Some(1));
+
+    for key in ["visible/notes", "hidden/notes"] {
+        hub.kv_set(KvWriteRequest {
+            host_node: "local".into(),
+            namespace: "limited".into(),
+            key: key.into(),
+            value: json!("plain fixture"),
+            write_model: WriteModel::Owner,
+            owner_id: None,
+            allowlist: None,
+            expected_version: None,
+            ttl_ms: None,
+            encrypt: false,
+            e2ee_members: None,
+        })
+        .await
+        .unwrap();
+    }
+    let inspection = bob.inspect_kv(now_ms()).await.unwrap();
+    assert_eq!(inspection.namespaces.len(), 2);
+    let limited = &inspection.namespaces[0];
+    assert_eq!(limited.name, "limited");
+    assert_eq!(limited.origin_node, "acme-kv-hub");
+    assert_eq!(limited.entry_count, 1);
+    assert_eq!(limited.entries[0].key, "visible/notes");
+    assert!(
+        !serde_json::to_string(&inspection)
+            .unwrap()
+            .contains("plain fixture")
+    );
+    assert_eq!(inspection.namespaces[1].name, "shared");
+    assert_eq!(inspection.namespaces[1].epoch, Some(1));
+    assert_eq!(inspection.namespaces[1].member_count, 2);
+    assert!(
+        !serde_json::to_string(&inspection)
+            .unwrap()
+            .contains(secret_v1)
+    );
+    assert!(
+        bob.preview_kv("acme-kv-hub", "limited", "hidden/notes")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let preview = bob
+        .preview_kv("acme-kv-hub", "shared", "config")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&preview.text).unwrap()["token"],
+        secret_v1
+    );
+    assert!(
+        guest
+            .inspect_kv(now_ms())
+            .await
+            .unwrap()
+            .namespaces
+            .is_empty()
+    );
+    for index in 0..65 {
+        hub.kv_set(KvWriteRequest {
+            host_node: "local".into(),
+            namespace: "limited".into(),
+            key: format!("visible/rows/{index:02}"),
+            value: json!("page fixture"),
+            write_model: WriteModel::Owner,
+            owner_id: None,
+            allowlist: None,
+            expected_version: None,
+            ttl_ms: None,
+            encrypt: false,
+            e2ee_members: None,
+        })
+        .await
+        .unwrap();
+    }
+    let first = bob
+        .inspect_kv_keys("acme-kv-hub", "limited", Some("visible/notes"))
+        .await
+        .unwrap();
+    assert_eq!(first.entries.len(), 64);
+    assert_eq!(first.entries[0].key, "visible/rows/00");
+    assert_eq!(first.next_after.as_deref(), Some("visible/rows/63"));
+    let last = bob
+        .inspect_kv_keys("acme-kv-hub", "limited", first.next_after.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(last.entries.len(), 1);
+    assert_eq!(last.entries[0].key, "visible/rows/64");
+    assert!(last.next_after.is_none());
 
     // Bob MUST immediately decrypt it via `kv_get`!
     let bob_v1 = bob

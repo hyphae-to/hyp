@@ -130,7 +130,9 @@ use crate::gates::{
 
 mod kv_inspect;
 
-pub use kv_inspect::{KvInspection, KvKeyInspection, KvNamespaceInspection, KvValuePreview};
+pub use kv_inspect::{
+    KvInspection, KvKeyInspection, KvKeyPage, KvNamespaceInspection, KvValuePreview,
+};
 
 const MANIFEST_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const MANIFEST_WINDOW_REFRESH_MS: i64 = 60 * 60 * 1000;

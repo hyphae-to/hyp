@@ -557,10 +557,10 @@ pub fn render_inspect_text(payload: &Value, is_all: bool) -> String {
         );
     }
     if let Some(namespaces) = payload.pointer("/kv/namespaces").and_then(Value::as_array) {
-        let entries: u64 = namespaces
+        let entries = namespaces
             .iter()
             .filter_map(|ns| ns["entryCount"].as_u64())
-            .sum();
+            .fold(0u64, u64::saturating_add);
         let _ = writeln!(
             out,
             "KV  {} namespaces  {entries} live entries",
@@ -838,7 +838,7 @@ pub fn run_inspect(args: &InspectArgs) -> ExitCode {
     }
 
     let mut payload = Value::Object(res.result.unwrap_or_default());
-    if target.all && payload.get("kv").is_none() {
+    if target.all {
         if let Some(kv) = crate::kv_cmd::inspect_live_kv(&socket_path) {
             payload["kv"] = kv;
         }

@@ -56,6 +56,24 @@ pub enum KvCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List metadata for a page of live Shared KV keys
+    Keys {
+        /// KV namespace
+        #[arg(long)]
+        ns: String,
+        /// Cursor returned as nextAfter by the previous page
+        #[arg(long)]
+        after: Option<String>,
+        /// Host node ID (defaults to this node)
+        #[arg(long, default_value = "local")]
+        node: String,
+        /// Explicit daemon state directory
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Output structured JSON envelope
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a bounded preview of a live Shared KV value
     Preview {
         /// KV namespace
@@ -166,6 +184,13 @@ pub fn run_kv(command: KvCommand) -> ExitCode {
             state_dir,
             json,
         } => run_kv_get(ns, key, node, state_dir, json),
+        KvCommand::Keys {
+            ns,
+            after,
+            node,
+            state_dir,
+            json,
+        } => run_kv_keys(ns, after, node, state_dir, json),
         KvCommand::Preview {
             ns,
             key,
@@ -300,7 +325,7 @@ fn execute_kv(
 
     if matches!(
         request.action,
-        LocalKvAction::Inspect | LocalKvAction::Preview { .. }
+        LocalKvAction::Inspect | LocalKvAction::Keys { .. } | LocalKvAction::Preview { .. }
     ) {
         return Err(KvCommandError::Daemon(
             "KV inspection requires the local daemon.".into(),
@@ -449,6 +474,51 @@ fn run_kv_get(
     }
 }
 
+fn run_kv_keys(
+    namespace: String,
+    after: Option<String>,
+    node: String,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> ExitCode {
+    let command = "kv keys";
+    let action = LocalKvAction::Keys { after };
+    match execute_kv(&node, &namespace, action, state_dir.as_deref()) {
+        Ok(LocalKvResponse::Keys(page)) => {
+            if as_json {
+                print_json(&JsonEnvelope {
+                    ok: true,
+                    command: command.to_owned(),
+                    summary: Some(format!("{} live KV keys", page.entries.len())),
+                    data: Some(json!(page)),
+                    warnings: Vec::new(),
+                    next: Vec::new(),
+                    error: None,
+                });
+            } else {
+                if page.entries.is_empty() {
+                    println!("No visible keys.");
+                }
+                for entry in page.entries {
+                    println!(
+                        "{}  v{}  {}  {} B",
+                        sanitize_terminal_text(&entry.key),
+                        entry.version,
+                        sanitize_terminal_text(&entry.updated_by),
+                        entry.size_bytes,
+                    );
+                }
+                if let Some(after) = page.next_after {
+                    println!("More keys after {}", sanitize_terminal_text(&after));
+                }
+            }
+            ExitCode::from(EXIT_OK)
+        }
+        Err(err) => emit_kv_error(command, as_json, err),
+        Ok(_) => unexpected_kv_response(command, as_json),
+    }
+}
+
 fn run_kv_preview(
     namespace: String,
     key: String,
@@ -494,6 +564,18 @@ fn run_kv_preview(
 }
 
 pub(crate) fn inspect_live_kv(socket: &Path) -> Option<Value> {
+    let request = LocalKvRequest {
+        host_node: "local".into(),
+        namespace: String::new(),
+        action: LocalKvAction::Inspect,
+    };
+    match request_live_kv(socket, &request)? {
+        LocalKvResponse::Inspect(kv) => Some(json!(kv)),
+        _ => None,
+    }
+}
+
+pub(crate) fn request_live_kv(socket: &Path, request: &LocalKvRequest) -> Option<LocalKvResponse> {
     let hinted_state = socket
         .parent()
         .filter(|path| path.join("node.sqlite").is_file());
@@ -505,11 +587,6 @@ pub(crate) fn inspect_live_kv(socket: &Path) -> Option<Value> {
         None,
     );
     let secret_store = open_secret_store(&state_dir, hinted_state.is_some());
-    let request = LocalKvRequest {
-        host_node: "local".into(),
-        namespace: String::new(),
-        action: LocalKvAction::Inspect,
-    };
     let response = daemon_local_kv_rpc(
         socket,
         &json!(request),
@@ -519,13 +596,9 @@ pub(crate) fn inspect_live_kv(socket: &Path) -> Option<Value> {
     .ok()?
     .result?
     .remove("response")?;
-    let response = serde_json::from_value::<Result<LocalKvResponse, LocalKvError>>(response)
+    serde_json::from_value::<Result<LocalKvResponse, LocalKvError>>(response)
         .ok()?
-        .ok()?;
-    match response {
-        LocalKvResponse::Inspect(kv) => Some(json!(kv)),
-        _ => None,
-    }
+        .ok()
 }
 
 #[allow(clippy::too_many_arguments)]
