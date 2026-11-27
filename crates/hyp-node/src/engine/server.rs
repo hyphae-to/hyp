@@ -466,6 +466,55 @@ impl<'a> PublicControlRoute<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PeerRoute<'a> {
+    Keys,
+    Handles,
+    Messages,
+    Channels,
+    ChannelJoin,
+    ChannelLeave,
+    ChannelPost,
+    ChannelEpochs,
+    KvEpochs,
+    Events,
+    Subscriptions,
+    InboxAck,
+    Transfer(&'a str),
+    KvMetadata,
+    Kv(&'a str),
+}
+
+impl<'a> PeerRoute<'a> {
+    fn classify(method: &Method, path: &'a str) -> Option<Self> {
+        let route = match (method, path) {
+            (_, "/v1/keys") => Self::Keys,
+            (_, "/v1/handles") => Self::Handles,
+            (&Method::POST, "/v1/messages") => Self::Messages,
+            (&Method::GET, "/v1/channels") => Self::Channels,
+            (&Method::POST, "/v1/channels/join") => Self::ChannelJoin,
+            (&Method::DELETE, "/v1/channels/members") => Self::ChannelLeave,
+            (&Method::POST, "/v1/channels/post") => Self::ChannelPost,
+            (_, "/v1/channel-epochs") => Self::ChannelEpochs,
+            (_, p) if p.starts_with("/v1/channel-epochs/") => Self::ChannelEpochs,
+            (_, "/v1/kv-epochs") => Self::KvEpochs,
+            (_, p) if p.starts_with("/v1/kv-epochs/") => Self::KvEpochs,
+            (&Method::POST, "/v1/events") => Self::Events,
+            (_, "/v1/subscriptions") => Self::Subscriptions,
+            (&Method::POST, "/v1/inbox/ack") => Self::InboxAck,
+            (&Method::GET, "/v1/kv-metadata") => Self::KvMetadata,
+            _ => {
+                if let Some(id) = path.strip_prefix("/v1/transfers/") {
+                    Self::Transfer(id)
+                } else {
+                    Self::Kv(path.strip_prefix("/v1/kv/")?)
+                }
+            }
+        };
+        Some(route)
+    }
+}
+
 async fn route_request(
     node: Arc<UnifiedNode>,
     peer_addr: SocketAddr,
@@ -517,7 +566,9 @@ async fn route_request(
     // Pre-auth route-appropriate body size guard: check route limits & `Content-Length` BEFORE
     // buffering request body bytes (preventing pre-auth memory amplification).
     let public_control = PublicControlRoute::classify(&method, &path);
-    let max_body = resolve_pre_read_body_limit(&node, &method, &path, &headers, public_control)?;
+    let peer_route = PeerRoute::classify(&method, &path);
+    let max_body =
+        resolve_pre_read_body_limit(&node, &method, &path, &headers, public_control, peer_route)?;
     check_content_length(&headers, max_body)?;
 
     let body_bytes = read_body_bytes(req.into_body(), max_body).await?;
@@ -617,9 +668,8 @@ async fn route_request(
 
     let caller = require_auth(&node, &headers, method.as_str(), &path_and_query, &body_sha)?;
 
-    // /v1/keys
-    if path == "/v1/keys" {
-        return match method {
+    match peer_route {
+        Some(PeerRoute::Keys) => match method {
             Method::PUT => {
                 let put_env: PutKeyRequestEnvelope = serde_json::from_slice(&body_bytes)?;
                 node.register_peer_key_proof_authorized(
@@ -641,12 +691,8 @@ async fn route_request(
                 Ok(json_response(StatusCode::OK, &PeerKeysResponse { keys }))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),
-        };
-    }
-
-    // /v1/handles
-    if path == "/v1/handles" {
-        return match method {
+        },
+        Some(PeerRoute::Handles) => match method {
             Method::PUT => {
                 let put_req: PutHandlesRequest = serde_json::from_slice(&body_bytes)?;
                 let pairs: Vec<(&str, Option<&str>)> = put_req
@@ -670,94 +716,83 @@ async fn route_request(
                 Ok(json_response(StatusCode::OK, &HandlesResponse { handles }))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),
-        };
-    }
-
-    // /v1/messages
-    if method == Method::POST && path == "/v1/messages" {
-        let msg_req: PostMessageRequest = serde_json::from_slice(&body_bytes)?;
-        let (id, deduplicated) = node.handle_server_post_message(&caller, msg_req).await?;
-        return Ok(json_response(
-            StatusCode::OK,
-            &PostMessageResponse { id, deduplicated },
-        ));
-    }
-
-    // /v1/channels/*
-    if method == Method::GET && path == "/v1/channels" {
-        let filter_ch = query.get("channel").map(String::as_str);
-        let channels = node.list_channels_for_caller(&caller, filter_ch)?;
-        return Ok(json_response(
-            StatusCode::OK,
-            &ChannelsResponse { channels },
-        ));
-    }
-
-    if method == Method::POST && path == "/v1/channels/join" {
-        let join_req: ChannelJoinRequest = serde_json::from_slice(&body_bytes)?;
-        let channel = Channel::normalize(&join_req.channel)?.into_inner();
-        node.require_scope(
-            &caller,
-            caller.scopes.may_channel_join(&channel),
-            &format!("channel:join={channel}"),
-        )?;
-        let now = now_ms();
-        let membership = {
-            let db = node.db();
-            let sender_addr = hyp_store::format_address(&caller.peer_id, &join_req.handle);
-            if !db.messages().is_enrolled(&sender_addr)? {
-                db.messages()
-                    .register_handle(&caller.peer_id, &join_req.handle, None, now)?;
-            }
-            db.channels().join(
-                node.node_id().as_str(),
-                &channel,
-                &caller.peer_id,
-                &join_req.handle,
-                now,
-            )?
-        };
-        let policy = node.get_channel_policy(&channel);
-        let can_post = caller.scopes.may_channel_post(&channel)
-            && policy.is_authorized_writer(&caller.peer_id, Some(&membership.address));
-        return Ok(json_response(
-            StatusCode::OK,
-            &ChannelJoinResponse {
-                host_node: membership.host_node,
-                channel: membership.channel,
-                address: membership.address,
-                members: membership.members,
-                mode: policy.mode,
-                writers: policy.writers,
-                can_post,
-            },
-        ));
-    }
-
-    if method == Method::DELETE && path == "/v1/channels/members" {
-        let leave_req: ChannelLeaveRequest = serde_json::from_slice(&body_bytes)?;
-        let channel = Channel::normalize(&leave_req.channel)?.into_inner();
-        let left = {
-            let db = node.db();
-            db.channels().leave(
-                node.node_id().as_str(),
-                &channel,
-                &caller.peer_id,
-                &leave_req.handle,
-            )?
-        };
-        return Ok(json_response(StatusCode::OK, &json!({ "left": left })));
-    }
-
-    if method == Method::POST && path == "/v1/channels/post" {
-        let post_req: ChannelPostRequest = serde_json::from_slice(&body_bytes)?;
-        let res = node.handle_server_channel_post(&caller, post_req).await?;
-        return Ok(json_response(StatusCode::OK, &res));
-    }
-
-    // /v1/channel-epochs
-    if path == "/v1/channel-epochs" || path.starts_with("/v1/channel-epochs/") {
-        return match method {
+        },
+        Some(PeerRoute::Messages) => {
+            let msg_req: PostMessageRequest = serde_json::from_slice(&body_bytes)?;
+            let (id, deduplicated) = node.handle_server_post_message(&caller, msg_req).await?;
+            Ok(json_response(
+                StatusCode::OK,
+                &PostMessageResponse { id, deduplicated },
+            ))
+        }
+        Some(PeerRoute::Channels) => {
+            let filter_ch = query.get("channel").map(String::as_str);
+            let channels = node.list_channels_for_caller(&caller, filter_ch)?;
+            Ok(json_response(
+                StatusCode::OK,
+                &ChannelsResponse { channels },
+            ))
+        }
+        Some(PeerRoute::ChannelJoin) => {
+            let join_req: ChannelJoinRequest = serde_json::from_slice(&body_bytes)?;
+            let channel = Channel::normalize(&join_req.channel)?.into_inner();
+            node.require_scope(
+                &caller,
+                caller.scopes.may_channel_join(&channel),
+                &format!("channel:join={channel}"),
+            )?;
+            let now = now_ms();
+            let membership = {
+                let db = node.db();
+                let sender_addr = hyp_store::format_address(&caller.peer_id, &join_req.handle);
+                if !db.messages().is_enrolled(&sender_addr)? {
+                    db.messages()
+                        .register_handle(&caller.peer_id, &join_req.handle, None, now)?;
+                }
+                db.channels().join(
+                    node.node_id().as_str(),
+                    &channel,
+                    &caller.peer_id,
+                    &join_req.handle,
+                    now,
+                )?
+            };
+            let policy = node.get_channel_policy(&channel);
+            let can_post = caller.scopes.may_channel_post(&channel)
+                && policy.is_authorized_writer(&caller.peer_id, Some(&membership.address));
+            Ok(json_response(
+                StatusCode::OK,
+                &ChannelJoinResponse {
+                    host_node: membership.host_node,
+                    channel: membership.channel,
+                    address: membership.address,
+                    members: membership.members,
+                    mode: policy.mode,
+                    writers: policy.writers,
+                    can_post,
+                },
+            ))
+        }
+        Some(PeerRoute::ChannelLeave) => {
+            let leave_req: ChannelLeaveRequest = serde_json::from_slice(&body_bytes)?;
+            let channel = Channel::normalize(&leave_req.channel)?.into_inner();
+            let left = {
+                let db = node.db();
+                db.channels().leave(
+                    node.node_id().as_str(),
+                    &channel,
+                    &caller.peer_id,
+                    &leave_req.handle,
+                )?
+            };
+            Ok(json_response(StatusCode::OK, &json!({ "left": left })))
+        }
+        Some(PeerRoute::ChannelPost) => {
+            let post_req: ChannelPostRequest = serde_json::from_slice(&body_bytes)?;
+            let res = node.handle_server_channel_post(&caller, post_req).await?;
+            Ok(json_response(StatusCode::OK, &res))
+        }
+        Some(PeerRoute::ChannelEpochs) => match method {
             Method::POST => {
                 let put_req: PutChannelEpochRequest = serde_json::from_slice(&body_bytes)?;
                 let saved = node.handle_server_put_channel_epoch(&caller, put_req)?;
@@ -794,12 +829,8 @@ async fn route_request(
                 ))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),
-        };
-    }
-
-    // /v1/kv-epochs
-    if path == "/v1/kv-epochs" || path.starts_with("/v1/kv-epochs/") {
-        return match method {
+        },
+        Some(PeerRoute::KvEpochs) => match method {
             Method::POST => {
                 let put_req: PutKvEpochRequest = serde_json::from_slice(&body_bytes)?;
                 let saved = node.handle_server_put_kv_epoch(&caller, put_req)?;
@@ -830,24 +861,19 @@ async fn route_request(
                 Ok(json_response(StatusCode::OK, &KvEpochResponse { epoch }))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),
-        };
-    }
-
-    // /v1/events
-    if method == Method::POST && path == "/v1/events" {
-        let pub_req: PublishEventRequest = serde_json::from_slice(&body_bytes)?;
-        node.require_scope(
-            &caller,
-            caller.scopes.may_stream_publish(&pub_req.topic),
-            &format!("stream:publish={}", pub_req.topic),
-        )?;
-        let res = node.ingest_inbound_event_for_caller(&caller, &pub_req.topic, &pub_req.event)?;
-        return Ok(json_response(StatusCode::OK, &res));
-    }
-
-    // /v1/subscriptions
-    if path == "/v1/subscriptions" {
-        return match method {
+        },
+        Some(PeerRoute::Events) => {
+            let pub_req: PublishEventRequest = serde_json::from_slice(&body_bytes)?;
+            node.require_scope(
+                &caller,
+                caller.scopes.may_stream_publish(&pub_req.topic),
+                &format!("stream:publish={}", pub_req.topic),
+            )?;
+            let res =
+                node.ingest_inbound_event_for_caller(&caller, &pub_req.topic, &pub_req.event)?;
+            Ok(json_response(StatusCode::OK, &res))
+        }
+        Some(PeerRoute::Subscriptions) => match method {
             Method::PUT => {
                 let put_req: PutSubscriptionsRequest = serde_json::from_slice(&body_bytes)?;
                 let (subscriptions, diagnostics) = node
@@ -891,132 +917,129 @@ async fn route_request(
                 ))
             }
             _ => Err(NodeError::BadRequest("method not allowed".into())),
-        };
-    }
-
-    // /v1/inbox/ack
-    if method == Method::POST && path == "/v1/inbox/ack" {
-        let ack_req: InboxAckRequest = serde_json::from_slice(&body_bytes)?;
-        let now = now_ms();
-        let acked = {
-            let db = node.db();
-            match ack_req.kind.as_str() {
-                "message" => {
-                    db.messages()
-                        .ack(&caller.peer_id, &ack_req.id, &ack_req.outcome, now)?
+        },
+        Some(PeerRoute::InboxAck) => {
+            let ack_req: InboxAckRequest = serde_json::from_slice(&body_bytes)?;
+            let now = now_ms();
+            let acked = {
+                let db = node.db();
+                match ack_req.kind.as_str() {
+                    "message" => {
+                        db.messages()
+                            .ack(&caller.peer_id, &ack_req.id, &ack_req.outcome, now)?
+                    }
+                    "batch" => db.events().ack_batch(
+                        &caller.peer_id,
+                        &ack_req.id,
+                        &ack_req.outcome,
+                        now,
+                    )?,
+                    "transfer" => {
+                        db.transfers()
+                            .ack(&caller.peer_id, &ack_req.id, &ack_req.outcome, now)?
+                    }
+                    other => {
+                        return Err(NodeError::BadRequest(format!(
+                            "unknown inbox ack kind '{other}'"
+                        )));
+                    }
                 }
-                "batch" => {
-                    db.events()
-                        .ack_batch(&caller.peer_id, &ack_req.id, &ack_req.outcome, now)?
-                }
-                "transfer" => {
-                    db.transfers()
-                        .ack(&caller.peer_id, &ack_req.id, &ack_req.outcome, now)?
-                }
-                other => {
-                    return Err(NodeError::BadRequest(format!(
-                        "unknown inbox ack kind '{other}'"
-                    )));
-                }
-            }
-        };
-        node.clear_in_flight(&caller.peer_id, &format!("{}:{}", ack_req.kind, ack_req.id));
-        // Trigger immediate next-item push if more items are queued for this peer!
-        node.notify_peer_inbox(&caller.peer_id);
-        node.notify_scheduler();
-        return Ok(json_response(StatusCode::OK, &InboxAckResponse { acked }));
-    }
-
-    // /v1/transfers/<id>
-    if let Some(raw_id) = path.strip_prefix("/v1/transfers/") {
-        let id = percent_decode(raw_id);
-        return match method {
-            Method::PUT => {
-                let to_node = headers
-                    .get("x-hyphae-transfer-to")
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| {
-                        NodeError::BadRequest("missing X-Hyphae-Transfer-To header".into())
+            };
+            node.clear_in_flight(&caller.peer_id, &format!("{}:{}", ack_req.kind, ack_req.id));
+            // Trigger immediate next-item push if more items are queued for this peer!
+            node.notify_peer_inbox(&caller.peer_id);
+            node.notify_scheduler();
+            Ok(json_response(StatusCode::OK, &InboxAckResponse { acked }))
+        }
+        Some(PeerRoute::Transfer(raw_id)) => {
+            let id = percent_decode(raw_id);
+            match method {
+                Method::PUT => {
+                    let to_node = headers
+                        .get("x-hyphae-transfer-to")
+                        .and_then(|v| v.to_str().ok())
+                        .ok_or_else(|| {
+                            NodeError::BadRequest("missing X-Hyphae-Transfer-To header".into())
+                        })?;
+                    let transfer_type = headers
+                        .get("x-hyphae-transfer-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("transfer.stream.v2");
+                    let header_b64 = headers
+                        .get("x-hyphae-transfer-header")
+                        .and_then(|v| v.to_str().ok())
+                        .ok_or_else(|| {
+                            NodeError::BadRequest("missing X-Hyphae-Transfer-Header header".into())
+                        })?;
+                    let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).map_err(|_| {
+                        NodeError::BadRequest("invalid transfer header base64url".into())
                     })?;
-                let transfer_type = headers
-                    .get("x-hyphae-transfer-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("transfer.stream.v2");
-                let header_b64 = headers
-                    .get("x-hyphae-transfer-header")
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| {
-                        NodeError::BadRequest("missing X-Hyphae-Transfer-Header header".into())
+                    let header_json = String::from_utf8(header_bytes).map_err(|_| {
+                        NodeError::BadRequest("transfer header is not valid UTF-8".into())
                     })?;
-                let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).map_err(|_| {
-                    NodeError::BadRequest("invalid transfer header base64url".into())
-                })?;
-                let header_json = String::from_utf8(header_bytes).map_err(|_| {
-                    NodeError::BadRequest("transfer header is not valid UTF-8".into())
-                })?;
-                let expected_sha = headers
-                    .get("x-hyphae-sha256")
-                    .and_then(|v| v.to_str().ok())
-                    .map(ToOwned::to_owned);
-                let to_handle = headers
-                    .get("x-hyphae-transfer-to-handle")
-                    .and_then(|v| v.to_str().ok());
+                    let expected_sha = headers
+                        .get("x-hyphae-sha256")
+                        .and_then(|v| v.to_str().ok())
+                        .map(ToOwned::to_owned);
+                    let to_handle = headers
+                        .get("x-hyphae-transfer-to-handle")
+                        .and_then(|v| v.to_str().ok());
 
-                let res = node
-                    .handle_server_upload_transfer(
+                    let res = node
+                        .handle_server_upload_transfer(
+                            &caller,
+                            &id,
+                            to_node,
+                            to_handle,
+                            transfer_type,
+                            &header_json,
+                            expected_sha,
+                            body_bytes,
+                        )
+                        .await?;
+                    Ok(json_response(
+                        StatusCode::OK,
+                        &TransferUploadResponse {
+                            id: res.id,
+                            sha256: res.sha256,
+                            size: res.size,
+                            deduplicated: res.deduplicated,
+                        },
+                    ))
+                }
+                Method::GET => {
+                    let rec = {
+                        let db = node.db();
+                        db.transfers().get(&id)?
+                    }
+                    .ok_or_else(|| NodeError::NotFound(format!("transfer '{id}' not found")))?;
+                    if rec.to_node != caller.peer_id {
+                        return Err(NodeError::Unauthorized(
+                            "transfer is not addressed to caller".into(),
+                        ));
+                    }
+                    node.require_scope(
                         &caller,
-                        &id,
-                        to_node,
-                        to_handle,
-                        transfer_type,
-                        &header_json,
-                        expected_sha,
-                        body_bytes,
-                    )
-                    .await?;
-                Ok(json_response(
-                    StatusCode::OK,
-                    &TransferUploadResponse {
-                        id: res.id,
-                        sha256: res.sha256,
-                        size: res.size,
-                        deduplicated: res.deduplicated,
-                    },
-                ))
+                        caller.scopes.may_receive_files(rec.size),
+                        "files:receive",
+                    )?;
+                    let blob = {
+                        let db = node.db();
+                        db.transfers().read_blob(&caller.peer_id, &id)?
+                    }
+                    .ok_or_else(|| {
+                        NodeError::NotFound(format!("transfer blob '{id}' not found"))
+                    })?;
+                    Ok(bytes_response(
+                        StatusCode::OK,
+                        "application/octet-stream",
+                        blob,
+                    ))
+                }
+                _ => Err(NodeError::BadRequest("method not allowed".into())),
             }
-            Method::GET => {
-                let rec = {
-                    let db = node.db();
-                    db.transfers().get(&id)?
-                }
-                .ok_or_else(|| NodeError::NotFound(format!("transfer '{id}' not found")))?;
-                if rec.to_node != caller.peer_id {
-                    return Err(NodeError::Unauthorized(
-                        "transfer is not addressed to caller".into(),
-                    ));
-                }
-                node.require_scope(
-                    &caller,
-                    caller.scopes.may_receive_files(rec.size),
-                    "files:receive",
-                )?;
-                let blob = {
-                    let db = node.db();
-                    db.transfers().read_blob(&caller.peer_id, &id)?
-                }
-                .ok_or_else(|| NodeError::NotFound(format!("transfer blob '{id}' not found")))?;
-                Ok(bytes_response(
-                    StatusCode::OK,
-                    "application/octet-stream",
-                    blob,
-                ))
-            }
-            _ => Err(NodeError::BadRequest("method not allowed".into())),
-        };
-    }
-
-    if method == Method::GET && path == "/v1/kv-metadata" {
-        return match (query.get("namespace"), query.get("key")) {
+        }
+        Some(PeerRoute::KvMetadata) => match (query.get("namespace"), query.get("key")) {
             (None, None) => Ok(json_response(
                 StatusCode::OK,
                 &node.inspect_hosted_kv_for_peer(&caller, now_ms())?,
@@ -1036,165 +1059,165 @@ async fn route_request(
             _ => Err(NodeError::BadRequest(
                 "KV preview requires a namespace and key".into(),
             )),
-        };
-    }
-
-    // /v1/kv/<namespace>[/<key...>]
-    if let Some(rest) = path.strip_prefix("/v1/kv/") {
-        if let Some((ns_raw, key_raw)) = rest.split_once('/') {
-            let namespace = percent_decode(ns_raw);
-            let key = key_raw
-                .split('/')
-                .map(percent_decode)
-                .collect::<Vec<_>>()
-                .join("/");
-            return match method {
-                Method::PUT => {
-                    node.require_scope(
-                        &caller,
-                        caller.scopes.may_kv_write(&namespace, &key),
-                        &format!("kv:write={namespace}/{key}"),
-                    )?;
-                    let body: KvSetBody = serde_json::from_slice(&body_bytes)?;
-                    let if_match_ver = parse_if_match_version(&headers)?;
-                    let expected_version = if_match_ver.or(body.expected_version);
-                    let res = {
-                        let db = node.db();
-                        db.kv().set(
-                            &KvSetInput {
-                                host_node: node.node_id().to_string(),
-                                namespace: namespace.clone(),
-                                key: key.clone(),
-                                value: body.value,
-                                content_type: body.content_type,
-                                write_model: body.write_model,
-                                owner_id: body.owner_id,
-                                allowlist: body.allowlist,
-                                writer_id: caller.peer_id.clone(),
-                                expected_version,
-                                e2ee_epoch: body.e2ee_epoch,
-                                signature: body.signature,
-                                ttl_ms: body.ttl_ms,
-                            },
-                            now_ms(),
-                        )
-                    };
-                    match res {
-                        Ok(set_res) => {
-                            node.notify_kv_metadata_change();
-                            node.notify_all_inbox_subscribers();
-                            node.notify_scheduler();
-                            let etag = format_version_etag(set_res.entry.version);
-                            Ok(json_response_with_etag(
-                                StatusCode::OK,
-                                &set_res.entry,
-                                &etag,
-                            ))
-                        }
-                        Err(StoreError::VersionConflict { current_version }) => {
-                            let problem = ProblemDetails::version_conflict(
-                                expected_version.unwrap_or(0),
-                                current_version,
-                                Some(&namespace),
-                                Some(&key),
-                            );
-                            Ok(problem_response(&problem))
-                        }
-                        Err(err) => Err(NodeError::Store(err)),
-                    }
-                }
-                Method::GET => {
-                    node.require_scope(
-                        &caller,
-                        caller.scopes.may_kv_read(&namespace, &key),
-                        &format!("kv:read={namespace}/{key}"),
-                    )?;
-                    let entry = {
-                        let db = node.db();
-                        db.kv()
-                            .get(node.node_id().as_str(), &namespace, &key, now_ms())?
-                    }
-                    .ok_or_else(|| {
-                        NodeError::NotFound(format!("kv entry '{namespace}/{key}' not found"))
-                    })?;
-                    let etag = format_version_etag(entry.version);
-                    if etag_matches_if_none_match(&headers, &etag) {
-                        return Ok(not_modified_response(&etag));
-                    }
-                    Ok(json_response_with_etag(StatusCode::OK, &entry, &etag))
-                }
-                Method::DELETE => {
-                    node.require_scope(
-                        &caller,
-                        caller.scopes.may_kv_write(&namespace, &key),
-                        &format!("kv:write={namespace}/{key}"),
-                    )?;
-                    let body: KvDeleteBody = if body_bytes.is_empty() {
-                        KvDeleteBody::default()
-                    } else {
-                        serde_json::from_slice(&body_bytes)?
-                    };
-                    let if_match_ver = parse_if_match_version(&headers)?;
-                    let expected_version = if_match_ver.or(body.expected_version);
-                    let res = {
-                        let db = node.db();
-                        db.kv().delete(
-                            &KvDeleteInput {
-                                host_node: node.node_id().to_string(),
-                                namespace: namespace.clone(),
-                                key: key.clone(),
-                                writer_id: caller.peer_id.clone(),
-                                expected_version,
-                            },
-                            now_ms(),
-                        )
-                    };
-                    match res {
-                        Ok(del_res) => {
-                            if del_res.deleted {
+        },
+        Some(PeerRoute::Kv(rest)) => {
+            if let Some((ns_raw, key_raw)) = rest.split_once('/') {
+                let namespace = percent_decode(ns_raw);
+                let key = key_raw
+                    .split('/')
+                    .map(percent_decode)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                return match method {
+                    Method::PUT => {
+                        node.require_scope(
+                            &caller,
+                            caller.scopes.may_kv_write(&namespace, &key),
+                            &format!("kv:write={namespace}/{key}"),
+                        )?;
+                        let body: KvSetBody = serde_json::from_slice(&body_bytes)?;
+                        let if_match_ver = parse_if_match_version(&headers)?;
+                        let expected_version = if_match_ver.or(body.expected_version);
+                        let res = {
+                            let db = node.db();
+                            db.kv().set(
+                                &KvSetInput {
+                                    host_node: node.node_id().to_string(),
+                                    namespace: namespace.clone(),
+                                    key: key.clone(),
+                                    value: body.value,
+                                    content_type: body.content_type,
+                                    write_model: body.write_model,
+                                    owner_id: body.owner_id,
+                                    allowlist: body.allowlist,
+                                    writer_id: caller.peer_id.clone(),
+                                    expected_version,
+                                    e2ee_epoch: body.e2ee_epoch,
+                                    signature: body.signature,
+                                    ttl_ms: body.ttl_ms,
+                                },
+                                now_ms(),
+                            )
+                        };
+                        match res {
+                            Ok(set_res) => {
                                 node.notify_kv_metadata_change();
+                                node.notify_all_inbox_subscribers();
+                                node.notify_scheduler();
+                                let etag = format_version_etag(set_res.entry.version);
+                                Ok(json_response_with_etag(
+                                    StatusCode::OK,
+                                    &set_res.entry,
+                                    &etag,
+                                ))
                             }
-                            node.notify_all_inbox_subscribers();
-                            Ok(json_response(StatusCode::OK, &del_res))
+                            Err(StoreError::VersionConflict { current_version }) => {
+                                let problem = ProblemDetails::version_conflict(
+                                    expected_version.unwrap_or(0),
+                                    current_version,
+                                    Some(&namespace),
+                                    Some(&key),
+                                );
+                                Ok(problem_response(&problem))
+                            }
+                            Err(err) => Err(NodeError::Store(err)),
                         }
-                        Err(StoreError::VersionConflict { current_version }) => {
-                            let problem = ProblemDetails::version_conflict(
-                                expected_version.unwrap_or(0),
-                                current_version,
-                                Some(&namespace),
-                                Some(&key),
-                            );
-                            Ok(problem_response(&problem))
-                        }
-                        Err(err) => Err(NodeError::Store(err)),
                     }
+                    Method::GET => {
+                        node.require_scope(
+                            &caller,
+                            caller.scopes.may_kv_read(&namespace, &key),
+                            &format!("kv:read={namespace}/{key}"),
+                        )?;
+                        let entry = {
+                            let db = node.db();
+                            db.kv()
+                                .get(node.node_id().as_str(), &namespace, &key, now_ms())?
+                        }
+                        .ok_or_else(|| {
+                            NodeError::NotFound(format!("kv entry '{namespace}/{key}' not found"))
+                        })?;
+                        let etag = format_version_etag(entry.version);
+                        if etag_matches_if_none_match(&headers, &etag) {
+                            return Ok(not_modified_response(&etag));
+                        }
+                        Ok(json_response_with_etag(StatusCode::OK, &entry, &etag))
+                    }
+                    Method::DELETE => {
+                        node.require_scope(
+                            &caller,
+                            caller.scopes.may_kv_write(&namespace, &key),
+                            &format!("kv:write={namespace}/{key}"),
+                        )?;
+                        let body: KvDeleteBody = if body_bytes.is_empty() {
+                            KvDeleteBody::default()
+                        } else {
+                            serde_json::from_slice(&body_bytes)?
+                        };
+                        let if_match_ver = parse_if_match_version(&headers)?;
+                        let expected_version = if_match_ver.or(body.expected_version);
+                        let res = {
+                            let db = node.db();
+                            db.kv().delete(
+                                &KvDeleteInput {
+                                    host_node: node.node_id().to_string(),
+                                    namespace: namespace.clone(),
+                                    key: key.clone(),
+                                    writer_id: caller.peer_id.clone(),
+                                    expected_version,
+                                },
+                                now_ms(),
+                            )
+                        };
+                        match res {
+                            Ok(del_res) => {
+                                if del_res.deleted {
+                                    node.notify_kv_metadata_change();
+                                }
+                                node.notify_all_inbox_subscribers();
+                                Ok(json_response(StatusCode::OK, &del_res))
+                            }
+                            Err(StoreError::VersionConflict { current_version }) => {
+                                let problem = ProblemDetails::version_conflict(
+                                    expected_version.unwrap_or(0),
+                                    current_version,
+                                    Some(&namespace),
+                                    Some(&key),
+                                );
+                                Ok(problem_response(&problem))
+                            }
+                            Err(err) => Err(NodeError::Store(err)),
+                        }
+                    }
+                    _ => Err(NodeError::BadRequest("method not allowed".into())),
+                };
+            } else if method == Method::GET {
+                let namespace = percent_decode(rest);
+                let prefix = query.get("prefix").map(String::as_str);
+                let probe_key = prefix.unwrap_or("");
+                node.require_scope(
+                    &caller,
+                    caller.scopes.may_kv_read(&namespace, probe_key),
+                    &format!("kv:read={namespace}/{probe_key}*"),
+                )?;
+                let entries: Vec<_> = {
+                    let db = node.db();
+                    db.kv()
+                        .list(node.node_id().as_str(), &namespace, prefix, now_ms())?
                 }
-                _ => Err(NodeError::BadRequest("method not allowed".into())),
-            };
-        } else if method == Method::GET {
-            let namespace = percent_decode(rest);
-            let prefix = query.get("prefix").map(String::as_str);
-            let probe_key = prefix.unwrap_or("");
-            node.require_scope(
-                &caller,
-                caller.scopes.may_kv_read(&namespace, probe_key),
-                &format!("kv:read={namespace}/{probe_key}*"),
-            )?;
-            let entries: Vec<_> = {
-                let db = node.db();
-                db.kv()
-                    .list(node.node_id().as_str(), &namespace, prefix, now_ms())?
+                .into_iter()
+                .filter(|e| caller.scopes.may_kv_read(&e.namespace, &e.key))
+                .collect();
+                return Ok(json_response(StatusCode::OK, &KvListResponse { entries }));
             }
-            .into_iter()
-            .filter(|e| caller.scopes.may_kv_read(&e.namespace, &e.key))
-            .collect();
-            return Ok(json_response(StatusCode::OK, &KvListResponse { entries }));
+            Err(NodeError::NotFound(format!(
+                "route '{method} {path}' not found"
+            )))
         }
+        None => Err(NodeError::NotFound(format!(
+            "route '{method} {path}' not found"
+        ))),
     }
-
-    Err(NodeError::NotFound(format!(
-        "route '{method} {path}' not found"
-    )))
 }
 
 fn webhook_outcome_response(
@@ -1316,6 +1339,7 @@ fn resolve_pre_read_body_limit(
     path: &str,
     headers: &HeaderMap,
     public_control: Option<PublicControlRoute<'_>>,
+    peer_route: Option<PeerRoute<'_>>,
 ) -> Result<usize, NodeError> {
     if let Some(route) = public_control {
         route.check_enabled(node)?;
@@ -1326,7 +1350,7 @@ fn resolve_pre_read_body_limit(
         return Ok(adapter.config().max_body_bytes);
     }
 
-    if method == Method::PUT && path.starts_with("/v1/transfers/") {
+    if method == Method::PUT && matches!(peer_route, Some(PeerRoute::Transfer(_))) {
         if !headers.contains_key(AUTHORIZATION) {
             return Err(NodeError::Unauthorized(
                 "missing Authorization header".into(),
