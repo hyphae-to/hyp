@@ -192,6 +192,49 @@ pub async fn consume_bounded_body(
     Ok(())
 }
 
+/// Stages remain distinct so callers preserve their diagnostics and observed HTTP status.
+#[derive(Debug)]
+pub enum BoundedRequestError<E, P> {
+    RequestTimeout,
+    Request(E),
+    Policy(P),
+    BodyTimeout {
+        status: u16,
+    },
+    Body {
+        status: u16,
+        error: BoundedBodyError,
+    },
+}
+
+/// Executes a request and bounded response read using two independent timeout windows.
+/// The caller inspects headers/status before body reading and owns all policy and diagnostics.
+pub async fn request_bounded<E, P, M>(
+    request: impl Future<Output = Result<Response<Incoming>, E>>,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+    inspect_response: impl FnOnce(&Response<Incoming>) -> Result<M, P>,
+) -> Result<(M, Vec<u8>), BoundedRequestError<E, P>> {
+    let response = tokio::time::timeout(timeout, request)
+        .await
+        .map_err(|_| BoundedRequestError::RequestTimeout)?
+        .map_err(BoundedRequestError::Request)?;
+    let status = response.status().as_u16();
+    let metadata = inspect_response(&response).map_err(BoundedRequestError::Policy)?;
+    let bytes = tokio::time::timeout(timeout, async {
+        let mut out = Vec::new();
+        consume_bounded_body(response.into_body(), max_bytes, |chunk| {
+            out.extend_from_slice(chunk)
+        })
+        .await
+        .map_err(|error| BoundedRequestError::Body { status, error })?;
+        Ok(out)
+    })
+    .await
+    .map_err(|_| BoundedRequestError::BodyTimeout { status })??;
+    Ok((metadata, bytes))
+}
+
 /// Reads an HTTP body up to `max_bytes`, failing closed with `PayloadTooLarge` if exceeded.
 pub async fn read_body_bytes(body: Incoming, max_bytes: usize) -> Result<Bytes, NodeError> {
     let mut buf = BytesMut::new();

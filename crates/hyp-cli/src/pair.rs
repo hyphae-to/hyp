@@ -40,8 +40,8 @@ use hyp_crypto::pairing::{
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
 use hyp_node::engine::http_util::{
-    BoundedBodyError, HttpClient, consume_bounded_body, empty_body, full_body, percent_encode,
-    resolve_ssh_binary,
+    BoundedBodyError, BoundedRequestError, HttpClient, empty_body, full_body, percent_encode,
+    request_bounded, resolve_ssh_binary,
 };
 use hyp_node::engine::pairing_client::{
     AdminPairReplyError, AdminPairRequestError, build_admin_pair_request,
@@ -2635,52 +2635,40 @@ fn post_json_handshake(
                 message: format!("Failed to build pairing HTTP request: {e}"),
             })?;
 
-        let outcome = async {
-            let resp = tokio::time::timeout(
-                Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS),
-                client.request_for_endpoint(base_endpoint, req),
-            )
-            .await
-            .map_err(|_| {
-                LiveHandshakeError::Unreachable(format!(
-                    "POST {display_url} timed out after {PAIR_HTTP_TIMEOUT_SECS}s"
-                ))
-            })?
-            .map_err(|e| {
-                LiveHandshakeError::Unreachable(format!("POST {display_url} failed: {e}"))
-            })?;
-
-            let status = resp.status().as_u16();
-            let bytes = tokio::time::timeout(Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS), async {
-                let body = resp.into_body();
-                let mut out = Vec::new();
-                consume_bounded_body(body, MAX_MANIFEST_RESPONSE_BYTES, |chunk| {
-                    out.extend_from_slice(chunk)
-                })
-                .await
-                .map_err(|error| match error {
-                    BoundedBodyError::Read(e) => LiveHandshakeError::Unreachable(format!(
-                        "Pairing response body read error: {e}"
-                    )),
-                    BoundedBodyError::TooLarge => LiveHandshakeError::Rejected {
-                        code: "PAIR_HANDSHAKE_INVALID",
-                        message: format!(
-                            "Pairing response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
-                        ),
-                    },
-                })?;
-                Ok::<Vec<u8>, LiveHandshakeError>(out)
-            })
-            .await
-            .map_err(|_| {
-                LiveHandshakeError::Unreachable(
-                    "Timed out reading pairing response body".to_string(),
-                )
-            })??;
-
-            Ok::<(u16, Vec<u8>), LiveHandshakeError>((status, bytes))
-        }
-        .await;
+        let outcome = request_bounded(
+            client.request_for_endpoint(base_endpoint, req),
+            Duration::from_secs(PAIR_HTTP_TIMEOUT_SECS),
+            MAX_MANIFEST_RESPONSE_BYTES,
+            |response| Ok::<_, LiveHandshakeError>(response.status().as_u16()),
+        )
+        .await
+        .map_err(|error| match error {
+            BoundedRequestError::RequestTimeout => LiveHandshakeError::Unreachable(format!(
+                "POST {display_url} timed out after {PAIR_HTTP_TIMEOUT_SECS}s"
+            )),
+            BoundedRequestError::Request(error) => {
+                LiveHandshakeError::Unreachable(format!("POST {display_url} failed: {error}"))
+            }
+            BoundedRequestError::Policy(error) => error,
+            BoundedRequestError::BodyTimeout { .. } => LiveHandshakeError::Unreachable(
+                "Timed out reading pairing response body".to_string(),
+            ),
+            BoundedRequestError::Body {
+                error: BoundedBodyError::Read(error),
+                ..
+            } => LiveHandshakeError::Unreachable(format!(
+                "Pairing response body read error: {error}"
+            )),
+            BoundedRequestError::Body {
+                error: BoundedBodyError::TooLarge,
+                ..
+            } => LiveHandshakeError::Rejected {
+                code: "PAIR_HANDSHAKE_INVALID",
+                message: format!(
+                    "Pairing response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
+                ),
+            },
+        });
 
         client.shutdown_ssh();
         outcome
@@ -4833,8 +4821,12 @@ fn fetch_and_verify_manifest(
         })?;
 
     let (body_bytes, etag) = rt.block_on(async {
-        let client = HttpClient::new()
-            .map_err(|e| ("HTTP_ERROR", format!("Failed to initialize HTTP client: {e}")))?;
+        let client = HttpClient::new().map_err(|e| {
+            (
+                "HTTP_ERROR",
+                format!("Failed to initialize HTTP client: {e}"),
+            )
+        })?;
 
         let req = Request::builder()
             .method(Method::GET)
@@ -4847,69 +4839,57 @@ fn fetch_and_verify_manifest(
             .body(empty_body())
             .map_err(|e| ("HTTP_ERROR", format!("Failed to build request: {e}")))?;
 
-        let outcome = async {
-            let resp = tokio::time::timeout(
-                Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
-                client.request_for_endpoint(base_url, req),
-            )
-            .await
-            .map_err(|_| {
-                (
-                    "MANIFEST_FETCH_FAILED",
-                    format!(
-                        "GET {manifest_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"
-                    ),
-                )
-            })?
-            .map_err(|e| (
+        let outcome = request_bounded(
+            client.request_for_endpoint(base_url, req),
+            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+            MAX_MANIFEST_RESPONSE_BYTES,
+            |response| {
+                let status = response.status().as_u16();
+                if status != 200 {
+                    return Err((
+                        "MANIFEST_FETCH_FAILED",
+                        format!("GET {manifest_url} returned HTTP {status} (expected 200)"),
+                    ));
+                }
+                let etag = response
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned);
+                Ok::<_, (&'static str, String)>(etag)
+            },
+        )
+        .await
+        .map(|(etag, bytes)| (bytes, etag))
+        .map_err(|error| match error {
+            BoundedRequestError::RequestTimeout => (
                 "MANIFEST_FETCH_FAILED",
-                format!("GET {manifest_url} failed: {e}"),
-            ))?;
-
-            let status = resp.status().as_u16();
-            if status != 200 {
-                return Err((
-                    "MANIFEST_FETCH_FAILED",
-                    format!("GET {manifest_url} returned HTTP {status} (expected 200)"),
-                ));
-            }
-            let etag = resp
-                .headers()
-                .get(header::ETAG)
-                .and_then(|v| v.to_str().ok())
-                .map(ToOwned::to_owned);
-
-            let bytes = tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
-                let body = resp.into_body();
-                let mut out = Vec::new();
-                consume_bounded_body(
-                    body,
-                    MAX_MANIFEST_RESPONSE_BYTES,
-                    |chunk| out.extend_from_slice(chunk),
-                )
-                .await
-                .map_err(|error| match error {
-                    BoundedBodyError::Read(e) => ("MANIFEST_FETCH_FAILED", format!("Manifest body read error: {e}")),
-                    BoundedBodyError::TooLarge => (
-                        "INVALID_MANIFEST",
-                        format!(
-                            "Manifest response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"
-                        ),
-                    ),
-                })?;
-                Ok::<Vec<u8>, (&'static str, String)>(out)
-            })
-            .await
-            .map_err(|_| {
-                (
-                    "MANIFEST_FETCH_FAILED",
-                    "Timed out reading /v1/manifest response body".to_string(),
-                )
-            })??;
-
-            Ok::<(Vec<u8>, Option<String>), (&'static str, String)>((bytes, etag))
-        }
-        .await;
+                format!("GET {manifest_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+            ),
+            BoundedRequestError::Request(error) => (
+                "MANIFEST_FETCH_FAILED",
+                format!("GET {manifest_url} failed: {error}"),
+            ),
+            BoundedRequestError::Policy(error) => error,
+            BoundedRequestError::BodyTimeout { .. } => (
+                "MANIFEST_FETCH_FAILED",
+                "Timed out reading /v1/manifest response body".to_string(),
+            ),
+            BoundedRequestError::Body {
+                error: BoundedBodyError::Read(error),
+                ..
+            } => (
+                "MANIFEST_FETCH_FAILED",
+                format!("Manifest body read error: {error}"),
+            ),
+            BoundedRequestError::Body {
+                error: BoundedBodyError::TooLarge,
+                ..
+            } => (
+                "INVALID_MANIFEST",
+                format!("Manifest response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte safety cap"),
+            ),
+        });
 
         client.shutdown_ssh();
         outcome
@@ -5074,54 +5054,42 @@ fn attempt_guest_self_enroll(
                 )
             })?;
 
-        let outcome = async {
-            let resp = tokio::time::timeout(
-                Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
-                client.request_for_endpoint(base_url, req),
-            )
-            .await
-            .map_err(|_| {
-                (
-                    "GUEST_PAIR_FAILED",
-                    format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
-                )
-            })?
-            .map_err(|e| ("GUEST_PAIR_FAILED", format!("POST {pair_url} failed: {e}")))?;
-
-            let status = resp.status().as_u16();
-            let bytes =
-                tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
-                    let body = resp.into_body();
-                    let mut out = Vec::new();
-                    consume_bounded_body(body, MAX_MANIFEST_RESPONSE_BYTES, |chunk| {
-                        out.extend_from_slice(chunk)
-                    })
-                    .await
-                    .map_err(|error| match error {
-                        BoundedBodyError::Read(e) => (
-                            "GUEST_PAIR_FAILED",
-                            format!("Guest pair body read error: {e}"),
-                        ),
-                        BoundedBodyError::TooLarge => (
-                            "GUEST_PAIR_INVALID",
-                            format!(
-                                "Guest pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"
-                            ),
-                        ),
-                    })?;
-                    Ok::<Vec<u8>, (&'static str, String)>(out)
-                })
-                .await
-                .map_err(|_| {
-                    (
-                        "GUEST_PAIR_FAILED",
-                        "Timed out reading /v1/guest/pair response body".to_string(),
-                    )
-                })??;
-
-            Ok::<(u16, Vec<u8>), (&'static str, String)>((status, bytes))
-        }
-        .await;
+        let outcome = request_bounded(
+            client.request_for_endpoint(base_url, req),
+            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+            MAX_MANIFEST_RESPONSE_BYTES,
+            |response| Ok::<_, (&'static str, String)>(response.status().as_u16()),
+        )
+        .await
+        .map_err(|error| match error {
+            BoundedRequestError::RequestTimeout => (
+                "GUEST_PAIR_FAILED",
+                format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+            ),
+            BoundedRequestError::Request(error) => (
+                "GUEST_PAIR_FAILED",
+                format!("POST {pair_url} failed: {error}"),
+            ),
+            BoundedRequestError::Policy(error) => error,
+            BoundedRequestError::BodyTimeout { .. } => (
+                "GUEST_PAIR_FAILED",
+                "Timed out reading /v1/guest/pair response body".to_string(),
+            ),
+            BoundedRequestError::Body {
+                error: BoundedBodyError::Read(error),
+                ..
+            } => (
+                "GUEST_PAIR_FAILED",
+                format!("Guest pair body read error: {error}"),
+            ),
+            BoundedRequestError::Body {
+                error: BoundedBodyError::TooLarge,
+                ..
+            } => (
+                "GUEST_PAIR_INVALID",
+                format!("Guest pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"),
+            ),
+        });
 
         client.shutdown_ssh();
         outcome
@@ -5314,66 +5282,47 @@ pub(crate) fn attempt_delegated_pair_enroll(
                 )
             })?;
 
-        let outcome = async {
-            let resp = tokio::time::timeout(
-                Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
-                client.request_for_endpoint(base_url, req),
-            )
-            .await
-            .map_err(|_| {
-                (
-                    0u16,
-                    "DELEGATED_PAIR_FAILED",
-                    format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
-                )
-            })?
-            .map_err(|e| {
-                (
-                    0u16,
-                    "DELEGATED_PAIR_FAILED",
-                    format!("POST {pair_url} failed: {e}"),
-                )
-            })?;
-
-            let status = resp.status().as_u16();
-            let bytes =
-                tokio::time::timeout(Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS), async {
-                    let body = resp.into_body();
-                    let mut out = Vec::new();
-                    consume_bounded_body(
-                    body,
-                    MAX_MANIFEST_RESPONSE_BYTES,
-                    |chunk| out.extend_from_slice(chunk),
-                )
-                .await
-                .map_err(|error| match error {
-                    BoundedBodyError::Read(e) => (
-                        status,
-                        "DELEGATED_PAIR_FAILED",
-                        format!("Delegated pair body read error: {e}"),
-                    ),
-                    BoundedBodyError::TooLarge => (
-                        status,
-                        "DELEGATED_PAIR_INVALID",
-                        format!(
-                            "Delegated pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"
-                        ),
-                    ),
-                })?;
-                    Ok::<Vec<u8>, (u16, &'static str, String)>(out)
-                })
-                .await
-                .map_err(|_| {
-                    (
-                        status,
-                        "DELEGATED_PAIR_FAILED",
-                        "Timed out reading /v1/pair/delegated response body".to_string(),
-                    )
-                })??;
-
-            Ok::<(u16, Vec<u8>), (u16, &'static str, String)>((status, bytes))
-        }
-        .await;
+        let outcome = request_bounded(
+            client.request_for_endpoint(base_url, req),
+            Duration::from_secs(MANIFEST_FETCH_TIMEOUT_SECS),
+            MAX_MANIFEST_RESPONSE_BYTES,
+            |response| Ok::<_, (u16, &'static str, String)>(response.status().as_u16()),
+        )
+        .await
+        .map_err(|error| match error {
+            BoundedRequestError::RequestTimeout => (
+                0u16,
+                "DELEGATED_PAIR_FAILED",
+                format!("POST {pair_url} timed out after {MANIFEST_FETCH_TIMEOUT_SECS}s"),
+            ),
+            BoundedRequestError::Request(error) => (
+                0u16,
+                "DELEGATED_PAIR_FAILED",
+                format!("POST {pair_url} failed: {error}"),
+            ),
+            BoundedRequestError::Policy(error) => error,
+            BoundedRequestError::BodyTimeout { status } => (
+                status,
+                "DELEGATED_PAIR_FAILED",
+                "Timed out reading /v1/pair/delegated response body".to_string(),
+            ),
+            BoundedRequestError::Body {
+                status,
+                error: BoundedBodyError::Read(error),
+            } => (
+                status,
+                "DELEGATED_PAIR_FAILED",
+                format!("Delegated pair body read error: {error}"),
+            ),
+            BoundedRequestError::Body {
+                status,
+                error: BoundedBodyError::TooLarge,
+            } => (
+                status,
+                "DELEGATED_PAIR_INVALID",
+                format!("Delegated pair response exceeds {MAX_MANIFEST_RESPONSE_BYTES} byte cap"),
+            ),
+        });
 
         client.shutdown_ssh();
         outcome
