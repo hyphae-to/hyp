@@ -5,8 +5,8 @@
 //! where they could leak to `ps` — always read from stdin or `--token-file`.
 
 use crate::config_file::{
-    ensure_dir, load_node_or_legacy_config, resolve_config_path_for_read,
-    resolve_effective_node_id, resolve_state_dir,
+    SocketEnvPolicy, ensure_dir, load_node_or_legacy_config, resolve_config_path_for_read,
+    resolve_daemon_socket_path, resolve_effective_node_id, resolve_state_dir,
 };
 use crate::ui::{
     CliError, CommandResult, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, print_json,
@@ -3074,18 +3074,6 @@ pub(crate) struct DaemonReloadOutcome {
     pub(crate) warnings: Vec<String>,
 }
 
-fn resolve_pair_daemon_socket(state_dir: &Path, explicit_state: bool) -> PathBuf {
-    if !explicit_state {
-        if let Some(raw) = std::env::var_os("HYPHAE_SOCKET")
-            .or_else(|| std::env::var_os("AGENTS_MESH_SOCKET"))
-            .filter(|v| !v.is_empty())
-        {
-            return PathBuf::from(raw);
-        }
-    }
-    state_dir.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME)
-}
-
 /// Best-effort bounded synchronous `peers.reload` ping to a running local daemon over
 /// `connector.sock` / Windows loopback `connector.addr`.
 ///
@@ -3095,7 +3083,8 @@ pub(crate) fn try_reload_live_daemon(
     state_dir: &Path,
     explicit_state: bool,
 ) -> DaemonReloadOutcome {
-    let socket_path = resolve_pair_daemon_socket(state_dir, explicit_state);
+    let socket_path =
+        resolve_daemon_socket_path(state_dir, !explicit_state, SocketEnvPolicy::PreserveOsValue);
     try_reload_live_daemon_at_socket(&socket_path)
 }
 
@@ -7404,8 +7393,13 @@ fn run_revoke(
         }
     }
 
-    let socket_path =
-        socket_arg.unwrap_or_else(|| resolve_pair_daemon_socket(&state_dir, explicit_state));
+    let socket_path = socket_arg.unwrap_or_else(|| {
+        resolve_daemon_socket_path(
+            &state_dir,
+            !explicit_state,
+            SocketEnvPolicy::PreserveOsValue,
+        )
+    });
     let reload = try_reload_live_daemon_at_socket(&socket_path);
     warnings.extend(reload.warnings);
     let daemon_reloaded = reload.reloaded;

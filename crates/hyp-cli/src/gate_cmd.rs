@@ -13,16 +13,16 @@ use crate::approval::{
     run_passkey_approval_ceremony, select_passkey_admin,
 };
 use crate::config_file::{
-    ensure_dir, ensure_v2_node_json_defaults, load_node_or_legacy_config, open_secret_store,
-    resolve_config_path_for_read, resolve_config_path_for_write, resolve_effective_node_id,
-    resolve_state_dir, write_atomic_json,
+    SocketEnvPolicy, ensure_dir, ensure_v2_node_json_defaults, load_node_or_legacy_config,
+    open_secret_store, resolve_config_path_for_read, resolve_config_path_for_write,
+    resolve_daemon_socket_path, resolve_effective_node_id, resolve_state_dir, write_atomic_json,
 };
 use crate::ui::{CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::human::HumanApprovalActionKind;
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
 use hyp_crypto::rfc3339::format_rfc3339_millis;
-use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, DaemonRpcResult, daemon_rpc_sync};
+use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_sync};
 use hyp_node::engine::NodeProfile;
 use hyp_node::gates::plugins::validate_filter_plugin_endpoint_url;
 use hyp_node::gates::policy::{
@@ -1281,31 +1281,16 @@ fn lookup_quarantined_trust_tier(db: &NodeDb, receipt: &str, session_id: &str) -
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn resolve_daemon_socket_for_cli(
-    explicit_state_dir: bool,
-    explicit_config: bool,
-    resolved_state_dir: &std::path::Path,
-) -> PathBuf {
-    if !explicit_state_dir && !explicit_config {
-        for key in ["HYPHAE_SOCKET", "AGENTS_MESH_SOCKET"] {
-            if let Ok(sock) = std::env::var(key) {
-                let trimmed = sock.trim();
-                if !trimmed.is_empty() {
-                    return PathBuf::from(trimmed);
-                }
-            }
-        }
-    }
-    resolved_state_dir.join(DEFAULT_SOCKET_FILENAME)
-}
-
 fn try_live_gate_reload(
     explicit_state_dir: bool,
     explicit_config: bool,
     resolved_state_dir: &std::path::Path,
 ) -> DaemonRpcResult {
-    let sock =
-        resolve_daemon_socket_for_cli(explicit_state_dir, explicit_config, resolved_state_dir);
+    let sock = resolve_daemon_socket_path(
+        resolved_state_dir,
+        !explicit_state_dir && !explicit_config,
+        SocketEnvPolicy::TrimmedUtf8,
+    );
     daemon_rpc_sync(
         &sock,
         &json!({ "type": "gate.reload" }),
@@ -1319,7 +1304,11 @@ fn try_live_inbox_wake(
     session_id: &str,
     receipt: &str,
 ) -> DaemonRpcResult {
-    let sock = resolve_daemon_socket_for_cli(explicit_state_dir, false, resolved_state_dir);
+    let sock = resolve_daemon_socket_path(
+        resolved_state_dir,
+        !explicit_state_dir,
+        SocketEnvPolicy::TrimmedUtf8,
+    );
     daemon_rpc_sync(
         &sock,
         &json!({

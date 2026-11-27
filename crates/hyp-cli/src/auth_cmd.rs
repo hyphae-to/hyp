@@ -16,9 +16,9 @@ use crate::approval::{
     persist_passkey_gate_seal, run_passkey_approval_ceremony,
 };
 use crate::config_file::{
-    ct_eq, default_node_id, ensure_dir, load_node_or_legacy_config, open_secret_store,
-    resolve_config_path_for_read, resolve_config_path_for_write, resolve_effective_node_id,
-    resolve_state_dir,
+    SocketEnvPolicy, ct_eq, default_node_id, ensure_dir, load_node_or_legacy_config,
+    open_secret_store, resolve_config_path_for_read, resolve_config_path_for_write,
+    resolve_daemon_socket_path, resolve_effective_node_id, resolve_state_dir,
 };
 use crate::gate_cmd::{
     ConfirmError, require_controlling_tty_confirmation, require_interactive_tty_confirmation,
@@ -45,7 +45,7 @@ use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519PublicKey
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
-use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
+use hyp_harness::sock::daemon_rpc_sync;
 use hyp_node::engine::{
     LocalIngestConfig, NodeConfig, NodeProfile, UnifiedNode, canonical_local_event_for_signing,
     resolve_drop_portal_url, send_local_ingest_event,
@@ -834,24 +834,6 @@ fn approve_authority_change(
     }
 }
 
-fn resolve_daemon_socket_for_auth(
-    explicit_state_dir: bool,
-    explicit_config: bool,
-    resolved_state_dir: &Path,
-) -> PathBuf {
-    if !explicit_state_dir && !explicit_config {
-        for key in ["HYPHAE_SOCKET", "AGENTS_MESH_SOCKET"] {
-            if let Ok(sock) = std::env::var(key) {
-                let trimmed = sock.trim();
-                if !trimmed.is_empty() {
-                    return PathBuf::from(trimmed);
-                }
-            }
-        }
-    }
-    resolved_state_dir.join(DEFAULT_SOCKET_FILENAME)
-}
-
 /// Attempts a live `gate.reload` IPC RPC against a running daemon after re-signing a locked gate
 /// policy. Returns `(gate_reloaded, error_detail)` and appends actionable warnings + restart hint
 /// whenever live reload did not confirm success.
@@ -862,7 +844,11 @@ fn reload_live_gate_after_resign(
     warnings: &mut Vec<String>,
     next: &mut Vec<String>,
 ) -> (bool, Option<String>) {
-    let sock = resolve_daemon_socket_for_auth(explicit_state_dir, explicit_config, state_dir);
+    let sock = resolve_daemon_socket_path(
+        state_dir,
+        !explicit_state_dir && !explicit_config,
+        SocketEnvPolicy::TrimmedUtf8,
+    );
     let resp = daemon_rpc_sync(
         &sock,
         &json!({ "type": "gate.reload" }),

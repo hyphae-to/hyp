@@ -285,6 +285,56 @@ pub const fn profile_as_str(p: NodeProfile) -> &'static str {
     }
 }
 
+/// Existing CLI families differ in whether socket overrides are trimmed UTF-8 or exact OS paths.
+#[derive(Clone, Copy)]
+pub(crate) enum SocketEnvPolicy {
+    TrimmedUtf8,
+    PreserveOsValue,
+}
+
+pub(crate) fn resolve_daemon_socket_path(
+    state_dir: &Path,
+    allow_ambient: bool,
+    policy: SocketEnvPolicy,
+) -> PathBuf {
+    resolve_daemon_socket_path_with(state_dir, allow_ambient, policy, |key| {
+        std::env::var_os(key)
+    })
+}
+
+fn resolve_daemon_socket_path_with(
+    state_dir: &Path,
+    allow_ambient: bool,
+    policy: SocketEnvPolicy,
+    mut read: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    if allow_ambient {
+        match policy {
+            SocketEnvPolicy::TrimmedUtf8 => {
+                for key in ["HYPHAE_SOCKET", "AGENTS_MESH_SOCKET"] {
+                    if let Some(raw) = read(key) {
+                        if let Some(value) = raw.to_str() {
+                            if !value.trim().is_empty() {
+                                return PathBuf::from(value.trim());
+                            }
+                        }
+                    }
+                }
+            }
+            SocketEnvPolicy::PreserveOsValue => {
+                // Presence of the primary variable wins even when it is empty, as in pairing.
+                if let Some(raw) = read("HYPHAE_SOCKET")
+                    .or_else(|| read("AGENTS_MESH_SOCKET"))
+                    .filter(|value| !value.is_empty())
+                {
+                    return PathBuf::from(raw);
+                }
+            }
+        }
+    }
+    state_dir.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME)
+}
+
 pub use hyp_crypto::constant_time_eq as ct_eq;
 
 pub use hyp_node::engine::http_util::build_http_client;
@@ -292,6 +342,94 @@ pub use hyp_node::engine::http_util::build_http_client;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_socket_overrides_keep_family_policy_and_explicit_state_isolation() {
+        use std::ffi::OsString;
+        let state = Path::new("isolated-state");
+        let resolve = |primary: &str, policy| {
+            resolve_daemon_socket_path_with(state, true, policy, |key| {
+                Some(OsString::from(if key == "HYPHAE_SOCKET" {
+                    primary
+                } else {
+                    "secondary.sock"
+                }))
+            })
+        };
+        assert_eq!(
+            resolve(" primary.sock ", SocketEnvPolicy::TrimmedUtf8),
+            PathBuf::from("primary.sock")
+        );
+        assert_eq!(
+            resolve(" primary.sock ", SocketEnvPolicy::PreserveOsValue),
+            PathBuf::from(" primary.sock ")
+        );
+        assert_eq!(
+            resolve("", SocketEnvPolicy::TrimmedUtf8),
+            PathBuf::from("secondary.sock")
+        );
+        assert_eq!(
+            resolve("", SocketEnvPolicy::PreserveOsValue),
+            state.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME)
+        );
+        for policy in [
+            SocketEnvPolicy::TrimmedUtf8,
+            SocketEnvPolicy::PreserveOsValue,
+        ] {
+            assert_eq!(
+                resolve_daemon_socket_path_with(state, false, policy, |_| panic!(
+                    "explicit state must ignore ambient sockets"
+                )),
+                state.join(hyp_harness::sock::DEFAULT_SOCKET_FILENAME)
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = OsString::from_vec(vec![0xff]);
+            for (policy, expected) in [
+                (
+                    SocketEnvPolicy::TrimmedUtf8,
+                    PathBuf::from("secondary.sock"),
+                ),
+                (SocketEnvPolicy::PreserveOsValue, PathBuf::from(&raw)),
+            ] {
+                assert_eq!(
+                    resolve_daemon_socket_path_with(state, true, policy, |key| Some(
+                        if key == "HYPHAE_SOCKET" {
+                            raw.clone()
+                        } else {
+                            OsString::from("secondary.sock")
+                        }
+                    )),
+                    expected
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let raw = OsString::from_wide(&[0xd800]);
+            for (policy, expected) in [
+                (
+                    SocketEnvPolicy::TrimmedUtf8,
+                    PathBuf::from("secondary.sock"),
+                ),
+                (SocketEnvPolicy::PreserveOsValue, PathBuf::from(&raw)),
+            ] {
+                assert_eq!(
+                    resolve_daemon_socket_path_with(state, true, policy, |key| Some(
+                        if key == "HYPHAE_SOCKET" {
+                            raw.clone()
+                        } else {
+                            OsString::from("secondary.sock")
+                        }
+                    )),
+                    expected
+                );
+            }
+        }
+    }
 
     #[test]
     fn node_file_compatibility_preserves_precedence_defaults_and_extensions() {
