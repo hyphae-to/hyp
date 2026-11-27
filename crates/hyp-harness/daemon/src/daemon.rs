@@ -3960,7 +3960,7 @@ impl LocalDaemonInner {
             let guard = self.sub_meta.lock_state("sub_meta lock poisoned");
             guard.get(session_id).and_then(|list| {
                 list.iter()
-                    .find(|meta| meta.key.as_deref() == Some(key) || meta.id == key)
+                    .find(|meta| meta.key.as_deref() == Some(key))
                     .map(|meta| meta.id.clone())
             })
         };
@@ -4002,12 +4002,8 @@ impl LocalDaemonInner {
         session_id: &str,
         args: &Map<String, Value>,
     ) -> Result<Value, (String, String)> {
-        let key_arg = args.get("key").and_then(Value::as_str);
-        let id_arg = if args.contains_key("id") {
-            args.get("id").and_then(Value::as_str)
-        } else {
-            key_arg.filter(|key| !key.contains(':'))
-        };
+        let key_arg = args.get("key").and_then(Value::as_str).map(str::trim);
+        let id_arg = args.get("id").and_then(Value::as_str);
         let sub_id = if let Some(id) = id_arg {
             id.to_string()
         } else if let Some(key) = key_arg {
