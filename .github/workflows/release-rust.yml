@@ -435,6 +435,31 @@ jobs:
           console.log("Verified dist/release-manifest.json signature against pinned DEFAULT_RELEASE_PUBKEY_B64.");
           EOF
 
+      - name: Set up Node.js for the upgrade rehearsal
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Download last stable release for upgrade rehearsal
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          previous_dir="$RUNNER_TEMP/hyp-previous-release"
+          previous_tag="$(gh release view --json tagName --jq .tagName)"
+          gh release download "$previous_tag" --dir "$previous_dir" \
+            --pattern "hyp-${previous_tag}-x86_64-unknown-linux-gnu.tar.gz" \
+            --pattern SHA256SUMS.txt
+          echo "PREVIOUS_RELEASE_TAG=$previous_tag" >> "$GITHUB_ENV"
+          echo "PREVIOUS_RELEASE_DIR=$previous_dir" >> "$GITHUB_ENV"
+
+      - name: Rehearse upgrade of a configured and paired installation
+        env:
+          CANDIDATE_TAG: ${{ needs.prepare.outputs.tag }}
+          CANDIDATE_DIR: dist
+        run: node --test itest/suites/release-candidate-upgrade.test.ts
+
       - name: Upload dry-run release bundle (workflow_dispatch)
         if: needs.prepare.outputs.dry_run == 'true'
         uses: actions/upload-artifact@v4
