@@ -27,8 +27,8 @@ use http_body_util::BodyExt;
 use hyp_crypto::OkpJwk as CryptoOkpJwk;
 use hyp_crypto::human::{
     EncryptedHumanDraftV1, HumanDraftPayloadV1, HumanDropEnvelopeV1, MAX_HUMAN_DRAFT_CONTEXT_CHARS,
-    NodeCertPayloadV1, SignedNodeCertV1, decode_hdrop1, encode_hcert1, is_reserved_secret_name,
-    seal_human_draft, validate_draft_text,
+    NodeCertPayloadV1, SignedNodeCertV1, decode_hdrop1, encode_hcert1,
+    is_reserved_drop_secret_name, seal_human_draft, validate_draft_text,
 };
 use hyp_crypto::jcs::to_canonical_json;
 use hyp_crypto::keystore::validate_secret_name;
@@ -9763,16 +9763,6 @@ fn store_err_tuple(err: hyp_store::StoreError) -> (String, String) {
 
 fn delivery_err_tuple(err: hyp_node::delivery::DeliveryError) -> (String, String) {
     ("delivery_error".into(), err.to_string())
-}
-
-fn is_reserved_drop_secret_name(name: &str) -> bool {
-    if is_reserved_secret_name(name) {
-        return true;
-    }
-    let lower = name.trim().to_ascii_lowercase();
-    lower.starts_with("node-ed25519-")
-        || lower.starts_with("node-x25519-")
-        || lower.starts_with("peer-auth-")
 }
 
 /// Validates a Drop Relay base URL matching `site/drop/drop.js` `isAllowedRelayUrl`:

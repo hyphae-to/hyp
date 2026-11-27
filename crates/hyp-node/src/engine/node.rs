@@ -42,7 +42,7 @@ use hyp_crypto::e2ee::{
 use hyp_crypto::human::{
     DelegatedPairProofV1, HumanDropEnvelopeV1, HumanDropKind, HumanRevocationPayloadV1,
     NodeCertPayloadV1, SignedHumanRevocationV1, SignedNodeCertV1, decode_hcert1, decode_hdrop1,
-    decode_hjoin1, encode_hcert1, is_reserved_secret_name, node_cert_sha256, open_human_drop,
+    decode_hjoin1, encode_hcert1, is_reserved_drop_secret_name, node_cert_sha256, open_human_drop,
     sign_delegated_pair_proof, sign_node_cert, verify_delegated_pair_proof, verify_human_invite,
     verify_human_invite_claim, verify_human_revocation, verify_node_cert,
 };
@@ -8941,7 +8941,7 @@ impl UnifiedNode {
                     );
                     return Err(NodeError::BadRequest(reason.into()));
                 }
-                if is_reserved_human_drop_secret_name(secret_name) {
+                if is_reserved_drop_secret_name(secret_name) {
                     let reason = format!(
                         "reserved system secret name '{secret_name}' cannot be written via human drop"
                     );
@@ -9430,16 +9430,6 @@ impl UnifiedNode {
         }
         Ok(LOCAL_NODE_ID.to_string())
     }
-}
-
-fn is_reserved_human_drop_secret_name(name: &str) -> bool {
-    if is_reserved_secret_name(name) {
-        return true;
-    }
-    let lower = name.trim().to_ascii_lowercase();
-    lower.starts_with("node-ed25519-")
-        || lower.starts_with("node-x25519-")
-        || lower.starts_with("peer-auth-")
 }
 
 // ============================================================================
