@@ -632,6 +632,19 @@ struct FocusChange {
     rev: u64,
 }
 
+#[derive(Clone, Copy)]
+struct HoldRetry {
+    attempt: u32,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct GateHoldRetry {
+    attempt: u32,
+    generation: u64,
+    fire_at_ms: i64,
+}
+
 #[derive(Default)]
 struct SessionRuntime {
     /// Sliding lease populated by actual hook activity.
@@ -642,6 +655,10 @@ struct SessionRuntime {
     last_midturn_digest_at_ms: Option<i64>,
     /// Cooldown after trying to attach a transport persisted from an earlier session.
     lazy_hydrate_attempt_at: Option<Instant>,
+    transport_retry: Option<HoldRetry>,
+    gate_retry: Option<GateHoldRetry>,
+    /// Serializes inbox reconciliation across async gate evaluations.
+    reconcile_lock: Option<Arc<AsyncMutex<()>>>,
 }
 
 impl SessionRuntime {
@@ -650,6 +667,9 @@ impl SessionRuntime {
             && self.activity_grace.is_none()
             && self.last_midturn_digest_at_ms.is_none()
             && self.lazy_hydrate_attempt_at.is_none()
+            && self.transport_retry.is_none()
+            && self.gate_retry.is_none()
+            && self.reconcile_lock.is_none()
     }
 }
 
@@ -712,17 +732,8 @@ struct LocalDaemonInner {
     wake_followup_gen: AtomicU64,
     /// Configured targets per bridge plugin (advertised even before any session links).
     configured_bridge_targets: Mutex<BTreeMap<String, Vec<String>>>,
-    /// Tier 3 bounded `Hold` retry state (`session_id -> (attempt, generation)`).
-    /// Empty when idle — zero background polling.
-    hold_retries: Mutex<HashMap<String, (u32, u64)>>,
-    /// Ephemeral turn activity, grace timers and digest reminders, keyed by session ID.
+    /// Turn and delivery state keyed by session ID.
     session_runtime: Mutex<HashMap<String, SessionRuntime>>,
-    /// Per-session async mutexes serializing `reconcile_session_inbox` so concurrent callers
-    /// NEVER double-classify items or race past Stage 2 awaits (G3).
-    reconcile_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
-    /// Bounded delayed retry state for Security Gate `Hold` verdicts (`session_id -> (attempt, generation, fire_at_ms)`).
-    /// Separate from Tier 3 transport `hold_retries` so delivering an earlier item never cancels a gate retry (G4).
-    gate_hold_retries: Mutex<HashMap<String, (u32, u64, i64)>>,
     /// Tier 4 per-wakeup concurrency guard (`maxConcurrentSpawns: 1`) for allowlisted Herdr cold spawns.
     active_cold_spawns: Mutex<HashSet<String>>,
     /// Optional monotonic test clock offset (ms) added to `now_ms()` for deterministic timing tests.
@@ -1308,16 +1319,11 @@ impl LocalDaemon {
 
     fn stop_sync(&self) {
         let _ = self.shutdown_tx.send(true);
-        self.inner
-            .hold_retries
-            .lock()
-            .expect("hold_retries lock poisoned")
-            .clear();
-        self.inner
-            .gate_hold_retries
-            .lock()
-            .expect("gate_hold_retries lock poisoned")
-            .clear();
+        self.inner.session_runtime().retain(|_, runtime| {
+            runtime.transport_retry = None;
+            runtime.gate_retry = None;
+            !runtime.is_empty()
+        });
         if let Some(h) = self
             .accept_task
             .lock()
@@ -1871,10 +1877,7 @@ impl LocalDaemonInner {
             wake_hooks: Mutex::new(Vec::new()),
             wake_followup_gen: AtomicU64::new(0),
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
-            hold_retries: Mutex::new(HashMap::new()),
             session_runtime: Mutex::new(HashMap::new()),
-            reconcile_locks: Mutex::new(HashMap::new()),
-            gate_hold_retries: Mutex::new(HashMap::new()),
             active_cold_spawns: Mutex::new(HashSet::new()),
             clock_offset_ms: AtomicI64::new(0),
             ui_rev: AtomicU64::new(1),
@@ -2015,10 +2018,7 @@ impl LocalDaemonInner {
     }
 
     fn cancel_hold_retry(&self, session_id: &str) {
-        self.hold_retries
-            .lock()
-            .expect("hold_retries lock poisoned")
-            .remove(session_id);
+        self.clear_runtime_field(session_id, |runtime| runtime.transport_retry = None);
     }
 
     fn session_runtime(&self) -> MutexGuard<'_, HashMap<String, SessionRuntime>> {
@@ -2215,22 +2215,17 @@ impl LocalDaemonInner {
     }
 
     fn reconcile_lock_for(&self, session_id: &str) -> Arc<AsyncMutex<()>> {
-        let mut locks = self
-            .reconcile_locks
-            .lock()
-            .expect("reconcile_locks lock poisoned");
+        let mut sessions = self.session_runtime();
+        let runtime = sessions.entry(session_id.to_owned()).or_default();
         Arc::clone(
-            locks
-                .entry(session_id.to_string())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            runtime
+                .reconcile_lock
+                .get_or_insert_with(|| Arc::new(AsyncMutex::new(()))),
         )
     }
 
     fn cancel_gate_hold_retry(&self, session_id: &str) {
-        self.gate_hold_retries
-            .lock()
-            .expect("gate_hold_retries lock poisoned")
-            .remove(session_id);
+        self.clear_runtime_field(session_id, |runtime| runtime.gate_retry = None);
     }
 
     /// Schedules a bounded delayed retry for Security Gate `Hold` verdicts (`rate_limited` /
@@ -2244,29 +2239,31 @@ impl LocalDaemonInner {
         let fire_at_ms = now.saturating_add(delay_ms as i64);
 
         let generation = {
-            let mut map = self
-                .gate_hold_retries
-                .lock()
-                .expect("gate_hold_retries lock poisoned");
-            if let Some(&(_, _, existing_fire_at)) = map.get(session_id) {
-                if existing_fire_at > now && existing_fire_at <= fire_at_ms {
+            let mut sessions = self.session_runtime();
+            let runtime = sessions.entry(session_id.to_owned()).or_default();
+            if let Some(retry) = runtime.gate_retry {
+                if retry.fire_at_ms > now && retry.fire_at_ms <= fire_at_ms {
                     // An earlier retry timer is already armed for this session; don't starve it.
                     return;
                 }
             }
-            let next_attempt = map
-                .get(session_id)
-                .map(|&(attempt, _, _)| attempt.saturating_add(1))
+            let next_attempt = runtime
+                .gate_retry
+                .map(|retry| retry.attempt.saturating_add(1))
                 .unwrap_or(1);
             if next_attempt > GATE_HOLD_RETRY_MAX_ATTEMPTS {
-                map.remove(session_id);
+                runtime.gate_retry = None;
+                if runtime.is_empty() {
+                    sessions.remove(session_id);
+                }
                 return;
             }
             let generation = self.next_seq();
-            map.insert(
-                session_id.to_string(),
-                (next_attempt, generation, fire_at_ms),
-            );
+            runtime.gate_retry = Some(GateHoldRetry {
+                attempt: next_attempt,
+                generation,
+                fire_at_ms,
+            });
             generation
         };
 
@@ -2284,15 +2281,14 @@ impl LocalDaemonInner {
                 return;
             }
             let still_current = {
-                let mut map = daemon
-                    .gate_hold_retries
-                    .lock()
-                    .expect("gate_hold_retries lock poisoned");
-                match map.get_mut(&sid) {
-                    Some(slot) if slot.1 == generation => {
-                        // Mark timer as fired so a subsequent Hold in reconcile can arm the next timer
-                        // while preserving the consecutive-attempt counter.
-                        slot.2 = 0;
+                let mut sessions = daemon.session_runtime();
+                match sessions
+                    .get_mut(&sid)
+                    .and_then(|runtime| runtime.gate_retry.as_mut())
+                {
+                    Some(retry) if retry.generation == generation => {
+                        // Mark timer as fired while preserving the consecutive-attempt counter.
+                        retry.fire_at_ms = 0;
                         true
                     }
                     _ => false,
@@ -2330,20 +2326,24 @@ impl LocalDaemonInner {
             return;
         }
         let (generation, delay_ms) = {
-            let mut map = self
-                .hold_retries
-                .lock()
-                .expect("hold_retries lock poisoned");
-            let next_attempt = map
-                .get(session_id)
-                .map(|(attempt, _)| attempt.saturating_add(1))
+            let mut sessions = self.session_runtime();
+            let runtime = sessions.entry(session_id.to_owned()).or_default();
+            let next_attempt = runtime
+                .transport_retry
+                .map(|retry| retry.attempt.saturating_add(1))
                 .unwrap_or(1);
             if next_attempt > max_attempts {
-                map.remove(session_id);
+                runtime.transport_retry = None;
+                if runtime.is_empty() {
+                    sessions.remove(session_id);
+                }
                 return;
             }
             let generation = self.next_seq();
-            map.insert(session_id.to_string(), (next_attempt, generation));
+            runtime.transport_retry = Some(HoldRetry {
+                attempt: next_attempt,
+                generation,
+            });
             let idx = ((next_attempt - 1) as usize)
                 .min(self.config.delivery_retry.hold_retry_backoff_ms.len() - 1);
             let delay = self.config.delivery_retry.hold_retry_backoff_ms[idx].max(1);
@@ -2363,13 +2363,11 @@ impl LocalDaemonInner {
             if *shutdown_rx.borrow() {
                 return;
             }
-            let still_current = {
-                let map = daemon
-                    .hold_retries
-                    .lock()
-                    .expect("hold_retries lock poisoned");
-                map.get(&sid).is_some_and(|&(_, g)| g == generation)
-            };
+            let still_current = daemon
+                .session_runtime()
+                .get(&sid)
+                .and_then(|runtime| runtime.transport_retry)
+                .is_some_and(|retry| retry.generation == generation);
             if !still_current {
                 return;
             }
@@ -2993,6 +2991,7 @@ impl LocalDaemonInner {
         //    `openclaw_missing_sessions`, and lazy hydrate cooldowns so nothing stays stuck.
         let now_inst = Instant::now();
         let mut interrupted_active = Vec::new();
+        let mut cleared_hold_retries = 0;
         self.session_runtime().retain(|session_id, runtime| {
             if runtime
                 .activity
@@ -3002,19 +3001,13 @@ impl LocalDaemonInner {
                 interrupted_active.push(session_id.clone());
             }
             runtime.activity_grace = None;
+            if runtime.transport_retry.take().is_some() {
+                cleared_hold_retries += 1;
+            }
             !runtime.is_empty()
         });
         interrupted_active.sort();
 
-        let cleared_hold_retries = {
-            let mut retries = self
-                .hold_retries
-                .lock()
-                .expect("hold_retries lock poisoned");
-            let count = retries.len();
-            retries.clear();
-            count
-        };
         self.openclaw_missing_sessions
             .lock()
             .expect("openclaw_missing_sessions lock poisoned")
@@ -4477,15 +4470,10 @@ impl LocalDaemonInner {
 
                 // Respect any active Tier 3 Hold backoff or active-turn hook grace timer rather
                 // than firing an unsolicited extra push attempt ahead of schedule.
-                let retry_or_grace_active = daemon
-                    .hold_retries
-                    .lock()
-                    .expect("hold_retries lock poisoned")
-                    .contains_key(&sid)
-                    || daemon
-                        .session_runtime()
-                        .get(&sid)
-                        .is_some_and(|runtime| runtime.activity_grace.is_some());
+                let retry_or_grace_active =
+                    daemon.session_runtime().get(&sid).is_some_and(|runtime| {
+                        runtime.transport_retry.is_some() || runtime.activity_grace.is_some()
+                    });
                 if retry_or_grace_active {
                     return;
                 }
@@ -4544,10 +4532,9 @@ impl LocalDaemonInner {
 
                 // Re-check backoff guard before flushing in case a live send just entered Hold.
                 let retry_active = daemon
-                    .hold_retries
-                    .lock()
-                    .expect("hold_retries lock poisoned")
-                    .contains_key(&sid);
+                    .session_runtime()
+                    .get(&sid)
+                    .is_some_and(|runtime| runtime.transport_retry.is_some());
                 if retry_active {
                     return;
                 }
