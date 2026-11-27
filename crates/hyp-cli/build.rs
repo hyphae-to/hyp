@@ -298,9 +298,9 @@ fn main() {
         .join("..")
         .join("plugins");
 
-    println!("cargo:rerun-if-changed=../hyp-harness/plugin_specs.json");
+    println!("cargo:rerun-if-changed=../hyp-harness/plugins/plugin_specs.json");
     let plugin_specs: Vec<BuildPluginSpec<'static>> =
-        serde_json::from_str(include_str!("../hyp-harness/plugin_specs.json"))
+        serde_json::from_str(include_str!("../hyp-harness/plugins/plugin_specs.json"))
             .expect("invalid official plugin registry");
 
     // Hash every unique official plugin file once, keeping track of canonical owner & binary flag.

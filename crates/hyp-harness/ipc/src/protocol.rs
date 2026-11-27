@@ -11,7 +11,7 @@ macro_rules! transport_hint_fields {
         /// Canonical names shared by hook and MCP packets and persisted daemon hints.
         #[derive(Default, Deserialize, Serialize)]
         #[serde(rename_all = "camelCase")]
-        pub(crate) struct TransportHintFields {
+        pub struct TransportHintFields {
             $(
                 #[serde(default, deserialize_with = "deserialize_hint", skip_serializing_if = "Option::is_none")]
                 pub $field: Option<$value>,
@@ -47,13 +47,13 @@ where
 }
 
 impl TransportHintFields {
-    pub(crate) fn from_packet(packet: &Map<String, Value>) -> Self {
+    pub fn from_packet(packet: &Map<String, Value>) -> Self {
         let entries = packet.iter().map(|(key, value)| (key.as_str(), value));
         Self::deserialize(MapDeserializer::<_, serde_json::Error>::new(entries))
             .expect("packet map contains unique keys and hints accept any JSON value")
     }
 
-    pub(crate) fn write_into(&self, packet: &mut Map<String, Value>) {
+    pub fn write_into(&self, packet: &mut Map<String, Value>) {
         let Value::Object(fields) =
             serde_json::to_value(self).expect("transport hints are JSON strings and integers")
         else {

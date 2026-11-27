@@ -40,13 +40,13 @@ mod webhook_deploy;
 mod wizard;
 
 use clap::{Parser, Subcommand};
-use hyp_harness::hooks::{
+use hyp_harness_client::hooks::{
     HandleHookOptions, HookEvent, HookTransportHints, run_hook_sync, shell_quote_cli,
 };
-use hyp_harness::mcp::{McpOptions, run_mcp};
-use hyp_harness::protocol::HarnessKind;
-use hyp_harness::sock::default_socket_path;
-use hyp_harness::wait::{WaitMode, WaitOptions, run_wait};
+use hyp_harness_client::mcp::{McpOptions, run_mcp};
+use hyp_harness_client::wait::{WaitMode, WaitOptions, run_wait};
+use hyp_harness_ipc::protocol::HarnessKind;
+use hyp_harness_ipc::sock::default_socket_path;
 use serde_json::json;
 use std::path::PathBuf;
 use std::process::ExitCode;

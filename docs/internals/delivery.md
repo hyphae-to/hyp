@@ -1,6 +1,6 @@
 # Delivery Engine, Metadata-Only Digests & Wakeup Ladder
 
-Implemented in `crates/hyp-node/src/delivery/` (`policy.rs`, `burst.rs`, `packer.rs`, `inbox_query.rs`) and `crates/hyp-harness/src/daemon.rs` (RFC 0004).
+Implemented in `crates/hyp-node/src/delivery/` (`policy.rs`, `burst.rs`, `packer.rs`, `inbox_query.rs`) and `crates/hyp-harness/daemon/src/daemon.rs` (RFC 0004).
 
 Every inbound source entering a local node — DMs, `#channels` / `#announcements`, stream subscriptions, `localIngest` triggers, and chat bridges — commits durably to `node.sqlite` before upstream ack and flows through one unified metadata-only delivery engine.
 

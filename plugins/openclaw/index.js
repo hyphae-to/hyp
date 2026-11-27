@@ -128,7 +128,7 @@ export function parseOpenClawAgentIdFromSessionKey(sessionKey) {
  * Hyphae session ID (`openclaw:<key>`, or `openclaw:sk_<sha256[0..32]>` when `<key>` contains
  * characters outside `[A-Za-z0-9._:-]` or exceeds 256 bytes with prefix).
  *
- * Matches `canonical_openclaw_session_id()` in `crates/hyp-harness/src/transport/openclaw.rs`
+ * Matches `canonical_openclaw_session_id()` in `crates/hyp-harness/ipc/src/hints.rs`
  * bit-for-bit.
  */
 export function canonicalOpenClawSessionId(rawKey) {

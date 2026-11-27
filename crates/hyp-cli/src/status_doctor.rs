@@ -18,10 +18,10 @@ use crate::ui::{
 use crate::update::read_cached_update_status;
 use clap::Args;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
-use hyp_harness::executable::{
+use hyp_harness_ipc::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
+use hyp_harness_transport::executable::{
     PathSearchPolicy, WindowsSuffixes, find_in_path as search_path, is_executable_file,
 };
-use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::engine::{DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile};
 use hyp_node::gates::policy::{FilterAdapterConfig, LlmProvider, SecurityGateConfig};
 use hyp_node::gates::stage2::validate_classifier_endpoint_url;
@@ -2565,7 +2565,7 @@ pub(crate) fn find_executable_path(bin: &Path) -> Option<PathBuf> {
         windows_suffixes: WindowsSuffixes::ReplaceCommonIfMissing,
     };
     if has_path_sep {
-        return hyp_harness::executable::find_in_directory(Path::new(""), bin, policy);
+        return hyp_harness_transport::executable::find_in_directory(Path::new(""), bin, policy);
     }
     let paths = std::env::var_os("PATH")?;
     search_path(bin, &paths, policy)

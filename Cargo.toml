@@ -6,6 +6,11 @@ members = [
   "crates/hyp-store",
   "crates/hyp-node",
   "crates/hyp-harness",
+  "crates/hyp-harness/daemon",
+  "crates/hyp-harness/client",
+  "crates/hyp-harness/ipc",
+  "crates/hyp-harness/plugins",
+  "crates/hyp-harness/transport",
   "crates/hyp-cli",
 ]
 
@@ -23,6 +28,11 @@ hyp-crypto = { path = "crates/hyp-crypto" }
 hyp-store = { path = "crates/hyp-store" }
 hyp-node = { path = "crates/hyp-node" }
 hyp-harness = { path = "crates/hyp-harness" }
+hyp-daemon = { path = "crates/hyp-harness/daemon" }
+hyp-harness-client = { path = "crates/hyp-harness/client" }
+hyp-harness-ipc = { path = "crates/hyp-harness/ipc" }
+hyp-harness-plugins = { path = "crates/hyp-harness/plugins" }
+hyp-harness-transport = { path = "crates/hyp-harness/transport" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

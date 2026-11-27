@@ -4,13 +4,18 @@ Thanks for contributing to Hyphae! Please read [AGENTS.md](AGENTS.md) for engine
 
 ## Workspace Layout
 
-Hyphae is a 6-crate pure-Rust workspace (Rust 1.87+, `edition = "2024"`):
+Hyphae uses a pure-Rust workspace (Rust 1.87+, `edition = "2024"`).
 
 - `crates/hyp-proto` — CloudEvents v1.0, RFC 8785 JCS, address/channel/filter AST, scopes, manifests, RFC 9457 Problem Details, JSON-RPC 2.0.
 - `crates/hyp-crypto` — Zeroized Ed25519 & RFC 7748 X25519 (`ring`), RFC 9180 HPKE Base Mode, E2EE DMs/`#channels`/KV, streaming AEAD `tar.gz` (`flate2`), `hp2p1_`/`am2_`/v1 compat, `SecretStore`.
 - `crates/hyp-store` — Single WAL `node.sqlite` (`rusqlite` bundled), atomic migrations, `EventStore`, `MessageStore`, `ChannelStore`, `KvStore`, `TransferStore`, `LocalStateStore` (`gate_audit` immutability triggers), `PeerStore`, exact `next_deadline_ms()` scheduler.
 - `crates/hyp-node` — `UnifiedNode` engine, `hyper 1` HTTP/SSE Peer Server & `PeerLink`, `SecurityGatePipeline` + 6 filter plugins, `DeliveryEngine` (delivery policy, burst protection, token-budget hybrid packer, paginated inbox), compiled-in webhook adapters & deduplicated `github-public` ETag poller.
-- `crates/hyp-harness` — Zero-Tokio synchronous `hook` shim, async `LocalDaemon` (`connector.sock` / Windows `connector.addr`), `mcp` stdio server, `wait`/`watch`, and `CallRegistry`.
+- `crates/hyp-harness` — Compatibility re-exports and cross-harness integration tests. New consumers can depend directly on the package they use.
+  - `ipc/` (`hyp-harness-ipc`) owns local socket framing, wire fields, session identifiers, loopback KV authentication, and the shared test-environment switch.
+  - `client/` (`hyp-harness-client`) implements synchronous hooks, MCP stdio, and wait/watch on top of IPC.
+  - `transport/` (`hyp-harness-transport`) delivers metadata-only wakeups to external harnesses. It shares identity hints with clients through IPC.
+  - `daemon/` (`hyp-daemon`) runs the socket server, verifies callers, and coordinates delivery through the node and transports.
+  - `plugins/` (`hyp-harness-plugins`) reads plugin configuration, supervises subprocesses, and connects bridge delivery to the daemon.
 - `crates/hyp-cli` — Single self-contained `hyp` binary (static musl on Linux x86_64, native glibc on Linux arm64).
 - `plugins/` — Optional external self-contained chat & webhook bridge scripts (Node/Python) supervised over JSON-RPC 2.0 / fd-3 NDJSON (never required for the core Rust binary).
 - `workers/drop-relay/` — Zero-dependency Cloudflare Workers kit for the Blind Drop Relay.

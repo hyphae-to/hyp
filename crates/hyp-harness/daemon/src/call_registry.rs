@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::protocol::{HarnessKind, normalize_mesh_tool_name};
+pub use hyp_harness_ipc::caller::{CallerErrorCode, is_valid_session_id};
+use hyp_harness_ipc::protocol::{HarnessKind, normalize_mesh_tool_name};
 
 /// Default TTL (60s) for an in-flight PreToolUse call registration.
 pub const DEFAULT_CALL_TTL_MS: i64 = 60_000;
@@ -62,25 +63,6 @@ pub struct RegisteredCall {
 pub enum VerificationMethod {
     CallId,
     Token,
-}
-
-/// Fail-closed caller verification error codes (matching `src/caller.ts`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CallerErrorCode {
-    CallerUnverifiable,
-    CallerNotFound,
-    CallerAmbiguous,
-}
-
-impl CallerErrorCode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::CallerUnverifiable => "caller_unverifiable",
-            Self::CallerNotFound => "caller_not_found",
-            Self::CallerAmbiguous => "caller_ambiguous",
-        }
-    }
 }
 
 /// Outcome of [`CallRegistry::resolve_call`].
@@ -402,20 +384,6 @@ impl CallRegistry {
             let _ = tokio::time::timeout(remaining, notified).await;
         }
     }
-}
-
-/// Validates a session ID matching `src/protocol.ts:sessionIdPattern` (`^[a-z0-9][a-z0-9._:-]{1,255}$`).
-pub fn is_valid_session_id(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() < 2 || bytes.len() > 256 {
-        return false;
-    }
-    if !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
-        return false;
-    }
-    bytes[1..]
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 fn generate_call_token() -> String {

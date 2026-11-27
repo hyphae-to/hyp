@@ -15,8 +15,10 @@
 
 use crate::config_file::{read_json_value, write_atomic_file, write_atomic_file_new};
 use crate::setup::{ClaudeConfigProfile, canonical_dedup_key};
-use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
-use hyp_harness::protocol::HarnessKind;
+use hyp_harness_ipc::protocol::HarnessKind;
+use hyp_harness_transport::executable::{
+    PathSearchPolicy, WindowsSuffixes, find_in_path as search_path,
+};
 use hyp_node::node_file::NodeFile;
 use serde_json::Value;
 use std::collections::BTreeSet;

@@ -12,7 +12,9 @@
 
 use crate::config_file::resolve_state_dir;
 use crate::plugin_cmd::{PluginSourceOverrides, install_herdr_mod_files};
-use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
+use hyp_harness_transport::executable::{
+    PathSearchPolicy, WindowsSuffixes, find_in_path as search_path,
+};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::fs;

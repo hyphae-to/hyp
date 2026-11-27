@@ -35,8 +35,8 @@ use hyp_crypto::compat_v1::parse_pairing_code_v1;
 use hyp_crypto::pairing::{
     AM2_PREFIX, HP2P1_PREFIX, decode_am2, decode_hp2p1, validate_endpoint_origin,
 };
-use hyp_harness::hooks::shell_quote_cli;
-use hyp_harness::protocol::HarnessKind;
+use hyp_harness_client::hooks::shell_quote_cli;
+use hyp_harness_ipc::protocol::HarnessKind;
 use hyp_node::engine::NodeProfile;
 use hyp_node::node_file::NodeFile;
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};

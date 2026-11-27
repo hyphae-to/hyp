@@ -25,8 +25,10 @@ use crate::term::RawTtyGuard;
 use crate::ui::{
     CliError, EXIT_ERROR, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
-use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
-use hyp_harness::protocol::HarnessKind;
+use hyp_harness_ipc::protocol::HarnessKind;
+use hyp_harness_transport::executable::{
+    PathSearchPolicy, WindowsSuffixes, find_in_path as search_path,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeSet;

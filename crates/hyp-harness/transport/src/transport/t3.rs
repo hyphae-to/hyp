@@ -11,7 +11,7 @@
 //!   (over loopback TCP `ws://` and `rustls` TLS `wss://`) speaking T3's orchestration protocol v2
 //!   Effect RPC (`orchestration.getThreadProjection` + `orchestration.dispatchCommand`).
 
-use crate::paths::{
+use hyp_harness_ipc::paths::{
     transport_config_dir as default_hyphae_config_dir, transport_home_dir as home_dir,
 };
 use hyp_node::engine::http_util::{
@@ -37,9 +37,9 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
 
-use crate::call_registry::CallerErrorCode;
-use crate::protocol::normalize_mesh_tool_name;
 use crate::transport::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
+use hyp_harness_ipc::caller::CallerErrorCode;
+use hyp_harness_ipc::protocol::normalize_mesh_tool_name;
 
 /// Default loopback T3 Code server origin.
 pub const DEFAULT_T3_URL: &str = "http://127.0.0.1:3773";
@@ -223,7 +223,7 @@ pub struct T3DeliveryDetail {
 
 /// Resolves the default T3 Code base directory (`$T3CODE_HOME` if non-empty, else `~/.t3`).
 pub fn default_t3_base_dir() -> PathBuf {
-    if let Some(env_home) = crate::ambient_env_var("T3CODE_HOME") {
+    if let Some(env_home) = hyp_harness_ipc::ambient_env_var("T3CODE_HOME") {
         let trimmed = env_home.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(trimmed);

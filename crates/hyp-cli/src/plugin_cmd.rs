@@ -39,10 +39,10 @@ use clap::Subcommand;
 use http::Uri;
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
-use hyp_harness::executable::{
+use hyp_harness_plugins::plugin_registry::BRIDGE_CONSUMER_IDS;
+use hyp_harness_transport::executable::{
     PathSearchPolicy, WindowsSuffixes, find_in_path as search_path, is_executable_file,
 };
-use hyp_harness::plugin_registry::BRIDGE_CONSUMER_IDS;
 use hyp_node::adapters::telegram::{
     DEFAULT_TELEGRAM_SECRET_NAME, resolve_telegram_default_target_from_store,
 };

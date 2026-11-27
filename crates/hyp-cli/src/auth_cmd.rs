@@ -48,7 +48,7 @@ use hyp_crypto::keys::{Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519PublicKey
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
 use hyp_crypto::pairing::validate_endpoint_origin;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms, parse_rfc3339_millis};
-use hyp_harness::sock::daemon_rpc_sync;
+use hyp_harness_ipc::sock::daemon_rpc_sync;
 use hyp_node::engine::http_util::{BoundedBodyError, consume_bounded_body};
 use hyp_node::engine::{
     LocalIngestConfig, NodeConfig, NodeProfile, UnifiedNode, canonical_local_event_for_signing,

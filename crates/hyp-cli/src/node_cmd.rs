@@ -14,13 +14,13 @@ use crate::ui::{CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json};
 use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::keystore::SecretBackend;
 use hyp_crypto::rfc3339::{format_rfc3339_millis, now_unix_ms};
-use hyp_harness::daemon::{
+use hyp_daemon::daemon::{
     BoxFuture as DaemonBoxFuture, DEFAULT_PEERS_RELOAD_TIMEOUT, DaemonError, DeliveryRetryConfig,
     LocalDaemon, LocalDaemonConfig, PeersReloader, WakeRecoveryConfig,
 };
-use hyp_harness::node_config::parse_plugins_config;
-use hyp_harness::plugin_runtime::{self, ParsedPlugin};
-use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
+use hyp_harness_ipc::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
+use hyp_harness_plugins::node_config::parse_plugins_config;
+use hyp_harness_plugins::plugin_runtime::{self, ParsedPlugin};
 use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig, GitHubWebhookAdapter};
 use hyp_node::engine::{
     DEFAULT_PEER_SOCKET_FILENAME, DEFAULT_WAKE_CHECK_INTERVAL_SECS, E2eePolicy, LocalIngestServer,

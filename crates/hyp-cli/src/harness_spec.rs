@@ -1,7 +1,7 @@
 //! User-level harness locations used by setup, onboarding, and diagnostics.
 
 use crate::setup::ClaudeConfigProfile;
-use hyp_harness::protocol::HarnessKind;
+use hyp_harness_ipc::protocol::HarnessKind;
 use serde::{Deserialize, Deserializer, de};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

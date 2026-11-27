@@ -229,6 +229,22 @@ jobs:
             exit "$result"
           fi
 
+      - name: Check harness dependency boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree() { cargo tree --locked --edges normal,build --prefix none --format '{p}' -p "$1"; }
+          client=$(tree hyp-harness-client)
+          daemon=$(tree hyp-daemon)
+          if grep -E '^(hyp-daemon|hyp-harness|hyp-harness-transport|hyp-harness-plugins|hyp-node|hyp-store|rusqlite|libsqlite3-sys) v' <<< "$client"; then
+            echo "The hook/MCP/wait client pulled in server or storage dependencies."
+            exit 1
+          fi
+          if grep -E '^(hyp-harness|hyp-harness-client|hyp-harness-plugins) v' <<< "$daemon"; then
+            echo "The daemon pulled in a client or a consumer of its API."
+            exit 1
+          fi
+
       - name: Clippy (zero warnings across workspace & all targets)
         run: cargo clippy --workspace --all-targets --keep-going --locked -- -D warnings
 

@@ -1,7 +1,7 @@
 //! Zero-polling blocking waiter (`hyp wait`) and streaming watcher (`hyp watch`)
 //! on `connector.sock`, matching `src/wait.ts` flags, timeouts, formatting, and signal handling.
 
-use crate::sock::{
+use hyp_harness_ipc::sock::{
     MAX_SOCKET_LINE_BYTES, connect_daemon_async, read_bounded_line_async, write_ndjson_line_async,
 };
 use serde_json::{Map, Value, json};
@@ -97,12 +97,12 @@ pub enum WaitError {
 /// 3. `CLAUDE_SESSION_ID` (`claude:<id>`)
 /// 4. `CODEX_THREAD_ID` (`codex:<id>`)
 pub fn infer_session_id_from_env() -> Option<String> {
-    infer_session_id_with(crate::ambient_env_var)
+    infer_session_id_with(hyp_harness_ipc::ambient_env_var)
 }
 
 /// Resolves a validated Herdr terminal ID from `HC_TERMINAL_ID`, if present.
 pub fn infer_herdr_terminal_from_env() -> Option<String> {
-    crate::transport::herdr::detect_env_terminal_id()
+    hyp_harness_ipc::hints::detect_env_terminal_id()
 }
 
 /// Resolves a validated per-session auth token strictly from `HYPHAE_SESSION_TOKEN` in the
@@ -117,7 +117,7 @@ where
 {
     if let Some(raw) = get_env("HYPHAE_SESSION_ID") {
         let trimmed = raw.trim();
-        if crate::call_registry::is_valid_session_id(trimmed) {
+        if hyp_harness_ipc::caller::is_valid_session_id(trimmed) {
             return Some(trimmed.to_string());
         }
     }

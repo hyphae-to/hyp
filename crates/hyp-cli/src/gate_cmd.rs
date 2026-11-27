@@ -22,7 +22,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use hyp_crypto::human::HumanApprovalActionKind;
 use hyp_crypto::keystore::{SecretStore, validate_secret_name};
 use hyp_crypto::rfc3339::format_rfc3339_millis;
-use hyp_harness::sock::{DaemonRpcResult, daemon_rpc_sync};
+use hyp_harness_ipc::sock::{DaemonRpcResult, daemon_rpc_sync};
 use hyp_node::engine::NodeProfile;
 use hyp_node::gates::plugins::validate_filter_plugin_endpoint_url;
 use hyp_node::gates::policy::{

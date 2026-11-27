@@ -12,11 +12,11 @@ use crate::ui::{
     CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
 use clap::Args;
-use hyp_harness::sock::{
+use hyp_harness_client::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
+use hyp_harness_ipc::sock::{
     MAX_SOCKET_LINE_BYTES, connect_daemon_async, daemon_rpc_sync, default_socket_path,
     read_bounded_line_async, write_ndjson_line_async,
 };
-use hyp_harness::wait::{infer_herdr_terminal_from_env, infer_session_id_from_env};
 use serde_json::{Map, Value, json};
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write as _};
