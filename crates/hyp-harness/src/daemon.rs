@@ -90,10 +90,8 @@ use crate::transport::herdr::{
 };
 use crate::transport::openclaw::{
     DEFAULT_OPENCLAW_AGENT_ID, DEFAULT_OPENCLAW_PROBE_TIMEOUT, OpenClawNodeConfig,
-    OpenClawTransport, REASON_OPENCLAW_AUTH_FAILED, REASON_OPENCLAW_GATEWAY_UNAVAILABLE,
-    REASON_OPENCLAW_HOOKS_DISABLED, REASON_OPENCLAW_INVALID_SESSION_KEY,
-    REASON_OPENCLAW_INVALID_URL, REASON_OPENCLAW_RATE_LIMITED, REASON_OPENCLAW_SESSION_MISSING,
-    REASON_OPENCLAW_TOKEN_MISSING, canonical_openclaw_session_id,
+    OpenClawTransport, REASON_OPENCLAW_GATEWAY_UNAVAILABLE, REASON_OPENCLAW_INVALID_SESSION_KEY,
+    REASON_OPENCLAW_SESSION_MISSING, canonical_openclaw_session_id,
     parse_openclaw_agent_id_from_session_key, probe_openclaw_gateway,
     validate_openclaw_session_key,
 };
@@ -103,7 +101,7 @@ use crate::transport::t3::{
     normalize_t3_server_url_with_remote, probe_t3_server_with_remote,
     resolve_t3_thread_by_provider_session, t3_state_db_path, verify_t3_thread_exists,
 };
-use crate::transport::{PushMode, PushOutcome, PushTransport};
+use crate::transport::{PushMode, PushOutcome, PushReason, PushTransport};
 
 /// Reserved `SecretStore` key name holding the daemon's 32-byte deterministic HMAC-SHA256
 /// key used to derive per-session `sessionToken` values that survive daemon restarts & resume.
@@ -4857,10 +4855,10 @@ impl LocalDaemonInner {
                         }
                         PushOutcome::Hold { ref reason, .. }
                             if matches!(
-                                reason.as_str(),
-                                "herdr_working"
-                                    | "herdr_send_guard_refused"
-                                    | "herdr_agent_not_ready"
+                                reason,
+                                PushReason::HerdrWorking
+                                    | PushReason::HerdrSendGuardRefused
+                                    | PushReason::HerdrAgentNotReady
                             ) =>
                         {
                             // Target is actively working or has an in-progress user draft;
@@ -4870,11 +4868,11 @@ impl LocalDaemonInner {
                         }
                         PushOutcome::Hold { ref reason, .. }
                             if matches!(
-                                reason.as_str(),
-                                "t3_server_unreachable"
-                                    | "codex_queue_unavailable"
-                                    | REASON_OPENCLAW_GATEWAY_UNAVAILABLE
-                                    | REASON_OPENCLAW_RATE_LIMITED
+                                reason,
+                                PushReason::T3ServerUnreachable
+                                    | PushReason::CodexQueueUnavailable
+                                    | PushReason::OpenclawGatewayUnavailable
+                                    | PushReason::OpenclawRateLimited
                             ) =>
                         {
                             // Transient transport unavailability: fall through to any live waiter;
@@ -4884,22 +4882,22 @@ impl LocalDaemonInner {
                         PushOutcome::Hold { ref reason, .. }
                         | PushOutcome::Reject { ref reason, .. } => {
                             if matches!(
-                                reason.as_str(),
-                                "herdr_target_unavailable"
-                                    | "t3_thread_deleted"
-                                    | "t3_thread_archived"
-                                    | "t3_thread_not_found"
-                                    | "t3_auth_missing"
-                                    | "t3_auth_failed"
-                                    | "t3_invalid_server_url"
-                                    | REASON_OPENCLAW_AUTH_FAILED
-                                    | REASON_OPENCLAW_HOOKS_DISABLED
-                                    | REASON_OPENCLAW_INVALID_URL
-                                    | REASON_OPENCLAW_INVALID_SESSION_KEY
-                                    | REASON_OPENCLAW_SESSION_MISSING
-                                    | REASON_OPENCLAW_TOKEN_MISSING
+                                reason,
+                                PushReason::HerdrTargetUnavailable
+                                    | PushReason::T3ThreadDeleted
+                                    | PushReason::T3ThreadArchived
+                                    | PushReason::T3ThreadNotFound
+                                    | PushReason::T3AuthMissing
+                                    | PushReason::T3AuthFailed
+                                    | PushReason::T3InvalidServerUrl
+                                    | PushReason::OpenclawAuthFailed
+                                    | PushReason::OpenclawHooksDisabled
+                                    | PushReason::OpenclawInvalidUrl
+                                    | PushReason::OpenclawInvalidSessionKey
+                                    | PushReason::OpenclawSessionMissing
+                                    | PushReason::OpenclawTokenMissing
                             ) {
-                                terminal_error = Some(reason.clone());
+                                terminal_error = Some(reason.as_str().to_owned());
                                 self.record_lazy_hydrate_attempt(session_id);
                                 if self
                                     .unregister_matching_session_transport(session_id, &transport)

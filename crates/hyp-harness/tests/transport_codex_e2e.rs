@@ -144,7 +144,7 @@ fn unit_stderr_classification_covers_all_six_keywords_and_unknown_errors() {
         assert_eq!(
             classify_codex_queue_failure(stderr),
             PushOutcome::Hold {
-                reason: REASON_QUEUE_UNAVAILABLE.to_string(),
+                reason: REASON_QUEUE_UNAVAILABLE.into(),
                 interrupted: false,
             },
             "keyword case {label} ({stderr:?}) must classify as hold(codex_queue_unavailable)"
@@ -166,7 +166,7 @@ fn unit_stderr_classification_covers_all_six_keywords_and_unknown_errors() {
         assert_eq!(
             classify_codex_queue_failure(stderr),
             PushOutcome::Reject {
-                reason: REASON_QUEUE_OUTCOME_UNKNOWN.to_string(),
+                reason: REASON_QUEUE_OUTCOME_UNKNOWN.into(),
                 interrupted: false,
             },
             "unknown stderr {stderr:?} must classify as reject(codex_queue_outcome_unknown)"
@@ -194,7 +194,7 @@ async fn deliver_fails_closed_on_invalid_config_before_spawning() {
     assert_eq!(
         bad_thread.deliver(&test_digest(), PushMode::Queue).await,
         PushOutcome::Reject {
-            reason: REASON_INVALID_THREAD_ID.to_string(),
+            reason: REASON_INVALID_THREAD_ID.into(),
             interrupted: false,
         }
     );
@@ -207,7 +207,7 @@ async fn deliver_fails_closed_on_invalid_config_before_spawning() {
     assert_eq!(
         bad_remote.deliver(&test_digest(), PushMode::Queue).await,
         PushOutcome::Reject {
-            reason: REASON_INVALID_REMOTE.to_string(),
+            reason: REASON_INVALID_REMOTE.into(),
             interrupted: false,
         }
     );
@@ -232,7 +232,7 @@ async fn deliver_missing_binary_returns_hold_codex_binary_missing() {
     assert_eq!(
         outcome,
         PushOutcome::Hold {
-            reason: REASON_BINARY_MISSING.to_string(),
+            reason: REASON_BINARY_MISSING.into(),
             interrupted: false,
         }
     );
@@ -242,7 +242,7 @@ async fn deliver_missing_binary_returns_hold_codex_binary_missing() {
     assert_eq!(
         empty_bin.deliver(&test_digest(), PushMode::Queue).await,
         PushOutcome::Hold {
-            reason: REASON_BINARY_MISSING.to_string(),
+            reason: REASON_BINARY_MISSING.into(),
             interrupted: false,
         }
     );
@@ -424,7 +424,7 @@ mod unix_subprocess_e2e {
             assert_eq!(
                 outcome,
                 PushOutcome::Hold {
-                    reason: REASON_QUEUE_UNAVAILABLE.to_string(),
+                    reason: REASON_QUEUE_UNAVAILABLE.into(),
                     interrupted: false,
                 },
                 "case {name} (exit {exit_code}) must return Hold(codex_queue_unavailable)"
@@ -445,7 +445,7 @@ mod unix_subprocess_e2e {
         assert_eq!(
             transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::Hold {
-                reason: REASON_QUEUE_UNAVAILABLE.to_string(),
+                reason: REASON_QUEUE_UNAVAILABLE.into(),
                 interrupted: false,
             }
         );
@@ -485,7 +485,7 @@ mod unix_subprocess_e2e {
             assert_eq!(
                 outcome,
                 PushOutcome::Reject {
-                    reason: REASON_QUEUE_OUTCOME_UNKNOWN.to_string(),
+                    reason: REASON_QUEUE_OUTCOME_UNKNOWN.into(),
                     interrupted: false,
                 },
                 "case {name} must return Reject(codex_queue_outcome_unknown)"
@@ -503,7 +503,7 @@ mod unix_subprocess_e2e {
         assert_eq!(
             transport.deliver(&test_digest(), PushMode::Queue).await,
             PushOutcome::Reject {
-                reason: REASON_QUEUE_OUTCOME_UNKNOWN.to_string(),
+                reason: REASON_QUEUE_OUTCOME_UNKNOWN.into(),
                 interrupted: false,
             }
         );
@@ -531,7 +531,7 @@ mod unix_subprocess_e2e {
         assert_eq!(
             outcome,
             PushOutcome::Reject {
-                reason: REASON_QUEUE_TIMEOUT.to_string(),
+                reason: REASON_QUEUE_TIMEOUT.into(),
                 interrupted: false,
             }
         );
@@ -587,7 +587,7 @@ mod unix_subprocess_e2e {
         assert_eq!(
             outcome,
             PushOutcome::Hold {
-                reason: REASON_QUEUE_UNAVAILABLE.to_string(),
+                reason: REASON_QUEUE_UNAVAILABLE.into(),
                 interrupted: false,
             }
         );

@@ -275,7 +275,7 @@ impl HerdrTransport {
                 }
             }
             _ => PushOutcome::Reject {
-                reason: "herdr_send_outcome_unknown".to_string(),
+                reason: "herdr_send_outcome_unknown".into(),
                 interrupted,
             },
         }
