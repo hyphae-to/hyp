@@ -18,7 +18,9 @@ use crate::ui::{
 use crate::update::read_cached_update_status;
 use clap::Args;
 use hyp_crypto::keystore::{SecretBackend, SecretStore};
-use hyp_harness::executable::is_executable_file;
+use hyp_harness::executable::{
+    PathSearchPolicy, WindowsSuffixes, find_in_path as search_path, is_executable_file,
+};
 use hyp_harness::sock::{DEFAULT_SOCKET_FILENAME, daemon_rpc_sync};
 use hyp_node::engine::{DEFAULT_HYPHAE_VERSION, DropRelayConfig, LocalIngestConfig, NodeProfile};
 use hyp_node::gates::policy::{FilterAdapterConfig, LlmProvider, SecurityGateConfig};
@@ -2082,22 +2084,17 @@ fn find_tailscale_binary() -> Option<String> {
         return Some(trimmed.to_string());
     }
 
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            let direct = dir.join("tailscale");
-            if direct.is_file() {
-                return Some(direct.display().to_string());
-            }
-            #[cfg(windows)]
-            {
-                let exe = dir.join("tailscale.exe");
-                if exe.is_file() {
-                    return Some(exe.display().to_string());
-                }
-            }
+    if let Some(paths) = std::env::var_os("PATH") {
+        if let Some(found) = search_path(
+            Path::new("tailscale"),
+            &paths,
+            PathSearchPolicy {
+                include_empty: false,
+                executable: false,
+                windows_suffixes: WindowsSuffixes::ReplaceExe,
+            },
+        ) {
+            return Some(found.display().to_string());
         }
     }
 
@@ -2555,25 +2552,6 @@ pub(crate) fn build_tailscale_checks(
     out
 }
 
-fn find_executable_in_dir(dir: &Path, name: &Path) -> Option<PathBuf> {
-    let direct = dir.join(name);
-    if is_executable_file(&direct) {
-        return Some(direct);
-    }
-    #[cfg(windows)]
-    {
-        if name.extension().is_none() {
-            for ext in ["exe", "cmd", "bat"] {
-                let with_ext = direct.with_extension(ext);
-                if is_executable_file(&with_ext) {
-                    return Some(with_ext);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Pure filesystem/PATH executable lookup — never spawns the target CLI or touches secrets.
 pub(crate) fn find_executable_path(bin: &Path) -> Option<PathBuf> {
     let raw = bin.to_string_lossy();
@@ -2581,33 +2559,16 @@ pub(crate) fn find_executable_path(bin: &Path) -> Option<PathBuf> {
         return None;
     }
     let has_path_sep = raw.contains('/') || raw.contains('\\') || bin.components().count() > 1;
+    let policy = PathSearchPolicy {
+        include_empty: false,
+        executable: true,
+        windows_suffixes: WindowsSuffixes::ReplaceCommonIfMissing,
+    };
     if has_path_sep {
-        if is_executable_file(bin) {
-            return Some(bin.to_path_buf());
-        }
-        #[cfg(windows)]
-        {
-            if bin.extension().is_none() {
-                for ext in ["exe", "cmd", "bat"] {
-                    let with_ext = bin.with_extension(ext);
-                    if is_executable_file(&with_ext) {
-                        return Some(with_ext);
-                    }
-                }
-            }
-        }
-        return None;
+        return hyp_harness::executable::find_in_directory(Path::new(""), bin, policy);
     }
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        if let Some(found) = find_executable_in_dir(&dir, bin) {
-            return Some(found);
-        }
-    }
-    None
+    let paths = std::env::var_os("PATH")?;
+    search_path(bin, &paths, policy)
 }
 
 /// Checks secret backend configuration and CLI binary availability cleanly without touching secrets.

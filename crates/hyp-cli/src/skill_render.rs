@@ -15,6 +15,7 @@
 
 use crate::config_file::{read_json_value, write_atomic_file, write_atomic_file_new};
 use crate::setup::{ClaudeConfigProfile, canonical_dedup_key};
+use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
 use hyp_harness::protocol::HarnessKind;
 use hyp_node::node_file::NodeFile;
 use serde_json::Value;
@@ -689,28 +690,19 @@ pub fn detect_capabilities_from_config_path(config_path: &Path) -> SkillCapabili
 }
 
 fn find_executable_in_path(program: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
+    let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
-    for dir in std::env::split_paths(&path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let direct = dir.join(program);
-        if direct.is_file() {
-            return true;
-        }
-        #[cfg(windows)]
-        {
-            for ext in ["exe", "cmd", "bat"] {
-                let with_ext = dir.join(format!("{program}.{ext}"));
-                if with_ext.is_file() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    search_path(
+        Path::new(program),
+        &paths,
+        PathSearchPolicy {
+            include_empty: false,
+            executable: false,
+            windows_suffixes: WindowsSuffixes::AppendCommon,
+        },
+    )
+    .is_some()
 }
 
 fn detect_claude_channel_in_file(claude_json: &Path) -> bool {

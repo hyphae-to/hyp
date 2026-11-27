@@ -25,6 +25,7 @@ use crate::term::RawTtyGuard;
 use crate::ui::{
     CliError, EXIT_ERROR, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
+use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
 use hyp_harness::protocol::HarnessKind;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3153,50 +3154,15 @@ pub fn run_preview_animation(no_anim: bool) -> ExitCode {
 
 /// Cross-platform executable lookup using an explicit `PATH` value (unit-testable).
 pub fn find_executable_in_path_env(bin_name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
-    let path_var = path_var?;
-    for dir in std::env::split_paths(path_var) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        #[cfg(windows)]
-        {
-            let exts: Vec<String> = std::env::var("PATHEXT")
-                .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string())
-                .split(';')
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.trim().to_string())
-                .collect();
-            let direct = dir.join(bin_name);
-            if direct.is_file() {
-                return Some(direct);
-            }
-            for ext in &exts {
-                let candidate = dir.join(format!("{bin_name}{ext}"));
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-                let lower_candidate = dir.join(format!("{bin_name}{}", ext.to_ascii_lowercase()));
-                if lower_candidate.is_file() {
-                    return Some(lower_candidate);
-                }
-            }
-        }
-        #[cfg(unix)]
-        {
-            let candidate = dir.join(bin_name);
-            if hyp_harness::executable::is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let candidate = dir.join(bin_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    search_path(
+        Path::new(bin_name),
+        path_var?,
+        PathSearchPolicy {
+            include_empty: false,
+            executable: true,
+            windows_suffixes: WindowsSuffixes::PathExt,
+        },
+    )
 }
 
 pub fn find_executable_in_path(bin_name: &str) -> Option<PathBuf> {

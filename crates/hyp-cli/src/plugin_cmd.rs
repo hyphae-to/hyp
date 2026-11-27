@@ -40,7 +40,9 @@ use http::{Method, Request, Uri, header};
 use http_body_util::{BodyExt, Empty};
 use hyp_crypto::keystore::validate_secret_name;
 use hyp_crypto::transfer::{TarUnpackOptions, unpack_tar_gz};
-use hyp_harness::executable::is_executable_file;
+use hyp_harness::executable::{
+    PathSearchPolicy, WindowsSuffixes, find_in_path as search_path, is_executable_file,
+};
 use hyp_node::adapters::telegram::{
     DEFAULT_TELEGRAM_SECRET_NAME, resolve_telegram_default_target_from_store,
 };
@@ -1598,16 +1600,22 @@ fn detect_telegram_secret_name_from_config(config_path: &Path) -> String {
 pub fn detect_node_path(home_override: Option<&Path>) -> Option<String> {
     let bin_name = if cfg!(windows) { "node.exe" } else { "node" };
 
-    if let Some(path_os) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_os) {
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            let cand = dir.join(bin_name);
-            if is_executable_file(&cand) {
-                let abs = fs::canonicalize(&cand).unwrap_or(cand);
-                return Some(abs.display().to_string());
-            }
+    if let Some(paths) = std::env::var_os("PATH") {
+        if let Some(found) = search_path(
+            Path::new(bin_name),
+            &paths,
+            PathSearchPolicy {
+                include_empty: false,
+                executable: true,
+                windows_suffixes: WindowsSuffixes::None,
+            },
+        ) {
+            return Some(
+                fs::canonicalize(&found)
+                    .unwrap_or(found)
+                    .display()
+                    .to_string(),
+            );
         }
     }
 

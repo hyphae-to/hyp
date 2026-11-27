@@ -12,6 +12,7 @@
 
 use crate::config_file::resolve_state_dir;
 use crate::plugin_cmd::{PluginSourceOverrides, install_herdr_mod_files};
+use hyp_harness::executable::{PathSearchPolicy, WindowsSuffixes, find_in_path as search_path};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::fs;
@@ -698,11 +699,16 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 fn find_herdr_app_binary(home: &Path) -> Option<PathBuf> {
     if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("herdr-app");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        if let Some(found) = search_path(
+            Path::new("herdr-app"),
+            &paths,
+            PathSearchPolicy {
+                include_empty: true,
+                executable: false,
+                windows_suffixes: WindowsSuffixes::None,
+            },
+        ) {
+            return Some(found);
         }
     }
     let local_bin = home.join(".local").join("bin").join("herdr-app");
