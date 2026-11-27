@@ -11,6 +11,8 @@ pub mod http_util;
 pub mod local_ingest;
 pub mod node;
 pub mod peer_link;
+#[cfg(unix)]
+mod private_socket;
 pub mod server;
 pub mod wake;
 
