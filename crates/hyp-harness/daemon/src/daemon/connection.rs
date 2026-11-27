@@ -358,7 +358,7 @@ pub(super) async fn handle_connection<R, W>(
                                 });
                         }
                         attached_waiter = Some((session_id.clone(), waiter_id));
-                        let flush_mode = daemon.mark_session_idle(&session_id);
+                        daemon.mark_session_idle(&session_id);
                         let _ = daemon
                             .node
                             .db()
@@ -384,9 +384,7 @@ pub(super) async fn handle_connection<R, W>(
                         let flush_daemon = Arc::clone(&daemon);
                         let flush_sid = session_id;
                         tokio::spawn(async move {
-                            flush_daemon
-                                .flush_session_inner(&flush_sid, flush_mode)
-                                .await;
+                            flush_daemon.flush_session(&flush_sid).await;
                         });
                     }
 
