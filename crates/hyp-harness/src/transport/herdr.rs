@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
+use super::process::{ProcessOutput, spawn_with_retry, wait_bounded};
 use super::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 
 /// Default `hc` binary name resolved via `PATH`.
@@ -715,54 +715,26 @@ impl CommandRunner for ProcessRunner {
         timeout: Duration,
     ) -> TransportFuture<'a, CommandOutcome> {
         Box::pin(async move {
-            let mut child = {
-                let mut attempts = 0u32;
-                loop {
-                    let mut cmd = Command::new(bin);
-                    cmd.args(args)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .kill_on_drop(true);
-                    match cmd.spawn() {
-                        Ok(child) => break child,
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                            return CommandOutcome::MissingBinary;
-                        }
-                        Err(err)
-                            if err.kind() == std::io::ErrorKind::ExecutableFileBusy
-                                && attempts < 5 =>
-                        {
-                            attempts += 1;
-                            tokio::time::sleep(Duration::from_millis(10 * u64::from(attempts)))
-                                .await;
-                        }
-                        Err(_) => return CommandOutcome::IoError,
-                    }
+            let mut command = Command::new(bin);
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = match spawn_with_retry(&mut command, 5).await {
+                Ok(child) => child,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return CommandOutcome::MissingBinary;
                 }
+                Err(_) => return CommandOutcome::IoError,
             };
-
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-
-            let wait_fut = async {
-                let stdout_fut = async {
-                    match stdout {
-                        Some(reader) => read_bounded(reader, MAX_HERDR_OUTPUT_BYTES).await,
-                        None => Ok((Vec::new(), false)),
-                    }
-                };
-                let stderr_fut = async {
-                    match stderr {
-                        Some(reader) => read_bounded(reader, MAX_HERDR_OUTPUT_BYTES).await,
-                        None => Ok((Vec::new(), false)),
-                    }
-                };
-                tokio::join!(stdout_fut, stderr_fut, child.wait())
-            };
-
-            match tokio::time::timeout(timeout, wait_fut).await {
-                Ok((Ok((out_bytes, out_trunc)), Ok((err_bytes, err_trunc)), Ok(status))) => {
+            match wait_bounded(&mut child, timeout, MAX_HERDR_OUTPUT_BYTES).await {
+                Ok(ProcessOutput {
+                    stdout: Ok((out_bytes, out_trunc)),
+                    stderr: Ok((err_bytes, err_trunc)),
+                    status: Ok(status),
+                }) => {
                     if out_trunc || err_trunc {
                         return CommandOutcome::OutputTooLarge;
                     }
@@ -776,38 +748,10 @@ impl CommandRunner for ProcessRunner {
                     let _ = child.kill().await;
                     CommandOutcome::IoError
                 }
-                Err(_) => {
-                    let _ = child.kill().await;
-                    CommandOutcome::TimedOut
-                }
+                Err(_) => CommandOutcome::TimedOut,
             }
         })
     }
-}
-
-async fn read_bounded<R: AsyncRead + Unpin>(
-    mut reader: R,
-    limit: usize,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let mut truncated = false;
-    loop {
-        let n = reader.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() < limit {
-            let take = (limit - buf.len()).min(n);
-            buf.extend_from_slice(&chunk[..take]);
-            if take < n {
-                truncated = true;
-            }
-        } else {
-            truncated = true;
-        }
-    }
-    Ok((buf, truncated))
 }
 
 #[cfg(test)]

@@ -26,9 +26,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
+use super::process::{spawn_with_retry, wait_bounded};
 use super::{InboxDigest, PushMode, PushOutcome, PushTransport, TransportFuture};
 
 /// Default Codex CLI command name.
@@ -180,57 +180,31 @@ impl CodexQueueTransport {
             return PushOutcome::hold(REASON_BINARY_MISSING);
         }
 
-        let mut child = {
-            let mut attempts = 0u32;
-            loop {
-                let mut cmd = Command::new(&self.target.bin);
-                cmd.args(&args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true);
-
-                if let Some(ref codex_home) = self.target.codex_home {
-                    if !codex_home.as_os_str().is_empty() {
-                        cmd.env("CODEX_HOME", codex_home);
-                    }
-                }
-
-                match cmd.spawn() {
-                    Ok(child) => break child,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                        return PushOutcome::hold(REASON_BINARY_MISSING);
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::ExecutableFileBusy && attempts < 5 => {
-                        attempts += 1;
-                        tokio::time::sleep(Duration::from_millis(10 * u64::from(attempts))).await;
-                    }
-                    Err(_) => {
-                        return PushOutcome::reject(REASON_QUEUE_OUTCOME_UNKNOWN);
-                    }
-                }
+        let mut command = Command::new(&self.target.bin);
+        command
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(ref codex_home) = self.target.codex_home {
+            if !codex_home.as_os_str().is_empty() {
+                command.env("CODEX_HOME", codex_home);
             }
-        };
-
-        let stderr = child.stderr.take();
-        let wait_and_read = async {
-            let stderr_fut = async {
-                match stderr {
-                    Some(mut reader) => read_bounded_drain(&mut reader, MAX_STDERR_BYTES).await,
-                    None => Ok(Vec::new()),
-                }
-            };
-            tokio::join!(child.wait(), stderr_fut)
-        };
-
-        let (status_res, stderr_res) = match tokio::time::timeout(self.timeout, wait_and_read).await
-        {
-            Ok(pair) => pair,
-            Err(_) => {
-                let _ = child.kill().await;
-                return PushOutcome::reject(REASON_QUEUE_TIMEOUT);
+        }
+        let mut child = match spawn_with_retry(&mut command, 5).await {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return PushOutcome::hold(REASON_BINARY_MISSING);
             }
+            Err(_) => return PushOutcome::reject(REASON_QUEUE_OUTCOME_UNKNOWN),
         };
+        let output = match wait_bounded(&mut child, self.timeout, MAX_STDERR_BYTES).await {
+            Ok(output) => output,
+            Err(_) => return PushOutcome::reject(REASON_QUEUE_TIMEOUT),
+        };
+        let status_res = output.status;
+        let stderr_res = output.stderr.map(|(bytes, _)| bytes);
 
         match status_res {
             Ok(status) if status.success() => PushOutcome::delivered(),
@@ -386,30 +360,9 @@ pub async fn codex_queue_supported_uncached(bin: &str, timeout: Duration) -> boo
     let Ok(mut child) = cmd.spawn() else {
         return false;
     };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let probe_fut = async {
-        let out_fut = async {
-            if let Some(mut r) = stdout {
-                let _ = read_bounded_drain(&mut r, 16 * 1024).await;
-            }
-        };
-        let err_fut = async {
-            if let Some(mut r) = stderr {
-                let _ = read_bounded_drain(&mut r, 16 * 1024).await;
-            }
-        };
-        let (status_res, _, _) = tokio::join!(child.wait(), out_fut, err_fut);
-        status_res
-    };
-
-    match tokio::time::timeout(timeout, probe_fut).await {
-        Ok(Ok(status)) => status.success(),
-        Ok(Err(_)) => false,
-        Err(_) => {
-            let _ = child.kill().await;
-            false
-        }
+    match wait_bounded(&mut child, timeout, 16 * 1024).await {
+        Ok(output) => output.status.is_ok_and(|status| status.success()),
+        Err(_) => false,
     }
 }
 
@@ -768,25 +721,6 @@ pub fn classify_codex_queue_failure(stderr: &str) -> PushOutcome {
     } else {
         PushOutcome::reject(REASON_QUEUE_OUTCOME_UNKNOWN)
     }
-}
-
-async fn read_bounded_drain<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    max_bytes: usize,
-) -> io::Result<Vec<u8>> {
-    let mut captured = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        if captured.len() < max_bytes {
-            let take = (max_bytes - captured.len()).min(n);
-            captured.extend_from_slice(&buf[..take]);
-        }
-    }
-    Ok(captured)
 }
 
 #[cfg(test)]
