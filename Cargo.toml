@@ -30,7 +30,6 @@ thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
 hex = "0.4"
-time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 semver = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -43,8 +42,6 @@ rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 flate2 = "1"
-tower = "0.5"
-tower-http = "0.6"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }

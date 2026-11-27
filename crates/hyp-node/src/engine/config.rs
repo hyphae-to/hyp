@@ -1329,15 +1329,6 @@ pub fn resolve_drop_portal_url(configured: Option<&str>) -> Result<String, Strin
     Ok(DEFAULT_DROP_PORTAL_URL.to_string())
 }
 
-#[allow(dead_code)]
-pub(crate) fn store_to_profile(p: PeerProfile) -> NodeProfile {
-    match p {
-        PeerProfile::Local => NodeProfile::Local,
-        PeerProfile::Router => NodeProfile::Router,
-        PeerProfile::P2p => NodeProfile::P2p,
-    }
-}
-
 #[cfg(test)]
 mod drop_portal_url_tests {
     use super::*;

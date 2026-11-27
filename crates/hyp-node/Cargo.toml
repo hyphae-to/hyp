@@ -10,8 +10,6 @@ hyp-proto.workspace = true
 hyp-crypto.workspace = true
 hyp-store.workspace = true
 tokio.workspace = true
-tower.workspace = true
-tower-http = { workspace = true, features = ["limit"] }
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

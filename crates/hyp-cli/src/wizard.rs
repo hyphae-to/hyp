@@ -774,7 +774,7 @@ pub fn detect_desktop_apps_in_with_env(
 /// Pure, hermetic Desktop/IDE detector accepting explicit `home`, optional macOS `apps_dir`
 /// (e.g. `Some("/Applications")` in live runs, `None` or a tempdir in tests), and optional
 /// Windows `appdata_dir` (e.g. `Some("%APPDATA%")`).
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn detect_desktop_apps_in(
     home: &Path,
     apps_dir: Option<&Path>,
@@ -3401,7 +3401,7 @@ fn try_open_in_herdr_app_tab(terminal_address: &str, raise_window: bool) -> bool
 }
 
 /// Builds the filtered main menu containing ONLY options actually detected/available on this machine.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn build_main_menu_items(
     diagnostics: &[HarnessDiagnostic],
     launchables: &[(LaunchableHarness, PathBuf)],
@@ -3565,7 +3565,7 @@ pub fn build_main_menu_items_with_env(
 /// Hermetic candidate detector taking explicit `home`, optional `config_path`, `PATH`,
 /// optional macOS `apps_dir`, and optional Windows `appdata_dir` so unit tests never leak
 /// host `/Applications`, `%APPDATA%`, or ambient `PATH`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn detect_candidates_in(
     home: &Path,
     config_path: Option<&Path>,
@@ -3587,6 +3587,7 @@ pub fn detect_candidates_in(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn detect_candidates_in_with_env(
     home: &Path,
@@ -3780,15 +3781,6 @@ fn parse_skill_harness_selection(
         return Err("no valid harnesses specified".to_string());
     }
     Ok(selected)
-}
-
-/// Installs the embedded `hyp-setup/SKILL.md` for all specified harnesses (deduplicating paths).
-#[allow(dead_code)]
-pub fn install_setup_skill_for_harnesses(
-    home: &Path,
-    harnesses: &[HarnessKind],
-) -> Result<Vec<InstalledSkillEntry>, String> {
-    install_setup_skill_for_harnesses_with_claude(home, true, None, harnesses)
 }
 
 /// Profile-aware installer for `hyp-setup/SKILL.md` that deduplicates symlinked `skills/`
