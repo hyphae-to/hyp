@@ -23,6 +23,7 @@ use crate::hpke::{self, hkdf_sha256};
 use crate::jcs::to_canonical_json;
 use crate::keys::{
     Ed25519KeyPair, Ed25519PublicKey, OkpJwk, X25519KeyPair, X25519PublicKey, decode_raw_key_32,
+    sign_with_domain, verify_with_domain,
 };
 use crate::keystore::validate_secret_name;
 use crate::pairing::{is_valid_node_id, validate_endpoint_origin};
@@ -539,29 +540,6 @@ fn is_valid_token_id(id: &str, allow_empty: bool) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-}
-
-fn sign_with_domain(signer: &Ed25519KeyPair, domain: &[u8], payload: &[u8]) -> String {
-    let mut msg = Zeroizing::new(Vec::with_capacity(domain.len() + payload.len()));
-    msg.extend_from_slice(domain);
-    msg.extend_from_slice(payload);
-    let sig = signer.sign_raw(&msg);
-    URL_SAFE_NO_PAD.encode(sig)
-}
-
-fn verify_with_domain(
-    pk: &Ed25519PublicKey,
-    domain: &[u8],
-    payload: &[u8],
-    sig_b64: &str,
-) -> Result<(), CryptoError> {
-    let sig = URL_SAFE_NO_PAD
-        .decode(sig_b64)
-        .map_err(|e| CryptoError::InvalidSignature(format!("invalid base64url sig: {e}")))?;
-    let mut msg = Zeroizing::new(Vec::with_capacity(domain.len() + payload.len()));
-    msg.extend_from_slice(domain);
-    msg.extend_from_slice(payload);
-    pk.verify_raw(&msg, &sig)
 }
 
 fn validate_claim_fields(claim: &HumanClaimV1) -> Result<(i64, i64), CryptoError> {
