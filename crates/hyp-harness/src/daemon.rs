@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -649,6 +649,27 @@ struct FocusChange {
     rev: u64,
 }
 
+#[derive(Default)]
+struct SessionRuntime {
+    /// Sliding lease populated by actual hook activity.
+    activity: Option<SessionActivity>,
+    /// One-shot fallback flush while the current turn is still active.
+    activity_grace: Option<ActivityGraceTimer>,
+    /// Most recent same-turn Queue reminder (RFC 0004 Decision #4).
+    last_midturn_digest_at_ms: Option<i64>,
+    /// Cooldown after trying to attach a transport persisted from an earlier session.
+    lazy_hydrate_attempt_at: Option<Instant>,
+}
+
+impl SessionRuntime {
+    fn is_empty(&self) -> bool {
+        self.activity.is_none()
+            && self.activity_grace.is_none()
+            && self.last_midturn_digest_at_ms.is_none()
+            && self.lazy_hydrate_attempt_at.is_none()
+    }
+}
+
 struct LocalDaemonInner {
     node: Arc<UnifiedNode>,
     gate: Arc<RwLock<Option<Arc<SecurityGatePipeline>>>>,
@@ -688,9 +709,6 @@ struct LocalDaemonInner {
     /// Sessions whose Herdr probe proved a live bare shell (`status == null` / `status.app == null`):
     /// maps `session_id -> terminal_id` so `--backend herdr` enrollment fails closed explicitly.
     herdr_bare_shell_rejections: Mutex<HashMap<String, String>>,
-    /// Per-session cooldown timestamps for lazy transport rehydration inside `flush_session_inner`
-    /// so permanently dead persisted targets never cause probe loops.
-    lazy_hydrate_cooldowns: Mutex<HashMap<String, Instant>>,
     flushing: Mutex<HashSet<String>>,
     /// Per-session classified metadata for `Pending` receipts (`receipt -> meta`).
     item_meta: Mutex<HashMap<String, HashMap<String, ClassifiedItemMeta>>>,
@@ -714,12 +732,8 @@ struct LocalDaemonInner {
     /// Tier 3 bounded `Hold` retry state (`session_id -> (attempt, generation)`).
     /// Empty when idle — zero background polling.
     hold_retries: Mutex<HashMap<String, (u32, u64)>>,
-    /// Sliding hook-observed `Active` activity leases (`session_id -> SessionActivity`).
-    /// Only populated by real hook activity (`PreToolUse`, `PostToolUse`, `PreInvocation`, continuation `Stop`).
-    session_activity: Mutex<HashMap<String, SessionActivity>>,
-    /// One-shot grace/lease-expiry timers deferring L2 `PushTransport` nudges while a hooked session
-    /// is actively running tools (`session_id -> ActivityGraceTimer`). Empty when idle.
-    activity_grace_timers: Mutex<HashMap<String, ActivityGraceTimer>>,
+    /// Ephemeral turn activity, grace timers and digest reminders, keyed by session ID.
+    session_runtime: Mutex<HashMap<String, SessionRuntime>>,
     /// Per-session async mutexes serializing `reconcile_session_inbox` so concurrent callers
     /// NEVER double-classify items or race past Stage 2 awaits (G3).
     reconcile_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
@@ -728,9 +742,6 @@ struct LocalDaemonInner {
     gate_hold_retries: Mutex<HashMap<String, (u32, u64, i64)>>,
     /// Tier 4 per-wakeup concurrency guard (`maxConcurrentSpawns: 1`) for allowlisted Herdr cold spawns.
     active_cold_spawns: Mutex<HashSet<String>>,
-    /// Per-session timestamp (ms) of the last mid-turn (`PostToolUse`) digest injected during the
-    /// current turn, used to rate-limit periodic long-turn `Queue` digest reminders (RFC 0004 Decision #4).
-    last_midturn_digest_at_ms: Mutex<HashMap<String, i64>>,
     /// Optional monotonic test clock offset (ms) added to `now_ms()` for deterministic timing tests.
     clock_offset_ms: AtomicI64,
     /// Monotonic UI projection revision counter bumped on every session/sub/mailbox/policy/channel change.
@@ -1867,7 +1878,6 @@ impl LocalDaemonInner {
             herdr_terminal_index: Mutex::new(hydrated_herdr_index),
             pending_probes: Mutex::new(HashMap::new()),
             herdr_bare_shell_rejections: Mutex::new(HashMap::new()),
-            lazy_hydrate_cooldowns: Mutex::new(HashMap::new()),
             flushing: Mutex::new(HashSet::new()),
             item_meta: Mutex::new(HashMap::new()),
             sub_meta: Mutex::new(hydrated_sub_meta),
@@ -1879,12 +1889,10 @@ impl LocalDaemonInner {
             wake_followup_gen: AtomicU64::new(0),
             configured_bridge_targets: Mutex::new(BTreeMap::new()),
             hold_retries: Mutex::new(HashMap::new()),
-            session_activity: Mutex::new(HashMap::new()),
-            activity_grace_timers: Mutex::new(HashMap::new()),
+            session_runtime: Mutex::new(HashMap::new()),
             reconcile_locks: Mutex::new(HashMap::new()),
             gate_hold_retries: Mutex::new(HashMap::new()),
             active_cold_spawns: Mutex::new(HashSet::new()),
-            last_midturn_digest_at_ms: Mutex::new(HashMap::new()),
             clock_offset_ms: AtomicI64::new(0),
             ui_rev: AtomicU64::new(1),
             ui_rev_tx,
@@ -2030,11 +2038,24 @@ impl LocalDaemonInner {
             .remove(session_id);
     }
 
-    fn cancel_activity_grace(&self, session_id: &str) {
-        self.activity_grace_timers
+    fn session_runtime(&self) -> MutexGuard<'_, HashMap<String, SessionRuntime>> {
+        self.session_runtime
             .lock()
-            .expect("activity_grace_timers lock poisoned")
-            .remove(session_id);
+            .expect("session_runtime lock poisoned")
+    }
+
+    fn clear_runtime_field(&self, session_id: &str, clear: impl FnOnce(&mut SessionRuntime)) {
+        let mut sessions = self.session_runtime();
+        if let Some(runtime) = sessions.get_mut(session_id) {
+            clear(runtime);
+            if runtime.is_empty() {
+                sessions.remove(session_id);
+            }
+        }
+    }
+
+    fn cancel_activity_grace(&self, session_id: &str) {
+        self.clear_runtime_field(session_id, |runtime| runtime.activity_grace = None);
     }
 
     fn infer_session_harness(
@@ -2079,16 +2100,13 @@ impl LocalDaemonInner {
             return;
         }
         let active_until = Instant::now() + self.config.queue_activity_lease;
-        self.session_activity
-            .lock()
-            .expect("session_activity lock poisoned")
-            .insert(
-                session_id.to_string(),
-                SessionActivity {
-                    harness,
-                    active_until,
-                },
-            );
+        self.session_runtime()
+            .entry(session_id.to_owned())
+            .or_default()
+            .activity = Some(SessionActivity {
+            harness,
+            active_until,
+        });
     }
 
     /// Returns the daemon's current wall-clock time (ms) plus any deterministic test clock offset.
@@ -2097,46 +2115,44 @@ impl LocalDaemonInner {
     }
 
     fn reset_midturn_digest_timer(&self, session_id: &str) {
-        self.last_midturn_digest_at_ms
-            .lock()
-            .expect("last_midturn_digest_at_ms lock poisoned")
-            .remove(session_id);
+        self.clear_runtime_field(session_id, |runtime| {
+            runtime.last_midturn_digest_at_ms = None
+        });
     }
 
     fn record_midturn_digest_timestamp(&self, session_id: &str, ts_ms: i64) {
-        self.last_midturn_digest_at_ms
-            .lock()
-            .expect("last_midturn_digest_at_ms lock poisoned")
-            .insert(session_id.to_string(), ts_ms);
+        self.session_runtime()
+            .entry(session_id.to_owned())
+            .or_default()
+            .last_midturn_digest_at_ms = Some(ts_ms);
     }
 
     /// Immediately transitions `session_id` to `Idle` and cancels any pending activity grace timer.
     fn mark_session_idle(&self, session_id: &str) {
-        self.session_activity
-            .lock()
-            .expect("session_activity lock poisoned")
-            .remove(session_id);
-        self.cancel_activity_grace(session_id);
-        self.reset_midturn_digest_timer(session_id);
+        self.clear_runtime_field(session_id, |runtime| {
+            runtime.activity = None;
+            runtime.activity_grace = None;
+            runtime.last_midturn_digest_at_ms = None;
+        });
     }
 
     /// Returns the active hook activity lease for `session_id`, pruning it if already expired.
     fn active_session_lease(&self, session_id: &str) -> Option<(HarnessKind, Duration)> {
         let now = Instant::now();
-        let mut map = self
-            .session_activity
-            .lock()
-            .expect("session_activity lock poisoned");
-        match map.get(session_id).copied() {
-            Some(act) if act.active_until > now => {
-                Some((act.harness, act.active_until.saturating_duration_since(now)))
-            }
-            Some(_) => {
-                map.remove(session_id);
-                None
-            }
-            None => None,
+        let mut sessions = self.session_runtime();
+        let runtime = sessions.get_mut(session_id)?;
+        let activity = runtime.activity?;
+        if activity.active_until > now {
+            return Some((
+                activity.harness,
+                activity.active_until.saturating_duration_since(now),
+            ));
         }
+        runtime.activity = None;
+        if runtime.is_empty() {
+            sessions.remove(session_id);
+        }
+        None
     }
 
     /// Schedules a single one-shot fallback flush timer when an L2 `PushTransport` nudge is
@@ -2158,11 +2174,9 @@ impl LocalDaemonInner {
         let fire_at = now + delay;
 
         let generation = {
-            let mut map = self
-                .activity_grace_timers
-                .lock()
-                .expect("activity_grace_timers lock poisoned");
-            if let Some(existing) = map.get(session_id).copied() {
+            let mut sessions = self.session_runtime();
+            let runtime = sessions.entry(session_id.to_owned()).or_default();
+            if let Some(existing) = runtime.activity_grace {
                 if existing.fire_at > now
                     && (existing.fire_at <= fire_at || (existing.bypass_grace && !bypass_grace))
                 {
@@ -2170,14 +2184,11 @@ impl LocalDaemonInner {
                 }
             }
             let generation = self.next_seq();
-            map.insert(
-                session_id.to_string(),
-                ActivityGraceTimer {
-                    generation,
-                    fire_at,
-                    bypass_grace,
-                },
-            );
+            runtime.activity_grace = Some(ActivityGraceTimer {
+                generation,
+                fire_at,
+                bypass_grace,
+            });
             generation
         };
 
@@ -2195,16 +2206,22 @@ impl LocalDaemonInner {
                 return;
             }
             let still_current = {
-                let mut map = daemon
-                    .activity_grace_timers
-                    .lock()
-                    .expect("activity_grace_timers lock poisoned");
-                match map.get(&sid).copied() {
-                    Some(slot) if slot.generation == generation => {
-                        map.remove(&sid);
+                let mut sessions = daemon.session_runtime();
+                if let Some(runtime) = sessions.get_mut(&sid) {
+                    if runtime
+                        .activity_grace
+                        .is_some_and(|timer| timer.generation == generation)
+                    {
+                        runtime.activity_grace = None;
+                        if runtime.is_empty() {
+                            sessions.remove(&sid);
+                        }
                         true
+                    } else {
+                        false
                     }
-                    _ => false,
+                } else {
+                    false
                 }
             };
             if !still_current {
@@ -2641,14 +2658,8 @@ impl LocalDaemonInner {
                     guard.remove(sid);
                 }
             }
-            {
-                let mut guard = self
-                    .lazy_hydrate_cooldowns
-                    .lock()
-                    .expect("lazy_hydrate_cooldowns lock poisoned");
-                for sid in &pruned {
-                    guard.remove(sid);
-                }
+            for session_id in &pruned {
+                self.clear_lazy_hydrate_cooldown(session_id);
             }
             self.bump_ui_rev();
         }
@@ -2998,25 +3009,20 @@ impl LocalDaemonInner {
         //    then clear stale activity leases, grace timers, transient hold retries,
         //    `openclaw_missing_sessions`, and lazy hydrate cooldowns so nothing stays stuck.
         let now_inst = Instant::now();
-        let mut interrupted_active: Vec<String> = {
-            let mut map = self
-                .session_activity
-                .lock()
-                .expect("session_activity lock poisoned");
-            let active: Vec<String> = map
-                .iter()
-                .filter(|(_, act)| act.active_until > now_inst)
-                .map(|(sid, _)| sid.clone())
-                .collect();
-            map.clear();
-            active
-        };
+        let mut interrupted_active = Vec::new();
+        self.session_runtime().retain(|session_id, runtime| {
+            if runtime
+                .activity
+                .take()
+                .is_some_and(|activity| activity.active_until > now_inst)
+            {
+                interrupted_active.push(session_id.clone());
+            }
+            runtime.activity_grace = None;
+            !runtime.is_empty()
+        });
         interrupted_active.sort();
 
-        self.activity_grace_timers
-            .lock()
-            .expect("activity_grace_timers lock poisoned")
-            .clear();
         let cleared_hold_retries = {
             let mut retries = self
                 .hold_retries
@@ -3030,10 +3036,10 @@ impl LocalDaemonInner {
             .lock()
             .expect("openclaw_missing_sessions lock poisoned")
             .clear();
-        self.lazy_hydrate_cooldowns
-            .lock()
-            .expect("lazy_hydrate_cooldowns lock poisoned")
-            .clear();
+        self.session_runtime().retain(|_, runtime| {
+            runtime.lazy_hydrate_attempt_at = None;
+            !runtime.is_empty()
+        });
 
         // 4. Rehydrate any dropped persisted push transports before flushing.
         if self.config.auto_detect_transports {
@@ -3250,24 +3256,20 @@ impl LocalDaemonInner {
     }
 
     fn clear_lazy_hydrate_cooldown(&self, session_id: &str) {
-        self.lazy_hydrate_cooldowns
-            .lock()
-            .expect("lazy_hydrate_cooldowns lock poisoned")
-            .remove(session_id);
+        self.clear_runtime_field(session_id, |runtime| runtime.lazy_hydrate_attempt_at = None);
     }
 
     fn record_lazy_hydrate_attempt(&self, session_id: &str) {
-        self.lazy_hydrate_cooldowns
-            .lock()
-            .expect("lazy_hydrate_cooldowns lock poisoned")
-            .insert(session_id.to_string(), Instant::now());
+        self.session_runtime()
+            .entry(session_id.to_owned())
+            .or_default()
+            .lazy_hydrate_attempt_at = Some(Instant::now());
     }
 
     fn is_lazy_hydrate_in_cooldown(&self, session_id: &str) -> bool {
-        self.lazy_hydrate_cooldowns
-            .lock()
-            .expect("lazy_hydrate_cooldowns lock poisoned")
+        self.session_runtime()
             .get(session_id)
+            .and_then(|runtime| runtime.lazy_hydrate_attempt_at)
             .is_some_and(|last| last.elapsed() < LAZY_HYDRATE_COOLDOWN)
     }
 
@@ -4026,11 +4028,9 @@ impl LocalDaemonInner {
                 if let Some(oldest_queue_ms) = oldest_unread_queue_ms {
                     let interval_ms = (interval_secs as i64).saturating_mul(1_000);
                     let last_reminded = self
-                        .last_midturn_digest_at_ms
-                        .lock()
-                        .expect("last_midturn_digest_at_ms lock poisoned")
+                        .session_runtime()
                         .get(session_id)
-                        .copied()
+                        .and_then(|runtime| runtime.last_midturn_digest_at_ms)
                         .unwrap_or(0);
                     let anchor_ms = last_reminded.max(oldest_queue_ms);
                     if now.saturating_sub(anchor_ms) >= interval_ms {
@@ -4500,10 +4500,9 @@ impl LocalDaemonInner {
                     .expect("hold_retries lock poisoned")
                     .contains_key(&sid)
                     || daemon
-                        .activity_grace_timers
-                        .lock()
-                        .expect("activity_grace_timers lock poisoned")
-                        .contains_key(&sid);
+                        .session_runtime()
+                        .get(&sid)
+                        .is_some_and(|runtime| runtime.activity_grace.is_some());
                 if retry_or_grace_active {
                     return;
                 }
