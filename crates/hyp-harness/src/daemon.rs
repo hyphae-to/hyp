@@ -5941,6 +5941,54 @@ impl LocalDaemonInner {
         }))
     }
 
+    fn add_mute(
+        self: &Arc<Self>,
+        scope: &str,
+        pattern: &str,
+        actor: &str,
+        ttl_seconds: Option<u64>,
+        policy: MutePolicyUpdate<'_>,
+    ) -> Result<(hyp_store::local::MuteRule, u64), (String, String)> {
+        let now = self.current_time_ms();
+        let expires_at =
+            ttl_seconds.map(|secs| now.saturating_add((secs as i64).saturating_mul(1_000)));
+        let rule = {
+            let db = self.node.db();
+            let added = db
+                .local()
+                .add_mute_with_expiry(scope, pattern, actor, now, expires_at)
+                .map_err(store_err_tuple)?;
+            let (session, required) = match policy {
+                MutePolicyUpdate::None => (None, false),
+                MutePolicyUpdate::BestEffort(session) => (Some(session), false),
+                MutePolicyUpdate::Required(session) => (Some(session), true),
+            };
+            if let Some(session) = session {
+                let updated = self.delivery.update_policy(&db, session, |p| {
+                    p.upsert_rule(DeliveryRule::new(pattern, DeliveryUrgency::Mute));
+                });
+                if required {
+                    updated.map_err(delivery_err_tuple)?;
+                }
+            }
+            added
+        };
+        if let Some(ttl) = ttl_seconds {
+            let timer_daemon = Arc::clone(self);
+            let mut shutdown_rx = self.shutdown_rx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+                if !*shutdown_rx.borrow() {
+                    timer_daemon.sweep_expired_mutes_and_policies(timer_daemon.current_time_ms());
+                }
+            });
+        }
+        Ok((rule, self.bump_ui_rev()))
+    }
+
     async fn tool_mute(
         self: &Arc<Self>,
         session_id: &str,
@@ -5962,49 +6010,14 @@ impl LocalDaemonInner {
         } else {
             session_id
         };
-        let ttl_seconds: Option<u64> = match args.get("ttlSeconds") {
-            None | Some(Value::Null) => None,
-            Some(v) => match v.as_u64() {
-                Some(secs) if (1..=MAX_MUTE_TTL_SECS).contains(&secs) => Some(secs),
-                _ => {
-                    return Err((
-                        "invalid_request".into(),
-                        format!("Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}"),
-                    ));
-                }
-            },
-        };
-        let now = self.current_time_ms();
-        let expires_at =
-            ttl_seconds.map(|secs| now.saturating_add((secs as i64).saturating_mul(1_000)));
-
-        let rule = {
-            let db = self.node.db();
-            let added = db
-                .local()
-                .add_mute_with_expiry(db_scope, target, session_id, now, expires_at)
-                .map_err(store_err_tuple)?;
-            let _ = self.delivery.update_policy(&db, session_id, |p| {
-                p.upsert_rule(DeliveryRule::new(target, DeliveryUrgency::Mute));
-            });
-            added
-        };
-        if let Some(ttl) = ttl_seconds {
-            let timer_daemon = Arc::clone(self);
-            let mut shutdown_rx = self.shutdown_rx.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
-                    _ = shutdown_rx.changed() => {
-                        return;
-                    }
-                }
-                if !*shutdown_rx.borrow() {
-                    timer_daemon.sweep_expired_mutes_and_policies(timer_daemon.current_time_ms());
-                }
-            });
-        }
-        self.bump_ui_rev();
+        let ttl_seconds = parse_mute_ttl(args.get("ttlSeconds"))?;
+        let (rule, _) = self.add_mute(
+            db_scope,
+            target,
+            session_id,
+            ttl_seconds,
+            MutePolicyUpdate::BestEffort(session_id),
+        )?;
 
         let mut out = json!({
             "muted": rule.pattern,
@@ -12108,6 +12121,28 @@ async fn handle_session_focus(
     })
 }
 
+enum MutePolicyUpdate<'a> {
+    None,
+    BestEffort(&'a str),
+    Required(&'a str),
+}
+
+fn parse_mute_ttl(value: Option<&Value>) -> Result<Option<u64>, (String, String)> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|secs| (1..=MAX_MUTE_TTL_SECS).contains(secs))
+            .map(Some)
+            .ok_or_else(|| {
+                (
+                    "invalid_request".into(),
+                    format!("Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}"),
+                )
+            }),
+    }
+}
+
 fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Value>) -> Value {
     let sel = match SessionSelector::from_packet(packet) {
         Ok(s) => s,
@@ -12155,75 +12190,25 @@ fn handle_session_mute(daemon: &Arc<LocalDaemonInner>, packet: &Map<String, Valu
         Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
     };
 
-    let ttl_seconds: Option<u64> = match packet.get("ttlSeconds") {
-        None | Some(Value::Null) => None,
-        Some(v) => match v.as_u64() {
-            Some(secs) if (1..=MAX_MUTE_TTL_SECS).contains(&secs) => Some(secs),
-            _ => {
-                return json!({
-                    "ok": false,
-                    "code": "invalid_request",
-                    "error": format!("Expected integer ttlSeconds in 1..={MAX_MUTE_TTL_SECS}")
-                });
-            }
-        },
+    let ttl_seconds = match parse_mute_ttl(packet.get("ttlSeconds")) {
+        Ok(ttl) => ttl,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
     };
-
     let db_scope = if scope_str == "connector" {
         "*"
     } else {
         resolved.as_ref().map(|s| s.id.as_str()).unwrap_or("*")
     };
     let actor = resolved.as_ref().map(|s| s.id.as_str()).unwrap_or("cli");
-    let now = daemon.current_time_ms();
-    let expires_at =
-        ttl_seconds.map(|secs| now.saturating_add((secs as i64).saturating_mul(1_000)));
-
-    let added = {
-        let db = daemon.node.db();
-        let added = match db
-            .local()
-            .add_mute_with_expiry(db_scope, &pattern, actor, now, expires_at)
-        {
-            Ok(rule) => rule,
-            Err(e) => {
-                return json!({ "ok": false, "code": "store_error", "error": e.to_string() });
-            }
-        };
-        if let Some(ref sess) = resolved {
-            if db_scope != "*" {
-                if let Err(e) = daemon.delivery.update_policy(&db, &sess.id, |p| {
-                    p.upsert_rule(DeliveryRule::new(&pattern, DeliveryUrgency::Mute));
-                }) {
-                    return json!({
-                        "ok": false,
-                        "code": "delivery_error",
-                        "error": e.to_string()
-                    });
-                }
-            }
-        }
-        added
+    let policy = match &resolved {
+        Some(session) if db_scope != "*" => MutePolicyUpdate::Required(&session.id),
+        _ => MutePolicyUpdate::None,
+    };
+    let (added, rev) = match daemon.add_mute(db_scope, &pattern, actor, ttl_seconds, policy) {
+        Ok(result) => result,
+        Err((code, msg)) => return json!({ "ok": false, "code": code, "error": msg }),
     };
 
-    if let Some(ttl) = ttl_seconds {
-        let timer_daemon = Arc::clone(daemon);
-        let mut shutdown_rx = daemon.shutdown_rx.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(ttl)) => {}
-                _ = shutdown_rx.changed() => {
-                    return;
-                }
-            }
-            if *shutdown_rx.borrow() {
-                return;
-            }
-            timer_daemon.sweep_expired_mutes_and_policies(timer_daemon.current_time_ms());
-        });
-    }
-
-    let rev = daemon.bump_ui_rev();
     let mut res = json!({
         "sessionId": resolved.map(|s| s.id),
         "pattern": added.pattern,
