@@ -43,13 +43,14 @@ use hyp_node::engine::http_util::{
     BoundedBodyError, HttpClient, consume_bounded_body, empty_body, full_body, percent_encode,
     resolve_ssh_binary,
 };
+use hyp_node::engine::node::{persist_p2p_offer_secret, persist_p2p_offer_sentinel};
 use hyp_node::engine::pairing_client::{
     AdminPairReplyError, AdminPairRequestError, build_admin_pair_request,
     build_delegated_pair_request, p2p_counter_grant,
 };
 use hyp_node::engine::{
-    DelegatedPairReply, GuestPairReply, GuestPairRequest, P2pPairServerReply, PairServerReply,
-    guest_pair_proof_canonical, p2p_offer_secret_name,
+    DelegatedPairReply, GuestPairReply, GuestPairRequest, NodeError, P2pPairServerReply,
+    PairServerReply, guest_pair_proof_canonical,
 };
 use hyp_proto::address::{LOCAL_NODE_ID, is_valid_node_id};
 use hyp_proto::manifest::{
@@ -1249,46 +1250,23 @@ fn run_invite(
                     ));
                 }
             };
-            let sentinel_json = match serde_json::to_string(&json!({
-                "offerId": offer_id,
-                "peerId": peer,
-            })) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(CliError::error("ENCODE_ERROR", e.to_string()));
+            persist_p2p_offer_sentinel(&db, &offer, now_ms, now_ms + ttl_ms).map_err(|error| {
+                match error {
+                    NodeError::Json(error) => CliError::error("ENCODE_ERROR", error.to_string()),
+                    NodeError::Store(error) => CliError::error(
+                        "DB_ERROR",
+                        format!("Failed to persist single-use P2P offer grant in SQLite: {error}"),
+                    ),
+                    error => CliError::error("DB_ERROR", error.to_string()),
                 }
-            };
-            if let Err(e) = db.peers().add_grant(
-                &GrantInput {
-                    id: format!("p2p-offer:{offer_id}"),
-                    peer_id: node_id.clone(),
-                    direction: GrantDirection::Inbound,
-                    signed_json: sentinel_json,
-                    scopes: offered_scopes.clone(),
-                    trust_tier: StoreTrustTier::Peer,
-                    issued_at: now_ms,
-                    pair_by: Some(now_ms + ttl_ms),
-                    expires_at: None,
-                },
-                now_ms,
-            ) {
-                return Err(CliError::error(
-                    "DB_ERROR",
-                    format!("Failed to persist single-use P2P offer grant in SQLite: {e}"),
-                ));
-            }
-            let offer_secret_key = p2p_offer_secret_name(&offer.offer_id);
-            let offer_json = match serde_json::to_string(&offer) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(CliError::error("ENCODE_ERROR", e.to_string()));
-                }
-            };
-            store.set(&offer_secret_key, &offer_json).map_err(|e| {
-                CliError::error(
+            })?;
+            persist_p2p_offer_secret(&store, &offer).map_err(|error| match error {
+                NodeError::Json(error) => CliError::error("ENCODE_ERROR", error.to_string()),
+                NodeError::Crypto(error) => CliError::error(
                     "KEYSTORE_ERROR",
-                    format!("Failed to persist P2P offer in SecretStore: {e}"),
-                )
+                    format!("Failed to persist P2P offer in SecretStore: {error}"),
+                ),
+                error => CliError::error("KEYSTORE_ERROR", error.to_string()),
             })?;
 
             let kid = keys.kid();

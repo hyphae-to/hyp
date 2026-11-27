@@ -90,6 +90,7 @@ mod pairing;
 mod streams;
 mod transfers;
 
+pub use pairing::{persist_p2p_offer_secret, persist_p2p_offer_sentinel};
 pub use streams::{SubscribeRequest, SubscribeResult};
 pub use transfers::TransferSendResult;
 use transfers::sweep_stale_transfer_staging;

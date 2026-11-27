@@ -18,22 +18,27 @@ use hyp_crypto::human::{
     verify_delegated_pair_proof, verify_human_invite, verify_human_invite_claim, verify_node_cert,
 };
 use hyp_crypto::jcs::to_canonical_json;
+use hyp_crypto::manifest::{
+    ManifestVerificationError, decode_manifest_payload, verify_manifest_integrity,
+};
 use hyp_crypto::pairing::{
     AdminInviteV2, GrantV2, P2pOfferToken, P2pPairResponse, create_p2p_confirmation,
     create_p2p_offer, create_p2p_response, decode_am2, decode_hp2p1, encode_am2_with_signed_grant,
     encode_hp2p1, extract_am2_signed_grant, sign_grant_v2, verify_grant_v2, verify_p2p_response,
 };
 use hyp_crypto::rfc3339::{format_rfc3339_millis, parse_rfc3339_millis};
-use hyp_crypto::{Ed25519KeyPair, OkpJwk as CryptoOkpJwk, SignedPayload};
+use hyp_crypto::{
+    Ed25519KeyPair, Ed25519PublicKey, OkpJwk as CryptoOkpJwk, SecretStore, SignedPayload,
+};
 use hyp_proto::address::{LOCAL_NODE_ID, NodeId};
-use hyp_proto::manifest::E2eePolicy;
+use hyp_proto::manifest::{E2eePolicy, SignedNodeManifest};
 use hyp_proto::scopes::{
     ScopePreset, ScopeSet, expand_v2_scopes, matches_node_prefix, validate_delegated_human_scopes,
 };
 use hyp_store::{
     GrantDirection, GrantInput, GrantRecord, HumanAuthorityInput, HumanAuthorityRole,
     HumanAuthorityStatus, HumanClaimKind, HumanDelegationPolicyInput, HumanNodeCertInput, KeyUse,
-    PeerInput, PeerStatus, StoreError, TrustTier, now_ms, uuid_v4,
+    NodeDb, PeerInput, PeerStatus, StoreError, TrustTier, now_ms, uuid_v4,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::json;
@@ -44,6 +49,70 @@ use super::{
     AuthenticatedPeer, HTTP_AUTH_SKEW_MS, PeerKeyPersistence, PeerLinkInfo, UnifiedNode,
     expand_node_scopes, p2p_offer_secret_name, persist_peer_key_pair, persist_peer_with_keys,
 };
+
+/// Records the single-use claim row for a P2P offer. Its secret belongs in
+/// SecretStore and can be stored after releasing the node database guard.
+pub fn persist_p2p_offer_sentinel(
+    db: &NodeDb,
+    offer: &P2pOfferToken,
+    issued_at: i64,
+    pair_by: i64,
+) -> Result<(), NodeError> {
+    db.peers().add_grant(
+        &GrantInput {
+            id: format!("p2p-offer:{}", offer.offer_id),
+            peer_id: offer.node_id.clone(),
+            direction: GrantDirection::Inbound,
+            signed_json: serde_json::to_string(&json!({
+                "offerId": offer.offer_id,
+                "peerId": offer.peer_id,
+            }))?,
+            scopes: offer.offered_scopes.clone(),
+            trust_tier: TrustTier::Peer,
+            issued_at,
+            pair_by: Some(pair_by),
+            expires_at: None,
+        },
+        issued_at,
+    )?;
+    Ok(())
+}
+
+/// Saves the private offer in the configured secret backend for daemon or reload use.
+pub fn persist_p2p_offer_secret(
+    secrets: &SecretStore,
+    offer: &P2pOfferToken,
+) -> Result<(), NodeError> {
+    let name = p2p_offer_secret_name(&offer.offer_id);
+    secrets.set(&name, &serde_json::to_string(offer)?)?;
+    Ok(())
+}
+
+fn verify_pairing_reply_manifest(
+    signed: &SignedNodeManifest,
+    peer_id: &str,
+    signing_pin: Option<&Ed25519PublicKey>,
+    encryption_pin: Option<&str>,
+) -> Result<Ed25519PublicKey, NodeError> {
+    let map_error = |error| match error {
+        ManifestVerificationError::Payload(error) => NodeError::Manifest(error),
+        ManifestVerificationError::NodeIdMismatch { actual, expected } => NodeError::Unauthorized(
+            format!("hub manifest nodeId '{actual}' does not match expected '{expected}'"),
+        ),
+        ManifestVerificationError::SigningPinMismatch
+        | ManifestVerificationError::EncryptionPinMismatch => NodeError::Unauthorized(format!(
+            "peer '{peer_id}' manifest key does not match pinned key"
+        )),
+        ManifestVerificationError::SigningKey(error)
+        | ManifestVerificationError::EncryptionKey(error)
+        | ManifestVerificationError::Signature(error) => NodeError::Crypto(error),
+        error => NodeError::BadRequest(error.to_string()),
+    };
+    let payload = decode_manifest_payload(signed, Some(peer_id)).map_err(map_error)?;
+    let (signing_key, _) = verify_manifest_integrity(signed, &payload, signing_pin, encryption_pin)
+        .map_err(map_error)?;
+    Ok(signing_key)
+}
 
 impl UnifiedNode {
     /// Creates an Org Admin-CA `am2_` invite bundle on this hub, persisting the single-use
@@ -1120,20 +1189,9 @@ impl UnifiedNode {
             )));
         }
 
-        // Verify signed manifest BEFORE persisting credentials or peer state.
-        let payload = reply.signed_manifest.decode_payload()?;
-        if payload.node_id.as_str() != hub_node_id {
-            return Err(NodeError::Unauthorized(format!(
-                "hub manifest nodeId '{}' does not match expected '{hub_node_id}'",
-                payload.node_id
-            )));
-        }
-        let hub_pk = hyp_crypto::OkpJwk::from(&payload.identity.signing_jwk).to_ed25519()?;
-        hub_pk.verify_domain_b64(
-            "manifest",
-            reply.signed_manifest.payload.as_bytes(),
-            &reply.signed_manifest.sig,
-        )?;
+        // Verify the signed identity before persisting credentials or peer state.
+        let hub_pk =
+            verify_pairing_reply_manifest(&reply.signed_manifest, hub_node_id, None, None)?;
         if let Some(expected_fp) = expected_hub_fingerprint {
             let actual_fp = hub_pk.fingerprint();
             if !expected_fp.eq_ignore_ascii_case(&actual_fp) {
@@ -1228,6 +1286,14 @@ impl UnifiedNode {
                     NodeError::Unauthorized("hub returned grant for wrong nodeId".into())
                 }
             })?;
+
+        let pinned_hub_signing = self.lookup_peer_signing_key(&reply.node_id)?;
+        verify_pairing_reply_manifest(
+            &reply.signed_manifest,
+            &reply.node_id,
+            pinned_hub_signing.as_ref(),
+            None,
+        )?;
 
         // Persist authCredential in SecretStore (never plaintext in SQLite!).
         let cred_ref = self.save_peer_auth_credential(&reply.node_id, &reply.auth_credential)?;
@@ -1329,35 +1395,8 @@ impl UnifiedNode {
         )?;
         offer.peer_id = target_peer_id.map(ToOwned::to_owned);
 
-        // Persist a single-use offer sentinel grant in `PeerStore` so `claim_grant` enforces
-        // atomic single-use semantics across concurrent pairing requests!
-        {
-            let db = self.db();
-            db.peers().add_grant(
-                &GrantInput {
-                    id: format!("p2p-offer:{offer_id}"),
-                    peer_id: self.config.node_id.to_string(),
-                    direction: GrantDirection::Inbound,
-                    signed_json: serde_json::to_string(&json!({
-                        "offerId": offer_id,
-                        "peerId": target_peer_id,
-                    }))?,
-                    scopes: expanded_offered,
-                    trust_tier: TrustTier::Peer,
-                    issued_at: now,
-                    pair_by: Some(now + ttl_ms),
-                    expires_at: None,
-                },
-                now,
-            )?;
-        }
-
-        // Persist the full offer in SecretStore (zero plaintext pairing nonce on disk!) so
-        // `POST /v1/p2p/pair/<offerId>` also succeeds across daemon restarts or when the offer
-        // was minted out-of-process by `hyp pair invite --mode p2p`.
-        let offer_secret_key = p2p_offer_secret_name(&offer_id);
-        let offer_json = serde_json::to_string(&offer)?;
-        self.secrets.set(&offer_secret_key, &offer_json)?;
+        persist_p2p_offer_sentinel(&self.db(), &offer, now, now + ttl_ms)?;
+        persist_p2p_offer_secret(&self.secrets, &offer)?;
 
         self.pending_p2p_offers
             .lock()
@@ -1720,9 +1759,15 @@ impl UnifiedNode {
         let verified_alice_grant =
             server_reply.verify_grant(&offer, self.config.node_id.as_str())?;
 
-        // Pin Alice's JWKs from the OOB `hp2p1_` offer BEFORE verifying Alice's manifest!
-        let alice_sign_pk = offer.signing_jwk.to_ed25519()?;
-        let alice_enc_pk = offer.encryption_jwk.to_x25519()?;
+        // The reply manifest must match the keys received in the out-of-band offer.
+        verify_pairing_reply_manifest(
+            &server_reply.signed_manifest,
+            &offer.node_id,
+            Some(&offer_sign_pk),
+            Some(&offer.encryption_jwk.x),
+        )?;
+        let alice_sign_pk = offer_sign_pk;
+        let alice_enc_pk = offer_enc_pk;
         let cred_ref =
             self.save_peer_auth_credential(&offer.node_id, &server_reply.auth_credential)?;
 
