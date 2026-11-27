@@ -1937,18 +1937,17 @@ fn inspect_hp2p1(
         } else {
             None
         };
-        let envelope = JsonEnvelope {
-            ok,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd,
+            format!(
                 "Inspected hp2p1_ offer from '{}' (expiry: {expiry_status})",
                 offer.node_id
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error,
-        };
+            ),
+            data,
+        )
+        .warnings(warnings)
+        .next(next)
+        .error(error);
         print_json(&envelope);
     } else {
         let tag = if ok { "OK" } else { "FAIL" };
@@ -2138,18 +2137,17 @@ fn inspect_am2(
         } else {
             None
         };
-        let envelope = JsonEnvelope {
-            ok,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd,
+            format!(
                 "Inspected am2_ Org Admin-CA bundle for {} (expiry: {expiry_status})",
                 invite.router
-            )),
-            data: Some(data),
-            warnings,
-            next,
-            error,
-        };
+            ),
+            data,
+        )
+        .warnings(warnings)
+        .next(next)
+        .error(error);
         print_json(&envelope);
     } else {
         let tag = if ok { "OK" } else { "FAIL" };

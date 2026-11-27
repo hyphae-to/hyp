@@ -14,8 +14,7 @@ use crate::config_file::{
     resolve_config_path_for_write, resolve_effective_node_id, resolve_state_dir, write_atomic_json,
 };
 use crate::ui::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json, print_next_steps,
-    print_warnings,
+    CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json, print_next_steps, print_warnings,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -178,7 +177,7 @@ pub enum RelayCommand {
     },
 }
 
-pub fn run_drop(command: DropCommand) -> ExitCode {
+pub fn run_drop(command: DropCommand) -> CommandResult {
     match command {
         DropCommand::Create {
             kind,
@@ -193,19 +192,23 @@ pub fn run_drop(command: DropCommand) -> ExitCode {
             state_dir,
             config,
             json,
-        } => run_drop_create(
-            kind,
-            secret_name,
-            handle,
-            draft,
-            draft_stdin,
-            context,
-            relay,
-            ttl,
-            offline,
-            state_dir,
-            config,
+        } => CommandResult::new(
+            "drop create",
             json,
+            run_drop_create(
+                kind,
+                secret_name,
+                handle,
+                draft,
+                draft_stdin,
+                context,
+                relay,
+                ttl,
+                offline,
+                state_dir,
+                config,
+                json,
+            ),
         ),
         DropCommand::Wait {
             relay,
@@ -215,31 +218,47 @@ pub fn run_drop(command: DropCommand) -> ExitCode {
             state_dir,
             config,
             json,
-        } => run_drop_wait(relay, drop_id, overwrite, timeout, state_dir, config, json),
+        } => CommandResult::new(
+            "drop wait",
+            json,
+            run_drop_wait(relay, drop_id, overwrite, timeout, state_dir, config, json),
+        ),
         DropCommand::Ingest {
             overwrite,
             state_dir,
             config,
             json,
-        } => run_drop_ingest(overwrite, state_dir, config, json),
+        } => CommandResult::new(
+            "drop ingest",
+            json,
+            run_drop_ingest(overwrite, state_dir, config, json),
+        ),
     }
 }
 
-pub fn run_relay(command: RelayCommand) -> ExitCode {
+pub fn run_relay(command: RelayCommand) -> CommandResult {
     match command {
         RelayCommand::Set {
             url,
             config,
             state_dir,
             json,
-        } => run_relay_set(url, config, state_dir, json),
+        } => CommandResult::new(
+            "relay set",
+            json,
+            run_relay_set(url, config, state_dir, json),
+        ),
         RelayCommand::Status {
             url,
             probe,
             config,
             state_dir,
             json,
-        } => run_relay_status(url, probe, config, state_dir, json),
+        } => CommandResult::new(
+            "relay status",
+            json,
+            run_relay_status(url, probe, config, state_dir, json),
+        ),
     }
 }
 
@@ -398,68 +417,48 @@ fn run_drop_create(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "drop create";
     if ttl_secs == 0 || ttl_secs > MAX_DROP_TTL_SECS {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_TTL",
             format!("--ttl must be in 1..={MAX_DROP_TTL_SECS} seconds"),
-            None,
-        );
+        ));
     }
 
     if draft_arg.is_some() && draft_stdin {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "Specify at most one of --draft or --draft-stdin",
-            None,
-        );
+        ));
     }
 
     // Fail-closed security invariant #1: secrets MUST NEVER carry draft or context prefill.
     if kind == CliDropKind::Secret && (draft_arg.is_some() || draft_stdin || context_arg.is_some())
     {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "DRAFT_FORBIDDEN_FOR_SECRET",
             "Draft prefill is forbidden for secret drops; secrets must be entered fresh by the human",
-            None,
-        );
+        ));
     }
 
     let draft_text: Option<String> = if draft_stdin {
         let mut raw = String::new();
-        if let Err(e) = io::stdin()
+        io::stdin()
             .lock()
             .take(MAX_DRAFT_STDIN_BYTES + 1)
             .read_to_string(&mut raw)
-        {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "STDIN_ERROR",
-                format!("Failed to read draft from stdin: {e}"),
-                None,
-            );
-        }
+            .map_err(|e| {
+                CliError::error(
+                    "STDIN_ERROR",
+                    format!("Failed to read draft from stdin: {e}"),
+                )
+            })?;
         if raw.len() as u64 > MAX_DRAFT_STDIN_BYTES {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "DRAFT_TOO_LARGE",
                 format!("Draft input exceeds {MAX_DRAFT_STDIN_BYTES} byte safety cap"),
-                None,
-            );
+            ));
         }
         Some(raw.trim_end_matches(['\r', '\n']).to_string())
     } else {
@@ -467,114 +466,69 @@ fn run_drop_create(
     };
 
     if draft_text.is_none() && context_arg.is_some() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONTEXT_WITHOUT_DRAFT",
             "Optional --context requires --draft or --draft-stdin",
-            None,
-        );
+        ));
     }
 
     if let Some(ref text) = draft_text {
-        if let Err(e) = validate_draft_text(text) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_DRAFT",
-                e.to_string(),
-                None,
-            );
-        }
+        validate_draft_text(text).map_err(|e| CliError::usage("INVALID_DRAFT", e.to_string()))?;
         if let Some(ref ctx) = context_arg {
-            if let Err(e) = validate_draft_text(ctx) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
-                    "INVALID_DRAFT_CONTEXT",
-                    e.to_string(),
-                    None,
-                );
-            }
+            validate_draft_text(ctx)
+                .map_err(|e| CliError::usage("INVALID_DRAFT_CONTEXT", e.to_string()))?;
             let ctx_chars = ctx.chars().count();
             if ctx_chars > MAX_HUMAN_DRAFT_CONTEXT_CHARS {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "INVALID_DRAFT_CONTEXT",
                     format!(
                         "human draft context length {ctx_chars} exceeds maximum {MAX_HUMAN_DRAFT_CONTEXT_CHARS} chars"
                     ),
-                    None,
-                );
+                ));
             }
         }
     }
 
     if let Some(ref h) = handle_arg {
         if !is_valid_handle(h) {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_HANDLE",
                 format!("Invalid --handle '{h}'"),
-                None,
-            );
+            ));
         }
     }
 
     let validated_secret_name = match kind {
         CliDropKind::Secret => {
             let Some(ref raw_name) = secret_name_arg else {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "MISSING_SECRET_NAME",
                     "--secret-name <name> is required when --kind secret",
-                    None,
-                );
+                ));
             };
             let name = raw_name.trim();
             if is_reserved_secret_name(name) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "RESERVED_SECRET_NAME",
                     format!(
                         "Reserved system secret name '{name}' is permanently blocked for human drops"
                     ),
-                    None,
-                );
+                ));
             }
-            if let Err(e) = validate_secret_name(name) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+            validate_secret_name(name).map_err(|e| {
+                CliError::usage(
                     "INVALID_SECRET_NAME",
                     format!("Invalid --secret-name '{name}': {e}"),
-                    None,
-                );
-            }
+                )
+            })?;
             Some(name.to_string())
         }
         CliDropKind::Directive => {
             if secret_name_arg.is_some() {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "UNEXPECTED_SECRET_NAME",
                     "--secret-name is only allowed when --kind secret",
-                    None,
-                );
+                ));
             }
             None
         }
@@ -596,36 +550,22 @@ fn run_drop_create(
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(s.clone()),
         Some(_) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "CONFIG_ERROR",
-                format!(
+            return Err(CliError::error("CONFIG_ERROR", format!(
                     "Invalid dropPortalUrl in {}: must be a string",
                     config_read.display()
-                ),
-                Some(
+                )).with_fix(
                     "Set dropPortalUrl to an https:// URL (e.g. \"https://hyphae.to/drop\") or loopback http://127.0.0.1."
                         .to_string(),
-                ),
-            );
+                ));
         }
     };
     let drop_portal_url = match resolve_drop_portal_url(configured_drop_portal_url.as_deref()) {
         Ok(u) => u,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "CONFIG_ERROR",
-                format!("Invalid Drop Portal URL: {e}"),
-                Some(
+            return Err(CliError::error("CONFIG_ERROR", format!("Invalid Drop Portal URL: {e}")).with_fix(
                     "Set HYPHAE_DROP_PORTAL_URL or node.json dropPortalUrl to an https:// URL (e.g. https://hyphae.to/drop) or loopback http://127.0.0.1."
                         .to_string(),
-                ),
-            );
+                ));
         }
     };
 
@@ -634,7 +574,7 @@ fn run_drop_create(
     } else if let Some(ref explicit) = relay_arg {
         match validate_relay_url(explicit) {
             Ok(u) => Some(u),
-            Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_RELAY_URL", e, None),
+            Err(e) => return Err(CliError::usage("INVALID_RELAY_URL", e)),
         }
     } else if let Some(configured) = loaded
         .as_ref()
@@ -645,15 +585,13 @@ fn run_drop_create(
     {
         match validate_relay_url(configured) {
             Ok(u) => Some(u),
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "INVALID_RELAY_URL", e, None),
+            Err(e) => return Err(CliError::error("INVALID_RELAY_URL", e)),
         }
     } else {
         None
     };
 
-    if let Err(e) = ensure_dir(&state_dir, true) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    ensure_dir(&state_dir, true).map_err(|e| CliError::error("IO_ERROR", e))?;
     let db_path = state_dir.join("node.sqlite");
     let db = if db_path.exists() {
         NodeDb::open(&db_path).ok()
@@ -669,14 +607,10 @@ fn run_drop_create(
     let identity = match secrets.load_or_create_node_keys(&node_id) {
         Ok(k) => k,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "NODE_KEY_ERROR",
                 format!("Failed to load node identity keys: {e}"),
-                None,
-            );
+            ));
         }
     };
     let enc_jwk = identity.encryption_jwk();
@@ -717,49 +651,29 @@ fn run_drop_create(
             .as_ref()
             .and_then(|d| d.human().get_preferred_human_enc_jwk(None).ok().flatten());
         let Some(auth_rec) = enc_authority else {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "NO_HUMAN_ENC_KEY",
-                "No human X25519 encryption key enrolled for encrypted directive draft prefill; refusing plaintext downgrade",
-                Some("hyp auth init --web".to_string()),
-            );
+            return Err(CliError::error("NO_HUMAN_ENC_KEY", "No human X25519 encryption key enrolled for encrypted directive draft prefill; refusing plaintext downgrade").with_fix("hyp auth init --web".to_string()));
         };
         let Some(ref raw_enc_jwk) = auth_rec.enc_jwk_json else {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "NO_HUMAN_ENC_KEY",
-                "No human X25519 encryption key enrolled for encrypted directive draft prefill; refusing plaintext downgrade",
-                Some("hyp auth init --web".to_string()),
-            );
+            return Err(CliError::error("NO_HUMAN_ENC_KEY", "No human X25519 encryption key enrolled for encrypted directive draft prefill; refusing plaintext downgrade").with_fix("hyp auth init --web".to_string()));
         };
         let parsed_enc_jwk: OkpJwk = match serde_json::from_str(raw_enc_jwk) {
             Ok(j) => j,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "INVALID_HUMAN_ENC_KEY",
                     format!("Stored human encryption JWK is invalid: {e}"),
-                    Some("hyp auth init --web".to_string()),
-                );
+                )
+                .with_fix("hyp auth init --web".to_string()));
             }
         };
         let human_enc_pk = match parsed_enc_jwk.to_x25519() {
             Ok(pk) => pk,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "INVALID_HUMAN_ENC_KEY",
                     format!("Stored human encryption JWK is not a valid X25519 public key: {e}"),
-                    Some("hyp auth init --web".to_string()),
-                );
+                )
+                .with_fix("hyp auth init --web".to_string()));
             }
         };
 
@@ -780,14 +694,10 @@ fn run_drop_create(
         match seal_human_draft(&payload, &human_enc_pk) {
             Ok(sealed) => Some(sealed),
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "DRAFT_SEAL_FAILED",
                     format!("Failed to seal encrypted directive draft: {e}"),
-                    None,
-                );
+                ));
             }
         }
     } else {
@@ -809,14 +719,10 @@ fn run_drop_create(
         {
             Ok(rt) => rt,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "RUNTIME_ERROR",
                     format!("Failed to start async runtime: {e}"),
-                    None,
-                );
+                ));
             }
         };
         let created = match rt.block_on(create_relay_drop_slot(
@@ -824,17 +730,9 @@ fn run_drop_create(
         )) {
             Ok(c) => c,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "RELAY_CREATE_FAILED",
-                    e,
-                    Some(
-                        "Re-run with --offline to generate an offline hdrop1_ invite URL."
-                            .to_string(),
-                    ),
-                );
+                return Err(CliError::error("RELAY_CREATE_FAILED", e).with_fix(
+                    "Re-run with --offline to generate an offline hdrop1_ invite URL.".to_string(),
+                ));
             }
         };
         let last_drop_doc = json!({
@@ -916,16 +814,14 @@ fn run_drop_create(
         let draft_val = match serde_json::to_value(sealed_draft) {
             Ok(v) => v,
             Err(e) => {
-                return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None);
+                return Err(CliError::error("JSON_ERROR", e.to_string()));
             }
         };
         frag.insert("encDraft".to_string(), draft_val);
     }
 
-    let canon = match to_canonical_json(&Value::Object(frag)) {
-        Ok(s) => s,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "JSON_ERROR", e.to_string(), None),
-    };
+    let canon = to_canonical_json(&Value::Object(frag))
+        .map_err(|e| CliError::error("JSON_ERROR", e.to_string()))?;
     let drop_url = format!(
         "{drop_portal_url}#drop={}",
         URL_SAFE_NO_PAD.encode(canon.as_bytes())
@@ -941,14 +837,13 @@ fn run_drop_create(
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Created {mode} {} drop URL for node '{node_id}'",
                 kind.to_crypto_kind().as_str()
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "mode": mode,
                 "url": drop_url,
                 "nodeId": node_id,
@@ -962,11 +857,10 @@ fn run_drop_create(
                 "hasNodeCert": node_cert_hcert1.is_some(),
                 "hasEncDraft": encrypted_draft.is_some(),
                 "expiresAt": expires_at,
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -990,7 +884,7 @@ fn run_drop_create(
         }
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 pub(crate) async fn create_relay_drop_slot(
@@ -1090,7 +984,7 @@ fn run_drop_wait(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "drop wait";
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
@@ -1109,14 +1003,10 @@ fn run_drop_wait(
         Some(raw) => {
             let trimmed = raw.trim().to_string();
             if trimmed.is_empty() {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
+                return Err(CliError::usage(
                     "INVALID_DROP_ID",
                     "--drop-id cannot be empty",
-                    None,
-                );
+                ));
             }
             let matched = saved_last.as_ref().is_some_and(|s| s.drop_id == trimmed);
             (trimmed, matched)
@@ -1126,40 +1016,26 @@ fn run_drop_wait(
                 if let Some(exp) = saved.expires_at_ms {
                     if exp <= now_unix_ms() {
                         let _ = std::fs::remove_file(&last_drop_path);
-                        return emit_error(
-                            cmd,
-                            as_json,
-                            EXIT_ERROR,
-                            "LAST_DROP_EXPIRED",
-                            format!(
+                        return Err(CliError::error("LAST_DROP_EXPIRED", format!(
                                 "Most recent drop slot '{}' in {} has expired; create a fresh drop link",
                                 saved.drop_id,
                                 last_drop_path.display()
-                            ),
-                            Some(format!(
+                            )).with_fix(format!(
                                 "hyp drop create --kind directive --state-dir {}",
                                 state_dir.display()
-                            )),
-                        );
+                            )));
                     }
                 }
                 (saved.drop_id.clone(), true)
             }
             None => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_USAGE,
-                    "MISSING_DROP_ID",
-                    format!(
+                return Err(CliError::usage("MISSING_DROP_ID", format!(
                         "No --drop-id specified and no pending drop found in {}",
                         last_drop_path.display()
-                    ),
-                    Some(format!(
+                    )).with_fix(format!(
                         "Run `hyp drop create --kind directive --state-dir {}` first, or pass --drop-id <id>.",
                         state_dir.display()
-                    )),
-                );
+                    )));
             }
         },
     };
@@ -1180,22 +1056,17 @@ fn run_drop_wait(
                 .map(ToOwned::to_owned)
         });
     let Some(relay_raw) = relay_raw else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "MISSING_RELAY",
             "No --relay URL specified and no dropRelayUrl configured in node.json",
-            Some(
-                "Pass --relay https://<your-relay> or run `hyp relay set https://<your-relay>`."
-                    .to_string(),
-            ),
-        );
+        )
+        .with_fix(
+            "Pass --relay https://<your-relay> or run `hyp relay set https://<your-relay>`."
+                .to_string(),
+        ));
     };
-    let relay_url = match validate_relay_url(&relay_raw) {
-        Ok(u) => u,
-        Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_RELAY_URL", e, None),
-    };
+    let relay_url =
+        validate_relay_url(&relay_raw).map_err(|e| CliError::usage("INVALID_RELAY_URL", e))?;
 
     // Optionally read `subCap` from piped stdin (NEVER argv!), falling back to `last_drop.json`.
     let stdin_sub_cap: Option<String> = if !io::stdin().is_terminal() {
@@ -1224,10 +1095,8 @@ fn run_drop_wait(
     });
 
     let (node, gate) =
-        match open_node_and_optional_gate(&state_dir, &config_read, state_dir_arg.is_some()) {
-            Ok(pair) => pair,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "NODE_OPEN_FAILED", e, None),
-        };
+        open_node_and_optional_gate(&state_dir, &config_read, state_dir_arg.is_some())
+            .map_err(|e| CliError::error("NODE_OPEN_FAILED", e))?;
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1235,14 +1104,10 @@ fn run_drop_wait(
     {
         Ok(rt) => rt,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RUNTIME_ERROR",
                 format!("Failed to start async runtime: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -1273,7 +1138,7 @@ fn run_drop_wait(
                 warnings,
             )
         }
-        Err(e) => emit_error(cmd, as_json, EXIT_ERROR, "DROP_WAIT_FAILED", e, None),
+        Err(e) => Err(CliError::error("DROP_WAIT_FAILED", e)),
     }
 }
 
@@ -1532,44 +1397,33 @@ fn run_drop_ingest(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "drop ingest";
     let mut raw = String::new();
-    if let Err(e) = io::stdin()
+    io::stdin()
         .lock()
         .take(MAX_HDROP1_STDIN_BYTES + 1)
         .read_to_string(&mut raw)
-    {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "STDIN_ERROR",
-            format!("Failed to read hdrop1_ token from stdin: {e}"),
-            None,
-        );
-    }
+        .map_err(|e| {
+            CliError::error(
+                "STDIN_ERROR",
+                format!("Failed to read hdrop1_ token from stdin: {e}"),
+            )
+        })?;
     if raw.len() as u64 > MAX_HDROP1_STDIN_BYTES {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "TOKEN_TOO_LARGE",
             format!("Token input exceeds {MAX_HDROP1_STDIN_BYTES} byte safety cap"),
-            None,
-        );
+        ));
     }
     let token = raw.trim().to_string();
     drop(raw);
     if token.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "EMPTY_STDIN",
             "Expected armored hdrop1_ token on stdin (never pass tokens as CLI arguments)",
-            Some("Example: printf '%s' \"$HDROP1\" | hyp drop ingest".to_string()),
-        );
+        )
+        .with_fix("Example: printf '%s' \"$HDROP1\" | hyp drop ingest".to_string()));
     }
 
     let state_dir = resolve_state_dir(state_dir_arg.as_deref(), config_arg.as_deref(), None);
@@ -1577,10 +1431,8 @@ fn run_drop_ingest(
         resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
 
     let (node, gate) =
-        match open_node_and_optional_gate(&state_dir, &config_read, state_dir_arg.is_some()) {
-            Ok(pair) => pair,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "NODE_OPEN_FAILED", e, None),
-        };
+        open_node_and_optional_gate(&state_dir, &config_read, state_dir_arg.is_some())
+            .map_err(|e| CliError::error("NODE_OPEN_FAILED", e))?;
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1588,14 +1440,10 @@ fn run_drop_ingest(
     {
         Ok(rt) => rt,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "RUNTIME_ERROR",
                 format!("Failed to start async runtime: {e}"),
-                None,
-            );
+            ));
         }
     };
 
@@ -1603,14 +1451,7 @@ fn run_drop_ingest(
         Ok(ingested) => {
             emit_ingested_drop_ok(cmd, as_json, &ingested, None, None, None, Vec::new())
         }
-        Err(e) => emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "DROP_INGEST_FAILED",
-            e.to_string(),
-            None,
-        ),
+        Err(e) => Err(CliError::error("DROP_INGEST_FAILED", e.to_string())),
     }
 }
 
@@ -1622,7 +1463,7 @@ fn emit_ingested_drop_ok(
     drop_id: Option<&str>,
     ack: Option<&AckDropResponse>,
     warnings: Vec<String>,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     // SECURITY: NEVER print secret values — only metadata!
     let summary = if let Some(ref sec_name) = ingested.secret_name {
         format!(
@@ -1637,11 +1478,10 @@ fn emit_ingested_drop_ok(
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            summary,
+            json!({
                 "claimId": ingested.claim_id,
                 "humanId": ingested.human_id,
                 "kid": ingested.kid,
@@ -1656,11 +1496,9 @@ fn emit_ingested_drop_ok(
                 "relay": relay_url,
                 "dropId": drop_id,
                 "relayAck": ack,
-            })),
-            warnings,
-            next: Vec::new(),
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings);
         print_json(&envelope);
     } else {
         println!("OK    {summary}");
@@ -1679,7 +1517,7 @@ fn emit_ingested_drop_ok(
         }
         print_warnings(&warnings);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn run_relay_set(
@@ -1687,22 +1525,14 @@ fn run_relay_set(
     config_arg: Option<PathBuf>,
     state_dir_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "relay set";
     let normalized = match validate_relay_url(&url) {
         Ok(u) => u,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
-                "INVALID_RELAY_URL",
-                e,
-                Some(
-                    "Pass an https:// URL (e.g. hyp relay set https://drop.example.com)."
-                        .to_string(),
-                ),
-            );
+            return Err(CliError::usage("INVALID_RELAY_URL", e).with_fix(
+                "Pass an https:// URL (e.g. hyp relay set https://drop.example.com).".to_string(),
+            ));
         }
     };
 
@@ -1710,10 +1540,8 @@ fn run_relay_set(
     let config_path =
         resolve_config_path_for_write(config_arg.as_deref(), state_dir_arg.as_deref(), None);
 
-    let mut cfg_map = match NodeFile::read_document_or_empty(&config_path) {
-        Ok(m) => m,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
-    };
+    let mut cfg_map = NodeFile::read_document_or_empty(&config_path)
+        .map_err(|e| CliError::error("CONFIG_ERROR", e))?;
     let node_id = cfg_map
         .get("nodeId")
         .and_then(Value::as_str)
@@ -1725,9 +1553,7 @@ fn run_relay_set(
         Value::String(normalized.clone()),
     );
 
-    if let Err(e) = NodeFile::write_document(&config_path, cfg_map) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-    }
+    NodeFile::write_document(&config_path, cfg_map).map_err(|e| CliError::error("IO_ERROR", e))?;
 
     let warnings = vec![
         "If a Hyphae daemon is running, restart it (`hyp service restart --json`) so it picks up the updated dropRelayUrl."
@@ -1743,22 +1569,20 @@ fn run_relay_set(
     ];
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Configured dropRelayUrl '{normalized}' in {}",
                 config_path.display()
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "dropRelayUrl": normalized,
                 "configPath": config_path.display().to_string(),
                 "stateDir": state_dir.display().to_string(),
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -1768,7 +1592,7 @@ fn run_relay_set(
         print_warnings(&warnings);
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn run_relay_status(
@@ -1777,14 +1601,14 @@ fn run_relay_status(
     config_arg: Option<PathBuf>,
     state_dir_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "relay status";
     let config_path =
         resolve_config_path_for_read(config_arg.as_deref(), state_dir_arg.as_deref(), None);
     let loaded = if config_path.exists() {
         match load_node_or_legacy_config(&config_path) {
             Ok(cfg) => Some(cfg),
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
+            Err(e) => return Err(CliError::error("CONFIG_ERROR", e)),
         }
     } else {
         None
@@ -1807,7 +1631,7 @@ fn run_relay_status(
     let explicit_probe_url = match url_arg {
         Some(ref raw) => match validate_relay_url(raw) {
             Ok(u) => Some(u),
-            Err(e) => return emit_error(cmd, as_json, EXIT_USAGE, "INVALID_RELAY_URL", e, None),
+            Err(e) => return Err(CliError::usage("INVALID_RELAY_URL", e)),
         },
         None => None,
     };
@@ -1833,10 +1657,9 @@ fn run_relay_status(
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(match configured_url.as_deref() {
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            match configured_url.as_deref() {
                 Some(u) => format!(
                     "Drop Relay configured: {u} (local hosted={})",
                     local_relay.enabled
@@ -1845,8 +1668,8 @@ fn run_relay_status(
                     "No remote dropRelayUrl configured (local hosted={})",
                     local_relay.enabled
                 ),
-            }),
-            data: Some(json!({
+            },
+            json!({
                 "configPath": config_path.display().to_string(),
                 "dropRelayUrl": configured_url,
                 "localDropRelay": {
@@ -1859,18 +1682,17 @@ fn run_relay_status(
                     "allowPrivateNetwork": local_relay.allow_private_network,
                 },
                 "probe": probe_result,
-            })),
-            warnings: Vec::new(),
-            next: if configured_url.is_none() && !local_relay.enabled {
-                vec![
-                    "hyp relay set https://<your-drop-relay>".to_string(),
-                    "hyp deploy init drop-relay --domain drop.example.com --out ./deploy-drop-relay".to_string(),
-                ]
-            } else {
-                Vec::new()
-            },
-            error: None,
-        };
+            }),
+        )
+        .next(if configured_url.is_none() && !local_relay.enabled {
+            vec![
+                "hyp relay set https://<your-drop-relay>".to_string(),
+                "hyp deploy init drop-relay --domain drop.example.com --out ./deploy-drop-relay"
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        });
         print_json(&envelope);
     } else {
         println!("Hyphae Drop Relay Status");
@@ -1916,7 +1738,7 @@ fn run_relay_status(
             }
         }
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 async fn probe_relay_health(base_url: &str) -> Value {

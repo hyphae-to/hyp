@@ -3,7 +3,7 @@
 
 use crate::drop_cmd::validate_relay_url;
 use crate::ui::{
-    CheckStatus, CliCheck, CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error,
+    CheckStatus, CliCheck, CliError, CommandResult, EXIT_ERROR, EXIT_OK, JsonEnvelope,
     print_checks, print_json, print_next_steps, print_warnings,
 };
 use clap::{Subcommand, ValueEnum};
@@ -213,10 +213,12 @@ struct ProviderInfo {
     init_command: &'static str,
 }
 
-pub fn run_deploy(command: DeployCommand) -> ExitCode {
+pub fn run_deploy(command: DeployCommand) -> CommandResult {
     match command {
         DeployCommand::Webhook(args) => crate::webhook_deploy::run(args),
-        DeployCommand::Providers { json } => run_providers(json),
+        DeployCommand::Providers { json } => {
+            CommandResult::new("deploy providers", json, run_providers(json))
+        }
         DeployCommand::Init {
             provider,
             node_id,
@@ -228,19 +230,25 @@ pub fn run_deploy(command: DeployCommand) -> ExitCode {
             out,
             force,
             json,
-        } => run_init(
-            provider,
-            node_id,
-            domain,
-            bind,
-            profile,
-            enable_drop_relay,
-            drop_max_memory_mb,
-            out,
-            force,
+        } => CommandResult::new(
+            "deploy init",
             json,
+            run_init(
+                provider,
+                node_id,
+                domain,
+                bind,
+                profile,
+                enable_drop_relay,
+                drop_max_memory_mb,
+                out,
+                force,
+                json,
+            ),
         ),
-        DeployCommand::Check { url, config, json } => run_check(url, config, json),
+        DeployCommand::Check { url, config, json } => {
+            CommandResult::new("deploy check", json, run_check(url, config, json))
+        }
     }
 }
 
@@ -467,7 +475,7 @@ fn build_provider_catalog(tools: &[DetectedTool]) -> Vec<ProviderInfo> {
     ]
 }
 
-fn run_providers(as_json: bool) -> ExitCode {
+fn run_providers(as_json: bool) -> Result<ExitCode, CliError> {
     let tools = detect_local_tools();
     let providers = build_provider_catalog(&tools);
     let next = vec![
@@ -478,23 +486,20 @@ fn run_providers(as_json: bool) -> ExitCode {
     ];
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: "deploy providers".to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            "deploy providers".to_string(),
+            format!(
                 "{} internet deployment providers supported",
                 providers.len()
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "providers": providers,
                 "detectedTools": tools,
-            })),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        };
+            }),
+        )
+        .next(next);
         print_json(&envelope);
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     println!("Hyphae Internet Deployment Providers");
@@ -519,7 +524,7 @@ fn run_providers(as_json: bool) -> ExitCode {
         println!();
     }
     print_next_steps(&next);
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 // ============================================================================
@@ -626,20 +631,17 @@ fn run_init(
     out_arg: Option<PathBuf>,
     force: bool,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "deploy init";
     let profile = profile_arg.unwrap_or_else(|| provider.default_profile());
     let enable_drop_relay = enable_drop_relay_flag || provider == DeployProvider::DropRelay;
     let drop_max_memory_mb = match drop_max_memory_mb_arg {
         Some(0) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_DROP_MEMORY",
                 "--drop-max-memory-mb must be >= 1",
-                Some("Example: --drop-max-memory-mb 256".to_string()),
-            );
+            )
+            .with_fix("Example: --drop-max-memory-mb 256".to_string()));
         }
         Some(mb) => mb,
         None => DEFAULT_DROP_RELAY_MEMORY_MB,
@@ -648,14 +650,11 @@ fn run_init(
     let domain = match validate_domain_hostname(&domain_raw) {
         Ok(d) => d,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_DOMAIN",
                 format!("Invalid --domain '{domain_raw}': {e}"),
-                Some("Pass a bare hostname such as --domain mesh.example.com".to_string()),
-            );
+            )
+            .with_fix("Pass a bare hostname such as --domain mesh.example.com".to_string()));
         }
     };
 
@@ -667,30 +666,20 @@ fn run_init(
         }
     });
     if node_id == LOCAL_NODE_ID || !is_valid_node_id(&node_id) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
-            "INVALID_NODE_ID",
-            format!(
+        return Err(CliError::usage("INVALID_NODE_ID", format!(
                 "Invalid --node-id '{node_id}': must match /^[a-z0-9][a-z0-9@._-]{{0,63}}$/ and cannot be 'local'"
-            ),
-            Some("Example: --node-id acme-team".to_string()),
-        );
+            )).with_fix("Example: --node-id acme-team".to_string()));
     }
 
     let bind_raw = bind_arg.unwrap_or_else(|| provider.default_bind().to_string());
     let bind = match validate_bind_addr(&bind_raw) {
         Ok(b) => b,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_USAGE,
+            return Err(CliError::usage(
                 "INVALID_BIND",
                 format!("Invalid --bind '{bind_raw}': {e}"),
-                Some("Example: --bind 127.0.0.1:8790".to_string()),
-            );
+            )
+            .with_fix("Example: --bind 127.0.0.1:8790".to_string()));
         }
     };
 
@@ -715,63 +704,47 @@ fn run_init(
             .map(|p| p.display().to_string())
             .collect();
         if !existing.is_empty() {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "FILES_EXIST",
                 format!(
                     "Refusing to overwrite existing deployment files without --force: {}",
                     existing.join(", ")
                 ),
-                Some(
-                    "Re-run with --force to overwrite, or pass a fresh --out directory."
-                        .to_string(),
-                ),
-            );
+            )
+            .with_fix(
+                "Re-run with --force to overwrite, or pass a fresh --out directory.".to_string(),
+            ));
         }
     }
 
-    if let Err(e) = fs::create_dir_all(&out_dir) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+    fs::create_dir_all(&out_dir).map_err(|e| {
+        CliError::error(
             "IO_ERROR",
             format!(
                 "Failed to create output directory {}: {e}",
                 out_dir.display()
             ),
-            None,
-        );
-    }
+        )
+    })?;
 
     let mut written_files = Vec::with_capacity(artifacts.len());
     for artifact in &artifacts {
         let full_path = out_dir.join(artifact.rel_path);
         if let Some(parent) = full_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+            fs::create_dir_all(parent).map_err(|e| {
+                CliError::error(
                     "IO_ERROR",
                     format!("Failed to create directory {}: {e}", parent.display()),
-                    None,
-                );
-            }
+                )
+            })?;
         }
         if let Err(e) =
             write_artifact_file(&full_path, artifact.content.as_bytes(), artifact.executable)
         {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "IO_ERROR",
                 format!("Failed to write {}: {e}", full_path.display()),
-                None,
-            );
+            ));
         }
         written_files.push(json!({
             "path": full_path.display().to_string(),
@@ -789,16 +762,15 @@ fn run_init(
     }
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Generated {} deployment kit for '{}' in {}",
                 provider.as_str(),
                 node_id,
                 out_dir.display()
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "provider": provider.as_str(),
                 "profile": profile.as_str(),
                 "nodeId": node_id,
@@ -809,13 +781,12 @@ fn run_init(
                 "dropMaxMemoryMb": if enable_drop_relay { Some(drop_max_memory_mb) } else { None },
                 "outDir": out_dir.display().to_string(),
                 "files": written_files,
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     println!(
@@ -834,7 +805,7 @@ fn run_init(
     }
     print_warnings(&warnings);
     print_next_steps(&next);
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn write_artifact_file(path: &Path, content: &[u8], executable: bool) -> std::io::Result<()> {
@@ -3040,7 +3011,11 @@ async fn probe_manifest_url(
     })
 }
 
-fn run_check(url: Option<String>, config: Option<PathBuf>, as_json: bool) -> ExitCode {
+fn run_check(
+    url: Option<String>,
+    config: Option<PathBuf>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
     let cmd = "deploy check";
     let tools = detect_local_tools();
     let mut checks = Vec::new();
@@ -3078,14 +3053,10 @@ fn run_check(url: Option<String>, config: Option<PathBuf>, as_json: bool) -> Exi
         {
             Ok(rt) => rt,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "RUNTIME_ERROR",
                     format!("Failed to start async runtime: {e}"),
-                    None,
-                );
+                ));
             }
         };
         rt.block_on(probe_manifest_url(target_url, &mut checks))
@@ -3146,20 +3117,19 @@ fn run_check(url: Option<String>, config: Option<PathBuf>, as_json: bool) -> Exi
                     .with_optional_fix(next.first().cloned()),
             )
         };
-        let envelope = JsonEnvelope {
-            ok,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd,
+            summary,
+            json!({
                 "tools": tools,
                 "config": config_validated,
                 "manifest": manifest_summary,
                 "checks": checks,
-            })),
-            warnings,
-            next,
-            error,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next)
+        .error(error);
         print_json(&envelope);
     } else {
         println!("Hyphae Deployment Check");
@@ -3179,9 +3149,9 @@ fn run_check(url: Option<String>, config: Option<PathBuf>, as_json: bool) -> Exi
     }
 
     if ok {
-        ExitCode::from(EXIT_OK)
+        Ok(ExitCode::from(EXIT_OK))
     } else {
-        ExitCode::from(EXIT_ERROR)
+        Ok(ExitCode::from(EXIT_ERROR))
     }
 }
 

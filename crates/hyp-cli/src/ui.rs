@@ -175,15 +175,27 @@ pub struct JsonEnvelope<T: Serialize> {
 
 impl<T: Serialize> JsonEnvelope<T> {
     pub fn ok(command: impl Into<String>, summary: impl Into<String>, data: T) -> Self {
+        let mut envelope = Self::data(command, data);
+        envelope.summary = Some(summary.into());
+        envelope
+    }
+
+    pub fn data(command: impl Into<String>, data: T) -> Self {
         Self {
             ok: true,
             command: command.into(),
-            summary: Some(summary.into()),
+            summary: None,
             data: Some(data),
             warnings: Vec::new(),
             next: Vec::new(),
             error: None,
         }
+    }
+
+    pub fn error(mut self, error: Option<CliError>) -> Self {
+        self.ok = error.is_none();
+        self.error = error;
+        self
     }
 
     pub fn warnings(mut self, warnings: Vec<String>) -> Self {
@@ -204,21 +216,6 @@ pub fn print_json<T: Serialize>(envelope: &JsonEnvelope<T>) {
             eprintln!("error: failed to serialize JSON output: {e}");
         }
     }
-}
-
-pub fn emit_error(
-    command: &str,
-    as_json: bool,
-    exit_code: u8,
-    code: &str,
-    message: impl Into<String>,
-    fix: Option<String>,
-) -> ExitCode {
-    print_command_error(
-        command,
-        as_json,
-        CliError::new(exit_code, code, message).with_optional_fix(fix),
-    )
 }
 
 pub fn print_command_error(command: &str, as_json: bool, mut error: CliError) -> ExitCode {

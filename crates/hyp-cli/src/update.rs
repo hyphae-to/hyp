@@ -16,8 +16,8 @@ use crate::config_file::{
     resolve_state_dir,
 };
 use crate::ui::{
-    CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json,
-    print_next_steps, print_warnings,
+    CliError, CommandResult, EXIT_ERROR, EXIT_OK, JsonEnvelope, print_json, print_next_steps,
+    print_warnings,
 };
 use clap::{Args, Subcommand, ValueEnum};
 use http::{Method, Request, header};
@@ -618,14 +618,18 @@ fn is_strict_version_downgrade(candidate: &str, current: &str) -> bool {
     cand < cur
 }
 
-pub fn run_update(args: UpdateArgs) -> ExitCode {
+pub fn run_update(args: UpdateArgs) -> CommandResult {
     match args.action {
         Some(UpdateAction::Channel {
             value,
             config,
             state_dir,
             json,
-        }) => run_update_channel(value, config, state_dir, json),
+        }) => CommandResult::new(
+            "update channel",
+            json,
+            run_update_channel(value, config, state_dir, json),
+        ),
         Some(UpdateAction::Check {
             channel,
             manifest_url,
@@ -634,21 +638,29 @@ pub fn run_update(args: UpdateArgs) -> ExitCode {
             state_dir,
             config,
             json,
-        }) => run_update_check(
-            channel,
-            manifest_url,
-            pubkey,
-            target,
-            state_dir,
-            config,
+        }) => CommandResult::new(
+            "update check",
             json,
+            run_update_check(
+                channel,
+                manifest_url,
+                pubkey,
+                target,
+                state_dir,
+                config,
+                json,
+            ),
         ),
         Some(UpdateAction::Dismiss {
             version,
             state_dir,
             json,
-        }) => run_update_dismiss(version, state_dir, json),
-        None => run_update_apply(args),
+        }) => CommandResult::new(
+            "update dismiss",
+            json,
+            run_update_dismiss(version, state_dir, json),
+        ),
+        None => CommandResult::new("update", args.json, run_update_apply(args)),
     }
 }
 
@@ -657,7 +669,7 @@ fn run_update_channel(
     config: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "update channel";
     let dir = resolve_state_dir(state_dir.as_deref(), config.as_deref(), None);
 
@@ -670,31 +682,25 @@ fn run_update_channel(
                 .and_then(|c| c.update_channel)
                 .unwrap_or_else(|| "stable".to_string());
             if as_json {
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!("Update channel: {channel}")),
-                    data: Some(json!({
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!("Update channel: {channel}"),
+                    json!({
                         "channel": channel,
                         "configPath": cfg_path.display().to_string(),
-                    })),
-                    warnings: Vec::new(),
-                    next: Vec::new(),
-                    error: None,
-                };
+                    }),
+                );
                 print_json(&envelope);
             } else {
                 println!("OK    Update channel: {channel}");
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
         Some(setting) => {
             let cfg_path =
                 resolve_config_path_for_write(config.as_deref(), state_dir.as_deref(), None);
-            let mut map = match NodeFile::read_document_or_empty(&cfg_path) {
-                Ok(m) => m,
-                Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "CONFIG_ERROR", e, None),
-            };
+            let mut map = NodeFile::read_document_or_empty(&cfg_path)
+                .map_err(|e| CliError::error("CONFIG_ERROR", e))?;
             let node_id = map
                 .get("nodeId")
                 .and_then(Value::as_str)
@@ -709,22 +715,20 @@ fn run_update_channel(
             update_obj.insert("channel".to_string(), json!(setting.as_str()));
             map.insert("update".to_string(), Value::Object(update_obj));
 
-            if let Err(e) = NodeFile::write_document(&cfg_path, map) {
-                return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None);
-            }
+            NodeFile::write_document(&cfg_path, map).map_err(|e| CliError::error("IO_ERROR", e))?;
             if as_json {
-                let envelope = JsonEnvelope {
-                    ok: true,
-                    command: cmd.to_string(),
-                    summary: Some(format!("Set update channel to '{}'", setting.as_str())),
-                    data: Some(json!({
+                let envelope = JsonEnvelope::ok(
+                    cmd.to_string(),
+                    format!("Set update channel to '{}'", setting.as_str()),
+                    json!({
                         "channel": setting.as_str(),
                         "configPath": cfg_path.display().to_string(),
-                    })),
-                    warnings: Vec::new(),
-                    next: vec![format!("hyp update check --channel {}", setting.as_str())],
-                    error: None,
-                };
+                    }),
+                )
+                .next(vec![format!(
+                    "hyp update check --channel {}",
+                    setting.as_str()
+                )]);
                 print_json(&envelope);
             } else {
                 println!(
@@ -733,57 +737,46 @@ fn run_update_channel(
                     cfg_path.display()
                 );
             }
-            ExitCode::from(EXIT_OK)
+            Ok(ExitCode::from(EXIT_OK))
         }
     }
 }
 
-fn run_update_dismiss(version: String, state_dir: Option<PathBuf>, as_json: bool) -> ExitCode {
+fn run_update_dismiss(
+    version: String,
+    state_dir: Option<PathBuf>,
+    as_json: bool,
+) -> Result<ExitCode, CliError> {
     let cmd = "update dismiss";
     let trimmed = version.trim();
     if trimmed.is_empty() {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_VERSION",
             "Version to dismiss cannot be empty",
-            None,
-        );
+        ));
     }
 
     let dir = resolve_state_dir(state_dir.as_deref(), None, None);
-    let db = match NodeDb::open(dir.join("node.sqlite")) {
-        Ok(db) => db,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None),
-    };
-    if let Err(e) = db
-        .local()
+    let db = NodeDb::open(dir.join("node.sqlite"))
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
+    db.local()
         .set_metadata(META_UPDATE_DISMISSED_VERSION, trimmed)
-    {
-        return emit_error(cmd, as_json, EXIT_ERROR, "DB_ERROR", e.to_string(), None);
-    }
+        .map_err(|e| CliError::error("DB_ERROR", e.to_string()))?;
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
-                "Dismissed update notification for version '{trimmed}'"
-            )),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!("Dismissed update notification for version '{trimmed}'"),
+            json!({
                 "dismissedVersion": trimmed,
                 "stateDir": dir.display().to_string(),
-            })),
-            warnings: Vec::new(),
-            next: Vec::new(),
-            error: None,
-        };
+            }),
+        );
         print_json(&envelope);
     } else {
         println!("OK    Dismissed update notifications for version '{trimmed}'");
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn resolve_channel(
@@ -831,13 +824,10 @@ fn run_update_check(
     state_dir_arg: Option<PathBuf>,
     config_arg: Option<PathBuf>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "update check";
-    let channel =
-        match resolve_channel(channel_arg, config_arg.as_deref(), state_dir_arg.as_deref()) {
-            Ok(c) => c,
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "UPDATES_DISABLED", e, None),
-        };
+    let channel = resolve_channel(channel_arg, config_arg.as_deref(), state_dir_arg.as_deref())
+        .map_err(|e| CliError::error("UPDATES_DISABLED", e))?;
     let manifest_url =
         manifest_url_arg.unwrap_or_else(|| channel.default_manifest_url().to_string());
     let pubkey = resolve_pubkey(pubkey_arg.as_deref());
@@ -850,20 +840,13 @@ fn run_update_check(
     {
         Ok(rt) => rt,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "RUNTIME_ERROR",
-                e.to_string(),
-                None,
-            );
+            return Err(CliError::error("RUNTIME_ERROR", e.to_string()));
         }
     };
 
     let signed = match rt.block_on(fetch_signed_manifest(&manifest_url)) {
         Ok(m) => m,
-        Err((code, msg)) => return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None),
+        Err((code, msg)) => return Err(CliError::error(code, msg)),
     };
 
     let db = NodeDb::open(dir.join("node.sqlite")).ok();
@@ -886,7 +869,7 @@ fn run_update_check(
         min_published,
     ) {
         Ok(v) => v,
-        Err((code, msg)) => return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None),
+        Err((code, msg)) => return Err(CliError::error(code, msg)),
     };
 
     let artifact = manifest.artifacts.get(&target_triple);
@@ -945,14 +928,13 @@ fn run_update_check(
     }
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            format!(
                 "Verified {} manifest {} (current: {}, updateAvailable: {})",
                 manifest.channel, manifest.version, current_version, update_available
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "channel": manifest.channel,
                 "currentVersion": current_version,
                 "latestVersion": manifest.version,
@@ -966,11 +948,9 @@ fn run_update_check(
                 "signatureVerified": true,
                 "updateAvailable": update_available,
                 "shouldNotify": should_notify,
-            })),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        };
+            }),
+        )
+        .next(next);
         print_json(&envelope);
     } else {
         println!(
@@ -984,20 +964,18 @@ fn run_update_check(
         println!("      Notify:    {should_notify}");
         print_next_steps(&next);
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
-fn run_update_apply(args: UpdateArgs) -> ExitCode {
+fn run_update_apply(args: UpdateArgs) -> Result<ExitCode, CliError> {
     let cmd = "update";
     let as_json = args.json;
-    let channel = match resolve_channel(
+    let channel = resolve_channel(
         args.channel,
         args.config.as_deref(),
         args.state_dir.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "UPDATES_DISABLED", e, None),
-    };
+    )
+    .map_err(|e| CliError::error("UPDATES_DISABLED", e))?;
     let manifest_url = args
         .manifest_url
         .clone()
@@ -1014,14 +992,10 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         None => match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "BIN_PATH_ERROR",
                     format!("Failed to locate current executable: {e}"),
-                    None,
-                );
+                ));
             }
         },
     };
@@ -1032,21 +1006,14 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "RUNTIME_ERROR",
-                e.to_string(),
-                None,
-            );
+            return Err(CliError::error("RUNTIME_ERROR", e.to_string()));
         }
     };
 
     // 1. Fetch & cryptographically verify signed release manifest (FAIL CLOSED!).
     let signed = match rt.block_on(fetch_signed_manifest(&manifest_url)) {
         Ok(m) => m,
-        Err((code, msg)) => return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None),
+        Err((code, msg)) => return Err(CliError::error(code, msg)),
     };
 
     let db = NodeDb::open(dir.join("node.sqlite")).ok();
@@ -1069,35 +1036,27 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         min_published,
     ) {
         Ok(v) => v,
-        Err((code, msg)) => return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None),
+        Err((code, msg)) => return Err(CliError::error(code, msg)),
     };
 
     if let Some(ref requested_version) = args.version {
         let req_ver = requested_version.trim();
         if manifest.version != req_ver {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "VERSION_MISMATCH",
                 format!(
                     "Requested version '{req_ver}' does not match verified release manifest version '{}'",
                     manifest.version
                 ),
-                None,
-            );
+            ));
         }
     }
 
     let Some(artifact) = manifest.artifacts.get(&target_triple) else {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "TARGET_NOT_FOUND",
             format!("Release manifest has no artifact for target '{target_triple}'"),
-            None,
-        );
+        ));
     };
     let expected_sha256 = normalize_sha256_hex(&artifact.sha256).expect("validated above");
 
@@ -1127,14 +1086,13 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     if args.dry_run {
         rollout_order.push("local".to_string());
         if as_json {
-            let envelope = JsonEnvelope {
-                ok: true,
-                command: cmd.to_string(),
-                summary: Some(format!(
+            let envelope = JsonEnvelope::ok(
+                cmd.to_string(),
+                format!(
                     "Dry-run verified {} {} (target {})",
                     manifest.channel, manifest.version, target_triple
-                )),
-                data: Some(json!({
+                ),
+                json!({
                     "dryRun": true,
                     "channel": manifest.channel,
                     "version": manifest.version,
@@ -1144,14 +1102,13 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                     "fleetAll": args.all,
                     "fleetPlan": fleet_plan,
                     "rolloutOrder": rollout_order,
-                })),
-                warnings,
-                next: vec![format!(
-                    "Re-run without --dry-run to apply {}",
-                    manifest.version
-                )],
-                error: None,
-            };
+                }),
+            )
+            .warnings(warnings)
+            .next(vec![format!(
+                "Re-run without --dry-run to apply {}",
+                manifest.version
+            )]);
             print_json(&envelope);
         } else {
             println!(
@@ -1160,41 +1117,30 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
             );
             print_fleet_table(&fleet_plan);
         }
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     // 3. Download archive bytes & verify SHA-256 fail-closed BEFORE touching target binary!
     let archive_bytes = match rt.block_on(download_bytes(&artifact.url, MAX_ARCHIVE_BYTES)) {
         Ok(b) => b,
-        Err((code, msg)) => return emit_error(cmd, as_json, EXIT_ERROR, code, msg, None),
+        Err((code, msg)) => return Err(CliError::error(code, msg)),
     };
 
     let actual_sha256 = hex::encode(Sha256::digest(&archive_bytes));
     if !ct_eq(actual_sha256.as_bytes(), expected_sha256.as_bytes()) {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
-            "CHECKSUM_MISMATCH",
-            format!(
+        return Err(CliError::error("CHECKSUM_MISMATCH", format!(
                 "Archive SHA-256 mismatch (fail-closed, 0 bytes written): expected {expected_sha256}, got {actual_sha256}"
-            ),
-            Some("Aborting update; verify release artifact integrity.".to_string()),
-        );
+            )).with_fix("Aborting update; verify release artifact integrity.".to_string()));
     }
     if artifact.size > 0 && archive_bytes.len() as u64 != artifact.size {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_ERROR,
+        return Err(CliError::error(
             "SIZE_MISMATCH",
             format!(
                 "Archive byte length mismatch (fail-closed, 0 bytes written): expected {}, got {}",
                 artifact.size,
                 archive_bytes.len()
             ),
-            None,
-        );
+        ));
     }
 
     // 4. Stage, unpack, smoke-check (`version --json`), atomically swap with backup & rollback!
@@ -1202,21 +1148,13 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
         Ok(r) => r,
         Err(swap_err) => {
             if as_json {
-                let envelope = JsonEnvelope {
-                    ok: false,
-                    command: cmd.to_string(),
-                    summary: Some(swap_err.message.clone()),
-                    data: Some(json!({
+                let envelope = JsonEnvelope::ok(cmd, swap_err.message.clone(), json!({
                         "targetBin": target_bin.display().to_string(),
                         "rolledBack": swap_err.rolled_back,
                         "originalPreserved": swap_err.original_preserved,
                         "smokeCheckPassed": false,
                         "fleetPlan": fleet_plan,
-                    })),
-                    warnings,
-                    next: Vec::new(),
-                    error: Some(CliError::error(swap_err.code.to_string(), swap_err.message).with_fix("Original binary remains intact; inspect the release artifact before retrying.".to_string())),
-                };
+                    })).warnings(warnings).error(Some(CliError::error(swap_err.code.to_string(), swap_err.message).with_fix("Original binary remains intact; inspect the release artifact before retrying.".to_string())));
                 print_json(&envelope);
             } else {
                 eprintln!("FAIL [{}] {}", swap_err.code, swap_err.message);
@@ -1227,7 +1165,7 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                     );
                 }
             }
-            return ExitCode::from(EXIT_ERROR);
+            return Ok(ExitCode::from(EXIT_ERROR));
         }
     };
 
@@ -1279,16 +1217,15 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     let ok = !remote_failed;
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok,
-            command: cmd.to_string(),
-            summary: Some(format!(
+        let envelope = JsonEnvelope::ok(
+            cmd,
+            format!(
                 "Updated local binary {} to {} ({})",
                 target_bin.display(),
                 manifest.version,
                 manifest.channel
-            )),
-            data: Some(json!({
+            ),
+            json!({
                 "channel": manifest.channel,
                 "version": manifest.version,
                 "gitSha": manifest.git_sha,
@@ -1306,18 +1243,18 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
                 "fleetAll": args.all,
                 "fleetPlan": fleet_plan,
                 "rolloutOrder": rollout_order,
-            })),
-            warnings,
-            next,
-            error: if ok {
-                None
-            } else {
-                Some(CliError::error(
-                    "FLEET_PARTIAL_FAILURE".to_string(),
-                    "Local node updated, but one or more remote peers failed to update".to_string(),
-                ))
-            },
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next)
+        .error(if ok {
+            None
+        } else {
+            Some(CliError::error(
+                "FLEET_PARTIAL_FAILURE".to_string(),
+                "Local node updated, but one or more remote peers failed to update".to_string(),
+            ))
+        });
         print_json(&envelope);
     } else {
         println!(
@@ -1343,9 +1280,9 @@ fn run_update_apply(args: UpdateArgs) -> ExitCode {
     }
 
     if ok {
-        ExitCode::from(EXIT_OK)
+        Ok(ExitCode::from(EXIT_OK))
     } else {
-        ExitCode::from(EXIT_ERROR)
+        Ok(ExitCode::from(EXIT_ERROR))
     }
 }
 
@@ -1838,17 +1775,15 @@ fn stage_smoke_check_and_swap(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    if let Err(e) = fs::create_dir_all(parent) {
-        return Err(SwapFailure {
-            code: "IO_ERROR",
-            message: format!(
-                "Failed to prepare target directory {}: {e}",
-                parent.display()
-            ),
-            rolled_back: false,
-            original_preserved: true,
-        });
-    }
+    fs::create_dir_all(parent).map_err(|e| SwapFailure {
+        code: "IO_ERROR",
+        message: format!(
+            "Failed to prepare target directory {}: {e}",
+            parent.display()
+        ),
+        rolled_back: false,
+        original_preserved: true,
+    })?;
 
     let suffix = random_suffix_hex().map_err(|e| SwapFailure {
         code: "RNG_ERROR",
@@ -1857,14 +1792,12 @@ fn stage_smoke_check_and_swap(
         original_preserved: true,
     })?;
     let stage_dir = parent.join(format!(".hyp-update-stage-{suffix}"));
-    if let Err(e) = fs::create_dir_all(&stage_dir) {
-        return Err(SwapFailure {
-            code: "IO_ERROR",
-            message: format!("Failed to create staging dir {}: {e}", stage_dir.display()),
-            rolled_back: false,
-            original_preserved: true,
-        });
-    }
+    fs::create_dir_all(&stage_dir).map_err(|e| SwapFailure {
+        code: "IO_ERROR",
+        message: format!("Failed to create staging dir {}: {e}", stage_dir.display()),
+        rolled_back: false,
+        original_preserved: true,
+    })?;
 
     let result = (|| -> Result<SwapSuccess, SwapFailure> {
         let staged_bin = extract_binary_into_stage(&stage_dir, artifact_url, archive_bytes)?;

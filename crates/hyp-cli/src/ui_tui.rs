@@ -40,6 +40,7 @@ use std::io::{self, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::ExitCode;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -1936,7 +1937,7 @@ fn refresh_kv_report(socket: &Path, state: &mut UiState) {
     state.clamp_selection();
 }
 
-fn fallback_to_inspect(args: &UiArgs) -> ExitCode {
+fn fallback_to_inspect(args: &UiArgs) -> crate::ui::CommandResult {
     let inspect_args = InspectArgs {
         session: args.session.clone(),
         herdr_terminal: args.herdr_terminal.clone(),
@@ -1950,7 +1951,7 @@ fn fallback_to_inspect(args: &UiArgs) -> ExitCode {
     run_inspect(&inspect_args)
 }
 
-pub fn run_ui(args: &UiArgs) -> ExitCode {
+pub fn run_ui(args: &UiArgs) -> crate::ui::CommandResult {
     if !io::stdout().is_terminal() {
         return fallback_to_inspect(args);
     }
@@ -2188,7 +2189,7 @@ pub fn run_ui(args: &UiArgs) -> ExitCode {
 
         stop.store(true, Ordering::Relaxed);
         let _ = watch_handle.join();
-        ExitCode::from(EXIT_OK)
+        crate::ui::CommandResult::new("ui", false, Ok(ExitCode::from(EXIT_OK)))
     }
 }
 

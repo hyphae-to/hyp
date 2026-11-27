@@ -1,7 +1,7 @@
 //! Host-side routing for dedicated, signed webhook listeners, independent of plugin language.
 
 use crate::deploy::find_in_path;
-use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error, print_json};
+use crate::ui::{CliError, CommandResult, EXIT_OK, JsonEnvelope, print_json};
 use clap::{Args, ValueEnum};
 use http_body_util::{BodyExt, Empty, Full, Limited};
 use hyper::{Method, Request, StatusCode, body::Bytes, header};
@@ -582,45 +582,30 @@ async fn check_cloudflare(
     Ok(())
 }
 
-pub(crate) fn run(args: WebhookArgs) -> ExitCode {
-    let target = match Target::parse(args.local_target) {
-        Ok(target) => target,
-        Err(err) => return emit_error(COMMAND, args.json, EXIT_USAGE, "INVALID_TARGET", err, None),
-    };
+pub(crate) fn run(args: WebhookArgs) -> CommandResult {
+    CommandResult::new(COMMAND, args.json, run_webhook(args))
+}
+
+fn run_webhook(args: WebhookArgs) -> Result<ExitCode, CliError> {
+    let target =
+        Target::parse(args.local_target).map_err(|err| CliError::usage("INVALID_TARGET", err))?;
     if args
         .funnel_port
         .is_some_and(|port| !FUNNEL_PORTS.contains(&port))
     {
-        return emit_error(
-            COMMAND,
-            args.json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_FUNNEL_PORT",
             "Use Funnel HTTPS port 8443, 10000, or 443.",
-            None,
-        );
+        ));
     }
     if let Some(ref url) = args.url {
-        if let Err(err) = https_callback(url) {
-            return emit_error(
-                COMMAND,
-                args.json,
-                EXIT_USAGE,
-                "INVALID_CALLBACK_URL",
-                err,
-                None,
-            );
-        }
+        https_callback(url).map_err(|err| CliError::usage("INVALID_CALLBACK_URL", err))?;
     }
     if args.plan && !matches!(args.provider, Some(Provider::Tailscale)) {
-        return emit_error(
-            COMMAND,
-            args.json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "INVALID_PLAN_PROVIDER",
             "--plan applies to Tailscale Funnel.",
-            None,
-        );
+        ));
     }
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -628,14 +613,7 @@ pub(crate) fn run(args: WebhookArgs) -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            return emit_error(
-                COMMAND,
-                args.json,
-                EXIT_ERROR,
-                "RUNTIME_ERROR",
-                err.to_string(),
-                None,
-            );
+            return Err(CliError::error("RUNTIME_ERROR", err.to_string()));
         }
     };
     let result = runtime.block_on(async {
@@ -685,27 +663,12 @@ pub(crate) fn run(args: WebhookArgs) -> ExitCode {
     let data = match result {
         Ok(data) => data,
         Err(err) => {
-            return emit_error(
-                COMMAND,
-                args.json,
-                EXIT_ERROR,
-                "WEBHOOK_ROUTE_UNAVAILABLE",
-                err,
-                None,
-            );
+            return Err(CliError::error("WEBHOOK_ROUTE_UNAVAILABLE", err));
         }
     };
     let next = args.provider.map(|_| vec!["Send a signed test delivery from the event provider after the receiver is running.".to_string()]).unwrap_or_default();
     if args.json {
-        print_json(&JsonEnvelope {
-            ok: true,
-            command: COMMAND.into(),
-            summary: None,
-            data: Some(data),
-            warnings: Vec::new(),
-            next,
-            error: None,
-        });
+        print_json(&JsonEnvelope::data(COMMAND, data).next(next));
     } else {
         println!(
             "{}",
@@ -715,5 +678,5 @@ pub(crate) fn run(args: WebhookArgs) -> ExitCode {
             println!("{step}");
         }
     }
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }

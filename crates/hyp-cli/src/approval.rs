@@ -59,7 +59,6 @@ use serde_json::{Map, Value, json};
 use std::convert::Infallible;
 use std::io::{self, Write as _};
 use std::path::Path;
-use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -158,10 +157,6 @@ impl CeremonyError {
     pub fn into_cli_error(self) -> crate::ui::CliError {
         crate::ui::CliError::new(self.exit_code, self.code, self.message)
             .with_optional_fix(self.next)
-    }
-
-    pub fn emit(self, cmd: &str, as_json: bool) -> ExitCode {
-        crate::ui::print_command_error(cmd, as_json, self.into_cli_error())
     }
 }
 

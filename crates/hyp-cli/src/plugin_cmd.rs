@@ -32,7 +32,7 @@ use crate::setup::{
     CLAUDE_SLASH_COMMANDS, ClaudeConfigProfile, canonical_dedup_key, resolve_claude_profiles,
 };
 use crate::ui::{
-    CheckStatus, CliCheck, CliError, EXIT_ERROR, EXIT_OK, EXIT_USAGE, JsonEnvelope, emit_error,
+    CheckStatus, CliCheck, CliError, CommandResult, EXIT_ERROR, EXIT_OK, JsonEnvelope,
     print_checks, print_json, print_next_steps, print_warnings,
 };
 use clap::Subcommand;
@@ -463,7 +463,7 @@ struct PluginInspection {
 }
 
 /// Entrypoint wired from `main.rs` (`Commands::Plugin { command }`).
-pub fn run_plugin(command: PluginCommand) -> ExitCode {
+pub fn run_plugin(command: PluginCommand) -> CommandResult {
     match command {
         PluginCommand::List {
             state_dir,
@@ -471,12 +471,16 @@ pub fn run_plugin(command: PluginCommand) -> ExitCode {
             home,
             claude_config_dir,
             json,
-        } => run_plugin_list(
-            state_dir.as_deref(),
-            config.as_deref(),
-            home.as_deref(),
-            claude_config_dir.as_deref(),
+        } => CommandResult::new(
+            "plugin list",
             json,
+            run_plugin_list(
+                state_dir.as_deref(),
+                config.as_deref(),
+                home.as_deref(),
+                claude_config_dir.as_deref(),
+                json,
+            ),
         ),
         PluginCommand::Install {
             plugin,
@@ -489,19 +493,23 @@ pub fn run_plugin(command: PluginCommand) -> ExitCode {
             from_dir,
             force,
             json,
-        } => run_plugin_install(
-            &plugin,
-            state_dir.as_deref(),
-            config.as_deref(),
-            home.as_deref(),
-            claude_config_dir.as_deref(),
-            PluginSourceOverrides {
-                archive: archive.as_deref(),
-                from_dir: from_dir.as_deref(),
-                url: url.as_deref(),
-            },
-            force,
+        } => CommandResult::new(
+            "plugin install",
             json,
+            run_plugin_install(
+                &plugin,
+                state_dir.as_deref(),
+                config.as_deref(),
+                home.as_deref(),
+                claude_config_dir.as_deref(),
+                PluginSourceOverrides {
+                    archive: archive.as_deref(),
+                    from_dir: from_dir.as_deref(),
+                    url: url.as_deref(),
+                },
+                force,
+                json,
+            ),
         ),
         PluginCommand::Update {
             plugin,
@@ -516,21 +524,25 @@ pub fn run_plugin(command: PluginCommand) -> ExitCode {
             archive,
             from_dir,
             json,
-        } => run_plugin_update(
-            plugin.as_deref(),
-            all,
-            dry_run,
-            force,
-            state_dir.as_deref(),
-            config.as_deref(),
-            home.as_deref(),
-            claude_config_dir.as_deref(),
-            PluginSourceOverrides {
-                archive: archive.as_deref(),
-                from_dir: from_dir.as_deref(),
-                url: url.as_deref(),
-            },
+        } => CommandResult::new(
+            "plugin update",
             json,
+            run_plugin_update(
+                plugin.as_deref(),
+                all,
+                dry_run,
+                force,
+                state_dir.as_deref(),
+                config.as_deref(),
+                home.as_deref(),
+                claude_config_dir.as_deref(),
+                PluginSourceOverrides {
+                    archive: archive.as_deref(),
+                    from_dir: from_dir.as_deref(),
+                    url: url.as_deref(),
+                },
+                json,
+            ),
         ),
         PluginCommand::Remove {
             plugin,
@@ -540,14 +552,18 @@ pub fn run_plugin(command: PluginCommand) -> ExitCode {
             home,
             claude_config_dir,
             json,
-        } => run_plugin_remove(
-            &plugin,
-            keep_config,
-            state_dir.as_deref(),
-            config.as_deref(),
-            home.as_deref(),
-            claude_config_dir.as_deref(),
+        } => CommandResult::new(
+            "plugin remove",
             json,
+            run_plugin_remove(
+                &plugin,
+                keep_config,
+                state_dir.as_deref(),
+                config.as_deref(),
+                home.as_deref(),
+                claude_config_dir.as_deref(),
+                json,
+            ),
         ),
         PluginCommand::Verify {
             plugin,
@@ -556,13 +572,17 @@ pub fn run_plugin(command: PluginCommand) -> ExitCode {
             home,
             claude_config_dir,
             json,
-        } => run_plugin_verify(
-            plugin.as_deref(),
-            state_dir.as_deref(),
-            config.as_deref(),
-            home.as_deref(),
-            claude_config_dir.as_deref(),
+        } => CommandResult::new(
+            "plugin verify",
             json,
+            run_plugin_verify(
+                plugin.as_deref(),
+                state_dir.as_deref(),
+                config.as_deref(),
+                home.as_deref(),
+                claude_config_dir.as_deref(),
+                json,
+            ),
         ),
     }
 }
@@ -2708,7 +2728,7 @@ fn run_plugin_list(
     home_arg: Option<&Path>,
     claude_config_dir_arg: Option<&Path>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "plugin list";
     let state_dir = resolve_state_dir(state_dir_arg, config_arg, home_arg);
     let plugins_dir = state_dir.join("plugins");
@@ -2716,10 +2736,7 @@ fn run_plugin_list(
     let explicit_home = home_arg.is_some();
     let node_path = detect_node_path(home_arg);
 
-    let receipts = match load_receipts(&state_dir) {
-        Ok(r) => r,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_ERROR", e, None),
-    };
+    let receipts = load_receipts(&state_dir).map_err(|e| CliError::error("RECEIPT_ERROR", e))?;
 
     let mut entries = Vec::with_capacity(PINNED_PLUGINS.len());
     let mut warnings = Vec::new();
@@ -2853,11 +2870,10 @@ fn run_plugin_list(
 
     let cache_path = cached_plugins_archive_path(&state_dir);
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            summary,
+            json!({
                 "pluginsDir": plugins_dir.display().to_string(),
                 "receiptsPath": receipts_file_path(&state_dir).display().to_string(),
                 "cachePath": cache_path.display().to_string(),
@@ -2867,11 +2883,10 @@ fn run_plugin_list(
                 "sdkVerified": sdk_verified,
                 "nodePath": node_path,
                 "plugins": entries,
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!("Plugins directory: {}", plugins_dir.display());
@@ -2908,7 +2923,7 @@ fn run_plugin_list(
         print_next_steps(&next);
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2921,37 +2936,29 @@ fn run_plugin_install(
     source: PluginSourceOverrides<'_>,
     force: bool,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "plugin install";
 
     let source_flags = usize::from(source.url.is_some())
         + usize::from(source.archive.is_some())
         + usize::from(source.from_dir.is_some());
     if source_flags > 1 {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "Specify at most one of --url, --archive, or --from-dir",
-            None,
-        );
+        ));
     }
 
-    let requested_targets = match resolve_plugin_targets(plugin_arg) {
-        Ok(t) => t,
-        Err(msg) => return emit_error(cmd, as_json, EXIT_USAGE, "UNKNOWN_PLUGIN", msg, None),
-    };
+    let requested_targets =
+        resolve_plugin_targets(plugin_arg).map_err(|msg| CliError::usage("UNKNOWN_PLUGIN", msg))?;
 
     let state_dir = resolve_state_dir(state_dir_arg, config_arg, home_arg);
     let plugins_dir = state_dir.join("plugins");
     let resolved_home = resolve_home_dir(home_arg);
     let explicit_home = home_arg.is_some();
 
-    let mut receipts = match load_receipts(&state_dir) {
-        Ok(r) => r,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_ERROR", e, None),
-    };
+    let mut receipts =
+        load_receipts(&state_dir).map_err(|e| CliError::error("RECEIPT_ERROR", e))?;
 
     // Expand bridge installs to also ensure `sdk` is installed & verified alongside them.
     let needs_sdk = requested_targets.iter().any(|s| is_bridge_consumer(s.id));
@@ -2978,21 +2985,14 @@ fn run_plugin_install(
                 &receipts,
             );
             if insp.status == PluginStatus::Modified {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
-                    "PLUGIN_MODIFIED",
-                    format!(
+                return Err(CliError::error("PLUGIN_MODIFIED", format!(
                         "Plugin '{}' has local modifications on disk ({}); refusing to overwrite without --force",
                         spec.id,
                         insp.detail.as_deref().unwrap_or("modified")
-                    ),
-                    Some(format!(
+                    )).with_fix(format!(
                         "Re-run with: hyp plugin install {} --force",
                         spec.id
-                    )),
-                );
+                    )));
             }
         }
     }
@@ -3009,22 +3009,17 @@ fn run_plugin_install(
             receipts.installed.get(spec.id),
         );
         if roots.is_empty() {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "MISSING_HOME",
                 format!(
                     "Could not determine target directory for '{}' (set HOME or pass --home)",
                     spec.id
                 ),
-                None,
-            );
+            ));
         }
         if !force {
-            if let Err(err) = check_panel_rename_targets(spec, &roots) {
-                return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
-            }
+            check_panel_rename_targets(spec, &roots)
+                .map_err(|err| CliError::error(err.code, err.message))?;
         }
         target_roots_by_id.insert(spec.id, install_target_roots(spec.id, roots));
     }
@@ -3055,7 +3050,7 @@ fn run_plugin_install(
             } else {
                 None
             };
-            return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, fix);
+            return Err(CliError::error(err.code, err.message).with_optional_fix(fix));
         }
     };
 
@@ -3064,18 +3059,14 @@ fn run_plugin_install(
         let roots = target_roots_by_id
             .get(spec.id)
             .expect("resolved target roots");
-        if let Err(err) = write_plugin_to_targets(spec, roots, &verified_files, true) {
-            return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
-        }
-        if let Err(err) = complete_harness_rename(spec, roots, receipts.installed.get(spec.id)) {
-            return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
-        }
+        write_plugin_to_targets(spec, roots, &verified_files, true)
+            .map_err(|err| CliError::error(err.code, err.message))?;
+        complete_harness_rename(spec, roots, receipts.installed.get(spec.id))
+            .map_err(|err| CliError::error(err.code, err.message))?;
         record_receipt(&mut receipts, spec, roots);
     }
 
-    if let Err(e) = save_receipts(&state_dir, &receipts) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_ERROR", e, None);
-    }
+    save_receipts(&state_dir, &receipts).map_err(|e| CliError::error("RECEIPT_ERROR", e))?;
 
     let sdk_spec = pinned_spec_for(SDK_PLUGIN_ID).expect("sdk spec");
     let sdk_dest = plugins_dir.join("sdk").join("client.mjs");
@@ -3180,11 +3171,10 @@ fn run_plugin_install(
     );
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            summary,
+            json!({
                 "plugins": installed_records,
                 "sdkPath": sdk_dest.display().to_string(),
                 "sdkSha256": sdk_mjs_sha,
@@ -3194,11 +3184,10 @@ fn run_plugin_install(
                 "nodePath": node_path,
                 "source": source_kind.as_str(),
                 "sourceLocation": redact_source_location(&source_detail),
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!("OK    {summary}");
@@ -3234,7 +3223,7 @@ fn run_plugin_install(
         print_next_steps(&next);
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3249,32 +3238,24 @@ fn run_plugin_update(
     claude_config_dir_arg: Option<&Path>,
     source: PluginSourceOverrides<'_>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "plugin update";
 
     let source_flags = usize::from(source.url.is_some())
         + usize::from(source.archive.is_some())
         + usize::from(source.from_dir.is_some());
     if source_flags > 1 {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "Specify at most one of --url, --archive, or --from-dir",
-            None,
-        );
+        ));
     }
 
     if plugin_arg.is_some() && all_flag {
-        return emit_error(
-            cmd,
-            as_json,
-            EXIT_USAGE,
+        return Err(CliError::usage(
             "CONFLICTING_FLAGS",
             "Specify either a plugin name or `--all`, not both",
-            None,
-        );
+        ));
     }
 
     let explicit_single = plugin_arg
@@ -3283,7 +3264,7 @@ fn run_plugin_update(
     let target_specs: Vec<&'static PinnedPluginSpec> = match explicit_single {
         Some(name) => match resolve_plugin_targets(name) {
             Ok(t) => t,
-            Err(msg) => return emit_error(cmd, as_json, EXIT_USAGE, "UNKNOWN_PLUGIN", msg, None),
+            Err(msg) => return Err(CliError::usage("UNKNOWN_PLUGIN", msg)),
         },
         None => PINNED_PLUGINS.iter().collect(),
     };
@@ -3292,10 +3273,8 @@ fn run_plugin_update(
     let resolved_home = resolve_home_dir(home_arg);
     let explicit_home = home_arg.is_some();
 
-    let mut receipts = match load_receipts(&state_dir) {
-        Ok(r) => r,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_ERROR", e, None),
-    };
+    let mut receipts =
+        load_receipts(&state_dir).map_err(|e| CliError::error("RECEIPT_ERROR", e))?;
 
     let mut to_update: Vec<PluginInspection> = Vec::new();
     let mut up_to_date: Vec<String> = Vec::new();
@@ -3369,38 +3348,21 @@ fn run_plugin_update(
     // Explicit single-plugin refusal cases (fail closed with exit 1).
     if let Some(single_name) = explicit_single {
         if !not_installed.is_empty() {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
+            return Err(CliError::error(
                 "NOT_INSTALLED",
                 format!("Plugin '{single_name}' is not installed"),
-                Some(format!("hyp plugin install {single_name}")),
-            );
+            )
+            .with_fix(format!("hyp plugin install {single_name}")));
         }
         if !modified_skipped.is_empty() {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "PLUGIN_MODIFIED",
-                format!(
+            return Err(CliError::error("PLUGIN_MODIFIED", format!(
                     "Plugin '{single_name}' has local modifications on disk; refusing to overwrite without --force"
-                ),
-                Some(format!("hyp plugin update {single_name} --force")),
-            );
+                )).with_fix(format!("hyp plugin update {single_name} --force")));
         }
         if !corrupt_skipped.is_empty() {
-            return emit_error(
-                cmd,
-                as_json,
-                EXIT_ERROR,
-                "PLUGIN_CORRUPT",
-                format!(
+            return Err(CliError::error("PLUGIN_CORRUPT", format!(
                     "Plugin '{single_name}' installation is corrupt on disk; repair with `hyp plugin install {single_name} --force` or `hyp plugin update {single_name} --force`"
-                ),
-                Some(format!("hyp plugin install {single_name} --force")),
-            );
+                )).with_fix(format!("hyp plugin install {single_name} --force")));
         }
     }
 
@@ -3452,11 +3414,10 @@ fn run_plugin_update(
         }
 
         if as_json {
-            let envelope = JsonEnvelope {
-                ok: true,
-                command: cmd.to_string(),
-                summary: Some(summary),
-                data: Some(json!({
+            let envelope = JsonEnvelope::ok(
+                cmd.to_string(),
+                summary,
+                json!({
                     "dryRun": dry_run,
                     "downloaded": false,
                     "updated": Vec::<String>::new(),
@@ -3465,18 +3426,17 @@ fn run_plugin_update(
                     "modified": modified_skipped,
                     "corrupt": corrupt_skipped,
                     "reloadHints": Vec::<String>::new(),
-                })),
-                warnings,
-                next,
-                error: None,
-            };
+                }),
+            )
+            .warnings(warnings)
+            .next(next);
             print_json(&envelope);
         } else {
             println!("{}  {summary}", if dry_run { "PLAN" } else { "OK  " });
             print_warnings(&warnings);
             print_next_steps(&next);
         }
-        return ExitCode::from(EXIT_OK);
+        return Ok(ExitCode::from(EXIT_OK));
     }
 
     // Fetch/verify the release archive AT MOST ONCE for ALL plugins needing update.
@@ -3502,16 +3462,15 @@ fn run_plugin_update(
                 } else {
                     None
                 };
-                return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, fix);
+                return Err(CliError::error(err.code, err.message).with_optional_fix(fix));
             }
         };
 
     // Atomically write ONLY the changed plugins and update their receipts.
     if !force {
         for insp in &to_update {
-            if let Err(err) = check_panel_rename_targets(insp.spec, &insp.target_paths) {
-                return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
-            }
+            check_panel_rename_targets(insp.spec, &insp.target_paths)
+                .map_err(|err| CliError::error(err.code, err.message))?;
         }
     }
 
@@ -3519,13 +3478,12 @@ fn run_plugin_update(
     let mut reload_hints: Vec<String> = Vec::new();
     for insp in &to_update {
         let roots = install_target_roots(insp.spec.id, insp.target_paths.clone());
-        if let Err(err) = write_plugin_to_targets(insp.spec, &roots, &verified_files, force) {
-            return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
-        }
+        write_plugin_to_targets(insp.spec, &roots, &verified_files, force)
+            .map_err(|err| CliError::error(err.code, err.message))?;
         if let Err(err) =
             complete_harness_rename(insp.spec, &roots, receipts.installed.get(insp.spec.id))
         {
-            return emit_error(cmd, as_json, EXIT_ERROR, err.code, err.message, None);
+            return Err(CliError::error(err.code, err.message));
         }
         record_receipt(&mut receipts, insp.spec, &roots);
         updated_names.push(insp.spec.id.to_string());
@@ -3535,9 +3493,7 @@ fn run_plugin_update(
         }
     }
 
-    if let Err(e) = save_receipts(&state_dir, &receipts) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_ERROR", e, None);
-    }
+    save_receipts(&state_dir, &receipts).map_err(|e| CliError::error("RECEIPT_ERROR", e))?;
 
     for hint in &reload_hints {
         if !next.contains(hint) {
@@ -3555,11 +3511,10 @@ fn run_plugin_update(
     );
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            summary,
+            json!({
                 "dryRun": false,
                 "downloaded": source_kind == InstallSourceKind::Release,
                 "source": source_kind.as_str(),
@@ -3569,11 +3524,10 @@ fn run_plugin_update(
                 "modified": modified_skipped,
                 "corrupt": corrupt_skipped,
                 "reloadHints": reload_hints,
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!("OK    {summary}");
@@ -3590,7 +3544,7 @@ fn run_plugin_update(
         print_next_steps(&next);
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn remove_plugin_on_disk(plugin_id: &str, target_roots: &[PathBuf]) -> Result<bool, String> {
@@ -3742,13 +3696,11 @@ fn run_plugin_remove(
     home_arg: Option<&Path>,
     claude_config_dir_arg: Option<&Path>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "plugin remove";
     let is_all = plugin_arg.trim().eq_ignore_ascii_case("all");
-    let targets = match resolve_plugin_targets(plugin_arg) {
-        Ok(t) => t,
-        Err(msg) => return emit_error(cmd, as_json, EXIT_USAGE, "UNKNOWN_PLUGIN", msg, None),
-    };
+    let targets =
+        resolve_plugin_targets(plugin_arg).map_err(|msg| CliError::usage("UNKNOWN_PLUGIN", msg))?;
 
     let state_dir = resolve_state_dir(state_dir_arg, config_arg, home_arg);
     let config_path = resolve_config_path_for_read(config_arg, state_dir_arg, home_arg);
@@ -3781,7 +3733,7 @@ fn run_plugin_remove(
                 }
             }
             Ok(false) => {}
-            Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "IO_ERROR", e, None),
+            Err(e) => return Err(CliError::error("IO_ERROR", e)),
         }
         receipts.installed.remove(spec.id);
     }
@@ -3793,24 +3745,18 @@ fn run_plugin_remove(
     if is_all || !any_bridge_remaining {
         let sdk_dir = plugins_dir.join(SDK_PLUGIN_ID);
         if fs::symlink_metadata(&sdk_dir).is_ok() {
-            if let Err(e) = fs::remove_dir_all(&sdk_dir) {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+            fs::remove_dir_all(&sdk_dir).map_err(|e| {
+                CliError::error(
                     "IO_ERROR",
                     format!("Failed to remove {}: {e}", sdk_dir.display()),
-                    None,
-                );
-            }
+                )
+            })?;
             sdk_removed = true;
         }
         receipts.installed.remove(SDK_PLUGIN_ID);
     }
 
-    if let Err(e) = save_receipts(&state_dir, &receipts) {
-        return emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_ERROR", e, None);
-    }
+    save_receipts(&state_dir, &receipts).map_err(|e| CliError::error("RECEIPT_ERROR", e))?;
 
     if is_all {
         if plugins_dir.exists() {
@@ -3871,22 +3817,20 @@ fn run_plugin_remove(
     };
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: true,
-            command: cmd.to_string(),
-            summary: Some(summary),
-            data: Some(json!({
+        let envelope = JsonEnvelope::ok(
+            cmd.to_string(),
+            summary,
+            json!({
                 "pluginsDir": plugins_dir.display().to_string(),
                 "configPath": config_path.display().to_string(),
                 "removed": removed,
                 "sdkRemoved": sdk_removed,
                 "keepConfig": keep_config,
                 "removedConfigEntries": removed_config_entries,
-            })),
-            warnings,
-            next,
-            error: None,
-        };
+            }),
+        )
+        .warnings(warnings)
+        .next(next);
         print_json(&envelope);
     } else {
         println!("OK    {summary}");
@@ -3901,7 +3845,7 @@ fn run_plugin_remove(
         print_next_steps(&next);
     }
 
-    ExitCode::from(EXIT_OK)
+    Ok(ExitCode::from(EXIT_OK))
 }
 
 fn run_plugin_verify(
@@ -3911,7 +3855,7 @@ fn run_plugin_verify(
     home_arg: Option<&Path>,
     claude_config_dir_arg: Option<&Path>,
     as_json: bool,
-) -> ExitCode {
+) -> Result<ExitCode, CliError> {
     let cmd = "plugin verify";
     let explicit_single = plugin_arg
         .map(|s| s.trim())
@@ -3919,7 +3863,7 @@ fn run_plugin_verify(
     let specs_to_check: Vec<&'static PinnedPluginSpec> = match explicit_single {
         Some(name) => match resolve_plugin_targets(name) {
             Ok(t) => t,
-            Err(msg) => return emit_error(cmd, as_json, EXIT_USAGE, "UNKNOWN_PLUGIN", msg, None),
+            Err(msg) => return Err(CliError::usage("UNKNOWN_PLUGIN", msg)),
         },
         None => PINNED_PLUGINS.iter().collect(),
     };
@@ -3929,10 +3873,7 @@ fn run_plugin_verify(
     let resolved_home = resolve_home_dir(home_arg);
     let explicit_home = home_arg.is_some();
 
-    let receipts = match load_receipts(&state_dir) {
-        Ok(r) => r,
-        Err(e) => return emit_error(cmd, as_json, EXIT_ERROR, "RECEIPT_ERROR", e, None),
-    };
+    let receipts = load_receipts(&state_dir).map_err(|e| CliError::error("RECEIPT_ERROR", e))?;
 
     let mut records: Vec<VerifiedFileRecord> = Vec::new();
     let mut plugin_reports: Vec<DoctorPluginSummary> = Vec::new();
@@ -3951,14 +3892,11 @@ fn run_plugin_verify(
         );
         if insp.status == PluginStatus::NotInstalled {
             if explicit_single.is_some() {
-                return emit_error(
-                    cmd,
-                    as_json,
-                    EXIT_ERROR,
+                return Err(CliError::error(
                     "NOT_INSTALLED",
                     format!("Plugin '{}' is not installed", spec.id),
-                    Some(format!("hyp plugin install {}", spec.id)),
-                );
+                )
+                .with_fix(format!("hyp plugin install {}", spec.id)));
             }
             continue;
         }
@@ -4136,28 +4074,24 @@ fn run_plugin_verify(
     }
 
     if as_json {
-        let envelope = JsonEnvelope {
-            ok: all_ok,
-            command: cmd.to_string(),
-            summary: Some(summary.clone()),
-            data: Some(json!({
+        let error = (!all_ok).then(|| {
+            CliError::error("PLUGIN_VERIFY_FAILED", summary.clone()).with_fix(
+                "Update outdated plugins via `hyp plugin update --all` or reinstall tampered ones via `hyp plugin install <name> --force`.",
+            )
+        });
+        let envelope = JsonEnvelope::ok(
+            cmd,
+            summary,
+            json!({
                 "pluginsDir": plugins_dir.display().to_string(),
                 "checked": records.len(),
                 "failed": failed_files.max(failed_checks),
                 "plugins": plugin_reports,
                 "files": records,
-            })),
-            warnings: Vec::new(),
-            next,
-            error: if all_ok {
-                None
-            } else {
-                Some(CliError::error("PLUGIN_VERIFY_FAILED".to_string(), summary).with_fix(
-                        "Update outdated plugins via `hyp plugin update --all` or reinstall tampered ones via `hyp plugin install <name> --force`."
-                            .to_string(),
-                    ))
-            },
-        };
+            }),
+        )
+        .next(next)
+        .error(error);
         print_json(&envelope);
     } else if plugin_reports.is_empty() {
         println!("OK    {summary}");
@@ -4167,15 +4101,16 @@ fn run_plugin_verify(
     }
 
     if all_ok {
-        ExitCode::from(EXIT_OK)
+        Ok(ExitCode::from(EXIT_OK))
     } else {
-        ExitCode::from(EXIT_ERROR)
+        Ok(ExitCode::from(EXIT_ERROR))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::EXIT_USAGE;
     use hyp_crypto::transfer::{TarInputEntry, TarPackOptions, pack_tar_gz, pack_tar_gz_bytes};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4401,7 +4336,7 @@ mod tests {
         let tmp_ok = TempDir::new().expect("temp dir");
         let state_ok = tmp_ok.path().join("state");
         let redirect_url = format!("http://{addr}/redirect.tar.gz");
-        let code = run_plugin(PluginCommand::Install {
+        let code = crate::finish_command(run_plugin(PluginCommand::Install {
             plugin: "telegram".to_string(),
             state_dir: Some(state_ok.clone()),
             config: None,
@@ -4412,7 +4347,7 @@ mod tests {
             from_dir: None,
             force: false,
             json: true,
-        });
+        }));
         assert_eq!(code, ExitCode::from(EXIT_OK));
         let tg_path = state_ok.join("plugins/telegram/index.mjs");
         let sdk_path = state_ok.join("plugins/sdk/client.mjs");
@@ -4426,7 +4361,7 @@ mod tests {
 
         // 2. Subsequent `hyp plugin update --all` when `up_to_date` makes ZERO HTTP requests!
         let hits_before_noop = hits.load(Ordering::SeqCst);
-        let noop_update = run_plugin(PluginCommand::Update {
+        let noop_update = crate::finish_command(run_plugin(PluginCommand::Update {
             plugin: None,
             all: true,
             dry_run: false,
@@ -4439,7 +4374,7 @@ mod tests {
             archive: None,
             from_dir: None,
             json: true,
-        });
+        }));
         assert_eq!(noop_update, ExitCode::from(EXIT_OK));
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -4458,7 +4393,7 @@ mod tests {
         save_receipts(&state_ok, &rec).unwrap();
 
         let hits_before_outdated = hits.load(Ordering::SeqCst);
-        let upd_ok = run_plugin(PluginCommand::Update {
+        let upd_ok = crate::finish_command(run_plugin(PluginCommand::Update {
             plugin: None,
             all: true,
             dry_run: false,
@@ -4471,21 +4406,21 @@ mod tests {
             archive: None,
             from_dir: None,
             json: true,
-        });
+        }));
         assert_eq!(upd_ok, ExitCode::from(EXIT_OK));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             hits_before_outdated + 1,
             "outdated update must fetch release archive exactly once"
         );
-        let verify_ok = run_plugin(PluginCommand::Verify {
+        let verify_ok = crate::finish_command(run_plugin(PluginCommand::Verify {
             plugin: None,
             state_dir: Some(state_ok.clone()),
             config: None,
             home: Some(tmp_ok.path().to_path_buf()),
             claude_config_dir: None,
             json: true,
-        });
+        }));
         assert_eq!(verify_ok, ExitCode::from(EXIT_OK));
 
         // 4. Local user edit -> MODIFIED (`disk != receipt && disk != pinned`):
@@ -4496,19 +4431,19 @@ mod tests {
         let custom_edit = b"// user custom telegram tweak\n";
         fs::write(&tg_path, custom_edit).unwrap();
         assert_eq!(
-            run_plugin(PluginCommand::Verify {
+            crate::finish_command(run_plugin(PluginCommand::Verify {
                 plugin: Some("telegram".to_string()),
                 state_dir: Some(state_ok.clone()),
                 config: None,
                 home: Some(tmp_ok.path().to_path_buf()),
                 claude_config_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_ERROR)
         );
         let hits_before_mod = hits.load(Ordering::SeqCst);
         assert_eq!(
-            run_plugin(PluginCommand::Update {
+            crate::finish_command(run_plugin(PluginCommand::Update {
                 plugin: Some("telegram".to_string()),
                 all: false,
                 dry_run: false,
@@ -4521,14 +4456,14 @@ mod tests {
                 archive: None,
                 from_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_ERROR)
         );
         assert_eq!(fs::read(&tg_path).unwrap(), custom_edit);
         assert_eq!(hits.load(Ordering::SeqCst), hits_before_mod);
 
         assert_eq!(
-            run_plugin(PluginCommand::Update {
+            crate::finish_command(run_plugin(PluginCommand::Update {
                 plugin: None,
                 all: true,
                 dry_run: false,
@@ -4541,7 +4476,7 @@ mod tests {
                 archive: None,
                 from_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_OK)
         );
         assert_eq!(
@@ -4552,7 +4487,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), hits_before_mod);
 
         assert_eq!(
-            run_plugin(PluginCommand::Update {
+            crate::finish_command(run_plugin(PluginCommand::Update {
                 plugin: Some("telegram".to_string()),
                 all: false,
                 dry_run: false,
@@ -4565,23 +4500,23 @@ mod tests {
                 archive: None,
                 from_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_OK)
         );
         assert_eq!(
-            run_plugin(PluginCommand::Verify {
+            crate::finish_command(run_plugin(PluginCommand::Verify {
                 plugin: None,
                 state_dir: Some(state_ok.clone()),
                 config: None,
                 home: Some(tmp_ok.path().to_path_buf()),
                 claude_config_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_OK)
         );
 
         // 5. Remove telegram -> cleans up telegram/ AND sdk/ (no bridges remain)!
-        let remove_code = run_plugin(PluginCommand::Remove {
+        let remove_code = crate::finish_command(run_plugin(PluginCommand::Remove {
             plugin: "telegram".to_string(),
             keep_config: false,
             state_dir: Some(state_ok.clone()),
@@ -4589,14 +4524,14 @@ mod tests {
             home: Some(tmp_ok.path().to_path_buf()),
             claude_config_dir: None,
             json: true,
-        });
+        }));
         assert_eq!(remove_code, ExitCode::from(EXIT_OK));
         assert!(!tg_path.exists());
         assert!(!sdk_path.exists());
 
         // 6. Prefixed `plugins/<rel>` tarball layout works cleanly too!
         let prefixed_url = format!("http://{addr}/prefixed.tar.gz");
-        let code_prefixed = run_plugin(PluginCommand::Install {
+        let code_prefixed = crate::finish_command(run_plugin(PluginCommand::Install {
             plugin: "slack".to_string(),
             state_dir: Some(state_ok.clone()),
             config: None,
@@ -4607,7 +4542,7 @@ mod tests {
             from_dir: None,
             force: false,
             json: true,
-        });
+        }));
         assert_eq!(code_prefixed, ExitCode::from(EXIT_OK));
         assert!(state_ok.join("plugins/slack/index.mjs").is_file());
 
@@ -4615,7 +4550,7 @@ mod tests {
         let tmp_bad = TempDir::new().expect("temp dir");
         let state_bad = tmp_bad.path().join("state");
         assert_eq!(
-            run_plugin(PluginCommand::Install {
+            crate::finish_command(run_plugin(PluginCommand::Install {
                 plugin: "telegram".to_string(),
                 state_dir: Some(state_bad.clone()),
                 config: None,
@@ -4626,7 +4561,7 @@ mod tests {
                 from_dir: None,
                 force: false,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_ERROR)
         );
         assert!(
@@ -4639,7 +4574,7 @@ mod tests {
         );
 
         assert_eq!(
-            run_plugin(PluginCommand::Install {
+            crate::finish_command(run_plugin(PluginCommand::Install {
                 plugin: "claude-code".to_string(),
                 state_dir: Some(state_bad.clone()),
                 config: None,
@@ -4650,7 +4585,7 @@ mod tests {
                 from_dir: None,
                 force: false,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_ERROR)
         );
         assert!(
@@ -4670,7 +4605,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
 
         // 1. --from-dir `all` installs bridges + sdk + claude-panel + claude-code + herdr-mod!
-        let code_ok = run_plugin(PluginCommand::Install {
+        let code_ok = crate::finish_command(run_plugin(PluginCommand::Install {
             plugin: "all".to_string(),
             state_dir: Some(state_dir.clone()),
             config: None,
@@ -4681,7 +4616,7 @@ mod tests {
             from_dir: Some(repo_plugins_dir()),
             force: false,
             json: true,
-        });
+        }));
         assert_eq!(code_ok, ExitCode::from(EXIT_OK));
         assert!(state_dir.join("plugins/telegram/index.mjs").is_file());
         assert!(state_dir.join("plugins/sdk/client.mjs").is_file());
@@ -4710,19 +4645,19 @@ mod tests {
 
         // Verify passes across ALL 9 plugins!
         assert_eq!(
-            run_plugin(PluginCommand::Verify {
+            crate::finish_command(run_plugin(PluginCommand::Verify {
                 plugin: None,
                 state_dir: Some(state_dir.clone()),
                 config: None,
                 home: Some(home.clone()),
                 claude_config_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_OK)
         );
 
         // Removing one bridge keeps sdk/ intact because 4 other bridges remain!
-        let rm_one = run_plugin(PluginCommand::Remove {
+        let rm_one = crate::finish_command(run_plugin(PluginCommand::Remove {
             plugin: "webhook".to_string(),
             keep_config: false,
             state_dir: Some(state_dir.clone()),
@@ -4730,13 +4665,13 @@ mod tests {
             home: Some(home.clone()),
             claude_config_dir: None,
             json: true,
-        });
+        }));
         assert_eq!(rm_one, ExitCode::from(EXIT_OK));
         assert!(!state_dir.join("plugins/webhook").exists());
         assert!(state_dir.join("plugins/sdk/client.mjs").is_file());
 
         // Removing `all` cleans up plugins/ AND harness mods!
-        let rm_all = run_plugin(PluginCommand::Remove {
+        let rm_all = crate::finish_command(run_plugin(PluginCommand::Remove {
             plugin: "all".to_string(),
             keep_config: false,
             state_dir: Some(state_dir.clone()),
@@ -4744,7 +4679,7 @@ mod tests {
             home: Some(home.clone()),
             claude_config_dir: None,
             json: true,
-        });
+        }));
         assert_eq!(rm_all, ExitCode::from(EXIT_OK));
         assert!(!state_dir.join("plugins").exists());
         assert!(!home.join(".claude/skills/hyp-panel").exists());
@@ -4762,7 +4697,7 @@ mod tests {
             }
             fs::write(&dst, &bytes).unwrap();
         }
-        let code_tampered_dir = run_plugin(PluginCommand::Install {
+        let code_tampered_dir = crate::finish_command(run_plugin(PluginCommand::Install {
             plugin: "telegram".to_string(),
             state_dir: Some(state_dir.clone()),
             config: None,
@@ -4773,7 +4708,7 @@ mod tests {
             from_dir: Some(tampered_dir),
             force: false,
             json: true,
-        });
+        }));
         assert_eq!(code_tampered_dir, ExitCode::from(EXIT_ERROR));
         assert!(
             !state_dir.join("plugins").exists(),
@@ -4792,7 +4727,7 @@ mod tests {
         let file = fs::File::create(&archive_path).unwrap();
         pack_tar_gz(&entries, file, TarPackOptions::default()).unwrap();
 
-        let code_archive = run_plugin(PluginCommand::Install {
+        let code_archive = crate::finish_command(run_plugin(PluginCommand::Install {
             plugin: "prometheus".to_string(),
             state_dir: Some(state_dir.clone()),
             config: None,
@@ -4803,14 +4738,14 @@ mod tests {
             from_dir: None,
             force: false,
             json: true,
-        });
+        }));
         assert_eq!(code_archive, ExitCode::from(EXIT_OK));
         assert!(state_dir.join("plugins/prometheus/index.mjs").is_file());
         assert!(state_dir.join("plugins/sdk/client.mjs").is_file());
 
         // 4. Unknown plugin name -> EXIT_USAGE (2)
         assert_eq!(
-            run_plugin(PluginCommand::Install {
+            crate::finish_command(run_plugin(PluginCommand::Install {
                 plugin: "discord".to_string(),
                 state_dir: Some(state_dir.clone()),
                 config: None,
@@ -4821,13 +4756,13 @@ mod tests {
                 from_dir: None,
                 force: false,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_USAGE)
         );
 
         // 5. Conflicting source flags (--url + --from-dir) -> EXIT_USAGE (2)
         assert_eq!(
-            run_plugin(PluginCommand::Install {
+            crate::finish_command(run_plugin(PluginCommand::Install {
                 plugin: "telegram".to_string(),
                 state_dir: Some(state_dir.clone()),
                 config: None,
@@ -4838,29 +4773,29 @@ mod tests {
                 from_dir: Some(repo_plugins_dir()),
                 force: false,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_USAGE)
         );
 
         // 6. List + permissions check + missing SDK fail-closed
         assert_eq!(
-            run_plugin(PluginCommand::List {
+            crate::finish_command(run_plugin(PluginCommand::List {
                 state_dir: Some(state_dir.clone()),
                 config: None,
                 home: Some(home.clone()),
                 claude_config_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_OK)
         );
         assert_eq!(
-            run_plugin(PluginCommand::List {
+            crate::finish_command(run_plugin(PluginCommand::List {
                 state_dir: Some(state_dir.clone()),
                 config: None,
                 home: Some(home.clone()),
                 claude_config_dir: None,
                 json: false,
-            }),
+            })),
             ExitCode::from(EXIT_OK)
         );
         #[cfg(unix)]
@@ -4889,14 +4824,14 @@ mod tests {
         // Deleting sdk/client.mjs while prometheus is installed -> verify MUST fail closed!
         fs::remove_file(state_dir.join("plugins/sdk/client.mjs")).unwrap();
         assert_eq!(
-            run_plugin(PluginCommand::Verify {
+            crate::finish_command(run_plugin(PluginCommand::Verify {
                 plugin: None,
                 state_dir: Some(state_dir),
                 config: None,
                 home: Some(home),
                 claude_config_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_ERROR)
         );
     }
@@ -4912,7 +4847,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
 
         assert_eq!(
-            run_plugin(PluginCommand::Install {
+            crate::finish_command(run_plugin(PluginCommand::Install {
                 plugin: "herdr-mod".to_string(),
                 state_dir: Some(state_dir.clone()),
                 config: None,
@@ -4923,7 +4858,7 @@ mod tests {
                 from_dir: Some(repo_plugins_dir()),
                 force: false,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_OK)
         );
 
@@ -4935,14 +4870,14 @@ mod tests {
         symlink(&decoy, &target_main).unwrap();
 
         assert_eq!(
-            run_plugin(PluginCommand::Verify {
+            crate::finish_command(run_plugin(PluginCommand::Verify {
                 plugin: Some("herdr-mod".to_string()),
                 state_dir: Some(state_dir.clone()),
                 config: None,
                 home: Some(home.clone()),
                 claude_config_dir: None,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_ERROR)
         );
         let doctor = inspect_plugins_for_doctor(&state_dir, Some(&home), true, None);
@@ -4950,7 +4885,7 @@ mod tests {
 
         // Reinstall with --force MUST unlink the symlink (leaving decoy untouched!) and restore real file!
         assert_eq!(
-            run_plugin(PluginCommand::Install {
+            crate::finish_command(run_plugin(PluginCommand::Install {
                 plugin: "herdr-mod".to_string(),
                 state_dir: Some(state_dir.clone()),
                 config: None,
@@ -4961,7 +4896,7 @@ mod tests {
                 from_dir: Some(repo_plugins_dir()),
                 force: true,
                 json: true,
-            }),
+            })),
             ExitCode::from(EXIT_OK)
         );
         assert!(
