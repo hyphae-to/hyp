@@ -15,6 +15,32 @@ use crate::error::CryptoError;
 use crate::jcs::to_canonical_json;
 use crate::x25519::{is_low_order_x25519_point, x25519_dh, x25519_public_from_private};
 
+fn domain_message(domain: &[u8], payload: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut msg = Zeroizing::new(Vec::with_capacity(domain.len() + payload.len()));
+    msg.extend_from_slice(domain);
+    msg.extend_from_slice(payload);
+    msg
+}
+
+pub(crate) fn sign_with_domain(signer: &Ed25519KeyPair, domain: &[u8], payload: &[u8]) -> String {
+    let msg = domain_message(domain, payload);
+    let sig = signer.sign_raw(&msg);
+    URL_SAFE_NO_PAD.encode(sig)
+}
+
+pub(crate) fn verify_with_domain(
+    pk: &Ed25519PublicKey,
+    domain: &[u8],
+    payload: &[u8],
+    sig_b64: &str,
+) -> Result<(), CryptoError> {
+    let sig = URL_SAFE_NO_PAD
+        .decode(sig_b64)
+        .map_err(|e| CryptoError::InvalidSignature(format!("invalid base64url sig: {e}")))?;
+    let msg = domain_message(domain, payload);
+    pk.verify_raw(&msg, &sig)
+}
+
 /// RFC 8410 PKCS#8 v1 DER prefix for a raw 32-byte Ed25519 private seed (16 bytes).
 /// Identical to Node `node:crypto` `export({ format: "der", type: "pkcs8" })`.
 const ED25519_PKCS8_V1_PREFIX: [u8; 16] = [
@@ -499,17 +525,13 @@ impl Ed25519KeyPair {
 
     /// Signs `payload` under Hyphae v2 domain separation: `"hyphae/v2/<kind>\n" || payload`.
     pub fn sign_domain(&self, kind: &str, payload: &[u8]) -> [u8; 64] {
-        let mut buf = Vec::with_capacity(11 + kind.len() + payload.len());
-        buf.extend_from_slice(b"hyphae/v2/");
-        buf.extend_from_slice(kind.as_bytes());
-        buf.push(b'\n');
-        buf.extend_from_slice(payload);
+        let buf = domain_message(format!("hyphae/v2/{kind}\n").as_bytes(), payload);
         self.sign_raw(&buf)
     }
 
     /// Signs `payload` under Hyphae v2 domain separation and encodes signature as base64url.
     pub fn sign_domain_b64(&self, kind: &str, payload: &[u8]) -> String {
-        URL_SAFE_NO_PAD.encode(self.sign_domain(kind, payload))
+        sign_with_domain(self, format!("hyphae/v2/{kind}\n").as_bytes(), payload)
     }
 
     /// Canonicalizes `value` with RFC 8785 JCS and signs under `"hyphae/v2/<kind>\n"`.
@@ -620,11 +642,7 @@ impl Ed25519PublicKey {
 
     /// Strictly verifies a Hyphae v2 domain-separated signature (`"hyphae/v2/<kind>\n" || payload`).
     pub fn verify_domain(&self, kind: &str, payload: &[u8], sig: &[u8]) -> Result<(), CryptoError> {
-        let mut buf = Vec::with_capacity(11 + kind.len() + payload.len());
-        buf.extend_from_slice(b"hyphae/v2/");
-        buf.extend_from_slice(kind.as_bytes());
-        buf.push(b'\n');
-        buf.extend_from_slice(payload);
+        let buf = domain_message(format!("hyphae/v2/{kind}\n").as_bytes(), payload);
         self.verify_raw(&buf, sig)
     }
 
@@ -635,10 +653,12 @@ impl Ed25519PublicKey {
         payload: &[u8],
         sig_b64: &str,
     ) -> Result<(), CryptoError> {
-        let sig = URL_SAFE_NO_PAD
-            .decode(sig_b64)
-            .map_err(|e| CryptoError::InvalidSignature(format!("invalid base64url sig: {e}")))?;
-        self.verify_domain(kind, payload, &sig)
+        verify_with_domain(
+            self,
+            format!("hyphae/v2/{kind}\n").as_bytes(),
+            payload,
+            sig_b64,
+        )
     }
 
     /// Verifies a `SignedPayload` under `"hyphae/v2/<kind>\n"` and deserializes its JSON payload.
