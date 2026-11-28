@@ -155,5 +155,14 @@
       ["herdr-mod/mods/hyphae-panel/ui-snapshot.js", false],
       ["herdr-mod/mods/hyphae-panel/hyphae.svg", false]
     ]
+  },
+  {
+    "id": "herdr-status",
+    "kind": "harness",
+    "defaultSource": false,
+    "files": [
+      ["herdr-status/publish.mjs", false],
+      ["herdr-status/README.md", false]
+    ]
   }
 ]
