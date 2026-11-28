@@ -90,7 +90,7 @@ fn build_rs_pinned_digests_and_tree_hashes_match_sha2_crate_and_crlf_invariance(
     ];
 
     assert_eq!(PINNED_PLUGINS.len(), expected_plugins.len());
-    assert_eq!(PINNED_PLUGIN_FILES.len(), 50);
+    assert_eq!(PINNED_PLUGIN_FILES.len(), 51);
     let plugins_dir = repo_root().join("plugins");
 
     for (spec, (exp_id, exp_kind, exp_count)) in PINNED_PLUGINS.iter().zip(expected_plugins.iter())
