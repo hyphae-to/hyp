@@ -136,8 +136,7 @@ The `github-webhook` source runs inside `hyp` and verifies `X-Hub-Signature-256`
       "args": ["<prometheus scriptPath>"],
       "targets": ["alerts"],
       "env": {
-        "PROMETHEUS_BEARER_TOKEN": { "secret": "prometheus-bearer-token" },
-        "PROMETHEUS_LEGACY_NATIVE": "1"
+        "PROMETHEUS_BEARER_TOKEN": { "secret": "prometheus-bearer-token" }
       }
     }
   ]
@@ -153,7 +152,9 @@ Use the old source topic as the plugin target to keep subscriptions. Remove the 
 | Alertmanager `bearerToken`, `webhookSecret`, `maxBodyBytes` | `PROMETHEUS_BEARER_TOKEN`, `PROMETHEUS_WEBHOOK_SECRET`, `PROMETHEUS_MAX_BODY_BYTES` |
 | Alertmanager `basicAuth` | `PROMETHEUS_BASIC_AUTH` references a SecretStore entry whose value is `username:password` |
 
-Use the migration flags shown above for existing sources. They preserve native event IDs and the generic native CloudEvents pass-through contract. New plugin entries can omit them. Retain signature and timestamp headers when forwarding.
+For a migrated generic webhook, `WEBHOOK_LEGACY_NATIVE=1` preserves native event IDs and the native CloudEvents pass-through contract. Retain signature and timestamp headers when forwarding.
+
+Alertmanager IDs include the alert fingerprint, status and a hash of the alert content. Annotation edits and resolutions publish new events. Retries reuse the same ID, including when the firing alert’s expiry moves. Updating from an older plugin may deliver an ongoing alert once more under its new ID. Existing configurations can remove `PROMETHEUS_LEGACY_NATIVE`.
 
 The default loopback targets are `http://127.0.0.1:8795/webhook` and `http://127.0.0.1:8793/alerts`. Set `WEBHOOK_PORT` / `WEBHOOK_PATH` or `PROMETHEUS_PORT` / `PROMETHEUS_PATH` when running multiple receivers. Update the sender or proxy to reach the new listener. For public callbacks, use [webhook routing setup](operations/deploying.md#public-webhook-routing) to preserve the existing HTTPS path or choose a new one. Send an authenticated test delivery and verify the event reaches the existing topic.
 

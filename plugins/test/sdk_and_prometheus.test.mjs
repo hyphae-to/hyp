@@ -106,7 +106,7 @@ function spawnFd3Script(code, { plugin = "test-plugin", targets = ["ops"], env =
 }
 
 /** Spawns the real plugins/prometheus/index.mjs subprocess over fd 3 on an ephemeral loopback port. */
-async function startPrometheusPlugin(env, { targets = ["alerts"] } = {}) {
+async function startPrometheusPlugin(env, { targets = ["alerts"], publish = () => ({ result: { status: "stored" } }) } = {}) {
   const child = spawn(process.execPath, [PROMETHEUS_SCRIPT], {
     env: {
       PATH: process.env.PATH,
@@ -139,7 +139,7 @@ async function startPrometheusPlugin(env, { targets = ["alerts"] } = {}) {
     const msg = JSON.parse(line);
     if (msg.method !== "hyphae/publish") return;
     events.push({ to: msg.params.to, event: msg.params.event });
-    channel.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { status: "stored" } }) + "\n");
+    channel.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, ...publish(msg.params.event) }) + "\n");
   });
   channel.write(JSON.stringify({ jsonrpc: "2.0", method: "hyphae/hello", params: { protocol: 2, plugin: "prometheus", targets } }) + "\n");
 
@@ -578,6 +578,61 @@ test("Issue #41: prometheus emits top-level alertname, severity, and service Clo
   assert.equal(ev4.data.alertname, longAttr);
 
   await prom.stop();
+});
+
+test("Alertmanager revisions follow per-alert content across edits, resolves and retries", async () => {
+  const prom = await startPrometheusPlugin({ PROMETHEUS_ALLOW_UNSIGNED: "1" });
+  const send = async (alert, group = {}) => {
+    const res = await fetch(prom.url, { method: "POST", body: JSON.stringify({ ...group, alerts: [alert] }) });
+    assert.equal(res.status, 200);
+    return prom.events.at(-1).event;
+  };
+  const alert = { status: "firing", labels: { alertname: "Slow", job: "db" }, annotations: { summary: "slow", value: "2s" } };
+  const first = await send(alert);
+  const edited = { ...alert, annotations: { ...alert.annotations, value: "3s" } };
+  const update = await send(edited);
+  assert.notEqual(update.id, first.id);
+  assert.equal(update.data.annotations.value, "3s");
+  const repeated = await send({ ...alert, labels: { job: "db", alertname: "Slow" },
+    annotations: { value: "2s", summary: "slow" }, endsAt: "2026-11-24T12:05:00Z" },
+    { groupKey: "regrouped", truncatedAlerts: 1 });
+  assert.deepEqual(repeated, first);
+  assert.equal(first.time, undefined);
+  const cleared = { ...edited, status: "resolved", endsAt: "2026-11-24T12:10:00Z" };
+  const resolved = await send(cleared);
+  assert.notEqual(resolved.id, update.id);
+  assert.equal(resolved.time, cleared.endsAt);
+  assert.equal(resolved.data.endsAt, cleared.endsAt);
+  assert.deepEqual(await send(cleared), resolved);
+});
+
+test("Alertmanager reports partial failure, attempts siblings and reuses IDs on batch retry", async () => {
+  const alerts = ["first", "middle", "last"].map(fingerprint => ({ fingerprint, status: "firing" }));
+  let failureCode = -32005;
+  const accepted = new Set();
+  const prom = await startPrometheusPlugin({ PROMETHEUS_ALLOW_UNSIGNED: "1" }, {
+    publish(event) {
+      if (failureCode && event.id.startsWith("middle:")) return { error: { code: failureCode, message: "fixture rejection" } };
+      const status = accepted.has(event.id) ? "duplicate" : "stored";
+      accepted.add(event.id);
+      return { result: { status } };
+    },
+  });
+  const send = () => fetch(prom.url, { method: "POST", body: JSON.stringify({ alerts }) });
+  const partial = await send();
+  assert.equal(partial.status, 503);
+  assert.deepEqual(await partial.json(), { ok: false, alerts: 2, failed: 1, error: "mesh_unavailable" });
+  const ids = prom.events.map(({ event }) => event.id);
+  assert.equal(ids.length, 3);
+  failureCode = -32002;
+  assert.equal((await send()).status, 422);
+  assert.deepEqual(prom.events.slice(3).map(({ event }) => event.id), ids);
+  failureCode = 0;
+  const retry = await send();
+  assert.equal(retry.status, 200);
+  assert.deepEqual(await retry.json(), { ok: true, alerts: 3 });
+  assert.deepEqual(prom.events.slice(6).map(({ event }) => event.id), ids);
+  assert.equal(accepted.size, 3);
 });
 
 // ============================================================================

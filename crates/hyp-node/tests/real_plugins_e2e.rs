@@ -543,20 +543,20 @@ mod unix_tests {
         assert_eq!(body_json["ok"], json!(true));
         assert_eq!(body_json["alerts"], json!(2));
 
-        // Frozen against identical deliveries to the former native adapter.
+        // Native alert fields and fingerprint prefix survive the revision-aware ID format.
         let plugin_events = plugin_host
             .wait_for_event_count(2, Duration::from_secs(5))
             .await;
         for (index, (id, kind, time, name, severity)) in [
             (
-                "fp-firing-001:firing:2026-11-24T12:00:00Z",
+                "fp-firing-001:firing:8cfee99be5eba5e8aa533ce2c74d87c289b4ad176e6cc78c0d5d199db424e449",
                 "firing",
                 "2026-11-24T12:00:00Z",
                 "HighErrorRate",
                 "critical",
             ),
             (
-                "fcf345f016fa3eae:resolved:2026-11-24T11:30:00Z",
+                "fcf345f016fa3eae:resolved:008d18d9c8fdb764ab62b02af3b484cbb15d41b01ded5587b353ea7a3d1d5a68",
                 "resolved",
                 "2026-11-24T12:05:00Z",
                 "HighLatency",
