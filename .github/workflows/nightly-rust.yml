@@ -89,7 +89,11 @@ jobs:
           else
             NIGHTLY_BASE="${BASE_VER}"
           fi
-          NIGHTLY_VER="${NIGHTLY_BASE}-nightly.${DATE_STAMP}.${SHORT_SHA}"
+          # Existing clients compare the whole prerelease string lexically. Keep the run
+          # number fixed-width, with a letter so leading zeros are valid SemVer.
+          # "run" sorts after all legacy hexadecimal SHA identifiers on the same day.
+          printf -v RUN_ID 'r%020d' "$GITHUB_RUN_NUMBER"
+          NIGHTLY_VER="${NIGHTLY_BASE}-nightly.${DATE_STAMP}.run.${RUN_ID}.g${SHORT_SHA}"
 
           LAST_SHA=""
           if LAST_TAG_JSON="$(gh api "repos/${REPO}/git/ref/tags/nightly" 2>/dev/null || true)"; then
