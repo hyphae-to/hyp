@@ -2048,14 +2048,18 @@ mod tests {
     }
 
     #[test]
-    fn numbered_nightlies_are_ordered_by_date_and_run() {
+    fn nightly_versions_are_ordered_across_label_formats() {
         let versions = [
             "0.8.0",
             "0.8.1-nightly.20261128.dec46ff",
             "0.8.1-nightly.20261128.fffffff",
+            "0.8.1-nightly.20261128.run.r00000000000000000014.gc70ba53",
             "0.8.1-nightly.20261128.run.r00000000000000000099.gfffffff",
             "0.8.1-nightly.20261128.run.r00000000000000000100.g0000001",
-            "0.8.1-nightly.20261129.run.r00000000000000000101.g0000000",
+            "0.8.1-nightly.20261128T120000Z.gfffffff",
+            "0.8.1-nightly.20261128T120001Z.g0000001",
+            "0.8.1-nightly.20261128T235959Z.gfffffff",
+            "0.8.1-nightly.20261129T000000Z.g0000000",
             "0.8.1",
         ];
         for (position, newer) in versions.iter().enumerate() {
@@ -2067,6 +2071,10 @@ mod tests {
                 assert!(
                     !is_strict_version_downgrade(newer, older),
                     "{newer} > {older}"
+                );
+                assert!(
+                    semver::Version::parse(older).unwrap() < semver::Version::parse(newer).unwrap(),
+                    "SemVer requires {older} < {newer}"
                 );
             }
         }

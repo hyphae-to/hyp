@@ -488,6 +488,7 @@ dependencies = [
  "hyper-util",
  "ring",
  "rustls",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml_ng",
