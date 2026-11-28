@@ -1565,3 +1565,110 @@ async fn digest_and_inbox_require_stored_daemon_notice_provenance() {
         }
     }
 }
+
+#[tokio::test]
+async fn subscription_review_accompanies_only_existing_digests_for_its_session() {
+    const NOTE: &str = "<system kind=\"subscription-review\" subscriptions=\"20\">Review subscriptions with hyp_stream(action=\"list\").</system>";
+
+    fn set_subscriptions(node: &UnifiedNode, sid: &str, count: usize) {
+        let specs = (0..count)
+            .map(|n| hyp_store::SubscriptionSpec {
+                id: format!("{sid}-sub-{n}"),
+                origin_node: "peer@net".into(),
+                topic: format!("private-topic-{n}"),
+                subscriber: sid.into(),
+                filters: vec![],
+                coalesce_seconds: 0,
+                max_batch_age_ms: None,
+                max_wakes_per_hour: None,
+                mode: hyp_store::DeliveryMode::Full,
+            })
+            .collect::<Vec<_>>();
+        node.db()
+            .events()
+            .set_subscriptions(sid, &specs, now_ms())
+            .unwrap();
+    }
+    async fn drain(daemon: &LocalDaemon, sid: &str) -> String {
+        let response = daemon_rpc_async(
+            daemon.socket_path(),
+            &json!({"type":"mailbox.drain", "sessionId":sid, "scope":"pre_turn"}),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(response.ok, "{response:?}");
+        response.result.unwrap()["items"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+    let tmp = TempDir::new().unwrap();
+    let node = open_local_node("review@box", tmp.path());
+    let cfg = LocalDaemonConfig {
+        auto_detect_transports: false,
+        ..Default::default()
+    };
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, cfg.clone())
+        .await
+        .unwrap();
+    let alice = "claude:review-a";
+    let bob = "claude:review-b";
+    for sid in [alice, bob] {
+        let db = node.db();
+        db.local().register_session(sid, "{}", now_ms()).unwrap();
+        let mut policy = daemon.delivery().policy(&db, sid).unwrap();
+        policy.overrides.push(DeliveryRule {
+            target: "peer@net/vip".into(),
+            delivery: DeliveryUrgency::Interrupt,
+        });
+        daemon.delivery().set_policy(&db, sid, policy).unwrap();
+    }
+    set_subscriptions(&node, alice, 19);
+    set_subscriptions(&node, bob, 20);
+    assert!(drain(&daemon, bob).await.is_empty());
+    send_dm(&daemon, alice, "a1", "peer@net/a", "private body").await;
+    let small = drain(&daemon, alice).await;
+    assert!(
+        small.contains("urgency=\"queue\"") && !small.contains("subscription-review"),
+        "{small}"
+    );
+
+    for (sid, source, urgency) in [
+        (alice, "peer@net/vip", "interrupt"),
+        (bob, "peer@net/b", "queue"),
+    ] {
+        set_subscriptions(&node, sid, 20);
+        send_dm(&daemon, sid, "review", source, "private body").await;
+        let digest = drain(&daemon, sid).await;
+        assert!(
+            digest.contains(&format!("urgency=\"{urgency}\"")),
+            "{digest}"
+        );
+        assert!(digest.contains(NOTE), "{digest}");
+        assert!(
+            !digest.contains("private-topic") && !digest.contains("private body"),
+            "{digest}"
+        );
+    }
+    daemon.stop().await;
+    let daemon = LocalDaemon::start(Arc::clone(&node), None, cfg)
+        .await
+        .unwrap();
+    send_dm(&daemon, alice, "a2", "peer@net/c", "private body").await;
+    let quiet = drain(&daemon, alice).await;
+    assert!(
+        quiet.contains("<dm ") && !quiet.contains("subscription-review"),
+        "{quiet}"
+    );
+    daemon.advance_clock_ms(7 * 24 * 60 * 60 * 1_000 + 1);
+    set_subscriptions(&node, bob, 19);
+    for (sid, should_remind) in [(alice, true), (bob, false)] {
+        assert!(drain(&daemon, sid).await.is_empty());
+        send_dm(&daemon, sid, "next-week", "peer@net/d", "private body").await;
+        let digest = drain(&daemon, sid).await;
+        assert!(digest.contains("<dm "), "{digest}");
+        assert_eq!(digest.contains(NOTE), should_remind, "{digest}");
+    }
+    daemon.stop().await;
+    node.shutdown();
+}

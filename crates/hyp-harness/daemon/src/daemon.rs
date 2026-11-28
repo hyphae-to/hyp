@@ -5194,6 +5194,7 @@ async fn handle_mailbox_drain(
         Some(built) => {
             let batch = built.batch;
             if built.is_midturn_queue_reminder {
+                daemon.record_subscription_review_if_shown(&target_session_id, &batch);
                 daemon
                     .record_midturn_digest_timestamp(&target_session_id, daemon.current_time_ms());
                 daemon.mark_surfaced_quarantine_notices(
@@ -5220,7 +5221,7 @@ async fn handle_mailbox_drain(
                 "ok": true,
                 "result": {
                     "items": [{
-                        "text": batch.rendered,
+                        "text": batch.confirmed_digest(),
                         "notifyOnly": batch.notify_only,
                         "mutedCount": batch.muted_count,
                         "receiptIds": batch.receipt_ids,
