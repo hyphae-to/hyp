@@ -4024,7 +4024,7 @@ mod tests {
     #[test]
     fn differential_build_rs_sha256_and_tree_digests_match_sha2_crate_for_all_plugins() {
         assert_eq!(PINNED_PLUGINS.len(), 16);
-        assert_eq!(PINNED_PLUGIN_FILES.len(), 50);
+        assert_eq!(PINNED_PLUGIN_FILES.len(), 51);
         let root = repo_plugins_dir();
 
         for entry in PINNED_PLUGIN_FILES {

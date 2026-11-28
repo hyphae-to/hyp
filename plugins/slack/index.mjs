@@ -13,6 +13,7 @@
  *   SLACK_API_BASE                           - Optional API base URL override (default https://slack.com/api)
  */
 import { readFileSync, statSync } from "node:fs";
+import { openSlackState, slackChoiceHandler } from "./actions.mjs";
 import { MeshPluginClient } from "../sdk/client.mjs";
 
 function readSecret(fileEnv, valEnv) {
@@ -332,6 +333,30 @@ const mentionRe = new RegExp(`<@${botUserId}>\\s*`, "g");
 const seen = new Set();
 const activeThreads = new Set();
 
+function admittedSender(user, channel, isDm, allowlist) {
+  if (isDm) return allowsDm(user, channel, allowlist);
+  return (!allowlist || (allowlist.people.has(user) && allowlist.channels.has(channel))) &&
+    (!allowedUsers || allowedUsers.has(user)) && (!allowedChannels || allowedChannels.has(channel));
+}
+
+let state;
+const handleClick = slackChoiceHandler({
+  team: auth.team_id, bot: botUserId, botId: auth.bot_id,
+  state: () => state ??= openSlackState(process.env.HYPHAE_STATE_DIR, teamId, botUserId, target),
+  sender: (user, channel) => {
+    const allowlist = readAllowlist();
+    return admittedSender(user, channel, channel.startsWith("D"), allowlist)
+      ? allowlist?.people.get(user) ?? {} : null;
+  },
+  update: (params) => slackApi("chat.update", botToken, params),
+  send: async (event) => {
+    await mesh.send(target, event);
+    if (event.data.channel_type === "dm") admittedDms.set(event.data.channel, event.data.user);
+    else seenAllowedChannels.add(event.data.channel);
+  },
+  redactInboundData: (data) => data,
+});
+
 async function handleEnvelope(envelope) {
   if (envelope.type !== "events_api") return;
   const ev = envelope.payload?.event;
@@ -345,13 +370,7 @@ async function handleEnvelope(envelope) {
   const isDm = ev.channel_type === "im" || channel.startsWith("D");
   const allowlist = readAllowlist();
   const person = allowlist?.people.get(user);
-  if (isDm) {
-    if (!allowsDm(user, channel, allowlist)) return;
-  } else {
-    if (allowlist && (!person || !allowlist.channels.has(channel))) return;
-    if (allowedUsers && !allowedUsers.has(user)) return;
-    if (allowedChannels && !allowedChannels.has(channel)) return;
-  }
+  if (!admittedSender(user, channel, isDm, allowlist)) return;
 
   const dedupKey = `${channel}:${ts}`;
   if (seen.has(dedupKey)) return;
@@ -454,6 +473,14 @@ while (true) {
         if (settled) return;
         let envelope;
         try { envelope = JSON.parse(String(msg.data)); } catch { return; }
+        if (envelope.type === "interactive") {
+          void handleClick(envelope.payload).then(() => {
+            if (envelope.envelope_id && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ envelope_id: envelope.envelope_id }));
+            }
+          }).catch(() => console.error("Slack button handling failed; leaving envelope unacknowledged for retry"));
+          return;
+        }
         if (envelope.envelope_id) {
           ws.send(JSON.stringify({ envelope_id: envelope.envelope_id }));
         }
