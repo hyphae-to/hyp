@@ -8,7 +8,6 @@
  *   PROMETHEUS_PORT                                                 - Bind port (default 8793)
  *   PROMETHEUS_PATH                                                 - Webhook path (default /alerts)
  *   PROMETHEUS_MAX_BODY_BYTES                                      - Maximum request body size (default 1048576)
- *   PROMETHEUS_LEGACY_NATIVE                                       - Keep native IDs for alerts without fingerprints when set to 1
  *   PROMETHEUS_TOPIC                                                - Target topic (default "alerts" or AGENTS_MESH_TOPIC)
  *   PROMETHEUS_BEARER_TOKEN_FILE or PROMETHEUS_BEARER_TOKEN         - Bearer token for Authorization header
  *   PROMETHEUS_BASIC_AUTH_FILE or PROMETHEUS_BASIC_AUTH             - Basic auth credentials ("user:pass") for Authorization header
@@ -18,11 +17,10 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { MeshPluginClient, PluginRpcError, RPC_UNAVAILABLE } from "../sdk/client.mjs";
+import { MeshPluginClient, PluginRpcError, RPC_INVALID_EVENT, RPC_TOO_LARGE } from "../sdk/client.mjs";
 import { answerWebhookReadiness, envInt, readWebhookBody } from "../sdk/source-kit.mjs";
 
 const maxBodyBytes = envInt("PROMETHEUS_MAX_BODY_BYTES", 1024 * 1024, { min: 1 });
-const nativeCompat = process.env.PROMETHEUS_LEGACY_NATIVE === "1";
 const MAX_SAFE_DATA_BYTES = 7_500;
 const MAX_ATTRIBUTE_CHARS = 256;
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
@@ -230,12 +228,12 @@ async function handleRequest(req, res) {
   const commonAnnotations = isPlainObject(payload.commonAnnotations) ? payload.commonAnnotations : {};
 
   let count = 0;
+  let failureStatus = 0;
   if (!payload.alerts.every(isPlainObject)) {
     sendJson(res, 400, { error: "invalid_alert_entry" });
     return;
   }
   for (const alert of payload.alerts) {
-
     const alertLabels = isPlainObject(alert.labels) ? alert.labels : {};
     const alertAnnotations = isPlainObject(alert.annotations) ? alert.annotations : {};
     const labels = { ...commonLabels, ...alertLabels };
@@ -255,12 +253,11 @@ async function handleRequest(req, res) {
     const fingerprint =
       typeof alert.fingerprint === "string" && alert.fingerprint.trim()
         ? alert.fingerprint.trim()
-        : createHash("sha256").update(nativeCompat ? canonicalJson(labels) : JSON.stringify(labels)).digest("hex").slice(0, 16);
+        : createHash("sha256").update(canonicalJson(labels)).digest("hex").slice(0, 16);
 
     const startsAt = typeof alert.startsAt === "string" ? alert.startsAt : "";
     const endsAt = typeof alert.endsAt === "string" ? alert.endsAt : "";
-    const eventTime = normalizeRfc3339(status === "resolved" ? endsAt : startsAt) ?? new Date().toISOString();
-    const eventId = `${fingerprint}:${status}:${startsAt}`.slice(0, 256);
+    const eventTime = normalizeRfc3339(status === "resolved" ? endsAt : startsAt);
     const subject = `severity=${severity}/${alertname}`.slice(0, 256);
 
     const rawData = {
@@ -274,19 +271,22 @@ async function handleRequest(req, res) {
       labels,
       annotations,
       ...(typeof alert.startsAt === "string" ? { startsAt: alert.startsAt } : {}),
-      ...(typeof alert.endsAt === "string" ? { endsAt: alert.endsAt } : {}),
+      // A firing alert can carry a moving expiry. Only a resolution has a final end time.
+      ...(status === "resolved" && typeof alert.endsAt === "string" ? { endsAt: alert.endsAt } : {}),
       ...(typeof alert.generatorURL === "string" ? { generatorURL: alert.generatorURL } : {}),
       ...(typeof payload.receiver === "string" ? { receiver: payload.receiver } : {}),
       ...(typeof payload.externalURL === "string" ? { externalURL: payload.externalURL } : {}),
     };
 
+    const revision = createHash("sha256").update(canonicalJson([fingerprint, rawData])).digest("hex");
+    const idPrefix = Buffer.byteLength(fingerprint) <= 64 ? fingerprint : "alert";
     const event = {
       specversion: "1.0",
-      id: eventId,
+      id: `${idPrefix}:${status}:${revision}`,
       type: status === "resolved" ? "io.prometheus.alert.resolved" : "io.prometheus.alert.firing",
       source: "prometheus/alertmanager",
       subject,
-      time: eventTime,
+      ...(eventTime ? { time: eventTime } : {}),
       ...(alertname && Buffer.byteLength(alertname, "utf8") <= MAX_ATTRIBUTE_CHARS ? { alertname } : {}),
       ...(severity && Buffer.byteLength(severity, "utf8") <= MAX_ATTRIBUTE_CHARS ? { severity } : {}),
       ...(service && Buffer.byteLength(service, "utf8") <= MAX_ATTRIBUTE_CHARS ? { service } : {}),
@@ -299,14 +299,21 @@ async function handleRequest(req, res) {
       count += 1;
     } catch (error) {
       console.error(`prometheus mesh send error: ${error instanceof Error ? error.message : String(error)}`);
-      if (!(error instanceof PluginRpcError) || error.code === RPC_UNAVAILABLE) {
-        sendJson(res, 503, { ok: false, error: error instanceof PluginRpcError ? "mesh_unavailable" : "mesh_error", alerts: count });
-        return;
-      }
+      const invalid = error instanceof PluginRpcError && [RPC_TOO_LARGE, RPC_INVALID_EVENT].includes(error.code);
+      failureStatus = Math.max(failureStatus, invalid ? 422 : 503);
     }
   }
 
-  sendJson(res, 200, { ok: true, alerts: count });
+  if (failureStatus) {
+    sendJson(res, failureStatus, {
+      ok: false,
+      error: failureStatus === 503 ? "mesh_unavailable" : "invalid_event",
+      alerts: count,
+      failed: payload.alerts.length - count,
+    });
+  } else {
+    sendJson(res, 200, { ok: true, alerts: count });
+  }
 }
 
 const server = createServer((req, res) => {
