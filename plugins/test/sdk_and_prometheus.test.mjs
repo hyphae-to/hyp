@@ -1138,7 +1138,8 @@ test("Issue #29: slack plugin aborts stalled Socket Mode WebSocket immediately o
   assert.ok(wsConns >= 2);
 });
 
-async function startSlackFixture(env) {
+async function startSlackFixture(env, { updateErrors = [], publishErrors = [] } = {}) {
+  const updates = [];
   const events = [];
   const posts = [];
   const responses = new Map();
@@ -1150,6 +1151,13 @@ async function startSlackFixture(env) {
       "/auth.test": { ok: true, user_id: "UBOT", team_id: "TDEMO" },
       "/apps.connections.open": { ok: true, url: `ws://127.0.0.1:${server.address().port}/ws` },
     };
+    if (req.url === "/chat.update") {
+      const body = [];
+      for await (const chunk of req) body.push(chunk);
+      updates.push(JSON.parse(Buffer.concat(body).toString()));
+      res.end(JSON.stringify(updateErrors.shift() ?? { ok: true }));
+      return;
+    }
     if (req.url === "/chat.postMessage") {
       const body = [];
       for await (const chunk of req) body.push(chunk);
@@ -1192,7 +1200,9 @@ async function startSlackFixture(env) {
     const msg = JSON.parse(line);
     if (msg.method === "hyphae/publish") {
       events.push(msg.params.event);
-      send({ id: msg.id, result: { status: "stored" } });
+      const error = publishErrors.shift();
+      if (error) send({ id: msg.id, error });
+      else send({ id: msg.id, result: { status: "stored" } });
     } else if (msg.id !== undefined) {
       responses.set(msg.id, msg);
     }
@@ -1200,7 +1210,9 @@ async function startSlackFixture(env) {
   await until(() => socket, "Slack Socket Mode fixture connected");
 
   return {
-    events, posts, stderr: child.stderr,
+    events, posts, updates, stderr: child.stderr,
+    async stop() { child.child.kill("SIGTERM"); await child.waitExit(); },
+    envelope(envelope) { socket.write(wsTextFrame(JSON.stringify(envelope))); },
     deliver(...items) {
       socket.write(Buffer.concat(items.map((event) => wsTextFrame(JSON.stringify({
         type: "events_api",
@@ -1218,6 +1230,90 @@ async function startSlackFixture(env) {
 function slackEvent(user, channel, ts, type = "message") {
   return { type, user, channel, ts, text: ts, channel_type: channel.startsWith("D") ? "im" : "channel" };
 }
+
+test("Slack records an external bot choice before forwarding, then retries the pending publish", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyp-slack-action-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "allowlist.json");
+  writeFileSync(file, JSON.stringify({ owner: { id: "UALICE", name: "Demo owner" }, allowed: [], channels: ["COPS"] }));
+  const env = { HYPHAE_STATE_DIR: dir, SLACK_ALLOWLIST_FILE: file };
+  let slack = await startSlackFixture(env, {
+    updateErrors: [{ ok: false, error: "rate_limited" }],
+    publishErrors: [{ code: -32001, message: "fixture failure" }],
+  });
+  const button = { type: "button", action_id: "slot_a", value: "tue-10", text: { type: "plain_text", text: "Tue 10:00" } };
+  const payload = {
+    type: "block_actions", team: { id: "TDEMO" }, user: { id: "UALICE" },
+    channel: { id: "COPS" }, container: { type: "message", channel_id: "COPS", message_ts: "100.01" },
+    message: { user: "UBOT", ts: "100.01", text: "Pick a time", thread_ts: "99.01",
+      blocks: [{ type: "section", text: { type: "plain_text", text: "Pick a time" }, accessory: button },
+        { type: "actions", block_id: "choices", elements: [button] }] },
+    actions: [{ ...button, action_ts: "101.01", block_id: "choices" }],
+    response_url: "https://example.invalid/PRIVATE",
+  };
+  function click(overrides = {}) {
+    slack.envelope({ type: "interactive", envelope_id: "test", payload: { ...payload, ...overrides } });
+  }
+  click({ team: { id: "TOTHER" } });
+  click({ message: { ...payload.message, user: "UOTHERBOT" } });
+  click({ user: { id: "UBOB" } });
+  click({ channel: { id: "COTHER" } });
+  click({ actions: [{ ...payload.actions[0], action_id: "forged" }] });
+  click();
+  await until(() => slack.stderr().includes("unacknowledged"), "Slack update failure");
+  assert.equal(slack.events.length, 0);
+  assert.equal(slack.updates.length, 1);
+  click();
+  await until(() => slack.stderr().split("unacknowledged").length === 3, "mesh delivery failed after update");
+  const first = slack;
+  await first.stop();
+  slack = await startSlackFixture(env);
+  click();
+  await until(() => slack.events.length === 1, "retry pending publish after process restart");
+  click({ actions: [{ ...payload.actions[0], action_ts: "101.02" }] });
+  await slack.post({ text: "fixture barrier", channel: "COPS" });
+  assert.equal(first.updates.length, 2);
+  assert.equal(slack.updates.length, 0);
+  assert.equal(slack.events.length, 1);
+  assert.equal(slack.events[0].id, first.events[0].id);
+  assert.equal(slack.events[0].data.role, "owner");
+  assert.equal(slack.events[0].data.from_name, "Demo owner");
+  assert.equal(slack.events[0].data.text, "[clicked] Tue 10:00 (action_id=slot_a, value=tue-10)");
+  assert.equal(slack.events[0].data.via, "action");
+  assert.equal(slack.events[0].data.thread_ts, "99.01");
+  assert.doesNotMatch(JSON.stringify([slack.events, slack.updates, slack.stderr()]), /PRIVATE/);
+  assert.deepEqual(first.updates[1], { channel: "COPS", ts: "100.01", text: "Pick a time", blocks: [
+    { type: "section", text: { type: "plain_text", text: "Pick a time" } },
+    { type: "context", elements: [{ type: "mrkdwn", text: ":white_check_mark: *Tue 10:00*, chosen by <@UALICE>" }] },
+  ] });
+});
+
+test("Slack handles external section selects and acknowledges URL buttons without recording them", async () => {
+  const slack = await startSlackFixture({ SLACK_ALLOWED_USERS: "UALICE" });
+  const selected = { value: "slot-a", text: { type: "plain_text", text: "Slot <A>" } };
+  const select = { type: "static_select", action_id: "q1", options: [selected] };
+  const link = { type: "button", action_id: "visit", url: "https://example.invalid/path" };
+  function click(element, data, stamp) {
+    slack.envelope({ type: "interactive", envelope_id: stamp, payload: {
+      type: "block_actions", team: { id: "TDEMO" }, user: { id: "UALICE" }, channel: { id: "DDEMO" },
+      container: { type: "message", channel_id: "DDEMO", message_ts: "10.1" },
+      message: { user: "UBOT", ts: "10.1", text: "Choose", blocks: [
+        { type: "section", block_id: "choices", text: { type: "plain_text", text: "Choose" }, accessory: element },
+      ] },
+      actions: [{ type: element.type, action_id: element.action_id, block_id: "choices", action_ts: stamp, ...data }],
+    } });
+  }
+  click(link, {}, "11.1");
+  click(select, { selected_option: selected }, "12.1");
+  click(select, { selected_option: selected }, "13.1");
+  await until(() => slack.events.length > 0, "section select");
+  await slack.post({ text: "fixture barrier", channel: "DDEMO" });
+  assert.equal(slack.events.length, 1);
+  assert.equal(slack.events[0].data.text, "[clicked] Slot <A> (action_id=q1, value=slot-a)");
+  assert.equal(slack.events[0].data.thread_ts, "-");
+  assert.equal(slack.updates.length, 1);
+  assert.equal(slack.updates[0].blocks[1].elements[0].text, ":white_check_mark: *Slot &lt;A&gt;*, chosen by <@UALICE>");
+});
 
 test("Slack env sender policy admits DMs independently of channel restrictions", async () => {
   const slack = await startSlackFixture({

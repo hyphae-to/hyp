@@ -23,7 +23,8 @@
     "kind": "bridge",
     "defaultSource": false,
     "files": [
-      ["slack/index.mjs", false]
+      ["slack/index.mjs", false],
+      ["slack/actions.mjs", false]
     ]
   },
   {

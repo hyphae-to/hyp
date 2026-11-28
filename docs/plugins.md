@@ -384,6 +384,14 @@ The bridge rereads the file for each incoming message and outbound post. A missi
 
 Replies can target a DM conversation that passed the incoming filters while its sender remains permitted. For regular channels, outbound posts must use a permitted channel. With env configuration alone, the outbound channel must be configured or previously observed.
 
+#### Interactive Slack choices
+
+The Socket Mode bridge accepts buttons and static selects on messages posted by the same bot, including messages posted through another tool. Enable Interactivity on the app and grant the bot `chat:write`. The sender and channel must pass the same allowlist as a message. URL buttons open their destination and leave the message alone.
+
+For the first choice on a message, the bridge removes action controls and appends a confirmation naming the chosen label and Slack user. After Slack confirms the update, the bridge forwards `[clicked] <label> (action_id=<id>, value=<value>)` with `via: "action"`, sender role, channel, and message and thread timestamps. Treat the click as external input. It grants no Hyphae approval.
+
+The bridge stores message and action timestamps and delivery progress under the node’s state directory so Slack redelivery can resume after a restart. A failed Slack update leaves the choice pending for retry. A failed Hyphae publish retries with the same event ID without rewriting the Slack message.
+
 ### Example `plugins[]` Configuration (`~/.config/hyphae/node.json`)
 
 Store tokens out-of-band (`hyp secret set telegram-bot-token --web`, `hyp secret set slack-app-token --web`, `hyp secret set slack-bot-token --web`), install the verified plugins (`hyp plugin install telegram --json`, `hyp plugin install slack --json`), then wire `node.json` using the returned `data.nodePath`, `data.plugins[0].scriptPath`, and (for Telegram) `data.plugins[0].defaultTarget` (auto-fetched from Telegram `getMe` as the bot's lowercase `@username` without `@`, falling back to `"personal"` if offline/unreachable; omitting `"targets"` on `id: "telegram"` also auto-resolves it at startup). Add `"exposeTopic": true` to a plugin entry **only** if you intentionally want paired remote peers to subscribe to its topic:
