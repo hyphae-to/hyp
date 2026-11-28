@@ -210,9 +210,11 @@ async function slackApi(method, token, payload) {
   return body;
 }
 
+const slackReady = Promise.withResolvers();
 const mesh = new MeshPluginClient({
   onDeliveryFailed: (msg) => console.error(`slack plugin delivery_failed target=${msg.target} reason=${msg.reason}`),
   onPost: async (params) => {
+    await slackReady.promise;
     const hasReaction = typeof params.reaction === "string" || typeof params.emoji === "string";
     const rawReactionArg =
       typeof params.reaction === "string"
@@ -305,7 +307,11 @@ const mesh = new MeshPluginClient({
           ...(threadTs ? { thread_ts: threadTs } : {}),
         });
         if (!channel.startsWith("D") && isTimestamp(threadTs ?? res.ts)) {
-          rememberThread(channel, threadTs ?? res.ts);
+          try {
+            rememberThread(channel, threadTs ?? res.ts);
+          } catch {
+            console.error("Slack message was posted but thread membership could not be saved");
+          }
         }
         if (i === 0) postRes = res;
         if (res?.ts) sentTs.push(res.ts);
@@ -501,6 +507,7 @@ mesh.onWake(() => {
   }
 });
 
+slackReady.resolve();
 while (true) {
   wakeRequested = false;
   try {

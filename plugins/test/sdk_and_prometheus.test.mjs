@@ -1366,6 +1366,18 @@ test("Slack persists external same-bot threads and verifies allowed replies to u
   assert.deepEqual(slack.history.map((q) => q.oldest).sort(), ["5.1", "6.1", "7.1", "8.1"]);
 });
 
+test("Slack reports a successful outbound post even if saving the thread fails", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyp-slack-storage-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "not-a-directory");
+  writeFileSync(file, "fixture");
+  const slack = await startSlackFixture({ SLACK_ALLOWED_CHANNELS: "COPS", HYPHAE_STATE_DIR: file });
+  const response = await slack.post({ text: "fixture", channel: "COPS" });
+  assert.equal(response.result.ts, "99.01");
+  assert.equal(slack.posts.length, 1);
+  await until(() => slack.stderr().includes("message was posted but thread membership could not be saved"), "storage diagnostic");
+});
+
 test("Slack env sender policy admits DMs independently of channel restrictions", async () => {
   const slack = await startSlackFixture({
     SLACK_ALLOWED_USERS: "UALLOWED",
