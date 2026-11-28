@@ -298,6 +298,7 @@ You do **not** need to clone the Hyphae git repository to install or update offi
   - `claude-panel` (`claude-code/hooks/{register.tsx,state.ts}` + minimal UI-only `.claude-plugin/plugin.json` & `hooks/hooks.json`) -> installed into `~/.claude/skills/hyp-panel/` (and `$CLAUDE_CONFIG_DIR/skills/hyp-panel/`, symlink-safe).
   - `claude-code` (full 12-file Claude Code plugin bundle including raw-hashed binary `icon.png`) -> installed under `~/.config/hyphae/plugins/claude-code/`.
   - `herdr-mod` (`hyphae-pane` + `hyphae-panel` GPUI mods, 9 files) -> installed as real directories under `~/.config/herdr-app/mods/` (FSEvents hot-reload friendly; never touches `keys.json` or custom/symlinked layouts unless run via `hyp setup --harness herdr --mod`).
+  - `herdr-status` installs an optional Shared KV publisher under the node's plugins directory. Use the [publisher setup guide](../plugins/herdr-status/README.md) to bind and start it explicitly.
 
 The `hyp` binary pins only per-file SHA-256 digests (LF-normalized for text files, raw bytes for binary `.png`) and deterministic per-plugin `treeSha256` digests at compile time (`crates/hyp-cli/build.rs`). Every install or update resolves sources in strict precedence order and verifies every required file in constant time **before writing a single byte**:
 
