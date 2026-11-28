@@ -33,6 +33,7 @@ const appToken = readSecret("SLACK_APP_TOKEN_FILE", "SLACK_APP_TOKEN");
 const botToken = readSecret("SLACK_BOT_TOKEN_FILE", "SLACK_BOT_TOKEN");
 const allowedUsers = csvSet("SLACK_ALLOWED_USERS");
 const allowedChannels = csvSet("SLACK_ALLOWED_CHANNELS");
+const topLevelChannels = csvSet("SLACK_TOP_LEVEL_CHANNELS");
 const allowAll = process.env.SLACK_ALLOW_ALL === "1";
 const allowlistFile = process.env.SLACK_ALLOWLIST_FILE;
 
@@ -197,10 +198,11 @@ function canPostTo(channel, allowlist) {
 }
 
 async function slackApi(method, token, payload) {
+  const form = payload instanceof URLSearchParams;
   const res = await fetch(`${apiBase}/${method}`, {
     method: "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json; charset=utf-8" },
-    ...(payload ? { body: JSON.stringify(payload) } : {}),
+    headers: { authorization: `Bearer ${token}`, "content-type": form ? "application/x-www-form-urlencoded" : "application/json; charset=utf-8" },
+    ...(payload ? { body: form ? payload : JSON.stringify(payload) } : {}),
     signal: AbortSignal.timeout(15_000),
   });
   const body = await res.json();
@@ -302,6 +304,9 @@ const mesh = new MeshPluginClient({
           text: chunks[i],
           ...(threadTs ? { thread_ts: threadTs } : {}),
         });
+        if (!channel.startsWith("D") && isTimestamp(threadTs ?? res.ts)) {
+          rememberThread(channel, threadTs ?? res.ts);
+        }
         if (i === 0) postRes = res;
         if (res?.ts) sentTs.push(res.ts);
       }
@@ -331,7 +336,40 @@ const botUserId = auth.user_id;
 const teamId = auth.team_id ?? "slack";
 const mentionRe = new RegExp(`<@${botUserId}>\\s*`, "g");
 const seen = new Set();
-const activeThreads = new Set();
+const isTimestamp = (value) => typeof value === "string" && /^\d{1,16}\.\d{1,10}$/.test(value);
+const pendingLookups = new Map();
+
+function rememberThread(channel, ts) {
+  slackState().prepare("INSERT OR IGNORE INTO threads(channel,ts) VALUES (?,?)").run(channel, ts);
+}
+
+function belongsToBot(message) {
+  return (typeof botUserId === "string" && botUserId === message?.user) ||
+    (typeof auth.bot_id === "string" && auth.bot_id === message?.bot_id);
+}
+
+async function followsThread(channel, rootTs) {
+  if (!isTimestamp(rootTs)) return false;
+  if (slackState().prepare("SELECT 1 FROM threads WHERE channel=? AND ts=?").get(channel, rootTs)) return true;
+  const key = channel + ":" + rootTs;
+  if (pendingLookups.has(key)) return pendingLookups.get(key);
+  const lookup = (async () => {
+    try {
+      const page = await slackApi("conversations.history", botToken, new URLSearchParams({
+        channel, oldest: rootTs, latest: rootTs, inclusive: "true", limit: "1",
+      }));
+      const root = page.messages?.[0];
+      if (root?.ts !== rootTs || (root.thread_ts && root.thread_ts !== rootTs) || !belongsToBot(root)) return false;
+      rememberThread(channel, rootTs);
+      return true;
+    } catch {
+      console.error("Slack thread parent could not be verified; reply was not forwarded");
+      return false;
+    }
+  })();
+  pendingLookups.set(key, lookup);
+  try { return await lookup; } finally { pendingLookups.delete(key); }
+}
 
 function admittedSender(user, channel, isDm, allowlist) {
   if (isDm) return allowsDm(user, channel, allowlist);
@@ -340,9 +378,16 @@ function admittedSender(user, channel, isDm, allowlist) {
 }
 
 let state;
+function slackState() {
+  if (!state) {
+    state = openSlackState(process.env.HYPHAE_STATE_DIR, teamId, botUserId, target);
+    state.exec("CREATE TABLE IF NOT EXISTS threads (channel TEXT NOT NULL, ts TEXT NOT NULL, PRIMARY KEY(channel,ts))");
+  }
+  return state;
+}
 const handleClick = slackChoiceHandler({
   team: auth.team_id, bot: botUserId, botId: auth.bot_id,
-  state: () => state ??= openSlackState(process.env.HYPHAE_STATE_DIR, teamId, botUserId, target),
+  state: slackState,
   sender: (user, channel) => {
     const allowlist = readAllowlist();
     return admittedSender(user, channel, channel.startsWith("D"), allowlist)
@@ -361,7 +406,18 @@ async function handleEnvelope(envelope) {
   if (envelope.type !== "events_api") return;
   const ev = envelope.payload?.event;
   if (!ev || (ev.type !== "message" && ev.type !== "app_mention")) return;
-  if ((ev.subtype && ev.subtype !== "file_share") || ev.bot_id || ev.user === botUserId) return;
+  if (envelope.payload.team_id && envelope.payload.team_id !== auth.team_id) return;
+  if (belongsToBot(ev)) {
+    const channel = ev.channel;
+    const root = ev.thread_ts ?? ev.ts;
+    if (ev.type === "message" && (!ev.subtype || ev.subtype === "bot_message" || ev.subtype === "file_share") &&
+        typeof channel === "string" && /^[CG][A-Z0-9]+$/.test(channel) && isTimestamp(root)) {
+      const policy = readAllowlist();
+      if ((!policy || policy.channels.has(channel)) && (!allowedChannels || allowedChannels.has(channel))) rememberThread(channel, root);
+    }
+    return;
+  }
+  if ((ev.subtype && ev.subtype !== "file_share") || ev.bot_id || ev.bot_profile) return;
 
   const user = ev.user ?? "";
   const channel = ev.channel ?? "";
@@ -372,21 +428,24 @@ async function handleEnvelope(envelope) {
   const person = allowlist?.people.get(user);
   if (!admittedSender(user, channel, isDm, allowlist)) return;
 
+  let via = null;
+  if (ev.type === "app_mention") {
+    via = "mention";
+    if (isTimestamp(ev.thread_ts ?? ts)) rememberThread(channel, ev.thread_ts ?? ts);
+  } else if (isDm) {
+    via = "dm";
+  } else if (ev.thread_ts && await followsThread(channel, ev.thread_ts)) {
+    via = "thread";
+  } else if (!ev.thread_ts && topLevelChannels?.has(channel)) {
+    via = "channel";
+  }
+  if (!via) return;
+
   const dedupKey = `${channel}:${ts}`;
   if (seen.has(dedupKey)) return;
   seen.add(dedupKey);
   if (seen.size > 2000) seen.delete(seen.values().next().value);
 
-  let via = null;
-  if (ev.type === "app_mention") {
-    via = "mention";
-    activeThreads.add(`${channel}:${ev.thread_ts ?? ts}`);
-  } else if (isDm) {
-    via = "dm";
-  } else if (ev.thread_ts && activeThreads.has(`${channel}:${ev.thread_ts}`)) {
-    via = "thread";
-  }
-  if (!via) return;
 
   if (isDm) {
     admittedDms.set(channel, user);
@@ -419,7 +478,7 @@ async function handleEnvelope(envelope) {
       text,
     },
   };
-  await mesh.send(target, event);
+  try { await mesh.send(target, event); } catch (error) { seen.delete(dedupKey); throw error; }
 }
 
 let backoff = 1000;
