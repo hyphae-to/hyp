@@ -366,6 +366,10 @@ All included `.mjs` scripts have zero external npm dependencies (**requires Node
 
 > **Fail-closed auth & loopback-only unsigned opt-in:** Both `plugins/webhook/index.mjs` and `plugins/prometheus/index.mjs` refuse to boot without configured auth credentials. Setting **`WEBHOOK_ALLOW_UNSIGNED=1`** or **`PROMETHEUS_ALLOW_UNSIGNED=1`** permits unsigned local development traffic **strictly on loopback binds (`127.0.0.1` / `::1`)** — both plugins still fail closed and refuse to start unsigned on any non-loopback bind (such as `0.0.0.0`).
 
+### Slack inbound secret redaction
+
+Set `"SLACK_REDACT": "1"` in the Slack plugin's `env` to redact known credential formats before inbound data reaches the daemon. The bridge replaces matching content with `[REDACTED]` and sets `data.secret_removed` to `true` on affected events. It recognizes Slack, GitHub, AWS, Google, and `sk-` credentials, JWTs, PEM private keys, and JSON `private_key` values.
+
 ### Slack sender and channel allowlists
 
 Set `SLACK_ALLOWLIST_FILE` to the path of a local JSON file to give permitted senders names and roles.

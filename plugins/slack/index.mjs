@@ -6,6 +6,7 @@
  *   SLACK_APP_TOKEN_FILE or SLACK_APP_TOKEN  - xapp-... Socket Mode token
  *   SLACK_BOT_TOKEN_FILE or SLACK_BOT_TOKEN  - xoxb-... Bot User OAuth token
  *   SLACK_TARGET                             - Target name (defaults to first target in hello)
+ *   SLACK_REDACT                             - Set to 1 to redact known secret formats in inbound data
  *   SLACK_ALLOWLIST_FILE                     - Optional JSON allowlist with owner, allowed users and channels
  *   SLACK_ALLOWED_USERS                      - Optional comma-separated Slack user IDs allowlist
  *   SLACK_ALLOWED_CHANNELS                   - Optional comma-separated channel IDs allowlist
@@ -15,6 +16,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { openSlackState, slackChoiceHandler } from "./actions.mjs";
 import { MeshPluginClient } from "../sdk/client.mjs";
+import { redactSlackInboundData, redactSlackSecrets } from "./redact.mjs";
 
 function readSecret(fileEnv, valEnv) {
   const file = process.env[fileEnv];
@@ -36,6 +38,9 @@ const allowedChannels = csvSet("SLACK_ALLOWED_CHANNELS");
 const topLevelChannels = csvSet("SLACK_TOP_LEVEL_CHANNELS");
 const allowAll = process.env.SLACK_ALLOW_ALL === "1";
 const allowlistFile = process.env.SLACK_ALLOWLIST_FILE;
+const redactEnabled = process.env.SLACK_REDACT === "1";
+const redactInboundData = redactEnabled ? redactSlackInboundData : (data) => data;
+const redactDiagnostic = redactEnabled ? redactSlackSecrets : (text) => text;
 
 function readAllowlist() {
   if (allowlistFile === undefined) return null;
@@ -205,14 +210,18 @@ async function slackApi(method, token, payload) {
     ...(payload ? { body: form ? payload : JSON.stringify(payload) } : {}),
     signal: AbortSignal.timeout(15_000),
   });
-  const body = await res.json();
-  if (!body.ok) throw new Error(`Slack ${method} failed: ${body.error ?? res.status}`);
+  const body = await res.json().catch((error) => {
+    if (!redactEnabled) throw error;
+    // JSON parse errors can quote truncated provider content.
+    throw new Error(`Slack ${method} returned invalid JSON`);
+  });
+  if (!body.ok) throw new Error(redactDiagnostic(`Slack ${method} failed: ${body.error ?? res.status}`));
   return body;
 }
 
 const slackReady = Promise.withResolvers();
 const mesh = new MeshPluginClient({
-  onDeliveryFailed: (msg) => console.error(`slack plugin delivery_failed target=${msg.target} reason=${msg.reason}`),
+  onDeliveryFailed: (msg) => console.error(redactDiagnostic(`slack plugin delivery_failed target=${msg.target} reason=${msg.reason}`)),
   onPost: async (params) => {
     await slackReady.promise;
     const hasReaction = typeof params.reaction === "string" || typeof params.emoji === "string";
@@ -405,7 +414,7 @@ const handleClick = slackChoiceHandler({
     if (event.data.channel_type === "dm") admittedDms.set(event.data.channel, event.data.user);
     else seenAllowedChannels.add(event.data.channel);
   },
-  redactInboundData: (data) => data,
+  redactInboundData,
 });
 
 async function handleEnvelope(envelope) {
@@ -429,6 +438,12 @@ async function handleEnvelope(envelope) {
   const channel = ev.channel ?? "";
   const ts = ev.ts ?? "";
   if (typeof user !== "string" || typeof channel !== "string" || !channel) return;
+  if (redactEnabled) {
+    // These provider fields are also used verbatim for routing and event identity.
+    const isTimestamp = (value) => typeof value === "string" && /^[0-9]+\.[0-9]+$/.test(value);
+    if (!/^[UW][A-Z0-9]+$/.test(user) || !/^[CGD][A-Z0-9]+$/.test(channel) ||
+      !isTimestamp(ts) || (ev.thread_ts != null && !isTimestamp(ev.thread_ts))) return;
+  }
   const isDm = ev.channel_type === "im" || channel.startsWith("D");
   const allowlist = readAllowlist();
   const person = allowlist?.people.get(user);
@@ -464,7 +479,7 @@ async function handleEnvelope(envelope) {
       lastTsByChannel.delete(lastTsByChannel.keys().next().value);
     }
   }
-  const text = String(ev.text ?? "").replace(mentionRe, "").trim().slice(0, 4000);
+  const text = String(ev.text ?? "").replace(mentionRe, "").trim();
   const event = {
     specversion: "1.0",
     id: `${channel}-${ts}`,
@@ -473,7 +488,7 @@ async function handleEnvelope(envelope) {
     subject: `${channel}/${ts}`,
     time: new Date().toISOString(),
     datacontenttype: "application/json",
-    data: {
+    data: redactInboundData({
       user,
       ...person,
       channel,
@@ -482,8 +497,9 @@ async function handleEnvelope(envelope) {
       ts,
       thread_ts: ev.thread_ts ?? null,
       text,
-    },
+    }),
   };
+  event.data.text = event.data.text.slice(0, 4000);
   try { await mesh.send(target, event); } catch (error) { seen.delete(dedupKey); throw error; }
 }
 
@@ -554,13 +570,13 @@ while (true) {
           ws.close();
           return;
         }
-        void handleEnvelope(envelope).catch((err) => console.error(`slack handle error: ${err.message}`));
+        void handleEnvelope(envelope).catch((err) => console.error(redactDiagnostic(`slack handle error: ${err.message}`)));
       });
       ws.addEventListener("close", finish);
       ws.addEventListener("error", finish);
     });
   } catch (error) {
-    console.error(`slack socket error: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(redactDiagnostic(`slack socket error: ${error instanceof Error ? error.message : String(error)}`));
   }
   if (wakeRequested) {
     wakeRequested = false;

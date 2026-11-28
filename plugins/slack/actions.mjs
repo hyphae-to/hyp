@@ -89,7 +89,10 @@ export function slackChoiceHandler({ team, bot, botId, state, sender, update, se
         text: `[clicked] ${choice.label} (action_id=${action.action_id}, value=${choice.value})`,
       });
       if (record.phase === "pending") {
-        await update({ channel, ts, text: payload.message.text ?? "", blocks: recordedBlocks(payload.message.blocks, data.label, user) });
+        const { secret_removed: _secretRemoved, ...message } = redactInboundData({
+          channel, ts, text: payload.message.text ?? "", blocks: recordedBlocks(payload.message.blocks, data.label, user),
+        });
+        await update(message);
         db.prepare("UPDATE clicks SET phase='updated' WHERE channel=? AND ts=?").run(channel, ts);
       }
       await send({ specversion: "1.0", id: `choice-${channel}-${ts}-${actionTs}`, source: `slack/${team}`,

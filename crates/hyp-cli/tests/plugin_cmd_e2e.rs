@@ -73,7 +73,7 @@ fn build_rs_pinned_digests_and_tree_hashes_match_sha2_crate_and_crlf_invariance(
     let expected_plugins = [
         ("sdk", PluginKind::Bridge, 4usize),
         ("telegram", PluginKind::Bridge, 1),
-        ("slack", PluginKind::Bridge, 2),
+        ("slack", PluginKind::Bridge, 3),
         ("whatsapp", PluginKind::Bridge, 1),
         ("webhook", PluginKind::Bridge, 1),
         ("prometheus", PluginKind::Bridge, 1),
@@ -90,7 +90,7 @@ fn build_rs_pinned_digests_and_tree_hashes_match_sha2_crate_and_crlf_invariance(
     ];
 
     assert_eq!(PINNED_PLUGINS.len(), expected_plugins.len());
-    assert_eq!(PINNED_PLUGIN_FILES.len(), 51);
+    assert_eq!(PINNED_PLUGIN_FILES.len(), 52);
     let plugins_dir = repo_root().join("plugins");
 
     for (spec, (exp_id, exp_kind, exp_count)) in PINNED_PLUGINS.iter().zip(expected_plugins.iter())
