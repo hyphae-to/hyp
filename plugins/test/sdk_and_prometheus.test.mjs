@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { after, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { redactSlackInboundData } from "../slack/redact.mjs";
 
 const PLUGINS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SDK_URL = pathToFileURL(join(PLUGINS_DIR, "sdk", "client.mjs")).href;
@@ -1222,6 +1223,9 @@ async function startSlackFixture(env, { updateErrors = [], publishErrors = [], r
     events, posts, updates, history, stderr: child.stderr,
     async stop() { child.child.kill("SIGTERM"); await child.waitExit(); },
     envelope(envelope) { socket.write(wsTextFrame(JSON.stringify(envelope))); },
+    deliveryFailed(reason) {
+      send({ method: "hyphae/deliveryFailed", params: { target: "ops", reason } });
+    },
     deliver(...items) {
       socket.write(Buffer.concat(items.map((event) => wsTextFrame(JSON.stringify({
         type: "events_api",
@@ -1376,6 +1380,126 @@ test("Slack reports a successful outbound post even if saving the thread fails",
   assert.equal(response.result.ts, "99.01");
   assert.equal(slack.posts.length, 1);
   await until(() => slack.stderr().includes("message was posted but thread membership could not be saved"), "storage diagnostic");
+});
+
+test("Slack redacts known secrets before publication and diagnostics when enabled", async () => {
+  const fakeSecrets = [
+    "xoxb-" + "0".repeat(24),
+    "xapp-" + "0".repeat(24),
+    "ghp_" + "0".repeat(36),
+    "github_pat_" + "0".repeat(60),
+    "AKIA" + "A".repeat(16),
+    "ASIA" + "A".repeat(16),
+    "AIza" + "_".repeat(34) + "-",
+    "ya29." + "0".repeat(24),
+    "sk-" + "0".repeat(24),
+    "sk-ant-" + "0".repeat(24),
+    "sk-proj-" + "0".repeat(24),
+    "eyJhbGciOiJub25lIn0.eyJzdWIiOiJkZW1vIn0.fixture",
+    "-----BEGIN PRIVATE KEY-----\nsynthetic body\n-----END PRIVATE KEY-----",
+  ];
+  const privateKey = JSON.stringify({ private_key: 'synthetic "escaped" key\nbody' });
+  const slack = await startSlackFixture({ SLACK_ALLOWED_USERS: "UALLOWED", SLACK_REDACT: "1" });
+  slack.deliver(
+    { ...slackEvent("UALLOWED", "DPRIVATE", "5.01"), text: `prefix | ${[...fakeSecrets, privateKey].join(" | ")} | suffix` },
+    { ...slackEvent("UALLOWED", "DPRIVATE", fakeSecrets[2]), text: "invalid timestamp" },
+    { ...slackEvent("UALLOWED", "DPRIVATE", "5.02"), text: `${"a".repeat(3990)} ${fakeSecrets[2]}` },
+    { ...slackEvent("UALLOWED", "DPRIVATE", "5.03"), text: "normal message" },
+  );
+  slack.deliveryFailed(`transient failure ${fakeSecrets[2]}`);
+  await until(() => slack.events.some(({ data }) => data.ts === "5.03"), "Slack redacted fixture");
+  await until(() => slack.stderr().includes("transient failure [REDACTED]"), "Slack redacted diagnostic");
+  assert.deepEqual(slack.events.map(({ data }) => data.ts), ["5.01", "5.02", "5.03"]);
+  const [sensitive, long, clean] = slack.events;
+  assert.equal(sensitive.id, "DPRIVATE-5.01");
+  assert.equal(sensitive.subject, "DPRIVATE/5.01");
+  assert.equal(sensitive.data.user, "UALLOWED");
+  assert.equal(sensitive.data.secret_removed, true);
+  assert.equal(sensitive.data.text,
+    `prefix | ${fakeSecrets.map(() => "[REDACTED]").join(" | ")} | {"private_key":"[REDACTED]"} | suffix`);
+  assert.equal(long.data.text, `${"a".repeat(3990)} [REDACTED`);
+  assert.equal(long.data.secret_removed, true);
+  assert.equal(clean.data.text, "normal message");
+  assert.equal(clean.data.secret_removed, undefined);
+  assert.ok(!slack.stderr().includes(fakeSecrets[2]));
+
+  const optOut = await startSlackFixture({ SLACK_ALLOWED_USERS: "UALLOWED", SLACK_REDACT: "0" });
+  optOut.deliver({ ...slackEvent("UALLOWED", "DPRIVATE", "5.04"), text: fakeSecrets[2] });
+  await until(() => optOut.events.length === 1, "Slack unchanged by default");
+  assert.equal(optOut.events[0].data.text, fakeSecrets[2]);
+  assert.equal(optOut.events[0].data.secret_removed, undefined);
+});
+
+test("Slack redacts verified choices in forwarded action data and updated message text", async () => {
+  const slack = await startSlackFixture({ SLACK_ALLOWED_USERS: "UALICE", SLACK_REDACT: "1" });
+  const actionId = "ghp_" + "0".repeat(36);
+  const blockId = "xapp-" + "0".repeat(24);
+  const value = "sk-proj-" + "0".repeat(24);
+  const label = "Option " + "xoxb-" + "0".repeat(24);
+  const text = "Choose a slot " + actionId;
+  const selected = { value, text: { type: "plain_text", text: label } };
+  const elements = [
+    { type: "button", action_id: actionId, ...selected },
+    { type: "static_select", action_id: actionId, options: [selected] },
+  ];
+  for (const [index, element] of elements.entries()) {
+    const ts = `201.0${index + 1}`;
+    slack.envelope({
+      type: "interactive", envelope_id: `action-${index}`, payload: {
+        type: "block_actions", team: { id: "TDEMO" }, user: { id: "UALICE" },
+        channel: { id: "COPS" }, container: { type: "message", channel_id: "COPS", message_ts: ts },
+        message: { user: "UBOT", ts, text,
+          blocks: [{ type: "section", block_id: blockId, text: { type: "plain_text", text } },
+            { type: "actions", block_id: blockId + "choice", elements: [element] }] },
+        actions: [{ type: element.type, action_id: actionId, action_ts: "202.01", block_id: blockId + "choice",
+          ...(element.type === "button" ? selected : { selected_option: selected }) }],
+      },
+    });
+  }
+  await until(() => slack.events.length === 2, "Slack redacted button and select");
+  assert.equal(slack.updates.length, 2);
+  for (const event of slack.events) {
+    assert.match(event.id, /^choice-COPS-201\.0[12]-202\.01$/);
+    assert.equal(event.data.user, "UALICE");
+    assert.equal(event.data.action_id, "[REDACTED]");
+    assert.equal(event.data.value, "[REDACTED]");
+    assert.equal(event.data.label, "Option [REDACTED]");
+    assert.equal(event.data.text, "[clicked] Option [REDACTED] (action_id=[REDACTED], value=[REDACTED])");
+    assert.equal(event.data.secret_removed, true);
+  }
+  for (const update of slack.updates) {
+    assert.equal(update.text, "Choose a slot [REDACTED]");
+    assert.equal(update.blocks[0].block_id, "[REDACTED]");
+    assert.equal(update.blocks[0].text.text, "Choose a slot [REDACTED]");
+    assert.equal(update.blocks[1].elements[0].text, ":white_check_mark: *Option [REDACTED]*, chosen by <@UALICE>");
+    assert.equal(update.secret_removed, undefined);
+  }
+  const emitted = JSON.stringify([slack.events, slack.updates, slack.stderr()]);
+  for (const secret of [actionId, blockId, value, label]) assert.ok(!emitted.includes(secret));
+});
+
+test("Slack secret redaction handles projected interaction text and structured values", () => {
+  const dummyValue = "xoxp-" + "0".repeat(24);
+  const data = {
+    text: `Label (choose): ${dummyValue}`,
+    action_id: "choose",
+    block_id: "block",
+    selected_option: { text: { text: "Label" }, value: dummyValue },
+    metadata: [{ private_key: "synthetic unprefixed value" }],
+  };
+  assert.deepEqual(redactSlackInboundData(data), {
+    text: "Label (choose): [REDACTED]",
+    action_id: "choose",
+    block_id: "block",
+    selected_option: { text: { text: "Label" }, value: "[REDACTED]" },
+    metadata: [{ private_key: "[REDACTED]" }],
+    secret_removed: true,
+  });
+  assert.equal(data.selected_option.value, dummyValue);
+  assert.deepEqual(redactSlackInboundData({ text: '{"private_key":"unfinished fixture' }), {
+    text: '{"private_key":"[REDACTED]"',
+    secret_removed: true,
+  });
 });
 
 test("Slack env sender policy admits DMs independently of channel restrictions", async () => {

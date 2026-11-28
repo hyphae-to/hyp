@@ -24,7 +24,8 @@
     "defaultSource": false,
     "files": [
       ["slack/index.mjs", false],
-      ["slack/actions.mjs", false]
+      ["slack/actions.mjs", false],
+      ["slack/redact.mjs", false]
     ]
   },
   {
