@@ -439,6 +439,19 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         .expect("observer should subscribe to exposed topic 'public-builds'");
     assert_eq!(exposed_sub.topic, "public-builds");
 
+    observer.register_session("coalesced", "{}").unwrap();
+    observer
+        .subscribe_local_or_remote(SubscribeRequest {
+            id: Some("sub-coalesced".into()),
+            qualified_topic: "alice@laptop.public-builds".into(),
+            subscriber_session: "coalesced".into(),
+            filters: vec![],
+            coalesce_seconds: 1,
+            mode: DeliveryMode::Full,
+        })
+        .await
+        .unwrap();
+
     // 8. Same-node local session subscribes to `local.private-alerts` with `coalesceSeconds: 0`!
     //    Must succeed cleanly with zero `UnprovisionedTopic` diagnostics!
     host.register_session("local-owner", "{}").unwrap();
@@ -508,6 +521,8 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     // Remote `observer` receives ONLY `public-builds` (and ZERO `private-alerts` events)!
     let obs_items = wait_for_mailbox_count(&observer, "obs-sess", 1, Duration::from_secs(5)).await;
     assert_eq!(obs_items.len(), 1);
+    assert_eq!(obs_items[0].origin_node, "alice@laptop");
+    assert_eq!(obs_items[0].source, "alice@laptop.public-builds");
     let obs_payload: Value = serde_json::from_str(&obs_items[0].text).unwrap();
     assert_eq!(obs_payload["topic"], "public-builds");
     assert_eq!(
@@ -518,6 +533,19 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         !obs_items[0].text.contains("Private local notice"),
         "remote peer must NEVER receive private local-only topic content"
     );
+
+    // The same remote event also reaches the coalesced session on its own deadline.
+    // No second upstream event or manual flush should be necessary.
+    let coalesced = wait_for_mailbox_count(&observer, "coalesced", 1, Duration::from_secs(5)).await;
+    assert_eq!(
+        coalesced.len(),
+        1,
+        "coalesced remote batch missed its deadline"
+    );
+    let payload: Value = serde_json::from_str(&coalesced[0].text).unwrap();
+    assert_eq!(coalesced[0].origin_node, obs_items[0].origin_node);
+    assert_eq!(coalesced[0].source, obs_items[0].source);
+    assert_eq!(payload["events"], obs_payload["events"]);
 
     // Confirm raw HTTP `POST /v1/subscriptions` also never bypasses anything (returns 400).
     let client = HttpClient::new().unwrap();
@@ -689,4 +717,72 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     guest.shutdown();
     host_reopened.shutdown();
     reopened_task.abort();
+}
+
+#[tokio::test]
+async fn scheduler_resumes_remote_backlog_after_hold_without_exceeding_wake_cap() {
+    use hyp_store::{AckOutcome, SubscriptionSpec, now_ms};
+
+    let dir = TempDir::new().unwrap();
+    let node = UnifiedNode::open(make_node_cfg("receiver@box", NodeProfile::P2p, &dir)).unwrap();
+    let mut wakes = node.subscribe_local_inbox();
+    let origin = "source@box";
+    {
+        // Seed the state of a receiver restarting with remote events already committed.
+        let db = node.db();
+        let events = db.events();
+        let now = now_ms();
+        for (subscriber, cap) in [("held", 100), ("capped", 1)] {
+            db.local().register_session(subscriber, "{}", now).unwrap();
+            events
+                .upsert_subscription(
+                    &SubscriptionSpec {
+                        id: subscriber.into(),
+                        subscriber: subscriber.into(),
+                        topic: "builds".into(),
+                        origin_node: origin.into(),
+                        filters: vec![],
+                        coalesce_seconds: 0,
+                        max_batch_age_ms: None,
+                        max_wakes_per_hour: Some(cap),
+                        mode: DeliveryMode::Full,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        for index in 0..65 {
+            let event = hyp_store::CloudEvent::new(
+                index.to_string(),
+                "builds",
+                "com.example.build",
+                json!({}),
+            );
+            events
+                .ingest(origin, "builds", origin, &event, now)
+                .unwrap();
+        }
+        let oldest = events.claim_due_batches("held", now).unwrap().remove(0);
+        events
+            .ack_batch(
+                "held",
+                &oldest.id,
+                &AckOutcome::Hold {
+                    reason: "local_inbox_full".into(),
+                    retry_after_ms: Some(200),
+                },
+                now_ms(),
+            )
+            .unwrap();
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while node.db().local().pending_count("held").unwrap() < 65 {
+            wakes.recv().await.unwrap();
+        }
+    })
+    .await
+    .expect("hold expiry must drain past the 64-round pass without a new event");
+    assert_eq!(node.db().local().pending_count("capped").unwrap(), 1);
+    node.shutdown();
 }
