@@ -302,10 +302,10 @@ impl UnifiedNode {
             if !remote_peers.is_empty() {
                 for sub in db.events().list_subscriptions(None)? {
                     if sub.origin_node == my_id
-                        && config.local_only_topics.contains(&sub.topic)
+                        && config.is_local_only_topic(&sub.topic)
                         && remote_peers.contains(&sub.subscriber)
                     {
-                        let _ = db.events().delete_subscription(&sub.id);
+                        db.events().delete_subscription(&sub.id)?;
                     }
                 }
             }
@@ -635,10 +635,7 @@ impl UnifiedNode {
     /// remote peer advertisement in `/v1/manifest`, remote `PUT /v1/subscriptions` / `POST /v1/events`,
     /// and SSE batch fan-out to remote peers.
     pub fn is_local_only_topic(&self, topic: &str) -> bool {
-        let bare = topic
-            .strip_prefix(&format!("{LOCAL_NODE_ID}."))
-            .unwrap_or(topic);
-        self.config.local_only_topics.contains(bare)
+        self.config.is_local_only_topic(topic)
     }
 
     pub fn identity(&self) -> &NodeIdentityKeys {
@@ -1199,9 +1196,7 @@ impl UnifiedNode {
             Some(peer) => {
                 let mut topics = Vec::new();
                 for t in &self.config.topics {
-                    if !self.is_local_only_topic(&t.topic)
-                        && peer_may_see_topic(&peer.scopes, &t.topic)
-                    {
+                    if peer_may_see_topic(&peer.scopes, &t.topic) {
                         topics.push(AdvertisedTopic {
                             topic: t.topic.clone(),
                             kind: t.kind.clone(),
@@ -1252,8 +1247,7 @@ impl UnifiedNode {
                 }
                 if self.config.local_ingest.enabled {
                     for ingest_topic in self.config.local_ingest.advertised_topics() {
-                        if !self.is_local_only_topic(&ingest_topic)
-                            && !topics.iter().any(|t| t.topic == ingest_topic)
+                        if !topics.iter().any(|t| t.topic == ingest_topic)
                             && peer_may_see_topic(&peer.scopes, &ingest_topic)
                         {
                             topics.push(AdvertisedTopic {
@@ -1267,6 +1261,10 @@ impl UnifiedNode {
                         }
                     }
                 }
+
+                // A privacy rule overrides every declaration of the local topic, including
+                // adapters attached at runtime and the built-in catalogs.
+                topics.retain(|topic| !self.is_local_only_topic(&topic.topic));
 
                 let mut channel_set: BTreeSet<String> = BTreeSet::new();
                 {

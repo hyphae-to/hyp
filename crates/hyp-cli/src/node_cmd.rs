@@ -558,6 +558,13 @@ fn node_start(args: NodeStartArgs) -> Result<ExitCode, CliError> {
             }
         }
 
+        node_cfg.local_only_topics.extend(
+            cfg.file
+                .native_local_only_topics()
+                .map_err(|e| CliError::error("CONFIG_ERROR", e))?
+                .map(str::to_owned),
+        );
+
         // Parse GitHub polling and repository webhook sources.
         if let Some(sources) = cfg.file.source_entries().transpose() {
             let public_read_only = cfg.file.public_read_only.unwrap_or(false);
