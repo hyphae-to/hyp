@@ -19,7 +19,7 @@ export function openSlackState(stateDir, team, bot, target) {
   }
   const db = new DatabaseSync(path);
   db.exec(`CREATE TABLE IF NOT EXISTS clicks (
-    channel TEXT NOT NULL, ts TEXT NOT NULL, action_ts TEXT NOT NULL, phase TEXT NOT NULL,
+    channel TEXT NOT NULL, ts TEXT NOT NULL, winner TEXT NOT NULL, phase TEXT NOT NULL,
     PRIMARY KEY(channel,ts)
   )`);
   return db;
@@ -32,11 +32,13 @@ function originalChoice(payload, action) {
   if (!element || element.url || action.url) return null;
   const selection = action.type === "static_select" ? action.selected_option : action;
   const value = selection?.value ?? "";
+  let original = element;
   if (action.type === "static_select") {
     const options = element.options ?? element.option_groups?.flatMap((g) => g.options);
-    if (!Array.isArray(options) || !options.some((option) => option?.value === value)) return null;
+    original = Array.isArray(options) && options.find((option) => option?.value === value);
+    if (!original) return null;
   } else if ((element.value ?? "") !== value) return null;
-  const label = selection?.text?.text ?? value;
+  const label = original.text?.text ?? selection?.text?.text ?? value;
   if (!text(label, 2000) || typeof value !== "string" || value.length > 2000) return null;
   return { value, label };
 }
@@ -74,9 +76,12 @@ export function slackChoiceHandler({ team, bot, botId, state, sender, update, se
     const key = channel + ":" + ts;
     if (active.has(key)) return active.get(key);
     const actionTs = action.action_ts;
-    db.prepare("INSERT OR IGNORE INTO clicks VALUES (?, ?, ?, 'pending')").run(channel, ts, actionTs);
-    const record = db.prepare("SELECT phase,action_ts FROM clicks WHERE channel=? AND ts=?").get(channel, ts);
-    if (record.action_ts !== actionTs || record.phase === "sent") return;
+    const winner = createHash("sha256")
+      .update(JSON.stringify([actionTs, user, action.block_id, action.action_id, choice.value, choice.label]))
+      .digest("hex");
+    db.prepare("INSERT OR IGNORE INTO clicks VALUES (?, ?, ?, 'pending')").run(channel, ts, winner);
+    const record = db.prepare("SELECT phase,winner FROM clicks WHERE channel=? AND ts=?").get(channel, ts);
+    if (record.winner !== winner || record.phase === "sent") return;
     const work = (async () => {
       const data = redactInboundData({ ...person, user, channel, channel_type: channel.startsWith("D") ? "dm" : "channel",
         via: "action", ts, thread_ts: timestamp(payload.message.thread_ts) ? payload.message.thread_ts : "-",

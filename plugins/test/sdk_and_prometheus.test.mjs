@@ -1248,7 +1248,7 @@ test("Slack records an external bot choice before forwarding, then retries the p
     message: { user: "UBOT", ts: "100.01", text: "Pick a time", thread_ts: "99.01",
       blocks: [{ type: "section", text: { type: "plain_text", text: "Pick a time" }, accessory: button },
         { type: "actions", block_id: "choices", elements: [button] }] },
-    actions: [{ ...button, action_ts: "101.01", block_id: "choices" }],
+    actions: [{ ...button, text: undefined, action_ts: "101.01", block_id: "choices" }],
     response_url: "https://example.invalid/PRIVATE",
   };
   function click(overrides = {}) {
@@ -1265,6 +1265,12 @@ test("Slack records an external bot choice before forwarding, then retries the p
   assert.equal(slack.updates.length, 1);
   click();
   await until(() => slack.stderr().split("unacknowledged").length === 3, "mesh delivery failed after update");
+  // A different control with the same Slack timestamp cannot finish a prior winner’s pending publish.
+  const otherButton = { ...button, value: "other" };
+  click({ message: { ...payload.message, blocks: [{ type: "actions", block_id: "choices", elements: [otherButton] }] },
+    actions: [{ ...payload.actions[0], value: "other" }] });
+  await slack.post({ text: "fixture barrier", channel: "COPS" });
+  assert.equal(slack.events.length, 1);
   const first = slack;
   await first.stop();
   slack = await startSlackFixture(env);
