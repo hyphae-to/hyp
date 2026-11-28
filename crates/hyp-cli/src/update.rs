@@ -2048,6 +2048,31 @@ mod tests {
     }
 
     #[test]
+    fn numbered_nightlies_are_ordered_by_date_and_run() {
+        let versions = [
+            "0.8.0",
+            "0.8.1-nightly.20261128.dec46ff",
+            "0.8.1-nightly.20261128.fffffff",
+            "0.8.1-nightly.20261128.run.r00000000000000000099.gfffffff",
+            "0.8.1-nightly.20261128.run.r00000000000000000100.g0000001",
+            "0.8.1-nightly.20261129.run.r00000000000000000101.g0000000",
+            "0.8.1",
+        ];
+        for (position, newer) in versions.iter().enumerate() {
+            for older in &versions[..position] {
+                assert!(
+                    is_strict_version_downgrade(older, newer),
+                    "{older} < {newer}"
+                );
+                assert!(
+                    !is_strict_version_downgrade(newer, older),
+                    "{newer} > {older}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn verify_release_manifest_rejects_bad_sig_and_rollback() {
         let kp = Ed25519KeyPair::generate().unwrap();
         let mut artifacts = BTreeMap::new();
