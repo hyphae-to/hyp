@@ -4682,7 +4682,10 @@ fn maybe_spawn_transport_probe(
                             );
                             if daemon_arc.attach_transport_if_higher_priority(
                                 &sid,
-                                Arc::new(HerdrTransport::new(target)),
+                                Arc::new(HerdrTransport::new(target).with_claude_turn_hooks(
+                                    LocalDaemonInner::infer_session_harness(&sid, hints.harness)
+                                        == Some(HarnessKind::Claude),
+                                )),
                                 PRIORITY_HERDR,
                             ) {
                                 attached = true;

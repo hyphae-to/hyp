@@ -1192,6 +1192,8 @@ impl LocalDaemonInner {
                     let push_mode = if !claude_idle_wake
                         && batch.max_urgency == DeliveryUrgency::Interrupt
                         && transport.supports_interrupt()
+                        && (!transport.interrupt_requires_active_turn()
+                            || self.active_session_lease(session_id).is_some())
                     {
                         PushMode::Interrupt
                     } else {

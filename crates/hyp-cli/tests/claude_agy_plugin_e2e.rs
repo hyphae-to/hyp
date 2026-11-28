@@ -134,6 +134,7 @@ fn claude_code_plugin_bundle_conforms_to_schema_and_security_invariants() {
         .expect("hooks.json must contain top-level hooks object");
     for (event, expected_subcmd) in [
         ("SessionStart", "hyp hook claude session-start"),
+        ("UserPromptSubmit", "hyp hook claude user-prompt-submit"),
         ("PreToolUse", "hyp hook claude pre-tool-use"),
         ("PostToolUse", "hyp hook claude post-tool-use"),
         ("Stop", "hyp hook claude stop"),
