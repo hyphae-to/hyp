@@ -64,8 +64,8 @@ jobs:
           set -euo pipefail
           HEAD_SHA="$(git rev-parse HEAD)"
           SHORT_SHA="$(git rev-parse --short=7 HEAD)"
-          DATE_STAMP="$(date -u +%Y%m%d)"
           PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          NIGHTLY_STAMP="${PUBLISHED_AT//[-:]/}"
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_DRY_RUN" = "true" ]; then
             DRY_RUN="true"
           else
@@ -89,11 +89,10 @@ jobs:
           else
             NIGHTLY_BASE="${BASE_VER}"
           fi
-          # Existing clients compare the whole prerelease string lexically. Keep the run
-          # number fixed-width, with a letter so leading zeros are valid SemVer.
-          # "run" sorts after all legacy hexadecimal SHA identifiers on the same day.
-          printf -v RUN_VERSION 'r%020d' "$GITHUB_RUN_NUMBER"
-          NIGHTLY_VER="${NIGHTLY_BASE}-nightly.${DATE_STAMP}.run.${RUN_VERSION}.g${SHORT_SHA}"
+          # The fixed-width UTC stamp sorts chronologically in both SemVer and the
+          # shipped lexical comparator. The T makes the stamp alphanumeric so
+          # SemVer sorts it after the previous numeric date identifier.
+          NIGHTLY_VER="${NIGHTLY_BASE}-nightly.${NIGHTLY_STAMP}.g${SHORT_SHA}"
 
           LAST_SHA=""
           if LAST_TAG_JSON="$(gh api "repos/${REPO}/git/ref/tags/nightly" 2>/dev/null || true)"; then
@@ -147,7 +146,7 @@ jobs:
         shell: bash
         run: |
           if [ "$GITHUB_RUN_ATTEMPT" != "1" ]; then
-            echo "::error::A rerun reuses its nightly run number and can roll back the release. Dispatch a fresh workflow run to publish."
+            echo "::error::A rerun can reuse a previous build and roll back the release. Dispatch a fresh workflow run to publish."
             exit 1
           fi
 
