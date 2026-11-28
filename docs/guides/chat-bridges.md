@@ -37,7 +37,7 @@ Capture the returned `data.nodePath` and `data.plugins[0].scriptPath`. For **Tel
 Use `{ "secret": "<name>" }` for all credentials (plaintext secret-like values in `plugins[].env` trigger a startup warning) and **always configure explicit sender allowlists** (all included bridges drop unauthorized senders fail-closed):
 
 - **Telegram:** `TELEGRAM_ALLOWED_USERS` and/or `TELEGRAM_ALLOWED_CHATS` (numeric IDs); set `"targets"` to `["<bot_username>"]` from `data.plugins[0].defaultTarget` (or omit `"targets"` on `id: "telegram"` to auto-resolve the bot's Telegram username via `getMe` at daemon startup, with `"personal"` as fallback)
-- **Slack:** `SLACK_ALLOWED_USERS` and/or `SLACK_ALLOWED_CHANNELS`
+- **Slack:** `SLACK_ALLOWLIST_FILE` for named senders and roles, or `SLACK_ALLOWED_USERS` and/or `SLACK_ALLOWED_CHANNELS`. See the [Slack sender and channel rules](../plugins.md#slack-sender-and-channel-allowlists).
 - **WhatsApp:** `WHATSAPP_ALLOWED_NUMBERS`
 
 See the verified, test-checked `plugins[]` JSON example in [docs/plugins.md](../plugins.md#example-plugins-configuration-confighyphaenodejson).

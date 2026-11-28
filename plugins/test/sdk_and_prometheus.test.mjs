@@ -13,8 +13,11 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { after, test } from "node:test";
@@ -991,26 +994,24 @@ test("Issue #29: telegram plugin aborts stalled getUpdates long-poll immediately
   assert.ok(pollCount >= 2);
 });
 
+// Minimal RFC 6455 text frame encoder (server -> client, unmasked).
+function wsTextFrame(str) {
+  const payload = Buffer.from(str, "utf8");
+  if (payload.length < 126) {
+    return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  }
+  const hdr = Buffer.alloc(4);
+  hdr[0] = 0x81;
+  hdr[1] = 126;
+  hdr.writeUInt16BE(payload.length, 2);
+  return Buffer.concat([hdr, payload]);
+}
+
 test("Issue #29: slack plugin aborts stalled Socket Mode WebSocket immediately on system.wake", async () => {
-  const { createHash } = await import("node:crypto");
-  const http = await import("node:http");
   let openCalls = 0;
   let wsConns = 0;
   const openSockets = new Set();
   let firstWsOpen = false;
-
-  // Minimal RFC 6455 text frame encoder (server -> client, unmasked).
-  function wsTextFrame(str) {
-    const payload = Buffer.from(str, "utf8");
-    if (payload.length < 126) {
-      return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
-    }
-    const hdr = Buffer.alloc(4);
-    hdr[0] = 0x81;
-    hdr[1] = 126;
-    hdr.writeUInt16BE(payload.length, 2);
-    return Buffer.concat([hdr, payload]);
-  }
 
   const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
@@ -1135,4 +1136,219 @@ test("Issue #29: slack plugin aborts stalled Socket Mode WebSocket immediately o
   assert.ok(elapsed < 1_000, `slack wake recycle took ${elapsed}ms, expected <1000ms`);
   assert.equal(events[0].data.text, "arrived-after-slack-wake");
   assert.ok(wsConns >= 2);
+});
+
+async function startSlackFixture(env) {
+  const events = [];
+  const posts = [];
+  const responses = new Map();
+  let socket;
+  let requestId = 0;
+  const server = http.createServer(async (req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    const apiResponses = {
+      "/auth.test": { ok: true, user_id: "UBOT", team_id: "TDEMO" },
+      "/apps.connections.open": { ok: true, url: `ws://127.0.0.1:${server.address().port}/ws` },
+    };
+    if (req.url === "/chat.postMessage") {
+      const body = [];
+      for await (const chunk of req) body.push(chunk);
+      posts.push(JSON.parse(Buffer.concat(body).toString()));
+      res.end(JSON.stringify({ ok: true, ts: "99.01" }));
+      return;
+    }
+    res.end(JSON.stringify(apiResponses[req.url] ?? { ok: false, error: "not_found" }));
+  });
+  server.on("upgrade", (req, connection) => {
+    socket = connection;
+    socket.on("error", () => {});
+    const accept = createHash("sha1")
+      .update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+      .digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise((resolve) => {
+    socket?.destroy();
+    server.closeAllConnections?.();
+    server.close(resolve);
+  }));
+
+  const child = spawnFd3Script("await import(process.env.SLACK_SCRIPT_URL)", {
+    plugin: "slack",
+    env: {
+      SLACK_SCRIPT_URL: pathToFileURL(SLACK_SCRIPT).href,
+      SLACK_APP_TOKEN: "xapp-fixture",
+      SLACK_BOT_TOKEN: "xoxb-fixture",
+      SLACK_API_BASE: `http://127.0.0.1:${server.address().port}`,
+      ...env,
+    },
+  });
+  const send = (msg) => child.channel.write(JSON.stringify({ jsonrpc: "2.0", ...msg }) + "\n");
+  createInterface({ input: child.channel }).on("line", (line) => {
+    const msg = JSON.parse(line);
+    if (msg.method === "hyphae/publish") {
+      events.push(msg.params.event);
+      send({ id: msg.id, result: { status: "stored" } });
+    } else if (msg.id !== undefined) {
+      responses.set(msg.id, msg);
+    }
+  });
+  await until(() => socket, "Slack Socket Mode fixture connected");
+
+  return {
+    events, posts, stderr: child.stderr,
+    deliver(...items) {
+      socket.write(Buffer.concat(items.map((event) => wsTextFrame(JSON.stringify({
+        type: "events_api",
+        payload: { event },
+      })))));
+    },
+    async post(params) {
+      const id = ++requestId;
+      send({ id, method: "hyphae/post", params: { target: "ops", params } });
+      return until(() => responses.get(id), `Slack post result ${id}`);
+    },
+  };
+}
+
+function slackEvent(user, channel, ts, type = "message") {
+  return { type, user, channel, ts, text: ts, channel_type: channel.startsWith("D") ? "im" : "channel" };
+}
+
+test("Slack env sender policy admits DMs independently of channel restrictions", async () => {
+  const slack = await startSlackFixture({
+    SLACK_ALLOWED_USERS: "UALLOWED",
+    SLACK_ALLOWED_CHANNELS: "COPEN,DEXPLICIT",
+  });
+  slack.deliver(
+    slackEvent("UUNKNOWN", "DEXPLICIT", "1.01"),
+    slackEvent("UALLOWED", "CBLOCKED", "1.02", "app_mention"),
+    slackEvent("UUNKNOWN", "COPEN", "1.03", "app_mention"),
+    slackEvent("UALLOWED", "DPRIVATE", "1.04"),
+    slackEvent("UALLOWED", "COPEN", "1.05", "app_mention"),
+  );
+  await until(() => slack.events.some(({ data }) => data.ts === "1.05"), "Slack allowlisted mention");
+  assert.deepEqual(slack.events.map(({ data }) => data.ts), ["1.04", "1.05"]);
+  assert.equal(slack.events[0].type, "com.slack.message.im");
+  assert.equal(slack.events[0].data.role, undefined);
+  assert.equal(slack.events[0].data.from_name, undefined);
+  assert.equal((await slack.post({ channel: "DPRIVATE", replyTo: "1.04", text: "reply" })).result?.ok, true);
+  assert.ok((await slack.post({ channel: "DUNSEEN", text: "denied" })).error);
+  assert.ok((await slack.post({ channel: "CBLOCKED", text: "denied" })).error);
+  assert.deepEqual(slack.posts, [{ channel: "DPRIVATE", thread_ts: "1.04", text: "reply" }]);
+});
+
+test("Slack channel-only env policy still admits explicitly listed DM channels only", async () => {
+  const slack = await startSlackFixture({ SLACK_ALLOWED_CHANNELS: "COPEN,DEXPLICIT" });
+  slack.deliver(
+    slackEvent("UUNLISTED", "DPRIVATE", "2.01"),
+    slackEvent("UUNLISTED", "DEXPLICIT", "2.02"),
+    slackEvent("UUNLISTED", "COPEN", "2.03", "app_mention"),
+  );
+  await until(() => slack.events.some(({ data }) => data.ts === "2.03"), "Slack channel-only mention");
+  assert.deepEqual(slack.events.map(({ data }) => data.ts), ["2.02", "2.03"]);
+  assert.ok((await slack.post({ channel: "DPRIVATE", text: "denied" })).error);
+});
+
+test("Slack file allowlist intersects env constraints and reloads roles and routes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyp-slack-policy-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "allowlist.json");
+  const owner = { id: "UOWNER", name: "Demo Owner" };
+  const member = { id: "UALLOWED", name: "Demo Member" };
+  const write = (allowed, channels = ["COPEN", "CFILEONLY"]) =>
+    writeFileSync(file, JSON.stringify({ owner, allowed, channels }));
+  write([member, { id: "UEXTRA", name: "Extra Member" }]);
+  const slack = await startSlackFixture({
+    SLACK_ALLOWLIST_FILE: file,
+    SLACK_ALLOWED_USERS: "UOWNER,UALLOWED,UNEW",
+    SLACK_ALLOWED_CHANNELS: "COPEN,CENVONLY",
+    SLACK_ALLOW_ALL: "1",
+  });
+  slack.deliver(
+    slackEvent("UOWNER", "DOWNER", "3.01"),
+    slackEvent("UALLOWED", "DMEMBER", "3.02"),
+    slackEvent("UEXTRA", "DEXTRA", "3.03"),
+    slackEvent("UNEW", "DNEW", "3.04"),
+    slackEvent("UOWNER", "CENVONLY", "3.05", "app_mention"),
+    slackEvent("UOWNER", "CFILEONLY", "3.06", "app_mention"),
+    slackEvent("UALLOWED", "COPEN", "3.07", "app_mention"),
+  );
+  await until(() => slack.events.some(({ data }) => data.ts === "3.07"), "Slack file-allowlisted mention");
+  assert.deepEqual(slack.events.map(({ data }) => [data.ts, data.role, data.from_name]), [
+    ["3.01", "owner", "Demo Owner"],
+    ["3.02", "allowed", "Demo Member"],
+    ["3.07", "allowed", "Demo Member"],
+  ]);
+
+  write([{ id: "UNEW", name: "New Member" }], ["CENVONLY"]);
+  slack.deliver(
+    slackEvent("UALLOWED", "DMEMBER", "3.08"),
+    slackEvent("UOWNER", "COPEN", "3.09", "app_mention"),
+    slackEvent("UNEW", "DNEW", "3.10"),
+  );
+  await until(() => slack.events.some(({ data }) => data.ts === "3.10"), "Slack reloaded sender");
+  assert.deepEqual(slack.events.slice(3).map(({ data }) => [data.ts, data.role, data.from_name]), [
+    ["3.10", "allowed", "New Member"],
+  ]);
+  assert.ok((await slack.post({ channel: "DMEMBER", text: "denied" })).error);
+  assert.ok((await slack.post({ channel: "COPEN", text: "denied" })).error);
+  assert.equal((await slack.post({ channel: "DNEW", text: "reply" })).result?.ok, true);
+
+  writeFileSync(file, "{invalid");
+  slack.deliver(slackEvent("UOWNER", "DOWNER", "3.11"));
+  await until(() => slack.stderr().includes("slack handle error: SLACK_ALLOWLIST_FILE"), "Slack rejection at reload");
+  assert.ok((await slack.post({ channel: "DOWNER", text: "denied" })).error);
+  assert.equal(slack.events.length, 4);
+  write([]);
+  slack.deliver(slackEvent("UOWNER", "DOWNER", "3.11"));
+  await until(() => slack.events.length === 5, "Slack recovers after allowlist repair");
+  assert.equal(slack.events[4].data.ts, "3.11");
+  assert.deepEqual(slack.posts, [{ channel: "DNEW", text: "reply" }]);
+});
+
+test("Slack file-only policy accepts the owner when no channels are listed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyp-slack-owner-policy-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "allowlist.json");
+  writeFileSync(file, JSON.stringify({
+    owner: { id: "UOWNER", name: "Demo Owner" },
+    allowed: [],
+    channels: [],
+  }));
+  const slack = await startSlackFixture({ SLACK_ALLOWLIST_FILE: file });
+  slack.deliver(
+    slackEvent("UUNKNOWN", "DOTHER", "4.01"),
+    slackEvent("UOWNER", "CUNLISTED", "4.02", "app_mention"),
+    slackEvent("UOWNER", "DOWNER", "4.03"),
+  );
+  await until(() => slack.events.some(({ data }) => data.ts === "4.03"), "Slack owner DM");
+  assert.deepEqual(slack.events.map(({ data }) => [data.ts, data.role]), [["4.03", "owner"]]);
+  assert.equal((await slack.post({ text: "only destination" })).result?.ok, true);
+  assert.deepEqual(slack.posts, [{ channel: "DOWNER", text: "only destination" }]);
+});
+
+test("Slack refuses startup with a missing or structurally invalid configured allowlist", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyp-slack-invalid-policy-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const bad = join(dir, "bad.json");
+  writeFileSync(bad, JSON.stringify({ owner: { id: "UOWNER" }, allowed: [], channels: [] }));
+  for (const file of [bad, join(dir, "missing.json")]) {
+    const slack = spawnFd3Script("await import(process.env.SLACK_SCRIPT_URL)", {
+      plugin: "slack",
+      env: {
+        SLACK_SCRIPT_URL: pathToFileURL(SLACK_SCRIPT).href,
+        SLACK_APP_TOKEN: "xapp-fixture",
+        SLACK_BOT_TOKEN: "xoxb-fixture",
+        SLACK_ALLOWLIST_FILE: file,
+        SLACK_ALLOW_ALL: "1",
+      },
+    });
+    assert.equal((await slack.waitExit()).code, 1);
+    assert.match(slack.stderr(), /SLACK_ALLOWLIST_FILE/);
+  }
 });

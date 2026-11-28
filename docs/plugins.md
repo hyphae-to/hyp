@@ -357,13 +357,31 @@ All included `.mjs` scripts have zero external npm dependencies (**requires Node
 
 | Script | Kind | Protocol / Transport | Required Fail-Closed Allowlist / Auth Env Vars |
 | --- | --- | --- | --- |
-| [plugins/slack/index.mjs](../plugins/slack/index.mjs) | `bridge` | Slack Socket Mode (WebSocket, no public port needed) + `chat.postMessage` | `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_ALLOWED_USERS` / `SLACK_ALLOWED_CHANNELS` |
+| [plugins/slack/index.mjs](../plugins/slack/index.mjs) | `bridge` | Slack Socket Mode (WebSocket, no public port needed) + `chat.postMessage` | `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and `SLACK_ALLOWLIST_FILE` or the env allowlists |
 | [plugins/telegram/index.mjs](../plugins/telegram/index.mjs) | `bridge` | Telegram Bot API long polling + `sendMessage` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS` / `TELEGRAM_ALLOWED_CHATS` *(numeric IDs)* |
 | [plugins/whatsapp/index.mjs](../plugins/whatsapp/index.mjs) | `bridge` | Meta WhatsApp Business Cloud API webhook (`X-Hub-Signature-256`) + Graph API | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_ALLOWED_NUMBERS` |
 | [plugins/webhook/index.mjs](../plugins/webhook/index.mjs) | `source` *(or `bridge` when `WEBHOOK_POST_URL` is set)* | Local HTTP webhook receiver (`X-Webhook-Signature-256`) + optional `WEBHOOK_POST_URL` | `WEBHOOK_PORT`, `WEBHOOK_SECRET` (or `WEBHOOK_SECRET_FILE`); fails closed without auth unless `WEBHOOK_ALLOW_UNSIGNED=1` on **loopback only** |
 | [plugins/prometheus/index.mjs](../plugins/prometheus/index.mjs) | `source` | Alertmanager v4 webhook receiver | `PROMETHEUS_PORT`, `PROMETHEUS_BEARER_TOKEN`, `PROMETHEUS_BASIC_AUTH`, and/or `PROMETHEUS_WEBHOOK_SECRET`; fails closed without auth unless `PROMETHEUS_ALLOW_UNSIGNED=1` on **loopback only** |
 
 > **Fail-closed auth & loopback-only unsigned opt-in:** Both `plugins/webhook/index.mjs` and `plugins/prometheus/index.mjs` refuse to boot without configured auth credentials. Setting **`WEBHOOK_ALLOW_UNSIGNED=1`** or **`PROMETHEUS_ALLOW_UNSIGNED=1`** permits unsigned local development traffic **strictly on loopback binds (`127.0.0.1` / `::1`)** — both plugins still fail closed and refuse to start unsigned on any non-loopback bind (such as `0.0.0.0`).
+
+### Slack sender and channel allowlists
+
+Set `SLACK_ALLOWLIST_FILE` to the path of a local JSON file to give permitted senders names and roles.
+
+```json
+{
+  "owner": { "id": "UDEMOOWNER", "name": "Demo Owner" },
+  "allowed": [{ "id": "UDEMOMEMBER", "name": "Demo Member" }],
+  "channels": ["CDEMOREVIEWS"]
+}
+```
+
+Use one owner and distinct user IDs in `allowed`. The bridge forwards the configured display name as `data.from_name` and the corresponding `data.role` as `owner` or `allowed`. Env-only senders retain their Slack user IDs and have no role or name assigned.
+
+The bridge rereads the file for each incoming message and outbound post. A missing, unreadable, or malformed configured file blocks delivery until corrected. When env lists are also set, they still restrict the file's permissions. Channel messages must match the configured sender and channel lists. A DM from a permitted sender can arrive in its own conversation even when that conversation is outside the channel allowlist. With only `SLACK_ALLOWED_CHANNELS` set in the environment and no env sender list, DMs are still limited to the conversation IDs explicitly listed there. With no file or env allowlists, `SLACK_ALLOW_ALL=1` explicitly permits any workspace sender.
+
+Replies can target a DM conversation that passed the incoming filters while its sender remains permitted. For regular channels, outbound posts must use a permitted channel. With env configuration alone, the outbound channel must be configured or previously observed.
 
 ### Example `plugins[]` Configuration (`~/.config/hyphae/node.json`)
 

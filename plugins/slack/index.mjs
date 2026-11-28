@@ -6,12 +6,13 @@
  *   SLACK_APP_TOKEN_FILE or SLACK_APP_TOKEN  - xapp-... Socket Mode token
  *   SLACK_BOT_TOKEN_FILE or SLACK_BOT_TOKEN  - xoxb-... Bot User OAuth token
  *   SLACK_TARGET                             - Target name (defaults to first target in hello)
+ *   SLACK_ALLOWLIST_FILE                     - Optional JSON allowlist with owner, allowed users and channels
  *   SLACK_ALLOWED_USERS                      - Optional comma-separated Slack user IDs allowlist
  *   SLACK_ALLOWED_CHANNELS                   - Optional comma-separated channel IDs allowlist
  *   SLACK_DEFAULT_CHANNEL                    - Optional default channel ID for outbound hyp_send
  *   SLACK_API_BASE                           - Optional API base URL override (default https://slack.com/api)
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { MeshPluginClient } from "../sdk/client.mjs";
 
 function readSecret(fileEnv, valEnv) {
@@ -32,6 +33,50 @@ const botToken = readSecret("SLACK_BOT_TOKEN_FILE", "SLACK_BOT_TOKEN");
 const allowedUsers = csvSet("SLACK_ALLOWED_USERS");
 const allowedChannels = csvSet("SLACK_ALLOWED_CHANNELS");
 const allowAll = process.env.SLACK_ALLOW_ALL === "1";
+const allowlistFile = process.env.SLACK_ALLOWLIST_FILE;
+
+function readAllowlist() {
+  if (allowlistFile === undefined) return null;
+
+  // Never fall back to the environment or a previous snapshot on a failed read.
+  const invalid = () => new Error("SLACK_ALLOWLIST_FILE must be a readable JSON allowlist with owner, allowed users, and channels");
+  let config;
+  try {
+    if (!statSync(allowlistFile).isFile()) throw invalid();
+    config = JSON.parse(readFileSync(allowlistFile, "utf8"));
+  } catch {
+    throw invalid();
+  }
+
+  if (!config || !Array.isArray(config.allowed) || !Array.isArray(config.channels)) {
+    throw invalid();
+  }
+  const people = new Map();
+  function addPerson(person, role) {
+    if (
+      typeof person?.id !== "string" || !/^[UW][A-Z0-9]+$/.test(person.id) ||
+      typeof person.name !== "string" || !person.name.trim() || people.has(person.id)
+    ) {
+      throw invalid();
+    }
+    people.set(person.id, { from_name: person.name.trim(), role });
+  }
+  addPerson(config.owner, "owner");
+  for (const person of config.allowed) addPerson(person, "allowed");
+  if (!config.channels.every((id) => typeof id === "string" && /^[CGD][A-Z0-9]+$/.test(id))) {
+    throw invalid();
+  }
+  return { people, channels: new Set(config.channels) };
+}
+
+function allowsDm(user, channel, allowlist) {
+  if (!user || (allowlist && !allowlist.people.has(user))) return false;
+  if (allowedUsers) return allowedUsers.has(user);
+  // With channel-only env configuration, retain explicitly listed DM conversations.
+  if (allowedChannels) return allowedChannels.has(channel);
+  return allowlist !== null || allowAll;
+}
+
 
 function resolveApiBase(raw, fallback) {
   const value = (raw?.trim() || fallback).replace(/\/+$/, "");
@@ -64,6 +109,7 @@ if (allowedChannels) {
     seenAllowedChannels.add(ch);
   }
 }
+const admittedDms = new Map();
 const lastTsByChannel = new Map();
 const lastReactionByMsg = new Map();
 
@@ -137,8 +183,16 @@ function normalizeSlackReaction(raw) {
   );
 }
 
-if (!allowedUsers && !allowedChannels && !allowAll) {
-  throw new Error("Refusing to start Slack bridge without SLACK_ALLOWED_USERS or SLACK_ALLOWED_CHANNELS (set SLACK_ALLOW_ALL=1 to explicitly allow any workspace member)");
+if (!readAllowlist() && !allowedUsers && !allowedChannels && !allowAll) {
+  throw new Error("Refusing to start Slack bridge without SLACK_ALLOWLIST_FILE, SLACK_ALLOWED_USERS or SLACK_ALLOWED_CHANNELS (set SLACK_ALLOW_ALL=1 to explicitly allow any workspace member)");
+}
+
+function canPostTo(channel, allowlist) {
+  const dmUser = admittedDms.get(channel);
+  if (dmUser) return allowsDm(dmUser, channel, allowlist);
+  if (allowedChannels && !allowedChannels.has(channel)) return false;
+  if (allowlist) return !channel.startsWith("D") && allowlist.channels.has(channel);
+  return seenAllowedChannels.has(channel);
 }
 
 async function slackApi(method, token, payload) {
@@ -166,29 +220,26 @@ const mesh = new MeshPluginClient({
     const hasRemoveReaction = typeof params.removeReaction === "string" && params.removeReaction.trim().length > 0;
     const text = typeof params.text === "string" ? params.text.trim() : "";
     if (!hasReaction && !hasRemoveReaction && !text) throw new Error("text or reaction is required");
-    const explicitChannel = pickNonEmpty(params.channel, params.chatId, params.to);
-    let channel = explicitChannel;
+    const allowlist = readAllowlist();
+    let channel = pickNonEmpty(params.channel, params.chatId, params.to, defaultChannel);
     if (!channel) {
-      if (defaultChannel) {
-        channel = defaultChannel;
-      } else if (seenAllowedChannels.size > 1) {
+      const candidates = new Set([...seenAllowedChannels, ...admittedDms.keys(), ...(allowlist?.channels ?? [])]);
+      const eligible = [...candidates].filter((candidate) => canPostTo(candidate, allowlist));
+      if (eligible.length > 1) {
         throw new Error(
           "Multiple Slack channels have been seen/configured; specify an explicit channel or set SLACK_DEFAULT_CHANNEL / SLACK_CHANNEL_ID",
         );
-      } else if (seenAllowedChannels.size === 1) {
-        channel = seenAllowedChannels.values().next().value;
-      } else {
+      }
+      [channel] = eligible;
+      if (!channel) {
         throw new Error(
           "No Slack channel specified and no recent inbound channel to reply to (pass channel or set SLACK_DEFAULT_CHANNEL)",
         );
       }
     }
-    if (allowedChannels && !allowedChannels.has(channel)) {
-      throw new Error(`Channel '${channel}' is not in SLACK_ALLOWED_CHANNELS`);
-    }
-    if (!seenAllowedChannels.has(channel)) {
+    if (!canPostTo(channel, allowlist)) {
       throw new Error(
-        `Channel '${channel}' is not an allowed or previously seen Slack channel (configure SLACK_ALLOWED_CHANNELS or SLACK_DEFAULT_CHANNEL)`,
+        `Channel '${channel}' is not an allowed or previously seen Slack channel (configure SLACK_ALLOWLIST_FILE, SLACK_ALLOWED_CHANNELS or SLACK_DEFAULT_CHANNEL)`,
       );
     }
 
@@ -290,15 +341,23 @@ async function handleEnvelope(envelope) {
   const user = ev.user ?? "";
   const channel = ev.channel ?? "";
   const ts = ev.ts ?? "";
-  if (allowedUsers && !allowedUsers.has(user)) return;
-  if (allowedChannels && !allowedChannels.has(channel)) return;
+  if (typeof user !== "string" || typeof channel !== "string" || !channel) return;
+  const isDm = ev.channel_type === "im" || channel.startsWith("D");
+  const allowlist = readAllowlist();
+  const person = allowlist?.people.get(user);
+  if (isDm) {
+    if (!allowsDm(user, channel, allowlist)) return;
+  } else {
+    if (allowlist && (!person || !allowlist.channels.has(channel))) return;
+    if (allowedUsers && !allowedUsers.has(user)) return;
+    if (allowedChannels && !allowedChannels.has(channel)) return;
+  }
 
   const dedupKey = `${channel}:${ts}`;
   if (seen.has(dedupKey)) return;
   seen.add(dedupKey);
   if (seen.size > 2000) seen.delete(seen.values().next().value);
 
-  const isDm = ev.channel_type === "im" || channel.startsWith("D");
   let via = null;
   if (ev.type === "app_mention") {
     via = "mention";
@@ -310,7 +369,9 @@ async function handleEnvelope(envelope) {
   }
   if (!via) return;
 
-  if (channel) {
+  if (isDm) {
+    admittedDms.set(channel, user);
+  } else {
     seenAllowedChannels.add(channel);
   }
   if (ts && channel) {
@@ -330,6 +391,7 @@ async function handleEnvelope(envelope) {
     datacontenttype: "application/json",
     data: {
       user,
+      ...person,
       channel,
       channel_type: isDm ? "dm" : "channel",
       via,
