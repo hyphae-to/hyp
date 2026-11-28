@@ -127,7 +127,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     host_cfg.admin_jwk = Some(admin_proto_jwk(&admin_key));
     let native: NodeFile = serde_json::from_value(json!({
         "sources": [
-            {"kind": "github-webhook", "topic": "private-alerts", "exposeTopic": false},
+            {"kind": "github-webhook", "topic": "local.private-alerts", "exposeTopic": false},
             {"kind": "github-webhook", "topic": "private-adapter", "exposeTopic": false},
             {"kind": "github-public", "topic": "private-poll", "exposeTopic": false},
             {"kind": "github-webhook", "topic": "public-builds"}
@@ -603,7 +603,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     let locked: NodeFile = serde_json::from_value(json!({
         "sources": [
             {"kind": "github-webhook", "topic": "private-alerts", "exposeTopic": false},
-            {"kind": "github-webhook", "topic": "public-builds", "exposeTopic": false}
+            {"kind": "github-webhook", "topic": "local.public-builds", "exposeTopic": false}
         ]
     }))
     .unwrap();
@@ -637,7 +637,14 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         );
     }
 
-    let (_, reopened_task) = Arc::clone(&host_reopened).serve(host_addr).await.unwrap();
+    let (reopened_addr, reopened_task) = Arc::clone(&host_reopened)
+        .serve("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let observer_link = observer
+        .connect_peer("alice@laptop", &format!("http://{reopened_addr}"))
+        .await
+        .unwrap();
     let manifest = observer_link.fetch_manifest(None).await.unwrap();
     let hyp_node::engine::ManifestFetchOutcome::Signed { manifest, .. } = manifest else {
         panic!("expected signed manifest after restart");

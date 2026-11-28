@@ -626,6 +626,11 @@ impl NodeFile {
                         return Err(format!("Invalid local-only source topic '{topic}'"));
                     }
                     topics.push(topic);
+                    // Store both spellings. Native adapters preserve literal topic names
+                    // while topic addressing and catalogs also recognize local.<topic>.
+                    if let Some(bare) = topic.strip_prefix("local.") {
+                        topics.push(bare);
+                    }
                 }
                 _ => return Err("sources[].exposeTopic must be a boolean".to_string()),
             }
@@ -729,7 +734,7 @@ mod tests {
         })).unwrap();
         assert_eq!(
             file.native_local_only_topics().unwrap().collect::<Vec<_>>(),
-            ["github", "local.private"],
+            ["github", "local.private", "private"],
         );
 
         for invalid in [json!(null), json!("false"), json!(0)] {
