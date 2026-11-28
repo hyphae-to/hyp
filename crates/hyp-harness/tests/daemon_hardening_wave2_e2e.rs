@@ -1884,7 +1884,7 @@ async fn r5_daemon_status_exposes_binary_version_and_pid() {
     assert!(res.ok, "daemon.status failed: {res:?}");
     let body = res.result.unwrap();
     assert_eq!(body["nodeId"], "r5-status@box");
-    assert_eq!(body["binaryVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["binaryVersion"], hyp_proto::build_version());
     assert_eq!(body["pid"], std::process::id());
     assert!(body.get("version").is_some());
     assert!(body.get("quarantinedCount").is_some());

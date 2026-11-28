@@ -14,6 +14,9 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
+#[path = "../hyp-proto/src/build_version.rs"]
+mod build_version;
+
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum SpecKind {
@@ -235,11 +238,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HYPHAE_RELEASE_TAG");
 
     let pkg_version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION not set");
-    let build_version = env::var("HYPHAE_BUILD_VERSION")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| pkg_version.clone());
+    let version_override = env::var("HYPHAE_BUILD_VERSION").ok();
+    let build_version =
+        build_version::resolve_build_version(version_override.as_deref(), &pkg_version);
     let explicit_tag = env::var("HYPHAE_RELEASE_TAG")
         .ok()
         .map(|s| s.trim().to_string())
@@ -252,7 +253,7 @@ fn main() {
     let is_nightly_ver = build_version
         .split('+')
         .next()
-        .unwrap_or(&build_version)
+        .unwrap_or(build_version)
         .split_once('-')
         .is_some_and(|(_, pre)| {
             pre.split('.')
@@ -280,7 +281,7 @@ fn main() {
     });
 
     for (name, val) in [
-        ("HYPHAE_BUILD_VERSION", &build_version),
+        ("HYPHAE_BUILD_VERSION", build_version),
         ("HYPHAE_BUILD_CHANNEL", &build_channel),
         ("HYPHAE_RELEASE_TAG", &release_tag),
     ] {

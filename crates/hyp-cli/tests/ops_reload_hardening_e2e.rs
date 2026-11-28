@@ -1260,7 +1260,7 @@ fn r5_doctor_flags_daemon_version_skew_and_update_supports_no_restart() {
     );
 
     // 3. Once daemon reports matching version, `DAEMON_VERSION_SKEW` disappears and `daemon.version` is OK!
-    *reported_version.lock().unwrap() = env!("CARGO_PKG_VERSION").to_string();
+    *reported_version.lock().unwrap() = env!("HYPHAE_BUILD_VERSION").to_string();
     let doc_ok_out = isolated_cmd(&home)
         .args([
             "doctor",

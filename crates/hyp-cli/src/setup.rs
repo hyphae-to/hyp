@@ -1063,7 +1063,7 @@ fn run_onboard_deterministic(
         .set_metadata("node_profile", profile_as_str(profile));
     let _ = db
         .local()
-        .set_metadata("node_version", env!("CARGO_PKG_VERSION"));
+        .set_metadata("node_version", hyp_proto::build_version());
 
     let mut live_join_outcome: Option<OnboardJoinResult> = None;
     let mut deferred_join_cmd: Option<String> = None;

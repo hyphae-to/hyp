@@ -5326,7 +5326,7 @@ async fn handle_daemon_status(daemon: &Arc<LocalDaemonInner>) -> Value {
         "result": {
             "nodeId": daemon.node.node_id().as_str(),
             "version": daemon.node.config().hyphae_version,
-            "binaryVersion": env!("CARGO_PKG_VERSION"),
+            "binaryVersion": hyp_proto::build_version(),
             "pid": std::process::id(),
             "profile": daemon.node.config().profile,
             "socketPath": daemon.socket_path.display().to_string(),
