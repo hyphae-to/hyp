@@ -86,10 +86,11 @@ fn build_rs_pinned_digests_and_tree_hashes_match_sha2_crate_and_crlf_invariance(
         ("claude-panel", PluginKind::Harness, 4),
         ("claude-code", PluginKind::Harness, 14),
         ("herdr-mod", PluginKind::Harness, 13),
+        ("herdr-status", PluginKind::Harness, 2),
     ];
 
     assert_eq!(PINNED_PLUGINS.len(), expected_plugins.len());
-    assert_eq!(PINNED_PLUGIN_FILES.len(), 48);
+    assert_eq!(PINNED_PLUGIN_FILES.len(), 50);
     let plugins_dir = repo_root().join("plugins");
 
     for (spec, (exp_id, exp_kind, exp_count)) in PINNED_PLUGINS.iter().zip(expected_plugins.iter())
@@ -591,7 +592,7 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     assert_eq!(list_json["ok"], true);
     assert_eq!(
         list_json["data"]["plugins"].as_array().map(Vec::len),
-        Some(15)
+        Some(16)
     );
     // Event-source plugins advertise their structured onboarding tree; bridges without one do not.
     let listed = list_json["data"]["plugins"].as_array().unwrap();
@@ -687,8 +688,8 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     .unwrap();
     fs::write(legacy_panel.join("notes.txt"), "my notes").unwrap();
 
-    // 2. Install telegram, claude-panel, and herdr-mod via --from-dir.
-    for name in ["telegram", "claude-panel", "herdr-mod"] {
+    // 2. Install a bridge, UI integrations, and the opt-in publisher via --from-dir.
+    for name in ["telegram", "claude-panel", "herdr-mod", "herdr-status"] {
         let inst = run(
             &[
                 "plugin",
@@ -718,6 +719,7 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
         "my notes"
     );
     assert!(state_dir.join("plugins/installed.json").is_file());
+    assert!(state_dir.join("plugins/herdr-status/publish.mjs").is_file());
     assert!(state_dir.join("plugins/telegram/index.mjs").is_file());
     assert!(state_dir.join("plugins/sdk/client.mjs").is_file());
     assert!(
@@ -761,8 +763,8 @@ fn compiled_hyp_plugin_cli_unified_three_way_update_cache_offline_setup_and_doct
     );
     assert!(doc_ok.status.success());
     let doc_json: Value = serde_json::from_slice(&doc_ok.stdout).unwrap();
-    assert_eq!(doc_json["data"]["plugins"]["installedCount"], 4);
-    assert_eq!(doc_json["data"]["plugins"]["upToDateCount"], 4);
+    assert_eq!(doc_json["data"]["plugins"]["installedCount"], 5);
+    assert_eq!(doc_json["data"]["plugins"]["upToDateCount"], 5);
 
     // 4. Simulate OUTDATED `telegram` (`disk == receipt && disk != pinned`):
     //    - `hyp doctor` warns with `hyp plugin update --all`

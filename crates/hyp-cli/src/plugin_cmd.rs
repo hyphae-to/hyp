@@ -6,7 +6,7 @@
 //!   and per-plugin deterministic `tree_sha256` digests for every official non-Rust plugin & mod:
 //!   - Bridges (`kind = "bridge"`): `sdk`, `telegram`, `slack`, `whatsapp`, `webhook`, `prometheus`,
 //!     and the event sources `agentmail`, `sentry`, `gmail`, `google-calendar`, `vercel`, `notion`
-//!   - Harness mods (`kind = "harness"`): `claude-panel`, `claude-code`, `herdr-mod`
+//!   - Harness mods (`kind = "harness"`): `claude-panel`, `claude-code`, `herdr-mod`, `herdr-status`
 //! - Source precedence (ALL verified in constant time via `ct_eq` BEFORE writing a single byte):
 //!   1. `--archive <path>` / `HYPHAE_PLUGINS_ARCHIVE`
 //!   2. `--from-dir <path>` / `HYPHAE_PLUGINS_DIR`
@@ -107,7 +107,7 @@ pub enum PluginCommand {
     },
     /// Download, SHA-256 verify, and atomically install an official plugin or harness mod (or `all`)
     Install {
-        /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, agentmail, sentry, gmail, google-calendar, vercel, notion, claude-panel, claude-code, herdr-mod, or all
+        /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, agentmail, sentry, gmail, google-calendar, vercel, notion, claude-panel, claude-code, herdr-mod, herdr-status, or all
         #[arg(value_name = "PLUGIN")]
         plugin: String,
         /// Explicit Hyphae state directory (defaults to ~/.config/hyphae)
@@ -179,7 +179,7 @@ pub enum PluginCommand {
     },
     /// Remove an installed official plugin or harness mod (or `all`)
     Remove {
-        /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, agentmail, sentry, gmail, google-calendar, vercel, notion, claude-panel, claude-code, herdr-mod, or all
+        /// Plugin name: sdk, telegram, slack, whatsapp, webhook, prometheus, agentmail, sentry, gmail, google-calendar, vercel, notion, claude-panel, claude-code, herdr-mod, herdr-status, or all
         #[arg(value_name = "PLUGIN")]
         plugin: String,
         /// Keep matching `plugins[]` entries in node.json instead of removing them
@@ -723,7 +723,7 @@ pub fn pinned_spec_for(plugin_id: &str) -> Option<&'static PinnedPluginSpec> {
     PINNED_PLUGINS.iter().find(|p| p.id == plugin_id)
 }
 
-/// Resolves a user plugin selector (`sdk|telegram|slack|whatsapp|webhook|prometheus|agentmail|sentry|gmail|google-calendar|vercel|notion|claude-panel|claude-code|herdr-mod|all`).
+/// Resolves a user plugin selector (`sdk|telegram|slack|whatsapp|webhook|prometheus|agentmail|sentry|gmail|google-calendar|vercel|notion|claude-panel|claude-code|herdr-mod|herdr-status|all`).
 pub fn resolve_plugin_targets(selector: &str) -> Result<Vec<&'static PinnedPluginSpec>, String> {
     let normalized = selector.trim().to_ascii_lowercase();
     if normalized == "all" {
@@ -4023,8 +4023,8 @@ mod tests {
 
     #[test]
     fn differential_build_rs_sha256_and_tree_digests_match_sha2_crate_for_all_plugins() {
-        assert_eq!(PINNED_PLUGINS.len(), 15);
-        assert_eq!(PINNED_PLUGIN_FILES.len(), 48);
+        assert_eq!(PINNED_PLUGINS.len(), 16);
+        assert_eq!(PINNED_PLUGIN_FILES.len(), 50);
         let root = repo_plugins_dir();
 
         for entry in PINNED_PLUGIN_FILES {

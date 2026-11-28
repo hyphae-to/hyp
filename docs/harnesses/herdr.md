@@ -29,3 +29,7 @@ When `HC_TERMINAL_ID` is set, `hyp onboard` discovers Herdr launch templates (`h
 - Sending an `interrupt`-tier message wakes an active or idle Herdr tab immediately.
 
 See [Troubleshooting](../operations/troubleshooting.md) if pills stay blank or a custom layout was skipped.
+
+## Builder status in Shared KV
+
+The optional Herdr status publisher follows the native event stream and exposes one stable status key per selected builder session. See the [publisher setup and access controls](../../plugins/herdr-status/README.md).
