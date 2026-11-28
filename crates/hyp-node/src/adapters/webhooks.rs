@@ -337,6 +337,32 @@ fn fit_github_data(mut data: GitHubData) -> Value {
     serde_json::to_value(data).expect("GitHubData serialization is infallible")
 }
 
+fn github_repository_parts(full_name: &str) -> Option<(&str, &str)> {
+    let (owner, name) = full_name.split_once('/')?;
+    let valid_segment = |segment: &str, max_len| {
+        !segment.is_empty()
+            && segment.len() <= max_len
+            && !matches!(segment, "." | "..")
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    (valid_segment(owner, 39) && valid_segment(name, 100)).then_some((owner, name))
+}
+
+fn github_repository_name(repository: &Value) -> Option<&str> {
+    let full_name = repository.as_object()?.get("full_name")?.as_str()?;
+    let (owner, _) = github_repository_parts(full_name)?;
+    if let Some(owner_data) = repository.get("owner") {
+        if let Some(login) = owner_data.as_object()?.get("login") {
+            if !login.as_str()?.eq_ignore_ascii_case(owner) {
+                return None;
+            }
+        }
+    }
+    Some(full_name)
+}
+
 /// Normalizes a GitHub webhook payload into a CloudEvents v1.0 envelope matching `src/core/github/normalize.ts`.
 pub fn normalize_github_webhook(
     event_name: &str,
@@ -364,8 +390,15 @@ pub fn normalize_github_webhook(
         }
     }
 
-    let repository = obj_get(Some(payload), "repository");
-    let repo = get_str(repository, "full_name");
+    let repository = payload.get("repository");
+    let repo = match repository {
+        Some(value) => match github_repository_name(value) {
+            Some(full_name) => Some(full_name),
+            None => return GitHubNormalizeOutcome::Ignore("invalid_repository".into()),
+        },
+        None if event_name == "ping" => None,
+        None => return GitHubNormalizeOutcome::Ignore("invalid_repository".into()),
+    };
 
     if event_name == "push" {
         if let Some(default_branch) = get_str(repository, "default_branch") {
@@ -583,7 +616,7 @@ pub fn normalize_github_webhook(
     }
 
     let org = get_str(obj_get(Some(payload), "organization"), "login");
-    let source = if let Some(ref r) = repo {
+    let source = if let Some(r) = repo {
         format!("github.com/{r}")
     } else if let Some(ref o) = org {
         format!("github.com/{o}")
@@ -729,25 +762,21 @@ impl GitHubWebhookAdapter {
         };
 
         if !self.config.allowed_repos.is_empty() || !self.config.allowed_orgs.is_empty() {
-            let repo_lower = ce
-                .extensions
-                .get("repo")
-                .and_then(Value::as_str)
-                .map(str::to_ascii_lowercase)
-                .unwrap_or_default();
-            let owner = repo_lower.split('/').next().unwrap_or("");
-            let repo_ok = !repo_lower.is_empty()
-                && self
-                    .config
+            let repo = ce.extensions.get("repo").and_then(Value::as_str);
+            let repo_ok = repo.is_some_and(|repo| {
+                self.config
                     .allowed_repos
                     .iter()
-                    .any(|r| r.trim().eq_ignore_ascii_case(&repo_lower));
-            let org_ok = !owner.is_empty()
-                && self
-                    .config
-                    .allowed_orgs
-                    .iter()
-                    .any(|o| o.trim().eq_ignore_ascii_case(owner));
+                    .any(|r| r.trim().eq_ignore_ascii_case(repo))
+            });
+            let org_ok = repo
+                .and_then(github_repository_parts)
+                .is_some_and(|(owner, _)| {
+                    self.config
+                        .allowed_orgs
+                        .iter()
+                        .any(|o| o.trim().eq_ignore_ascii_case(owner))
+                });
             if !repo_ok && !org_ok {
                 return Ok(WebhookIngestOutcome::Ignored {
                     reason: "repo_not_allowed".to_string(),

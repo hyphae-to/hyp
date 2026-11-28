@@ -102,7 +102,7 @@ hyp secret set github-acme-token --web
 
 ### B. GitHub repository webhooks
 
-The `github-webhook` source runs inside `hyp` and verifies `X-Hub-Signature-256` with the configured SecretStore reference. It also supports `allowedRepos` and `allowedOrgs`. Normalized events carry `repo`, `source`, `type`, `action`, `actor`, and `subject`.
+The `github-webhook` source runs inside `hyp` and verifies `X-Hub-Signature-256` with the configured SecretStore reference. For repository events, `repository.full_name` must contain exactly two nonempty GitHub slug segments. Dot segments are invalid. When supplied, `repository.owner.login` must match the owner segment case-insensitively. `allowedRepos` matches whole repository slugs and `allowedOrgs` matches whole owner segments, both case-insensitively. A repository-free `ping` is accepted only with no repository or organization allowlist. Normalized repository events carry `repo`, `source`, `type`, `action`, `actor`, and `subject`.
 
 #### Repository webhook setup
 

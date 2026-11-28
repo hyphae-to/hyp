@@ -1501,6 +1501,129 @@ async fn github_webhook_hmac_mutations_and_event_types() {
     adapter.stop().await.unwrap();
 }
 
+#[tokio::test]
+async fn github_webhook_requires_repository_identity_before_matching_allowlists() {
+    let host = RecordingHost::new();
+    let secret = "fictional-webhook-fixture-key";
+    let mut cfg = GitHubWebhookConfig::new("github-webhook", "github", secret);
+    cfg.allowed_repos = vec!["Example-Team/Exact.Repo".into()];
+    cfg.allowed_orgs = vec!["Example-Org".into()];
+    let restricted = GitHubWebhookAdapter::new(cfg);
+    restricted.start(host.clone()).await.unwrap();
+    let unrestricted = GitHubWebhookAdapter::new(GitHubWebhookConfig::new(
+        "github-unrestricted",
+        "github",
+        secret,
+    ));
+    unrestricted.start(host.clone()).await.unwrap();
+
+    async fn ingest(
+        adapter: &GitHubWebhookAdapter,
+        secret: &str,
+        event: &'static str,
+        payload: &Value,
+    ) -> WebhookIngestOutcome {
+        let body = serde_json::to_vec(payload).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", HeaderValue::from_static(event));
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&compute_hmac_sha256_header(secret.as_bytes(), &body)).unwrap(),
+        );
+        adapter.ingest_webhook(&headers, &body).await.unwrap()
+    }
+
+    let cases = [
+        (
+            json!({"full_name":"example-team/exact.repo","owner":{"login":"EXAMPLE-TEAM"}}),
+            None,
+        ),
+        (
+            json!({"full_name":"EXAMPLE-ORG/Release_Tools","owner":{"name":"Example Org"}}),
+            None,
+        ),
+        (
+            json!({"full_name":"example-team/another"}),
+            Some("repo_not_allowed"),
+        ),
+        (
+            json!({"full_name":"example-org-other/another"}),
+            Some("repo_not_allowed"),
+        ),
+        (
+            json!({"full_name":"example-org"}),
+            Some("invalid_repository"),
+        ),
+        (
+            json!({"full_name":"example-org/"}),
+            Some("invalid_repository"),
+        ),
+        (json!({"full_name":"/project"}), Some("invalid_repository")),
+        (
+            json!({"full_name":"example-org/project/extra"}),
+            Some("invalid_repository"),
+        ),
+        (
+            json!({"full_name":"example-org/."}),
+            Some("invalid_repository"),
+        ),
+        (
+            json!({"full_name":"../project"}),
+            Some("invalid_repository"),
+        ),
+        (
+            json!({"full_name":"example-org/project "}),
+            Some("invalid_repository"),
+        ),
+        (
+            json!({"full_name":"example-org/project","owner":{"login":"other-org"}}),
+            Some("invalid_repository"),
+        ),
+        (
+            json!({"full_name":"example-org/project","owner":{"login":null}}),
+            Some("invalid_repository"),
+        ),
+        (
+            json!({"full_name":"example-org/project","owner":false}),
+            Some("invalid_repository"),
+        ),
+        (json!({"full_name":3}), Some("invalid_repository")),
+        (json!(null), Some("invalid_repository")),
+    ];
+    for (repository, reason) in cases {
+        let payload = json!({"action":"opened","repository":repository});
+        let outcome = ingest(&restricted, secret, "issues", &payload).await;
+        match reason {
+            Some(expected) => assert!(
+                matches!(
+                    outcome, WebhookIngestOutcome::Ignored { ref reason } if reason == expected
+                ),
+                "{payload}: {outcome:?}"
+            ),
+            None => assert!(matches!(outcome, WebhookIngestOutcome::Published { .. })),
+        }
+    }
+    assert!(matches!(
+        ingest(&unrestricted, secret, "issues", &json!({"action":"opened"})).await,
+        WebhookIngestOutcome::Ignored { ref reason } if reason == "invalid_repository"
+    ));
+    let ping = json!({"organization":{"login":"Example-Org"}});
+    assert!(matches!(
+        ingest(&restricted, secret, "ping", &ping).await,
+        WebhookIngestOutcome::Ignored { ref reason } if reason == "repo_not_allowed"
+    ));
+    assert!(matches!(
+        ingest(&unrestricted, secret, "ping", &ping).await,
+        WebhookIngestOutcome::Published { .. }
+    ));
+    let events = host.events().await;
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].1.extensions["repo"], "example-team/exact.repo");
+    assert_eq!(events[1].1.extensions["repo"], "EXAMPLE-ORG/Release_Tools");
+    assert_eq!(events[2].1.event_type, "com.github.ping");
+    assert!(!events[2].1.extensions.contains_key("repo"));
+}
+
 // ============================================================================
 // Multi-Owner `repoTokens` Isolation, Private+Public Coalescing & Poller Cap
 // ============================================================================
