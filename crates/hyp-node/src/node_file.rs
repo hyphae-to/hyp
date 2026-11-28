@@ -324,6 +324,8 @@ pub struct SourceFile {
     id: Option<String>,
     #[serde(deserialize_with = "clean_string")]
     topic: Option<String>,
+    #[serde(deserialize_with = "present_value")]
+    expose_topic: Option<Value>,
     #[serde(deserialize_with = "clean_string")]
     api_base_url: Option<String>,
     #[serde(deserialize_with = "lenient")]
@@ -604,6 +606,33 @@ impl NodeFile {
             .map_err(String::as_str)
     }
 
+    /// Collect startup-only privacy rules before reconciling source or topic collisions.
+    pub fn native_local_only_topics(&self) -> Result<impl Iterator<Item = &str>, String> {
+        let mut topics = Vec::new();
+        for source in self.source_entries()?.unwrap_or_default() {
+            if source.enabled == Some(false)
+                || !matches!(
+                    source.kind.as_deref(),
+                    Some("github-public" | "github-webhook")
+                )
+            {
+                continue;
+            }
+            match source.expose_topic.as_ref() {
+                None | Some(Value::Bool(true)) => {}
+                Some(Value::Bool(false)) => {
+                    let topic = source.topic.as_deref().unwrap_or("github");
+                    if !hyp_proto::address::is_valid_topic(topic) {
+                        return Err(format!("Invalid local-only source topic '{topic}'"));
+                    }
+                    topics.push(topic);
+                }
+                _ => return Err("sources[].exposeTopic must be a boolean".to_string()),
+            }
+        }
+        Ok(topics.into_iter())
+    }
+
     pub fn state_dir(&self, path: &Path) -> Option<PathBuf> {
         let dir = self.state_dir.as_ref()?;
         Some(match path.parent() {
@@ -686,6 +715,31 @@ pub fn load_node_or_legacy_config(path: &Path) -> Result<LoadedNodeFile, String>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_source_visibility_defaults_to_exposed_and_requires_a_boolean() {
+        let file: NodeFile = serde_json::from_value(json!({
+            "sources": [
+                {"kind": "github-public", "topic": "public-default"},
+                {"kind": "github-webhook", "topic": "public-explicit", "exposeTopic": true},
+                {"kind": "github-webhook", "exposeTopic": false},
+                {"kind": "github-public", "topic": "local.private", "exposeTopic": false},
+                {"kind": "github-webhook", "topic": "disabled", "enabled": false, "exposeTopic": false}
+            ]
+        })).unwrap();
+        assert_eq!(
+            file.native_local_only_topics().unwrap().collect::<Vec<_>>(),
+            ["github", "local.private"],
+        );
+
+        for invalid in [json!(null), json!("false"), json!(0)] {
+            let file: NodeFile = serde_json::from_value(json!({
+                "sources": [{"kind": "github-webhook", "exposeTopic": invalid}]
+            }))
+            .unwrap();
+            assert!(file.native_local_only_topics().is_err());
+        }
+    }
 
     #[test]
     fn legacy_wakeup_retry_fields_preserve_precedence_across_spellings() {

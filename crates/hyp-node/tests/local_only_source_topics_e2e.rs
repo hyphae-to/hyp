@@ -8,20 +8,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{Method, Request, StatusCode};
+use http::{HeaderMap, Method, Request, StatusCode};
 use hyp_crypto::{Ed25519KeyPair, SecretBackend};
-use hyp_node::adapters::webhooks::{EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK};
+use hyp_node::adapters::webhooks::{
+    EXT_SOURCE_KIND, GitHubWebhookAdapter, GitHubWebhookConfig, SOURCE_KIND_EXTERNAL_WEBHOOK,
+    compute_hmac_sha256_header,
+};
+use hyp_node::adapters::{GitHubPublicAdapter, GitHubPublicConfig};
 use hyp_node::engine::http_util::{HttpClient, full_body};
 use hyp_node::engine::node::SubscribeRequest;
 use hyp_node::engine::peer_link::{
     PublishEventRequest, PutSubscriptionsRequest, SubscriptionInputWire,
 };
 use hyp_node::engine::{NodeConfig, NodeError, NodeProfile, TopicConfig, UnifiedNode};
+use hyp_node::node_file::NodeFile;
 use hyp_proto::address::NodeId;
 use hyp_proto::cloudevent::CloudEvent;
 use hyp_proto::filter::DiagnosticCode;
 use hyp_proto::scopes::ScopePreset;
-use hyp_store::{DeliveryMode, MailboxPutOptions, TrustTier, now_ms};
+use hyp_store::{DeliveryMode, TrustTier};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -116,18 +121,32 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     let guest_dir = TempDir::new().unwrap();
     let admin_key = Ed25519KeyPair::generate().unwrap();
 
-    // 1. Boot host node with one local-only source topic (`gmail`, default `exposeTopic: false`)
+    // 1. Boot host node with one local-only source topic (`private-alerts`, default `exposeTopic: false`)
     //    and one explicitly exposed source topic (`public-builds`, `exposeTopic: true`).
     let mut host_cfg = make_node_cfg("alice@laptop", NodeProfile::P2p, &host_dir);
     host_cfg.admin_jwk = Some(admin_proto_jwk(&admin_key));
+    let native: NodeFile = serde_json::from_value(json!({
+        "sources": [
+            {"kind": "github-webhook", "topic": "private-alerts", "exposeTopic": false},
+            {"kind": "github-webhook", "topic": "private-adapter", "exposeTopic": false},
+            {"kind": "github-public", "topic": "private-poll", "exposeTopic": false},
+            {"kind": "github-webhook", "topic": "public-builds"}
+        ]
+    }))
+    .unwrap();
+    host_cfg.local_only_topics.extend(
+        native
+            .native_local_only_topics()
+            .unwrap()
+            .map(str::to_owned),
+    );
     host_cfg.topics.push(TopicConfig {
-        topic: "gmail".to_string(),
-        kind: Some("source".to_string()),
-        description: Some("Personal Gmail source plugin".to_string()),
+        topic: "private-alerts".into(),
+        kind: Some("github-webhook".into()),
+        description: None,
         metadata: None,
         has_provisioned_publisher: true,
     });
-    host_cfg.local_only_topics.insert("gmail".to_string());
     host_cfg.topics.push(TopicConfig {
         topic: "public-builds".to_string(),
         kind: Some("source".to_string()),
@@ -137,6 +156,30 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     });
 
     let host = UnifiedNode::open(host_cfg).unwrap();
+    let webhook_secret = "fixture-webhook-key";
+    let webhook = Arc::new(GitHubWebhookAdapter::new(GitHubWebhookConfig::new(
+        "private-alerts",
+        "private-alerts",
+        webhook_secret,
+    )));
+    host.attach_github_webhook(Arc::clone(&webhook))
+        .await
+        .unwrap();
+    host.attach_github_webhook(Arc::new(GitHubWebhookAdapter::new(
+        GitHubWebhookConfig::new("private-adapter", "private-adapter", webhook_secret),
+    )))
+    .await
+    .unwrap();
+    host.attach_github_public(Arc::new(
+        GitHubPublicAdapter::new(GitHubPublicConfig {
+            topic: "private-poll".into(),
+            api_base_url: "http://127.0.0.1:9".into(),
+            ..Default::default()
+        })
+        .unwrap(),
+    ))
+    .await
+    .unwrap();
     let (host_addr, host_task) = Arc::clone(&host)
         .serve("127.0.0.1:0".parse().unwrap())
         .await
@@ -146,7 +189,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     // 2. Pair four real remote peer nodes with `member`, `observer`, `full`, and `guest` presets!
     let member = UnifiedNode::open(make_node_cfg(
         "peer-member@box",
-        NodeProfile::Local,
+        NodeProfile::Router,
         &member_dir,
     ))
     .unwrap();
@@ -182,7 +225,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     ] {
         let link = peer.peer_link("alice@laptop").await.expect("peer link");
 
-        // 3a. `/v1/manifest` MUST NOT advertise local-only `gmail`, MUST advertise `public-builds`.
+        // 3a. `/v1/manifest` MUST NOT advertise local-only `private-alerts`, MUST advertise `public-builds`.
         let manifest_outcome = link.fetch_manifest(None).await.unwrap();
         let payload = match manifest_outcome {
             hyp_node::engine::ManifestFetchOutcome::Signed { manifest, .. } => {
@@ -191,8 +234,11 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
             other => panic!("{label}: expected Signed manifest, got {other:?}"),
         };
         assert!(
-            !payload.advertised.topics.iter().any(|t| t.topic == "gmail"),
-            "{label}: local-only topic 'gmail' MUST NOT appear in remote /v1/manifest: {:?}",
+            !payload.advertised.topics.iter().any(|t| matches!(
+                t.topic.as_str(),
+                "private-alerts" | "private-adapter" | "private-poll"
+            )),
+            "{label}: local-only topic 'private-alerts' MUST NOT appear in remote /v1/manifest: {:?}",
             payload.advertised.topics
         );
         assert!(
@@ -205,12 +251,12 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
             payload.advertised.topics
         );
 
-        // 3b. `PUT /v1/subscriptions` on local-only `gmail` MUST fail closed with 403 `topic_local_only`!
+        // 3b. `PUT /v1/subscriptions` on local-only `private-alerts` MUST fail closed with 403 `topic_local_only`!
         let err = link
             .put_subscriptions(&PutSubscriptionsRequest {
                 subscriptions: vec![SubscriptionInputWire {
                     id: format!("snoop-{label}"),
-                    topic: "gmail".to_string(),
+                    topic: "private-alerts".to_string(),
                     filters: vec![],
                     coalesce_seconds: 0,
                     max_batch_age_ms: None,
@@ -221,7 +267,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
             })
             .await
             .expect_err(&format!(
-                "{label} preset holding stream:subscribe=* MUST be blocked from local-only topic 'gmail'"
+                "{label} preset holding stream:subscribe=* MUST be blocked from local-only topic 'private-alerts'"
             ));
         match err {
             NodeError::RemoteProblem(prob) => {
@@ -257,7 +303,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
                     },
                     SubscriptionInputWire {
                         id: format!("bad-mixed-{label}"),
-                        topic: "gmail".to_string(),
+                        topic: "private-alerts".to_string(),
                         filters: vec![],
                         coalesce_seconds: 0,
                         max_batch_age_ms: None,
@@ -281,6 +327,22 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         );
     }
 
+    // A paired router uses the same authenticated upstream subscription endpoint.
+    let relay_error = member
+        .subscribe_local_or_remote(SubscribeRequest {
+            id: None,
+            qualified_topic: "alice@laptop.private-alerts".into(),
+            subscriber_session: "relay-session".into(),
+            filters: vec![],
+            coalesce_seconds: 0,
+            mode: DeliveryMode::Full,
+        })
+        .await
+        .expect_err("upstream pushdown from a paired router must respect local-only policy");
+    assert!(
+        matches!(&relay_error, NodeError::RemoteProblem(p) if p.status == 403 && p.error == "topic_local_only")
+    );
+
     // 4. Unprivileged `guest` peer (no `stream:subscribe`) MUST receive `403 not_granted` (NOT
     //    `topic_local_only`) so unprivileged callers cannot enumerate local-only topic names.
     {
@@ -289,7 +351,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
             .put_subscriptions(&PutSubscriptionsRequest {
                 subscriptions: vec![SubscriptionInputWire {
                     id: "probe-guest".to_string(),
-                    topic: "gmail".to_string(),
+                    topic: "private-alerts".to_string(),
                     filters: vec![],
                     coalesce_seconds: 0,
                     max_batch_age_ms: None,
@@ -312,7 +374,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         }
     }
 
-    // 5. Subscription diagnostics for an unknown topic MUST NOT leak `"gmail"` in `(available: ...)`.
+    // 5. Subscription diagnostics for an unknown topic MUST NOT leak `"private-alerts"` in `(available: ...)`.
     {
         let obs_link = observer.peer_link("alice@laptop").await.expect("peer link");
         let resp = obs_link
@@ -332,29 +394,29 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
             .unwrap();
         for diag in &resp.diagnostics {
             assert!(
-                !diag.message.contains("gmail"),
-                "remote subscription diagnostic leaked local-only topic 'gmail': {diag:?}"
+                !diag.message.contains("private-alerts"),
+                "remote subscription diagnostic leaked local-only topic 'private-alerts': {diag:?}"
             );
         }
         let _ = obs_link.delete_subscription("probe-unknown").await;
     }
 
-    // 6. Remote `POST /v1/events` onto local-only `gmail` by `full` peer MUST fail closed with 403!
+    // 6. Remote `POST /v1/events` onto local-only `private-alerts` by `full` peer MUST fail closed with 403!
     {
         let full_link = full.peer_link("alice@laptop").await.expect("peer link");
         let spoof_ev = CloudEvent::new(
             "spoof-1",
             "spoof://remote",
             "com.evil.spoof",
-            json!({ "text": "forged gmail event" }),
+            json!({ "text": "forged private-alerts event" }),
         );
         let pub_err = full_link
             .publish_event(&PublishEventRequest {
-                topic: "gmail".to_string(),
+                topic: "private-alerts".to_string(),
                 event: spoof_ev,
             })
             .await
-            .expect_err("remote peer MUST NOT publish onto local-only topic 'gmail'");
+            .expect_err("remote peer MUST NOT publish onto local-only topic 'private-alerts'");
         assert!(
             matches!(&pub_err, NodeError::RemoteProblem(p) if p.status == 403 && p.error == "topic_local_only"),
             "expected 403 topic_local_only on remote POST /v1/events, got {pub_err:?}"
@@ -377,13 +439,13 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         .expect("observer should subscribe to exposed topic 'public-builds'");
     assert_eq!(exposed_sub.topic, "public-builds");
 
-    // 8. Same-node local session subscribes to `local.gmail` with `coalesceSeconds: 0`!
+    // 8. Same-node local session subscribes to `local.private-alerts` with `coalesceSeconds: 0`!
     //    Must succeed cleanly with zero `UnprovisionedTopic` diagnostics!
     host.register_session("local-owner", "{}").unwrap();
     let local_sub = host
         .subscribe_local_or_remote(SubscribeRequest {
-            id: Some("sub-local-gmail".to_string()),
-            qualified_topic: "local.gmail".to_string(),
+            id: Some("sub-local-private-alerts".to_string()),
+            qualified_topic: "local.private-alerts".to_string(),
             subscriber_session: "local-owner".to_string(),
             filters: vec![],
             coalesce_seconds: 0,
@@ -400,31 +462,19 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         local_sub.diagnostics
     );
 
-    // 9. Publish events onto BOTH `local.gmail` (local-only) and `local.public-builds` (exposed),
+    // 9. Publish events onto BOTH `local.private-alerts` (local-only) and `local.public-builds` (exposed),
     //    and flush immediately via public `deliver_local_topic_batches` (testing both bare and
     //    `local.`-prefixed topic forms!).
-    let mut gmail_ev = CloudEvent::new(
-        "gmail-priv-1",
-        "source:mailfeed",
-        "to.hyphae.mail.received",
-        json!({ "subject": "PRIVATE_OTP_991122" }),
+    let payload = br#"{"action":"opened","repository":{"full_name":"demo/project"},"issue":{"number":1,"title":"Private local notice"},"sender":{"login":"demo"}}"#;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-github-event", "issues".parse().unwrap());
+    headers.insert(
+        "x-hub-signature-256",
+        compute_hmac_sha256_header(webhook_secret.as_bytes(), payload)
+            .parse()
+            .unwrap(),
     );
-    gmail_ev.set_extension(EXT_SOURCE_KIND, SOURCE_KIND_EXTERNAL_WEBHOOK);
-    let gmail_ingest = host.publish_event("local.gmail", gmail_ev).await.unwrap();
-    assert_eq!(
-        gmail_ingest.matched, 1,
-        "only local session should match gmail"
-    );
-    let woken = host
-        .deliver_local_topic_batches(
-            "local.gmail",
-            &MailboxPutOptions::default(),
-            None,
-            None,
-            now_ms(),
-        )
-        .unwrap();
-    assert_eq!(woken, 1, "local session should be woken immediately");
+    webhook.ingest_webhook(&headers, payload).await.unwrap();
 
     let mut build_ev = CloudEvent::new(
         "build-pub-1",
@@ -442,20 +492,20 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         "remote observer should match public-builds"
     );
 
-    // Local session immediately received `PRIVATE_OTP_991122` with `hyphaesourcekind=external-webhook`!
+    // Local session immediately received `Private local notice` with `hyphaesourcekind=external-webhook`!
     let local_items = wait_for_mailbox_count(&host, "local-owner", 1, Duration::from_secs(2)).await;
     assert_eq!(local_items.len(), 1);
     let local_payload: Value = serde_json::from_str(&local_items[0].text).unwrap();
     assert_eq!(
-        local_payload["events"][0]["data"]["subject"],
-        "PRIVATE_OTP_991122"
+        local_payload["events"][0]["data"]["title"],
+        "Private local notice"
     );
     assert_eq!(
         local_payload["events"][0]["hyphaesourcekind"],
         "external-webhook"
     );
 
-    // Remote `observer` receives ONLY `public-builds` (and ZERO `gmail` events)!
+    // Remote `observer` receives ONLY `public-builds` (and ZERO `private-alerts` events)!
     let obs_items = wait_for_mailbox_count(&observer, "obs-sess", 1, Duration::from_secs(5)).await;
     assert_eq!(obs_items.len(), 1);
     let obs_payload: Value = serde_json::from_str(&obs_items[0].text).unwrap();
@@ -465,7 +515,7 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         "external-webhook"
     );
     assert!(
-        !obs_items[0].text.contains("PRIVATE_OTP_991122"),
+        !obs_items[0].text.contains("Private local notice"),
         "remote peer must NEVER receive private local-only topic content"
     );
 
@@ -484,13 +534,60 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     //     Now shut down `host` and reopen with `public-builds` added to `local_only_topics`!
     //     Stale remote subscriptions on `public-builds` MUST be pruned on startup while same-node
     //     local subscriptions remain intact!
+    let observer_link = observer.peer_link("alice@laptop").await.unwrap();
+    observer_link
+        .put_subscriptions(&PutSubscriptionsRequest {
+            subscriptions: vec![SubscriptionInputWire {
+                id: "legacy-prefixed".into(),
+                topic: "local.public-builds".into(),
+                filters: vec![],
+                coalesce_seconds: 0,
+                max_batch_age_ms: None,
+                max_wakes_per_hour: None,
+                mode: DeliveryMode::Full,
+            }],
+            replace_topic: None,
+        })
+        .await
+        .unwrap();
+
     host.shutdown();
     host_task.abort();
+    let _ = host_task.await;
+    // Keep an undelivered batch in SQLite to exercise removal of queued data at restart.
+    let prior_remote_id = host
+        .db()
+        .events()
+        .list_subscriptions(Some("peer-observer@box"))
+        .unwrap()
+        .into_iter()
+        .find(|s| s.topic == "public-builds")
+        .unwrap()
+        .id;
+    host.publish_event(
+        "local.public-builds",
+        CloudEvent::new(
+            "pending-before-restart",
+            "source:ci",
+            "com.demo.build",
+            json!({"status":"queued"}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        host.db()
+            .events()
+            .list_batches(&prior_remote_id)
+            .unwrap()
+            .iter()
+            .any(|batch| batch.state == hyp_store::BatchState::Pending)
+    );
 
     let mut host_cfg_locked = make_node_cfg("alice@laptop", NodeProfile::P2p, &host_dir);
     host_cfg_locked.admin_jwk = Some(admin_proto_jwk(&admin_key));
     host_cfg_locked.topics.push(TopicConfig {
-        topic: "gmail".to_string(),
+        topic: "private-alerts".to_string(),
         kind: Some("source".to_string()),
         description: None,
         metadata: None,
@@ -503,30 +600,65 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
         metadata: None,
         has_provisioned_publisher: true,
     });
-    host_cfg_locked
-        .local_only_topics
-        .insert("gmail".to_string());
-    host_cfg_locked
-        .local_only_topics
-        .insert("public-builds".to_string());
+    let locked: NodeFile = serde_json::from_value(json!({
+        "sources": [
+            {"kind": "github-webhook", "topic": "private-alerts", "exposeTopic": false},
+            {"kind": "github-webhook", "topic": "public-builds", "exposeTopic": false}
+        ]
+    }))
+    .unwrap();
+    host_cfg_locked.local_only_topics.extend(
+        locked
+            .native_local_only_topics()
+            .unwrap()
+            .map(str::to_owned),
+    );
 
     let host_reopened = UnifiedNode::open(host_cfg_locked).unwrap();
     {
         let db = host_reopened.db();
         let all_subs = db.events().list_subscriptions(None).unwrap();
         assert!(
+            db.events()
+                .list_batches(&prior_remote_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
             all_subs
                 .iter()
-                .any(|s| s.subscriber == "local-owner" && s.topic == "gmail"),
+                .any(|s| s.subscriber == "local-owner" && s.topic == "private-alerts"),
             "same-node local session subscription must survive restart: {all_subs:?}"
         );
         assert!(
-            !all_subs
-                .iter()
-                .any(|s| s.subscriber == "peer-observer@box" && s.topic == "public-builds"),
+            !all_subs.iter().any(|s| s.subscriber == "peer-observer@box"
+                && matches!(s.topic.as_str(), "public-builds" | "local.public-builds")),
             "stale remote peer subscription on newly local-only topic MUST be pruned on open: {all_subs:?}"
         );
     }
+
+    let (_, reopened_task) = Arc::clone(&host_reopened).serve(host_addr).await.unwrap();
+    let manifest = observer_link.fetch_manifest(None).await.unwrap();
+    let hyp_node::engine::ManifestFetchOutcome::Signed { manifest, .. } = manifest else {
+        panic!("expected signed manifest after restart");
+    };
+    assert!(
+        !manifest
+            .decode_payload()
+            .unwrap()
+            .advertised
+            .topics
+            .iter()
+            .any(|t| t.topic == "public-builds")
+    );
+    assert!(
+        observer_link
+            .list_subscriptions()
+            .await
+            .unwrap()
+            .subscriptions
+            .is_empty()
+    );
 
     // Publishing to `public-builds` now matches 0 remote subscribers!
     let build_ev2 = CloudEvent::new(
@@ -549,4 +681,5 @@ async fn local_only_topics_fail_closed_across_member_observer_full_presets_and_p
     full.shutdown();
     guest.shutdown();
     host_reopened.shutdown();
+    reopened_task.abort();
 }

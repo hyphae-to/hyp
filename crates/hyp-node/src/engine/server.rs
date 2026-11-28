@@ -883,6 +883,10 @@ async fn route_request(
                     .events()
                     .list_subscriptions(Some(&caller.peer_id))?
                     .into_iter()
+                    .filter(|s| {
+                        s.origin_node != node.node_id().as_str()
+                            || !node.is_local_only_topic(&s.topic)
+                    })
                     .map(|mut s| {
                         if let Some(stripped) = s.id.strip_prefix(&prefix) {
                             s.id = stripped.to_string();

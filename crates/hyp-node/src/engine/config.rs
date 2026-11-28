@@ -578,6 +578,13 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    pub(crate) fn is_local_only_topic(&self, topic: &str) -> bool {
+        self.local_only_topics.contains(topic)
+            || topic
+                .strip_prefix("local.")
+                .is_some_and(|bare| self.local_only_topics.contains(bare))
+    }
+
     /// Creates a `NodeConfig` for a given `node_id`, `profile`, and `state_dir`.
     pub fn new(node_id: NodeId, profile: NodeProfile, state_dir: impl Into<PathBuf>) -> Self {
         Self {

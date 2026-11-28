@@ -60,6 +60,10 @@ Default workstation path: `~/.config/hyphae/node.json` (`0600`). Server path: `/
 - **`kind: "github-public"`**: `topic` (`"github"`), `allowPrivateWithToken` (bool), `minPollIntervalSeconds` (`60`), `graceWindowSeconds` (`300`), `maxActivePollers` (`100`), `repoTokens` (`{ "owner/*": { "secret": "..." }, "owner/repo": { "secret": "..." } }`).
 - **`kind: "github-webhook"`**: `topic` (recommend `"github-webhooks"` on hubs with guest pairing), `secret: { "secret": "..." }`, optional `allowedRepos`, `allowedOrgs`, `maxBodyBytes`. See [repository webhook setup](../plugins.md#repository-webhook-setup).
 
+Both native source kinds accept `exposeTopic: false` to keep their topic local. Same-node sessions can still discover, subscribe to, and receive the topic. Paired peers and relays cannot discover or subscribe to it, even with a wildcard stream grant. An enabled native source's local-only setting takes precedence over declarations of the same topic in `topics[]` or another source or plugin. Omit the setting or use `true` to retain the existing scope-based remote access. Other values cause a startup config error.
+
+Restart the node to apply changes to `sources[]`. Startup removes existing remote subscriptions and their queued batches on newly local-only topics. Local subscriptions stay active.
+
 Configure generic HTTP and Alertmanager receivers in `plugins[]`. See [webhook plugin migration](../plugins.md#webhook-plugin-migration) for the former native source settings.
 
 ### Local Ingest (`localIngest`)
@@ -71,7 +75,7 @@ Enabled by default even when omitted (`defaultTopic: "schedule"`, accepting `to.
 - `command` *(alias `exec`)* and `args`: Absolute binary and verified script path returned by `hyp plugin install <name> --json`.
 - `targets`: List of target identifiers (e.g. `["my_assistant_bot"]`; for `id: "telegram"`, omitting `targets` auto-resolves the bot's Telegram username via `getMe` with `"personal"` as fallback).
 - `kind`: `"bridge"` (thread-linked chat bridge) or `"source"` (1-to-many `hyp_stream` topic named after each target). Omitted, it defaults to `source` for `prometheus`, `agentmail`, `sentry`, `gmail`, `google-calendar`, `vercel`, `notion` and for `webhook` without `WEBHOOK_POST_URL`; otherwise `bridge`.
-- `exposeTopic`: Boolean (default **`false`**). Bridge topics stay local-only unless explicitly set to `true`. Source topics are always subscribable by paired peers holding a matching `stream:subscribe` scope.
+- `exposeTopic`: Boolean (default **`false`**). Bridge and source topics stay local-only unless explicitly exposed. Remote access to an exposed topic still requires a matching `stream:subscribe` scope.
 - The node adds `HYPHAE_STATE_DIR` (its state directory) to every plugin's environment unless `env` sets it.
 - `env`: Map of string values or `{ "secret": "<name>" }` references.
 
