@@ -14,6 +14,18 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "hyp hook claude user-prompt-submit",
+            "statusMessage": "Hyphae · Inject queued messages",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "mcp__hyphae__.*",

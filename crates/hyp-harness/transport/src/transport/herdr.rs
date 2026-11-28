@@ -147,6 +147,7 @@ pub struct HerdrTerminalInfo {
 #[derive(Debug, Clone)]
 pub struct HerdrTransport {
     target: HerdrTarget,
+    claude_turn_hooks: bool,
     get_timeout: Duration,
     interrupt_timeout: Duration,
     send_timeout: Duration,
@@ -158,10 +159,18 @@ impl HerdrTransport {
     pub fn new(target: HerdrTarget) -> Self {
         Self {
             target,
+            claude_turn_hooks: false,
             get_timeout: DEFAULT_GET_TIMEOUT,
             interrupt_timeout: DEFAULT_INTERRUPT_TIMEOUT,
             send_timeout: DEFAULT_SEND_TIMEOUT,
         }
+    }
+
+    /// Claude's turn hooks select when to queue or interrupt. Background shells
+    /// can keep the terminal's reported status working between foreground turns.
+    pub fn with_claude_turn_hooks(mut self, enabled: bool) -> Self {
+        self.claude_turn_hooks = enabled;
+        self
     }
 
     /// Customizes per-phase command timeouts (useful for fast deterministic tests).
@@ -202,48 +211,56 @@ impl HerdrTransport {
             GetStateOutcome::Unavailable => return PushOutcome::hold("herdr_target_unavailable"),
         };
 
-        // Step 3: Gate on initial agent state (never interrupt in Queue mode).
-        let (current_state, interrupted) = match initial_state.as_str() {
-            "idle" | "done" => (initial_state, false),
-            "working" if mode == PushMode::Queue => return PushOutcome::hold("herdr_working"),
-            "working" => {
-                // Step 4: Interrupt active work and verify stop outcome before re-checking state.
-                let interrupt_args = [
-                    "interrupt",
-                    "--json",
-                    "--timeout",
-                    INTERRUPT_CLI_TIMEOUT_SECS,
-                    self.target.terminal_id.as_str(),
-                ];
-                let interrupt_out = runner
-                    .run(&self.target.bin, &interrupt_args, self.interrupt_timeout)
-                    .await;
-                let stopped = matches!(
-                    interrupt_out,
-                    CommandOutcome::Completed {
-                        code: Some(0),
-                        ref stdout,
-                        ..
-                    } if parse_herdr_interrupt_stopped(stdout)
-                );
-                if !stopped {
-                    return PushOutcome::reject("herdr_interrupt_outcome_unknown");
-                }
-
-                // Re-run `hc get --json <terminal_id>` and verify live identity + ready state.
-                match self.fetch_verified_agent_state(runner).await {
-                    GetStateOutcome::Ready(state) if state == "idle" || state == "done" => {
-                        (state, true)
-                    }
-                    _ => return PushOutcome::hold_interrupted("herdr_agent_not_ready"),
-                }
+        if !matches!(initial_state.as_str(), "idle" | "done" | "working") {
+            return PushOutcome::hold(format!("herdr_{initial_state}"));
+        }
+        if !self.claude_turn_hooks && initial_state == "working" && mode == PushMode::Queue {
+            return PushOutcome::hold("herdr_working");
+        }
+        let interrupted =
+            mode == PushMode::Interrupt && (self.claude_turn_hooks || initial_state == "working");
+        let current_state = if interrupted {
+            // Claude's lifecycle already selected an interrupt. Ask hc to issue the
+            // stop key without waiting for background shells to report idle.
+            let timeout = if self.claude_turn_hooks {
+                "0"
+            } else {
+                INTERRUPT_CLI_TIMEOUT_SECS
+            };
+            let args = [
+                "interrupt",
+                "--json",
+                "--timeout",
+                timeout,
+                self.target.terminal_id.as_str(),
+            ];
+            let out = runner
+                .run(&self.target.bin, &args, self.interrupt_timeout)
+                .await;
+            let acknowledged = matches!(
+                out,
+                CommandOutcome::Completed { code: Some(0), ref stdout, .. }
+                    if parse_interrupt_ack(stdout, self.claude_turn_hooks)
+            );
+            if !acknowledged {
+                return PushOutcome::reject("herdr_interrupt_outcome_unknown");
             }
-            other => return PushOutcome::hold(format!("herdr_{other}")),
+            match self.fetch_verified_agent_state(runner).await {
+                GetStateOutcome::Ready(state)
+                    if state == "idle"
+                        || state == "done"
+                        || (self.claude_turn_hooks && state == "working") =>
+                {
+                    state
+                }
+                _ => return PushOutcome::hold_interrupted("herdr_agent_not_ready"),
+            }
+        } else {
+            initial_state
         };
 
-        // Step 5: Guarded paste & submit.
-        // Herdr `send` supports `--if idle`; `"done"` is reported as a distinct ready state.
-        let send_out = if current_state == "idle" {
+        // Plain send retains hc's own draft and blocked-dialog guards.
+        let send_out = if !self.claude_turn_hooks && current_state == "idle" {
             let args = [
                 "send",
                 "--json",
@@ -310,6 +327,10 @@ impl PushTransport for HerdrTransport {
 
     fn supports_interrupt(&self) -> bool {
         true
+    }
+
+    fn interrupt_requires_active_turn(&self) -> bool {
+        self.claude_turn_hooks
     }
 
     fn herdr_terminal_id(&self) -> Option<&str> {
@@ -640,13 +661,19 @@ fn is_valid_agent_state(state: &str) -> bool {
 
 /// Returns `true` iff `hc interrupt --json` output is a JSON object with `"outcome": "stopped"`.
 pub fn parse_herdr_interrupt_stopped(stdout: &str) -> bool {
+    parse_interrupt_ack(stdout, false)
+}
+
+fn parse_interrupt_ack(stdout: &str, accept_working: bool) -> bool {
     serde_json::from_str::<Value>(stdout.trim())
         .ok()
         .and_then(|v| {
             v.as_object()
                 .and_then(|obj| obj.get("outcome"))
                 .and_then(Value::as_str)
-                .map(|outcome| outcome == "stopped")
+                .map(|outcome| {
+                    outcome == "stopped" || (accept_working && outcome == "still_working")
+                })
         })
         .unwrap_or(false)
 }

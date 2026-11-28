@@ -308,7 +308,7 @@ async fn restart_auto_hydrates_persisted_herdr_transport_and_flushes_on_startup(
     let calls_file = dir.path().join("hc_send_calls.log");
     let sid = "claude:herdr-restart";
 
-    // Build a tiny deterministic fake `hc` script reporting terminal `t7` as live & idle.
+    // Build a tiny deterministic fake `hc` script reporting a live Claude terminal with background work.
     let hc_tmp = dir.path().join("hc.tmp");
     let hc_bin = dir.path().join("hc");
     let script = format!(
@@ -317,7 +317,7 @@ set -eu
 CMD="${{1:-}}"
 case "$CMD" in
   get)
-    printf '%s\n' '{{"address":"t7","created_ms":1700000000123,"pid":4242,"state":"live","status":{{"app":"claude-code","state":"idle"}}}}'
+    printf '%s\n' '{{"address":"t7","created_ms":1700000000123,"pid":4242,"state":"live","status":{{"app":"claude-code","state":"working"}}}}'
     exit 0
     ;;
   send)
@@ -396,7 +396,7 @@ esac
         if let Ok(content) = fs::read_to_string(&calls_file) {
             if !content.trim().is_empty() {
                 assert_eq!(
-                    content.matches("send --json --if idle t7 ").count(),
+                    content.matches("send --json t7 ").count(),
                     1,
                     "expected strictly one Herdr wake digest on startup, got:\n{content}"
                 );
@@ -427,7 +427,7 @@ esac
     tokio::time::sleep(Duration::from_millis(50)).await;
     let final_log = fs::read_to_string(&calls_file).unwrap();
     assert_eq!(
-        final_log.matches("send --json --if idle t7 ").count(),
+        final_log.matches("send --json t7 ").count(),
         1,
         "startup flush must not re-nudge Herdr terminal: {final_log}"
     );

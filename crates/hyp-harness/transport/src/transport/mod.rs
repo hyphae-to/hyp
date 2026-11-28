@@ -223,6 +223,11 @@ pub trait PushTransport: Send + Sync {
         false
     }
 
+    /// Whether hook activity determines when interrupt urgency needs an actual stop key.
+    fn interrupt_requires_active_turn(&self) -> bool {
+        false
+    }
+
     /// Returns the bound Herdr terminal ID when this transport targets a Herdr terminal.
     fn herdr_terminal_id(&self) -> Option<&str> {
         None

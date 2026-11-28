@@ -381,16 +381,14 @@ esac
             .to_string()
         };
         hc.set_get_default(0, &state("working"));
-        for recheck in [2, 4, 6] {
-            hc.set_get_seq(recheck, 0, &state("idle"));
-        }
-        hc.set_interrupt(0, r#"{"outcome":"stopped"}"#);
+        hc.set_interrupt(0, r#"{"outcome":"still_working"}"#);
         hc.set_send(0, r#"{"outcome":"sent"}"#);
         daemon.register_session_transport(
             SESSION,
-            Arc::new(HerdrTransport::new(
-                HerdrTarget::new("burst-terminal").with_bin(hc.bin()),
-            )),
+            Arc::new(
+                HerdrTransport::new(HerdrTarget::new("burst-terminal").with_bin(hc.bin()))
+                    .with_claude_turn_hooks(true),
+            ),
         );
 
         let sock = daemon.socket_path();
@@ -532,6 +530,155 @@ esac
             .expect("the next isolated interrupt should only wait for hook grace");
         assert_eq!(count_interrupts(), 3);
         mcp.close().await;
+        daemon.shutdown();
+    }
+
+    #[tokio::test]
+    async fn claude_turn_hooks_take_precedence_over_herdr_activity() {
+        use std::sync::Arc;
+
+        use common::{run_hook, run_hook_with_hints, wait_for_live_transport};
+        use hyp_crypto::SecretBackend;
+        use hyp_harness::daemon::{InboundItem, LocalDaemon, LocalDaemonConfig};
+        use hyp_harness::hooks::{HookEvent, HookTransportHints};
+        use hyp_harness::protocol::HarnessKind;
+        use hyp_node::delivery::{DeliveryRule, DeliveryUrgency};
+        use hyp_node::engine::{NodeConfig, UnifiedNode};
+        use hyp_node::gates::TrustTier;
+        use hyp_proto::address::NodeId;
+        use hyp_store::MailboxKind;
+
+        const SID: &str = "claude:monitors";
+        hyp_harness::enable_test_env_isolation();
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = NodeConfig::local(NodeId::new("hooks@local").unwrap(), dir.path());
+        cfg.secret_backend = Some(SecretBackend::File);
+        let node = UnifiedNode::open(cfg).unwrap();
+        node.register_session(SID, r#"{"kind":"claude"}"#).unwrap();
+        let hc = FakeHc::new();
+        let state = |word| nested_json("t3", 100, 42, "claude-code", word);
+        hc.set_get_default(0, &state("idle"));
+        let daemon = LocalDaemon::start(
+            Arc::clone(&node),
+            None,
+            LocalDaemonConfig {
+                auto_detect_transports: true,
+                queue_activity_lease: Duration::from_secs(1),
+                herdr_bin: Some(hc.bin()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let sock = daemon.socket_path();
+        let payload = json!({"session_id":"monitors"});
+        run_hook_with_hints(
+            sock,
+            HarnessKind::Claude,
+            HookEvent::SessionStart,
+            payload.clone(),
+            HookTransportHints {
+                herdr_terminal_id: Some("t3".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        wait_for_live_transport(sock, SID).await;
+        run_hook(
+            sock,
+            HarnessKind::Claude,
+            HookEvent::PreInvocation,
+            payload.clone(),
+        )
+        .await;
+        hc.reset_calls();
+        let ingest = |id: &str, source: &str| {
+            daemon.ingest_inbound(InboundItem {
+                session_id: SID.into(),
+                origin_node: node.node_id().to_string(),
+                item_id: id.into(),
+                source: source.into(),
+                text: "private event body".into(),
+                kind: MailboxKind::Event,
+                trust_tier: TrustTier::SelfHost,
+            })
+        };
+        ingest("during-turn", "local.schedule").await.unwrap();
+        assert!(
+            hc.recorded_calls().is_empty(),
+            "active Claude turn holds a queue even if Herdr reports idle"
+        );
+        hc.set_get_default(0, &state("working"));
+        let stop = run_hook(sock, HarnessKind::Claude, HookEvent::Stop, payload.clone()).await;
+        assert!(
+            stop["reason"]
+                .as_str()
+                .unwrap()
+                .contains("<stream topic=\"local.schedule\"")
+        );
+        assert!(
+            hc.recorded_calls().is_empty(),
+            "turn end surfaces the digest inline"
+        );
+        assert_eq!(
+            run_hook(sock, HarnessKind::Claude, HookEvent::Stop, payload).await,
+            json!({})
+        );
+
+        ingest("after-stop", "local.schedule").await.unwrap();
+        let calls = hc.recorded_calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0], ["get", "--json", "t3"]);
+        assert_eq!(calls[1][..3], ["send", "--json", "t3"]);
+        assert_eq!(calls[1].len(), 4);
+        assert!(calls[1][3].contains("<stream topic=\"local.schedule\""));
+        assert!(!calls[1][3].contains("private event body"));
+        assert_eq!(node.db().local().unnotified_count(SID).unwrap(), 0);
+        assert_eq!(node.db().local().pending_count(SID).unwrap(), 2);
+        hc.reset_calls();
+        {
+            let db = node.db();
+            let mut policy = daemon.delivery().policy(&db, SID).unwrap();
+            policy.upsert_rule(DeliveryRule::new(
+                "local.schedule",
+                DeliveryUrgency::Interrupt,
+            ));
+            daemon.delivery().set_policy(&db, SID, policy).unwrap();
+        }
+        assert_eq!(
+            ingest("urgent-after-stop", "local.schedule").await.unwrap(),
+            Some(DeliveryUrgency::Interrupt)
+        );
+        let calls = hc.recorded_calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(
+            calls[1][..3],
+            ["send", "--json", "t3"],
+            "idle Claude needs no interrupt"
+        );
+        hc.reset_calls();
+        run_hook(
+            sock,
+            HarnessKind::Claude,
+            HookEvent::PreInvocation,
+            json!({"session_id":"monitors"}),
+        )
+        .await;
+        assert_eq!(
+            ingest("missed-stop", "local.other").await.unwrap(),
+            Some(DeliveryUrgency::Queue)
+        );
+        assert!(hc.recorded_calls().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node.db().local().unnotified_count(SID).unwrap() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("lease expiry retries held queue with no further arrival or Stop");
+        let calls = hc.recorded_calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[1][..3], ["send", "--json", "t3"]);
         daemon.shutdown();
     }
 
@@ -997,8 +1144,6 @@ esac
     #[tokio::test]
     async fn e2e_unknown_agent_state_holds_with_state_reason() {
         let hc = FakeHc::new();
-        hc.set_get_default(0, &nested_json("t3", 100, 4242, "codex", "permission"));
-
         let transport = HerdrTransport::new(HerdrTarget {
             terminal_id: "t3".into(),
             created_ms: Some(100),
@@ -1007,13 +1152,19 @@ esac
             bin: hc.bin(),
         });
 
-        for mode in [PushMode::Queue, PushMode::Interrupt] {
-            hc.reset_calls();
-            assert_eq!(
-                transport.deliver(&test_digest(), mode).await,
-                PushOutcome::hold("herdr_permission")
-            );
-            assert_eq!(hc.recorded_calls(), vec![vec!["get", "--json", "t3"]]);
+        for hooks in [false, true] {
+            let transport = transport.clone().with_claude_turn_hooks(hooks);
+            for state in ["blocked", "permission"] {
+                hc.set_get_default(0, &nested_json("t3", 100, 4242, "codex", state));
+                for mode in [PushMode::Queue, PushMode::Interrupt] {
+                    hc.reset_calls();
+                    assert_eq!(
+                        transport.deliver(&test_digest(), mode).await,
+                        PushOutcome::hold(format!("herdr_{state}"))
+                    );
+                    assert_eq!(hc.recorded_calls(), vec![vec!["get", "--json", "t3"]]);
+                }
+            }
         }
     }
 
