@@ -1296,7 +1296,7 @@ fn compose_fullscreen_anim_frame(
     let (term_rows, term_cols) = term_size;
     let (canvas_w, canvas_h) = canvas_size;
     let art = render_frame(frame_idx, total_frames, 0, canvas_w, canvas_h, color_mode);
-    let version = env!("CARGO_PKG_VERSION");
+    let version = hyp_proto::build_version();
     let footer_main = format!("hyphae v{version} · growing local mesh...");
     let footer_hint = if show_skip_hint {
         "press any key to skip"
@@ -3415,7 +3415,7 @@ fn build_banner_lines_at_tick(
     }
 
     // Dimmed plain-text version centered directly underneath the animated HYPHAE wordmark.
-    let ver_label = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let ver_label = truncate_chars(&format!("v{}", hyp_proto::build_version()), term_cols);
     let ver_pad = " ".repeat(term_cols.saturating_sub(ver_label.chars().count()) / 2);
     let ver_styled = match color_mode {
         ColorMode::Plain => ver_label,
@@ -5487,7 +5487,7 @@ pub fn render_setup_toggle_screen(
         }
     }
 
-    let version = env!("CARGO_PKG_VERSION");
+    let version = hyp_proto::build_version();
     let title = if include_node_bootstrap {
         format!("hyphae v{version} · local CLI setup — choose harnesses & components")
     } else {
@@ -6962,7 +6962,7 @@ fn run_numbered_fallback_wizard(
     let dispatch = WizardDispatch::new(args, home, existing_node, cli_bin);
     play_mycelium_animation(args.no_anim);
 
-    let version = env!("CARGO_PKG_VERSION");
+    let version = hyp_proto::build_version();
     println!();
     if let Some(existing) = existing_node {
         let legacy_tag = if existing.is_legacy_v1 {
@@ -7478,7 +7478,7 @@ mod tests {
         assert_eq!(banner.len(), 10);
         assert_eq!(
             banner.last().map(|s| s.trim()),
-            Some(format!("v{}", env!("CARGO_PKG_VERSION")).as_str())
+            Some(format!("v{}", hyp_proto::build_version()).as_str())
         );
         let banner_text = banner.join("\n");
         assert!(banner_text.chars().any(is_braille_char));
@@ -7934,7 +7934,7 @@ mod tests {
                 "expected clean setup prompt in main menu:\n{joined}"
             );
             assert!(
-                joined.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+                joined.contains(&format!("v{}", hyp_proto::build_version())),
                 "expected version directly under animated banner:\n{joined}"
             );
             assert!(

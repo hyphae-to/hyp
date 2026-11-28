@@ -58,7 +58,7 @@ use crate::ui::{EXIT_ERROR, EXIT_OK, EXIT_USAGE};
 #[command(
     name = "hyp",
     about = "Hyphae v2 native CLI (hook, statusline, mcp, wait, watch, node, onboard, setup, plugin, inspect, session, ui, status, doctor, secret, exec, gate, inbox, kv, emit, auth, drop, relay, update, uninstall, deploy, pair, version)",
-    version
+    version = hyp_proto::build_version()
 )]
 struct Cli {
     #[command(subcommand)]
@@ -529,7 +529,7 @@ fn main() -> ExitCode {
         Commands::Session(args) => finish_command(session_cmd::run_session(&args)),
         Commands::Ui(args) => finish_command(ui_tui::run_ui(&args)),
         Commands::Version { json: as_json } => {
-            let version = env!("CARGO_PKG_VERSION");
+            let version = hyp_proto::build_version();
             if as_json {
                 let envelope = json!({
                     "ok": true,

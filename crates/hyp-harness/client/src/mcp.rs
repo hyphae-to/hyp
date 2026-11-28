@@ -485,7 +485,7 @@ fn initialize_result(params: &Map<String, Value>, options: &McpOptions) -> Value
     );
     json!({
         "protocolVersion": protocol_version,
-        "serverInfo": { "name": "hyphae", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "hyphae", "version": hyp_proto::build_version() },
         "capabilities": capabilities,
         "instructions": instructions,
     })

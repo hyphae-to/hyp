@@ -8,7 +8,7 @@
 mod common;
 
 use common::{
-    ManagedProcess, McpSubprocess, hyp_bin, isolated_cmd, run_claude_pre_tool_use_hook,
+    ManagedProcess, McpSubprocess, isolated_cmd, run_claude_pre_tool_use_hook,
     wait_for_session_live,
 };
 use serde_json::{Value, json};
@@ -81,26 +81,32 @@ fn start_native_rust_daemon() -> NativeRustDaemon {
 
 #[test]
 fn version_plain_and_json_envelope() {
-    let plain = Command::new(hyp_bin())
-        .arg("version")
-        .output()
-        .expect("run hyp version");
-    assert_eq!(plain.status.code(), Some(0));
-    assert!(
-        String::from_utf8_lossy(&plain.stdout).starts_with("hyphae "),
-        "stdout: {}",
-        String::from_utf8_lossy(&plain.stdout)
+    let tmp = tempfile::tempdir().unwrap();
+    let expected = env!("HYPHAE_BUILD_VERSION");
+    let run = |args: &[&str]| {
+        let out = isolated_cmd(tmp.path())
+            .args(args)
+            .env("HYPHAE_BUILD_VERSION", "0.0.0-runtime-override")
+            .output()
+            .expect("run hyp version query");
+        assert_eq!(out.status.code(), Some(0));
+        out.stdout
+    };
+    assert_eq!(
+        String::from_utf8(run(&["--version"])).unwrap().trim(),
+        format!("hyp {expected}")
+    );
+    assert_eq!(
+        String::from_utf8(run(&["version"])).unwrap().trim(),
+        format!("hyphae {expected}")
     );
 
-    let json_out = Command::new(hyp_bin())
-        .args(["version", "--json"])
-        .output()
-        .expect("run hyp version --json");
-    assert_eq!(json_out.status.code(), Some(0));
-    let env: Value = serde_json::from_slice(&json_out.stdout).expect("valid JSON envelope");
+    let json_out = run(&["version", "--json"]);
+    let env: Value = serde_json::from_slice(&json_out).expect("valid JSON envelope");
     assert_eq!(env["ok"], true);
     assert_eq!(env["command"], "version");
     assert_eq!(env["data"]["name"], "hyphae");
+    assert_eq!(env["data"]["version"], expected);
     assert_eq!(env["data"]["protocol"], 2);
 }
 
@@ -184,8 +190,11 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
         &fs::read_to_string(daemon.state_dir.join("node.status.json")).unwrap(),
     )
     .unwrap();
+    let expected = env!("HYPHAE_BUILD_VERSION");
     assert_eq!(status_file["socketPath"], sock_str);
+    assert_eq!(status_file["version"], expected);
     assert_eq!(daemon.startup_envelope["data"]["socketPath"], sock_str);
+    assert_eq!(daemon.startup_envelope["data"]["version"], expected);
 
     let status_out = isolated_cmd(daemon.tmp.path())
         .args([
@@ -202,11 +211,14 @@ fn cli_subprocesses_mcp_hook_and_wait_interop() {
     let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
     assert_eq!(status_json["ok"], true);
     assert_eq!(status_json["data"]["node"]["socketPath"], sock_str);
+    assert_eq!(status_json["data"]["node"]["binaryVersion"], expected);
+    assert_eq!(status_json["data"]["node"]["daemonBinaryVersion"], expected);
 
     // 1. Spawn `hyp mcp <socket>` subprocess with bounded-timeout RPCs
     let mut mcp = McpSubprocess::spawn(daemon.tmp.path(), &socket_path);
     let init = mcp.initialize(RPC_TIMEOUT);
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(init["result"]["serverInfo"]["version"], expected);
 
     // Verify `tools/list` returns exactly the 4 core tools
     let list = mcp.rpc(

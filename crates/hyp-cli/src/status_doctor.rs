@@ -537,7 +537,7 @@ fn run_status_or_doctor(
     }
 
     if let Some(ref daemon_ver) = daemon_binary_version {
-        let cli_ver = env!("CARGO_PKG_VERSION");
+        let cli_ver = hyp_proto::build_version();
         if daemon_ver != cli_ver {
             checks.push(CliCheck::warn(
                 "DAEMON_VERSION_SKEW",
@@ -994,7 +994,7 @@ fn run_status_or_doctor(
             "nodeId": node_id,
             "profile": profile_as_str(profile),
             "version": DEFAULT_HYPHAE_VERSION,
-            "binaryVersion": env!("CARGO_PKG_VERSION"),
+            "binaryVersion": hyp_proto::build_version(),
             "daemonBinaryVersion": daemon_binary_version,
             "daemonPid": daemon_pid,
             "protocol": PROTOCOL_VERSION,
@@ -1058,7 +1058,7 @@ fn run_status_or_doctor(
         println!(
             "  Version:  {} (bin {}, proto v{})",
             DEFAULT_HYPHAE_VERSION,
-            env!("CARGO_PKG_VERSION"),
+            hyp_proto::build_version(),
             PROTOCOL_VERSION
         );
         if let Some(ref k) = kid {
@@ -1090,8 +1090,8 @@ fn run_status_or_doctor(
                 .unwrap_or_else(|| "-".to_string());
             let ver_str = daemon_binary_version.as_deref().unwrap_or("-");
             let skew_note = match daemon_binary_version.as_deref() {
-                Some(v) if v != env!("CARGO_PKG_VERSION") => {
-                    format!(" [WARN: skew vs CLI {}]", env!("CARGO_PKG_VERSION"))
+                Some(v) if v != hyp_proto::build_version() => {
+                    format!(" [WARN: skew vs CLI {}]", hyp_proto::build_version())
                 }
                 _ => String::new(),
             };

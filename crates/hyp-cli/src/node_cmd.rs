@@ -712,7 +712,7 @@ fn node_start(args: NodeStartArgs) -> Result<ExitCode, CliError> {
                 .set_metadata("node_profile", profile_as_str(profile));
             let _ = db
                 .local()
-                .set_metadata("node_version", env!("CARGO_PKG_VERSION"));
+                .set_metadata("node_version", hyp_proto::build_version());
         }
 
         // Attach and start demand-driven `github-public` adapter BEFORE serving HTTP!
@@ -985,7 +985,7 @@ fn node_start(args: NodeStartArgs) -> Result<ExitCode, CliError> {
             "pid": pid,
             "nodeId": node.node_id().as_str(),
             "profile": profile_as_str(profile),
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": hyp_proto::build_version(),
             "kid": kid,
             "fingerprint": fingerprint,
             "bind": bound_addr.map(|a| a.to_string()),
