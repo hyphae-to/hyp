@@ -1224,6 +1224,73 @@ fn kv_cli_and_mcp_wake_two_subscribers_under_the_real_node_id() {
 }
 
 #[test]
+fn herdr_status_publisher_writes_and_filters_two_exact_builder_keys() {
+    let mut daemon = start_native_rust_daemon();
+    let home = daemon.tmp.path();
+    let state = daemon.state_dir.to_str().unwrap();
+    let socket = daemon.socket_path.as_deref().unwrap();
+    let mut mcp = McpSubprocess::spawn(home, socket);
+    mcp.initialize(RPC_TIMEOUT);
+
+    let call = |mcp: &mut McpSubprocess, session, tool, args| {
+        let (text, is_error) =
+            mcp.call_verified_claude(home, socket, session, tool, args, RPC_TIMEOUT);
+        assert!(!is_error, "{text}");
+        serde_json::from_str::<Value>(&text).unwrap()
+    };
+    for key in ["builder-a", "builder-b"] {
+        call(
+            &mut mcp,
+            key,
+            "hyp_mesh",
+            json!({"action":"join","handle":key}),
+        );
+        call(
+            &mut mcp,
+            key,
+            "hyp_stream",
+            json!({"action":"subscribe","topic":"local.kv","coalesceSeconds":0,
+                   "filters":[{"exact":{"ns":"herdr-status","key":key}}]}),
+        );
+    }
+
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/herdr-status/kv-fixture.mjs");
+    let result = Command::new("node")
+        .arg(fixture)
+        .args([common::hyp_bin(), state])
+        .env("HYPHAE_SECRET_BACKEND", "file")
+        .output()
+        .expect("run Herdr status publisher fixture");
+    assert!(result.status.success(), "{result:?}");
+    for (key, expected) in [
+        ("builder-a", &["working", "blocked", "finished"][..]),
+        ("builder-b", &["idle"][..]),
+    ] {
+        let deadline = std::time::Instant::now() + RPC_TIMEOUT;
+        let mut states = Vec::new();
+        while states.len() < expected.len() {
+            assert!(std::time::Instant::now() < deadline, "{key}: {states:?}");
+            let inbox = call(&mut mcp, key, "hyp_inbox", json!({}));
+            for item in inbox["items"].as_array().unwrap() {
+                let payload: Value = serde_json::from_str(item["text"].as_str().unwrap()).unwrap();
+                for event in payload["events"].as_array().unwrap() {
+                    assert_eq!(event["ns"], "herdr-status");
+                    assert_eq!(event["key"], key);
+                    states.push(event["data"]["value"]["state"].as_str().unwrap().to_owned());
+                }
+            }
+            if states.len() < expected.len() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(states, expected, "{key}");
+    }
+    assert_eq!(mcp.close(RPC_TIMEOUT), Some(0));
+    daemon.proc.shutdown_gracefully();
+}
+
+#[test]
 fn kv_cli_and_mcp_preserve_and_clear_ttl_across_daemon_and_offline_writes() {
     let mut daemon = start_native_rust_daemon();
     let home = daemon.tmp.path();

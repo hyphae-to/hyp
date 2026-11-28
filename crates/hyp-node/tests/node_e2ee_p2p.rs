@@ -767,7 +767,12 @@ async fn direct_two_node_p2p_hp2p1_asymmetric_scopes_and_public_manifest_isolati
 
     let (hp2p_token, offer) = alice
         .create_p2p_invite(
-            vec!["dm:*".to_string(), "kv:read=pair/*".to_string()],
+            vec![
+                "dm:*".into(),
+                "kv:read=pair/*".into(),
+                "kv:read=herdr-status/builder-a".into(),
+                "kv:read=herdr-status-lease/builder-a".into(),
+            ],
             vec!["dm:*".to_string()],
             300_000,
         )
@@ -862,6 +867,38 @@ async fn direct_two_node_p2p_hp2p1_asymmetric_scopes_and_public_manifest_isolati
         .unwrap()
         .expect("pair/plan readable");
     assert_eq!(pair_plan.value, json!({ "step": "ship-v2" }));
+
+    for namespace in ["herdr-status", "herdr-status-lease"] {
+        for key in ["builder-a", "builder-b"] {
+            alice
+                .kv_set(KvWriteRequest {
+                    host_node: "local".into(),
+                    namespace: namespace.into(),
+                    key: key.into(),
+                    value: json!({"fixture": key}),
+                    write_model: WriteModel::Owner,
+                    owner_id: None,
+                    allowlist: None,
+                    expected_version: Some(0),
+                    ttl_ms: None,
+                    clear_ttl: false,
+                    encrypt: false,
+                    e2ee_members: None,
+                })
+                .await
+                .unwrap();
+        }
+        let allowed = bob
+            .kv_get("alice@macbook", namespace, "builder-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(allowed.value, json!({"fixture": "builder-a"}));
+        assert!(matches!(
+            bob.kv_get("alice@macbook", namespace, "builder-b").await,
+            Err(NodeError::RemoteProblem(problem)) if problem.status == 403
+        ));
+    }
 
     let denied_err = bob
         .kv_set(KvWriteRequest {

@@ -52,13 +52,13 @@ function parseJson(text, label) {
   }
 }
 
-export function localKv(binding) {
+export function localKv(binding, binary = "hyp") {
   async function run(action, ns, flags = []) {
     const args = ["kv", action, "--ns", ns, "--key", binding.key,
       "--state-dir", binding.stateDir, "--json", ...flags];
     let result;
     try {
-      result = await exec("hyp", args, { timeout: 10_000, maxBuffer: 1024 * 1024 });
+      result = await exec(binary, args, { timeout: 10_000, maxBuffer: 1024 * 1024 });
     } catch (error) {
       if (action === "get" && error.stdout &&
           parseJson(error.stdout, "Hyphae")?.error?.code === "NOT_FOUND") return null;
@@ -90,7 +90,8 @@ export async function publishStatus(binding, frames, kv, now = Date.now) {
   let ownerLease = await kv.get(leaseNamespace);
   if (ownerLease && (ownerLease.writeModel !== "owner" ||
       ownerLease.value?.schema !== leaseSchema || ownerLease.value.session !== binding.session ||
-      !Number.isSafeInteger(ownerLease.value.validUntil))) {
+      (!Number.isSafeInteger(ownerLease.value.validUntil) ||
+       !Number.isSafeInteger(ownerLease.value.statusVersion)))) {
     throw new Error("Builder lease already belongs to another session");
   }
   if (ownerLease?.value.validUntil > now()) {
@@ -98,23 +99,24 @@ export async function publishStatus(binding, frames, kv, now = Date.now) {
   }
   let ownsLease = false;
   let lastSeq;
-  let observation;
 
   async function observe(status) {
-    observation = status;
-    const value = { schema: statusSchema, session: binding.session, ...observation };
-    if (stored?.value?.state === value.state && stored.value.kind === value.kind) return;
-    stored = await kv.set(namespace, value, stored?.version ?? 0);
+    const value = { schema: statusSchema, session: binding.session, ...status };
+    const unchanged = stored?.value?.state === value.state && stored.value.kind === value.kind;
+    const version = stored?.version ?? 0;
+    await lease(unchanged ? version : version + 1);
+    if (!unchanged) stored = await kv.set(namespace, value, version);
   }
 
-  async function lease() {
+  async function lease(statusVersion) {
     const stamp = now();
     if (ownsLease && ownerLease.value.validUntil <= stamp) {
       throw new Error("Builder lease expired while publishing");
     }
-    if (ownsLease && ownerLease.value.validUntil - stamp > leaseMs - renewalMs) return;
+    if (ownsLease && ownerLease.value.statusVersion === statusVersion &&
+        ownerLease.value.validUntil - stamp > leaseMs - renewalMs) return;
     ownerLease = await kv.set(leaseNamespace, {
-      schema: leaseSchema, session: binding.session, validUntil: stamp + leaseMs,
+      schema: leaseSchema, session: binding.session, statusVersion, validUntil: stamp + leaseMs,
     }, ownerLease?.version ?? 0);
     ownsLease = true;
   }
@@ -125,7 +127,6 @@ export async function publishStatus(binding, frames, kv, now = Date.now) {
     }
     const terminal = frame.terminals.find((entry) => entry?.address === binding.terminal);
     const status = projectTerminal(terminal, binding);
-    await lease();
     await observe(status);
     lastSeq = frame.seq;
   }
@@ -142,7 +143,6 @@ export async function publishStatus(binding, frames, kv, now = Date.now) {
             event.seq <= lastSeq || !changes.has(event.type)) continue;
         lastSeq = event.seq;
         if (event.type === "removed") return;
-        await lease();
         const status = event.type === "created" || event.type === "restarted"
           ? projectTerminal(event.data, binding)
           : event.type === "status"
@@ -150,16 +150,16 @@ export async function publishStatus(binding, frames, kv, now = Date.now) {
             : { state: event.type === "finished" ? "finished" : "unknown" };
         await observe(status);
       } else if (frame?.method === "heartbeat") {
-        await lease();
+        await lease(stored.version);
       }
-      if (observation?.state === "finished") return;
+      if (stored?.value.state === "finished") return;
     }
   } finally {
     if (ownsLease) {
       // CAS prevents a late exit from clearing a replacement publisher's lease.
       try {
         await kv.set(leaseNamespace, {
-          schema: leaseSchema, session: binding.session, validUntil: 0,
+          ...ownerLease.value, validUntil: 0,
         }, ownerLease.version);
       } catch {
         // If the node is unavailable, readers still have the bounded deadline.
@@ -181,14 +181,22 @@ async function run(binding) {
   controller.signal.addEventListener("abort", () => child.kill(), { once: true });
   const lines = createInterface({ input: child.stdout });
   async function* frames() {
-    let timeout = setTimeout(stop, heartbeatTimeoutMs);
+    let timedOut = false;
+    const expire = () => {
+      timedOut = true;
+      stop();
+    };
+    let timeout = setTimeout(expire, heartbeatTimeoutMs);
     try {
       for await (const line of lines) {
+        if (controller.signal.aborted) break;
         clearTimeout(timeout);
-        timeout = setTimeout(stop, heartbeatTimeoutMs);
+        timeout = setTimeout(expire, heartbeatTimeoutMs);
         yield parseJson(line, "Herdr");
       }
       if (streamError) throw new Error("Cannot start Herdr event stream");
+      if (timedOut) throw new Error("Herdr event stream timed out");
+      if (!controller.signal.aborted) throw new Error("Herdr event stream disconnected");
     } finally {
       clearTimeout(timeout);
     }

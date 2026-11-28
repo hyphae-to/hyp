@@ -1,6 +1,6 @@
 # Publish Herdr builder status to Shared KV
 
-This optional publisher follows Herdr Core's event stream and records a small status for one explicitly selected local terminal. It requires Node.js 24, Herdr Core `hc` 0.1.22 or later, and a `hyp` build that supports `kv set --clear-ttl`. Run it alongside the local node. Loading the Herdr UI mods does not start the publisher.
+This optional publisher follows Herdr Core's event stream and records a small status for one explicitly selected local terminal. It requires Node.js 24, Herdr Core `hc` 0.1.22 or later, and a `hyp` build that supports `kv set --clear-ttl`. Keep the publisher and reader clocks synchronized when using leases across hosts. Run it alongside the local node. Loading the Herdr UI mods does not start the publisher.
 
 ## Start
 
@@ -17,7 +17,7 @@ From an official plugin archive that includes this plugin, `hyp plugin install h
 
 Read `herdr-status/builder-a` using `hyp kv get --ns herdr-status --key builder-a --json`. The value contains the schema, a session fingerprint, and the state. Native states include `idle`, `working`, `done`, `blocked`, and `error`. `blocked` can include `kind` with the native value `permission`, `question`, or `auth`. It signals that the builder may need input. `unknown` covers a live terminal with no recognized status or a lost process. `finished` records an observed terminal exit.
 
-Check `herdr-status-lease/builder-a` when reading a current status. Treat the status as stale unless the lease has the same session fingerprint and `validUntil` is later than the current epoch time in milliseconds. A recorded `finished` remains historical evidence of exit. A clean publisher stop clears the lease. A crash or lost connection makes the lease stale within 75 seconds of its last renewal. A service supervisor can restart the foreground publisher. After an abrupt exit, wait for the previous lease to become stale before restarting it.
+Check `herdr-status-lease/builder-a` when reading a current status. Treat the status as stale unless the lease has the same session fingerprint, its `statusVersion` matches the status entry’s KV `version`, and `validUntil` is later than the current epoch time in milliseconds. A recorded `finished` remains historical evidence of exit. A clean publisher stop clears the lease. A crash or lost connection makes the lease stale within 75 seconds of its last renewal. A service supervisor can restart the foreground publisher. After an abrupt exit, wait for the previous lease to become stale before restarting it.
 
 For notifications, subscribe to the built-in `local.kv` stream with both fields in the exact filter:
 

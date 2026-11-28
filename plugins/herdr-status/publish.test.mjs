@@ -70,7 +70,7 @@ test("two pinned builders publish only transitions on their exact status keys", 
   assert.doesNotMatch(JSON.stringify(h.events), /PRIVATE|t1|t2/);
   assert.equal((await h.kv(a).get("herdr-status-lease")).value.validUntil, 0);
   assert.equal((await h.kv(b).get("herdr-status-lease")).value.validUntil, 0);
-  assert.equal(h.events.filter((ev) => ev.ns === "herdr-status-lease" && ev.key === a.key).length, 3);
+  assert.equal(h.events.filter((ev) => ev.ns === "herdr-status-lease" && ev.key === a.key).length, 9);
 });
 
 test("restart bootstrap deduplicates and recycled terminals cannot claim a status key", async () => {
@@ -98,6 +98,7 @@ test("a duplicate publisher cannot claim a live key, and stale leases are bounde
     yield frames[0];
     const lease = await kv.get("herdr-status-lease");
     assert.equal(lease.value.validUntil, h.now() + 75_000);
+    assert.equal(lease.value.statusVersion, (await kv.get("herdr-status")).version);
     await assert.rejects(publishStatus(a, frames, kv, h.now), /active publisher/);
     h.advance(75_000);
     yield { method: "heartbeat" };
