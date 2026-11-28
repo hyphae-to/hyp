@@ -126,6 +126,9 @@ impl InboxDigest {
 pub struct PackedDeliveryBatch {
     /// Rendered compact metadata-only `<hyphae-inbox ...>...</hyphae-inbox>` XML digest.
     pub rendered: InboxDigest,
+    /// Full digest with a daemon advisory, for confirmed delivery paths only.
+    #[serde(skip)]
+    subscription_review: Option<InboxDigest>,
     /// Receipt IDs counted in the XML digest (marked `notified = 1` while kept `unread` in SQLite
     /// until the agent reads them via `hyp_inbox`).
     pub receipt_ids: Vec<String>,
@@ -137,6 +140,26 @@ pub struct PackedDeliveryBatch {
     pub max_urgency: DeliveryUrgency,
     /// Quarantined receipts counted in `<quarantined count="..."/>` (never part of `unread`).
     pub quarantined_receipts: Vec<String>,
+}
+
+impl PackedDeliveryBatch {
+    /// Add one bounded, daemon-authored element. No event or subscription text crosses this boundary.
+    pub fn add_subscription_review(&mut self, count: u64) {
+        const END: &str = "</hyphae-inbox>";
+        if let Some(prefix) = self.rendered.as_str().strip_suffix(END) {
+            self.subscription_review = Some(InboxDigest(format!(
+                "{prefix}  <system kind=\"subscription-review\" subscriptions=\"{count}\">Review subscriptions with hyp_stream(action=\"list\").</system>\n{END}"
+            )));
+        }
+    }
+
+    pub fn confirmed_digest(&self) -> &InboxDigest {
+        self.subscription_review.as_ref().unwrap_or(&self.rendered)
+    }
+
+    pub fn includes_subscription_review(&self) -> bool {
+        self.subscription_review.is_some()
+    }
 }
 
 /// Sanitizes and strictly XML-escapes an attribute value (`&`, `<`, `>`, `"`, `'`),
@@ -491,6 +514,7 @@ pub fn pack_inbox_digest(
 
     Some(PackedDeliveryBatch {
         rendered,
+        subscription_review: None,
         receipt_ids,
         notify_only,
         muted_count,
@@ -522,6 +546,22 @@ mod tests {
 
     fn dm(id: &str, urgency: DeliveryUrgency, source: &str) -> PackableItem {
         mk(id, urgency, MailboxKind::Message, source)
+    }
+
+    #[test]
+    fn subscription_review_is_local_to_the_confirmed_digest() {
+        let items = [dm("r1", DeliveryUrgency::Queue, "peer@net/dev")];
+        let mut batch = pack_inbox_digest(Some("dev"), &items, 0, &[]).unwrap();
+        let original = serde_json::to_value(&batch).unwrap();
+        batch.add_subscription_review(20);
+        assert!(
+            batch
+                .confirmed_digest()
+                .as_str()
+                .contains("subscription-review")
+        );
+        assert!(!batch.rendered.as_str().contains("subscription-review"));
+        assert_eq!(serde_json::to_value(&batch).unwrap(), original);
     }
 
     #[test]

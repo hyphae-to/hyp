@@ -315,6 +315,36 @@ impl<'a> LocalStateStore<'a> {
         Ok(())
     }
 
+    /// Count this session's subscriptions only when its last delivered review notice is old enough.
+    pub fn subscription_review_count(
+        &self,
+        session_id: &str,
+        threshold: u64,
+        eligible_before: i64,
+    ) -> StoreResult<Option<u64>> {
+        Ok(self
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM subscriptions WHERE subscriber = ?1
+             HAVING COUNT(*) >= ?2 AND NOT EXISTS (
+                SELECT 1 FROM metadata WHERE key = ?3 AND CAST(value AS INTEGER) > ?4
+             )",
+                params![
+                    session_id,
+                    threshold,
+                    subscription_review_key(session_id),
+                    eligible_before
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn record_subscription_review(&self, session_id: &str, now_ms: i64) -> StoreResult<()> {
+        self.set_metadata(&subscription_review_key(session_id), &now_ms.to_string())
+    }
+
     /// Sets `metadata[key] = value` if absent; fails closed with [`StoreError::InvalidState`]
     /// if already bound to a different value (protects identity & origin pinning).
     pub fn ensure_metadata(&self, key: &str, value: &str) -> StoreResult<()> {
@@ -620,6 +650,10 @@ impl<'a> LocalStateStore<'a> {
             tx.conn().execute(
                 "DELETE FROM plugin_targets WHERE session_id = ?1",
                 params![id],
+            )?;
+            tx.conn().execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                params![subscription_review_key(id)],
             )?;
             tx.conn()
                 .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
@@ -2035,4 +2069,8 @@ fn decode_gate_audit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResul
             reviewer,
         })
     })())
+}
+
+fn subscription_review_key(session_id: &str) -> String {
+    format!("subscription-review:{session_id}")
 }

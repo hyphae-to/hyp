@@ -694,7 +694,7 @@ impl LocalDaemonInner {
         } else {
             None
         };
-        build_digest(
+        let mut built = build_digest(
             session_handle.as_deref(),
             candidates,
             DigestPolicy {
@@ -706,7 +706,31 @@ impl LocalDaemonInner {
             now,
             muted,
             &q_notices,
-        )
+        )?;
+        const LARGE_SUBSCRIPTION_LIST: u64 = 20;
+        const REVIEW_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+        if let Ok(Some(count)) = self.node.db().local().subscription_review_count(
+            session_id,
+            LARGE_SUBSCRIPTION_LIST,
+            now.saturating_sub(REVIEW_INTERVAL_MS),
+        ) {
+            built.batch.add_subscription_review(count);
+        }
+        Some(built)
+    }
+
+    pub(super) fn record_subscription_review_if_shown(
+        &self,
+        session_id: &str,
+        batch: &PackedDeliveryBatch,
+    ) {
+        if batch.includes_subscription_review() {
+            let _ = self
+                .node
+                .db()
+                .local()
+                .record_subscription_review(session_id, self.current_time_ms());
+        }
     }
 
     /// Commits a delivered [`PackedDeliveryBatch`]:
@@ -720,6 +744,8 @@ impl LocalDaemonInner {
             let notified_ids: Vec<&str> = batch.receipt_ids.iter().map(String::as_str).collect();
             mark_receipts_notified(&db, session_id, &notified_ids);
         }
+
+        self.record_subscription_review_if_shown(session_id, batch);
 
         // G10: Mark quarantine notices as surfaced only once their rendered digest actually commits.
         self.mark_surfaced_quarantine_notices(session_id, &batch.quarantined_receipts);
@@ -1084,7 +1110,7 @@ impl LocalDaemonInner {
                     }
 
                     let batch_id = compute_batch_idempotency_id(session_id, &batch);
-                    let digest_xml = batch.rendered.as_str().to_owned();
+                    let digest_xml = batch.confirmed_digest().as_str().to_owned();
                     let delivery_id = self.next_seq();
                     let (ack_tx, ack_rx) = oneshot::channel();
                     let sent = tx
@@ -1214,7 +1240,7 @@ impl LocalDaemonInner {
 
                     let batch_id = compute_batch_idempotency_id(session_id, &batch);
                     let outcome = transport
-                        .deliver_digest(&batch.rendered, &batch_id, push_mode)
+                        .deliver_digest(batch.confirmed_digest(), &batch_id, push_mode)
                         .await;
                     if push_mode == PushMode::Interrupt
                         && matches!(
@@ -1290,7 +1316,7 @@ impl LocalDaemonInner {
                     "items": [{
                         "router": self.node.node_id().as_str(),
                         "received": self.current_time_ms() / 1000,
-                        "text": batch.rendered,
+                        "text": batch.confirmed_digest(),
                         "notifyOnly": batch.notify_only,
                         "mutedCount": batch.muted_count,
                     }]
@@ -1318,7 +1344,7 @@ impl LocalDaemonInner {
                     "items": [{
                         "router": self.node.node_id().as_str(),
                         "received": self.current_time_ms() / 1000,
-                        "text": batch.rendered,
+                        "text": batch.confirmed_digest(),
                         "notifyOnly": batch.notify_only,
                         "mutedCount": batch.muted_count,
                     }]
@@ -1382,7 +1408,11 @@ impl LocalDaemonInner {
                     {
                         let spawn_key = format!("herdr-cold:{session_id}:{template}");
                         if self
-                            .try_herdr_cold_spawn(&spawn_key, &template, batch.rendered.as_str())
+                            .try_herdr_cold_spawn(
+                                &spawn_key,
+                                &template,
+                                batch.confirmed_digest().as_str(),
+                            )
                             .await
                             .is_delivered()
                         {

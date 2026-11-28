@@ -40,6 +40,7 @@ A digest sent while a turn is active is the same digest the wake nudge would hav
 - `urgency` is the highest tier among the counted items.
 - DMs, channels and bridges are grouped by source; stream events by subscription key (falling back to topic when the subscription has no key).
 - Daemon wake notices appear as `<system from="hyphae:system" count="N"/>`. Read the notice text with `hyp_inbox`.
+- When a session owns at least 20 subscriptions, its next full digest on a confirmed delivery path can include a daemon-authored reminder to review them with `hyp_stream(action="list")`. Only the count appears. A confirmed delivery starts a seven-day cooldown for that session, including across daemon restarts. Two deliveries already in flight can both show the reminder before either confirms. The reminder neither creates a wake nor changes subscriptions. Count-only wakes keep their existing format.
 - Attribute values are node-generated identifiers. Sender display names, subjects and bodies never appear.
 - `human-verified` items get `verified="true"` on their element so an agent can prioritise them without reading them.
 
