@@ -31,4 +31,10 @@ Only changes to the status or blocker kind update that status key. The Herdr hea
 
 The publisher writes as the local node, with an owner-mode entry and a version check. Keep it on a trusted node and use public-safe key names. The payload excludes terminal text, prompts, commands, working directories, process IDs, labels, and freeform status fields.
 
-A remote reader that only needs these two records can be granted `kv:read=herdr-status/builder-a` and `kv:read=herdr-status-lease/builder-a`; it needs no write scope. Remote subscriptions to `<peer>.kv` use separate stream permissions. A broad KV stream grant exposes KV event values even when direct KV reads are scoped. Exact filters select notifications and do not restrict a grantee's authorization. Keep remote stream access limited to peers trusted to read the KV event stream.
+A remote reader that only needs these two records can be granted `kv:read=herdr-status/builder-a` and `kv:read=herdr-status-lease/builder-a`. It needs no write scope. A paired agent can read the status using:
+
+```json
+{"action":"get","node":"publisher@host","namespace":"herdr-status","key":"builder-a"}
+```
+
+Use the same `hyp_kv` query against `herdr-status-lease` for liveness. Remote subscriptions to `<peer>.kv` use separate stream permissions. A broad KV stream grant exposes KV event values even when direct KV reads are scoped. Exact filters select notifications and do not restrict a grantee's authorization. Keep remote stream access limited to peers trusted to read the KV event stream.

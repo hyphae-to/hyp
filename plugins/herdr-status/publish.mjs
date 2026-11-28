@@ -173,14 +173,15 @@ async function run(binding) {
   const stop = () => controller.abort();
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
-  const child = spawn("hc", ["events", "--json", "--terminal", binding.terminal], {
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  let streamError = false;
-  child.on("error", () => { streamError = true; });
-  controller.signal.addEventListener("abort", () => child.kill(), { once: true });
-  const lines = createInterface({ input: child.stdout });
   async function* frames() {
+    if (controller.signal.aborted) return;
+    const child = spawn("hc", ["events", "--json", "--terminal", binding.terminal], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let streamError = false;
+    child.on("error", () => { streamError = true; });
+    controller.signal.addEventListener("abort", () => child.kill(), { once: true });
+    const lines = createInterface({ input: child.stdout });
     let timedOut = false;
     const expire = () => {
       timedOut = true;
@@ -199,13 +200,13 @@ async function run(binding) {
       if (!controller.signal.aborted) throw new Error("Herdr event stream disconnected");
     } finally {
       clearTimeout(timeout);
+      lines.close();
+      child.kill();
     }
   }
   try {
     await publishStatus(binding, frames(), localKv(binding));
   } finally {
-    lines.close();
-    child.kill();
     process.removeListener("SIGINT", stop);
     process.removeListener("SIGTERM", stop);
   }
