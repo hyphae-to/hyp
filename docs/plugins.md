@@ -384,6 +384,14 @@ The bridge rereads the file for each incoming message and outbound post. A missi
 
 Replies can target a DM conversation that passed the incoming filters while its sender remains permitted. For regular channels, outbound posts must use a permitted channel. With env configuration alone, the outbound channel must be configured or previously observed.
 
+#### Slack channel and thread delivery
+
+Mentions start a followed thread. The bridge also follows threads where the authenticated bot posted, including posts made through another tool using the same bot identity. The bridge records only the channel and thread timestamp under the node’s state directory. An allowed sender’s reply to a followed thread is delivered across restarts. The bridge suppresses the bot’s own posts.
+
+If an allowed reply arrives for an unknown thread, the bridge requests the single root message with `conversations.history` and checks that the same bot authored it. This lookup needs `channels:history` or `groups:history` and channel membership. An unavailable, mismatched, or differently authored root leaves the thread unfollowed.
+
+Set `SLACK_TOP_LEVEL_CHANNELS` to a comma-separated list of channel IDs to also forward ordinary top-level messages there. Sender and channel allowlists still apply. Other channels retain mention and followed-thread delivery.
+
 #### Interactive Slack choices
 
 The Socket Mode bridge accepts buttons and static selects on messages posted by the same bot, including messages posted through another tool. Enable Interactivity on the app and grant the bot `chat:write`. The sender and channel must pass the same allowlist as a message. URL buttons open their destination and leave the message alone.

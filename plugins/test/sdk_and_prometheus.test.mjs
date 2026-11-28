@@ -1138,8 +1138,9 @@ test("Issue #29: slack plugin aborts stalled Socket Mode WebSocket immediately o
   assert.ok(wsConns >= 2);
 });
 
-async function startSlackFixture(env, { updateErrors = [], publishErrors = [] } = {}) {
+async function startSlackFixture(env, { updateErrors = [], publishErrors = [], roots = {} } = {}) {
   const updates = [];
+  const history = [];
   const events = [];
   const posts = [];
   const responses = new Map();
@@ -1151,6 +1152,14 @@ async function startSlackFixture(env, { updateErrors = [], publishErrors = [] } 
       "/auth.test": { ok: true, user_id: "UBOT", team_id: "TDEMO" },
       "/apps.connections.open": { ok: true, url: `ws://127.0.0.1:${server.address().port}/ws` },
     };
+    if (req.url === "/conversations.history") {
+      const body = [];
+      for await (const chunk of req) body.push(chunk);
+      const query = Object.fromEntries(new URLSearchParams(Buffer.concat(body).toString()));
+      history.push(query);
+      res.end(JSON.stringify(roots[query.channel + ":" + query.oldest] ?? { ok: false, error: "missing_scope" }));
+      return;
+    }
     if (req.url === "/chat.update") {
       const body = [];
       for await (const chunk of req) body.push(chunk);
@@ -1210,7 +1219,7 @@ async function startSlackFixture(env, { updateErrors = [], publishErrors = [] } 
   await until(() => socket, "Slack Socket Mode fixture connected");
 
   return {
-    events, posts, updates, stderr: child.stderr,
+    events, posts, updates, history, stderr: child.stderr,
     async stop() { child.child.kill("SIGTERM"); await child.waitExit(); },
     envelope(envelope) { socket.write(wsTextFrame(JSON.stringify(envelope))); },
     deliver(...items) {
@@ -1319,6 +1328,54 @@ test("Slack handles external section selects and acknowledges URL buttons withou
   assert.equal(slack.events[0].data.thread_ts, "-");
   assert.equal(slack.updates.length, 1);
   assert.equal(slack.updates[0].blocks[1].elements[0].text, ":white_check_mark: *Slot &lt;A&gt;*, chosen by <@UALICE>");
+});
+
+test("Slack persists external same-bot threads and verifies allowed replies to unknown roots", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyp-slack-threads-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const env = { HYPHAE_STATE_DIR: dir, SLACK_ALLOWED_USERS: "UALICE", SLACK_ALLOWED_CHANNELS: "COPS,CWATCH",
+    SLACK_TOP_LEVEL_CHANNELS: "CWATCH,CDENIED" };
+  const first = await startSlackFixture(env);
+  first.deliver(
+    { ...slackEvent("UBOT", "COPS", "10.1"), bot_id: "BSAME", subtype: "bot_message" },
+    { ...slackEvent("UBOT", "COPS", "10.2"), thread_ts: "9.1", bot_id: "BSAME" },
+    slackEvent("UALICE", "COPS", "11.1", "app_mention"),
+  );
+  await until(() => first.events.length === 1, "own bot posts are tracked silently");
+  await first.stop();
+  const slack = await startSlackFixture(env, { roots: {
+    "COPS:8.1": { ok: true, messages: [{ user: "UBOT", ts: "8.1" }] },
+    "COPS:7.1": { ok: true, messages: [{ user: "UOTHER", ts: "7.1" }] },
+    "COPS:6.1": { ok: true, messages: [{ user: "UBOT", ts: "6.2" }] },
+  } });
+  const reply = (ts, thread_ts, user = "UALICE", channel = "COPS") => ({ ...slackEvent(user, channel, ts), thread_ts });
+  slack.deliver(reply("20.1", "10.1"), reply("20.2", "9.1"), reply("20.3", "11.1"),
+    reply("20.4", "8.1"), reply("20.5", "7.1"), reply("20.6", "6.1"), reply("20.7", "5.1"),
+    reply("20.8", "4.1", "UDENIED"), reply("20.9", "3.1", "UALICE", "CDENIED"),
+    slackEvent("UALICE", "COPS", "21.1"), slackEvent("UALICE", "CDENIED", "21.2"),
+    slackEvent("UALICE", "CWATCH", "21.3"), slackEvent("UALICE", "CWATCH", "21.3", "app_mention"),
+    slackEvent("UALICE", "COPS", "21.4"), slackEvent("UALICE", "COPS", "21.4", "app_mention"));
+  await until(() => slack.history.length === 4 && slack.events.length === 6, "thread and channel routing");
+  assert.deepEqual(slack.events.map((e) => [e.data.ts, e.data.via]).sort(), [
+    ["20.1", "thread"], ["20.2", "thread"], ["20.3", "thread"], ["20.4", "thread"],
+    ["21.3", "channel"], ["21.4", "mention"],
+  ]);
+  for (const query of slack.history) {
+    assert.deepEqual(query, { channel: "COPS", oldest: query.oldest, latest: query.oldest, inclusive: "true", limit: "1" });
+  }
+  assert.deepEqual(slack.history.map((q) => q.oldest).sort(), ["5.1", "6.1", "7.1", "8.1"]);
+});
+
+test("Slack reports a successful outbound post even if saving the thread fails", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hyp-slack-storage-"));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, "not-a-directory");
+  writeFileSync(file, "fixture");
+  const slack = await startSlackFixture({ SLACK_ALLOWED_CHANNELS: "COPS", HYPHAE_STATE_DIR: file });
+  const response = await slack.post({ text: "fixture", channel: "COPS" });
+  assert.equal(response.result.ts, "99.01");
+  assert.equal(slack.posts.length, 1);
+  await until(() => slack.stderr().includes("message was posted but thread membership could not be saved"), "storage diagnostic");
 });
 
 test("Slack env sender policy admits DMs independently of channel restrictions", async () => {
