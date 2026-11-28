@@ -833,60 +833,40 @@ impl UnifiedNode {
         Ok(res)
     }
 
-    /// Sweeps ALL locally subscribed topics (`origin_node == self.node_id` and subscriber is not a
-    /// remote peer), closes any due coalescing batches, materializes all ready `pending` batches
-    /// into local session mailboxes (strictly at-most-once), wakes matched local sessions, and
-    /// notifies the deadline scheduler.
-    ///
-    /// Returns the total number of batches materialized into local mailboxes.
+    /// Closes due batches and flushes them into local session mailboxes, including
+    /// subscriptions to remote topics. Peer pushdown batches belong to the SSE transport.
     pub fn flush_pending_local_topic_batches(&self) -> usize {
-        self.flush_pending_local_topic_batches_inner(true)
+        let now = now_ms();
+        let _ = self.db().events().tick(now);
+        let total = self.flush_session_batch_routes(now, true);
+        self.notify_scheduler();
+        total
     }
 
-    pub(super) fn flush_pending_local_topic_batches_inner(&self, wake_scheduler: bool) -> usize {
-        let now = now_ms();
-        let my_id = self.config.node_id.to_string();
-        let local_topics: Vec<String> = {
-            let db = self.db();
-            let _ = db.events().tick(now);
-            let remote_peers: HashSet<String> = db
-                .peers()
-                .list_peers(None)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| p.peer_id)
-                .filter(|pid| pid != &my_id)
-                .collect();
-            db.events()
-                .list_subscriptions(None)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|s| s.origin_node == my_id && !remote_peers.contains(&s.subscriber))
-                .map(|s| s.topic)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        };
-
-        let mut total_batches = 0usize;
-        let default_opts = MailboxPutOptions::default();
-        for topic in local_topics {
-            if let Ok((_, batches)) = self.deliver_local_topic_batches_inner(
+    pub(super) fn flush_session_batch_routes(&self, now: i64, include_local_origin: bool) -> usize {
+        let my_id = self.node_id().as_str();
+        let routes = self
+            .db()
+            .events()
+            .pending_session_batch_routes(my_id)
+            .unwrap_or_default();
+        let mut total = 0;
+        for (origin, topic) in routes {
+            if !include_local_origin && origin == my_id {
+                continue;
+            }
+            if let Ok((_, batches)) = self.deliver_session_topic_batches(
+                &origin,
                 &topic,
-                &default_opts,
+                &MailboxPutOptions::default(),
                 None,
                 None,
                 now,
-                false,
             ) {
-                total_batches += batches;
+                total += batches;
             }
         }
-
-        if wake_scheduler {
-            self.notify_scheduler();
-        }
-        total_batches
+        total
     }
 
     /// Like [`Self::deliver_local_topic_batches`], recording an explicit Stage 1 `gate_reason`
@@ -902,25 +882,27 @@ impl UnifiedNode {
         let bare_topic = topic
             .strip_prefix(&format!("{LOCAL_NODE_ID}."))
             .unwrap_or(topic);
-        let (sessions_woken, _batches) = self.deliver_local_topic_batches_inner(
+        let _ = self.db().events().tick(now_ms);
+        let (sessions_woken, _batches) = self.deliver_session_topic_batches(
+            self.node_id().as_str(),
             bare_topic,
             put_opts,
             human_auth,
             gate_reason,
             now_ms,
-            true,
         )?;
+        self.notify_scheduler();
         Ok(sessions_woken)
     }
 
-    fn deliver_local_topic_batches_inner(
+    fn deliver_session_topic_batches(
         &self,
+        origin: &str,
         topic: &str,
         put_opts: &MailboxPutOptions,
         human_auth: Option<&VerifiedHumanClaim>,
         gate_reason: Option<&str>,
         now_ms: i64,
-        wake_scheduler: bool,
     ) -> Result<(usize, usize), NodeError> {
         let my_id = self.config.node_id.to_string();
         let auth_json = match human_auth {
@@ -932,8 +914,6 @@ impl UnifiedNode {
 
         {
             let db = self.db();
-            let _ = db.events().tick(now_ms);
-
             let remote_peers: HashSet<String> = db
                 .peers()
                 .list_peers(None)?
@@ -947,7 +927,7 @@ impl UnifiedNode {
                 .list_subscriptions(None)?
                 .into_iter()
                 .filter(|s| {
-                    s.origin_node == my_id
+                    s.origin_node == origin
                         && s.topic == topic
                         && !remote_peers.contains(&s.subscriber)
                 })
@@ -957,11 +937,12 @@ impl UnifiedNode {
             for subscriber in local_subscribers {
                 // `claim_due_batches` yields at most one pending batch per subscription per call,
                 // so drain boundedly while making progress to flush batches queued across downtime.
-                for _round in 0..64 {
+                const MAX_DRAIN_ROUNDS: usize = 64;
+                for round in 1..=MAX_DRAIN_ROUNDS {
                     let due = db.events().claim_due_batches(&subscriber, now_ms)?;
                     let mut progressed = false;
                     for local_batch in due {
-                        if local_batch.origin_node != my_id || local_batch.topic != topic {
+                        if local_batch.origin_node != origin || local_batch.topic != topic {
                             continue;
                         }
                         let kind = if local_batch.topic == "kv" {
@@ -985,11 +966,15 @@ impl UnifiedNode {
                         let put = db.local().put_in_mailbox_ex(
                             &MailboxInsert {
                                 session_id: subscriber.clone(),
-                                origin_node: my_id.clone(),
+                                origin_node: origin.to_owned(),
                                 item_id: format!("batch:{}", local_batch.id),
                                 text: payload_text,
                                 kind,
-                                source: format!("local.{}", local_batch.topic),
+                                source: format!(
+                                    "{}.{}",
+                                    if origin == my_id { "local" } else { origin },
+                                    topic
+                                ),
                                 gate_state: GateState::Pending,
                                 gate_reason: gate_reason.map(str::to_string),
                                 traceparent,
@@ -1038,6 +1023,11 @@ impl UnifiedNode {
                     if !progressed {
                         break;
                     }
+                    if round == MAX_DRAIN_ROUNDS && origin != my_id {
+                        // A high-cap subscription can still have ready batches. Yield this DB
+                        // pass and schedule the rest without waiting for another peer event.
+                        self.notify_scheduler();
+                    }
                 }
             }
         }
@@ -1045,9 +1035,6 @@ impl UnifiedNode {
         let delivered = sessions_to_wake.len();
         for sid in sessions_to_wake {
             self.notify_local_session(&sid);
-        }
-        if wake_scheduler {
-            self.notify_scheduler();
         }
         Ok((delivered, batches_materialized))
     }
@@ -1211,68 +1198,22 @@ impl UnifiedNode {
 
         // 2. Durable local ingest inside BEGIN IMMEDIATE per event + route to local session mailboxes.
         let now = now_ms();
-        let mut sessions_to_wake = HashSet::new();
         {
             let db = self.db();
             for ev in &prepared_events {
                 db.events()
                     .ingest(origin_node, &batch.topic, origin_node, ev, now)?;
             }
-            // Tick immediately so coalesce_seconds == 0 batches are closed, and drain local subscribers!
-            let _ = db.events().tick(now);
-
-            let local_subscribers: BTreeSet<String> = db
-                .events()
-                .list_subscriptions(None)?
-                .into_iter()
-                .filter(|s| s.origin_node == origin_node && s.topic == batch.topic)
-                .map(|s| s.subscriber)
-                .collect();
-
-            for subscriber in local_subscribers {
-                let due = db.events().claim_due_batches(&subscriber, now)?;
-                for local_batch in due {
-                    let kind = if local_batch.topic == "kv" {
-                        MailboxKind::Kv
-                    } else {
-                        MailboxKind::Event
-                    };
-                    let payload_text = serde_json::to_string(&json!({
-                        "batchId": local_batch.id,
-                        "originNode": local_batch.origin_node,
-                        "topic": local_batch.topic,
-                        "events": local_batch.events,
-                    }))?;
-                    let put = db.local().put_in_mailbox(
-                        &MailboxInsert {
-                            session_id: subscriber.clone(),
-                            origin_node: origin_node.to_string(),
-                            item_id: format!("batch:{}", local_batch.id),
-                            text: payload_text,
-                            kind,
-                            source: format!("{origin_node}.{}", local_batch.topic),
-                            gate_state: GateState::Pending,
-                            gate_reason: None,
-                            traceparent: None,
-                        },
-                        now,
-                    )?;
-                    if !matches!(put, MailboxPutResult::QueueFull) {
-                        db.events().ack_batch(
-                            &subscriber,
-                            &local_batch.id,
-                            &AckOutcome::Delivered,
-                            now,
-                        )?;
-                        sessions_to_wake.insert(subscriber.clone());
-                    }
-                }
-            }
+            db.events().tick(now)?;
         }
-
-        for sid in sessions_to_wake {
-            self.notify_local_session(&sid);
-        }
+        self.deliver_session_topic_batches(
+            origin_node,
+            &batch.topic,
+            &MailboxPutOptions::default(),
+            None,
+            None,
+            now,
+        )?;
         self.notify_scheduler();
         Ok(())
     }

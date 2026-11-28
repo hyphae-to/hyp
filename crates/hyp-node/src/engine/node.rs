@@ -399,15 +399,9 @@ impl UnifiedNode {
                     break;
                 }
                 let now = now_ms();
-                let step = {
-                    let db = node.db();
-                    let tick = db.tick(now);
-                    let next = db.next_deadline_ms(now);
-                    (tick, next)
-                };
-
+                let tick = node.db().tick(now);
                 let mut closed_batches = false;
-                if let (Ok(report), _) = &step {
+                if let Ok(report) = tick {
                     if report.kv_expired > 0 {
                         node.notify_kv_metadata_change();
                     }
@@ -416,13 +410,14 @@ impl UnifiedNode {
                         node.notify_all_inbox_subscribers();
                     }
                 }
-                if first_tick || closed_batches {
-                    first_tick = false;
-                    let _ = node.flush_pending_local_topic_batches_inner(false);
-                }
+                // A remote batch may already be pending when its hold or wake cap expires.
+                // Check on every scheduler wake; newly published local batches use their source's
+                // delivery options until the normal startup/coalescing sweep.
+                node.flush_session_batch_routes(now, first_tick || closed_batches);
+                first_tick = false;
                 node.drop_relay.sweep_expired(now);
 
-                let next_deadline = step.1.ok().flatten();
+                let next_deadline = node.db().next_deadline_ms(now).ok().flatten();
                 match next_deadline {
                     None => {
                         // Completely idle: park indefinitely with zero polling wakeups!
@@ -742,8 +737,7 @@ impl UnifiedNode {
             next_epoch = *epoch;
         });
         self.notify_all_inbox_subscribers();
-        let _ = self.flush_pending_local_topic_batches_inner(false);
-        self.notify_scheduler();
+        let _ = self.flush_pending_local_topic_batches();
         next_epoch
     }
 

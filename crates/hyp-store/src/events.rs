@@ -922,6 +922,23 @@ impl<'a> EventStore<'a> {
 
     // ---- Batch Claim, Wake-Cap & Ack ----
 
+    /// Distinct origin/topic pairs with pending batches for local consumers. Batches addressed
+    /// to another node remain owned by that peer's SSE inbox.
+    pub fn pending_session_batch_routes(
+        &self,
+        local_node: &str,
+    ) -> StoreResult<Vec<(String, String)>> {
+        query_vec(
+            self.db.conn(),
+            "SELECT DISTINCT origin_node, topic FROM batches b
+             WHERE state = 'pending' AND (subscriber = ?1 OR NOT EXISTS
+                 (SELECT 1 FROM peers WHERE peer_id = b.subscriber))
+             ORDER BY origin_node, topic",
+            params![local_node],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    }
+
     /// Returns the oldest due `pending` batch per subscription for `subscriber`, skipping any
     /// batch that is in flight, held (`hold_until > now_ms`), expired, or wake-capped for the
     /// rolling 1-hour window.
